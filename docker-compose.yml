@@ -1,0 +1,148 @@
+version: '3.9'
+
+networks:
+  btc-simnet-network:
+    name: btc-simnet-network
+    driver: bridge
+
+services:
+  btc-simnet-node1:
+    build:
+      context: ../.
+      dockerfile: Dockerfile
+      ## TO share volumes and avoid permission issues with chain data, fill that args with id -u and id -g
+      ## export UID=$(id -u) && export GID=$(id -g) && docker-compose up --build
+      # args:
+      #   UID: ${UID}   # Pass host UID
+      #   GID: ${GID}   # Pass host GID
+    image: simchainbitcoinnode:29.0
+    container_name: btc-simnet-node1
+    ports:
+      - "18443:18443"
+      - "18444:18444"
+    networks:
+      - btc-simnet-network
+    command:
+      - -printtoconsole
+      - -regtest=1
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -rpcuser=bituser
+      - -rpcpassword=bitpass
+      - -fallbackfee=0.0001
+      - -minrelaytxfee=0.00001
+      - -maxtxfee=10000000
+      - -disablewallet=1
+      - -port=18444
+      - -rpcport=18443
+      - -txindex
+      - -addnode=btc-simnet-node2:18444
+      - -addnode=btc-simnet-node3:18444
+      # - -debug=1
+      # - -debug=rpc
+      # - -debug=net
+      # - -debug=mempool
+      # - -debug=validation
+
+  btc-simnet-node2:
+    build:
+      context: ../.
+      dockerfile: Dockerfile
+      ## TO share volumes and avoid permission issues with chain data, fill that args with id -u and id -g
+      ## export UID=$(id -u) && export GID=$(id -g) && docker-compose up --build
+      # args:
+      #   UID: ${UID}   # Pass host UID
+      #   GID: ${GID}   # Pass host GID
+    image: simchainbitcoinnode:29.0
+    container_name: btc-simnet-node2
+    ports:
+      - "28443:18443"
+      - "28444:18444"
+    networks:
+      - btc-simnet-network
+    command:
+      - -printtoconsole
+      - -regtest=1
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -rpcuser=bituser
+      - -rpcpassword=bitpass
+      - -fallbackfee=0.0001
+      - -minrelaytxfee=0.00001
+      - -maxtxfee=10000000
+      # - -disablewallet=1
+      - -port=18444
+      - -rpcport=18443
+      - -txindex
+      - -addnode=btc-simnet-node1:18444
+      - -addnode=btc-simnet-node3:18444
+      # - -debug=1
+      # - -debug=rpc
+      # - -debug=net
+      # - -debug=mempool
+      # - -debug=validation
+
+  btc-simnet-node3:
+    build:
+      context: ../.
+      dockerfile: Dockerfile
+      ## TO share volumes and avoid permission issues with chain data, fill that args with id -u and id -g
+      ## export UID=$(id -u) && export GID=$(id -g) && docker-compose up --build
+      # args:
+      #   UID: ${UID}   # Pass host UID
+      #   GID: ${GID}   # Pass host GID
+    image: simchainbitcoinnode:29.0
+    container_name: btc-simnet-node3
+    networks:
+      - btc-simnet-network
+    command:
+      - -printtoconsole
+      - -regtest=1
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -rpcuser=bituser
+      - -rpcpassword=bitpass
+      - -fallbackfee=0.0001
+      - -minrelaytxfee=0.00001
+      - -maxtxfee=10000000
+      # - -disablewallet=1
+      - -port=18444
+      - -rpcport=18443
+      - -txindex
+      - -addnode=btc-simnet-node1:18444
+      - -addnode=btc-simnet-node2:18444
+      # - -debug=1
+      # - -debug=rpc
+      # - -debug=net
+      # - -debug=mempool
+      # - -debug=validation
+
+  btc-simnet-mining-controller:
+    build:
+      context: ./mining-controller
+    container_name: btc-simnet-mining-controller
+    depends_on:
+      - btc-simnet-node1
+      - btc-simnet-node2
+      - btc-simnet-node3
+    networks:
+      - btc-simnet-network
+    environment:
+      - USER_ADDRESS=${USER_ADDRESS}
+      - BLOCK_INTERVAL_SECS=${BLOCK_INTERVAL_SECS}
+
+  btc-simnet-spammer:
+    build:
+      context: ./spammer
+    container_name: btc-simnet-spammer
+    depends_on:
+      - btc-simnet-node1
+      - btc-simnet-node2
+      - btc-simnet-node3
+      - btc-simnet-mining-controller
+    networks:
+      - btc-simnet-network
+    environment:
+      - ENABLE_SPAM=${ENABLE_SPAM}
+      - SPAM_PER_MINER_PER_BLOCK=${SPAM_PER_MINER_PER_BLOCK}
+

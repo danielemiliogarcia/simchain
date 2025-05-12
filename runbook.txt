@@ -1,0 +1,29 @@
+
+docker exec btc-simnet-node1 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass addnode btc-simnet-node2:18444 add
+
+docker exec btc-simnet-node1 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass getpeerinfo
+
+while true; do
+  docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass generatetoaddress 1 bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr
+  sleep 5
+done
+
+# spam
+while true; do
+    docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.00000500 "spam0"
+    docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.00000501 "spam1"
+    docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.00000502 "spam2"
+    docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.00000503 "spam3"
+    docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.00000504 "spam4"
+    docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.00000505 "spam5"
+    docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.00000506 "spam6"
+    docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.00000507 "spam7"
+    docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.00000508 "spam8"
+    docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.00000509 "spam9"
+    docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.00000510 "spam10"
+  sleep 5
+done
+
+
+docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass scantxoutset start '["addr(bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr)"]'
+
