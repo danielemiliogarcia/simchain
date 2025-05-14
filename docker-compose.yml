@@ -7,9 +7,9 @@ networks:
 
 services:
   btc-simnet-node1:
-    build:
-      context: ../.
-      dockerfile: Dockerfile
+    # build:
+    #   context: ../.
+    #   dockerfile: Dockerfile
       ## TO share volumes and avoid permission issues with chain data, fill that args with id -u and id -g
       ## export UID=$(id -u) && export GID=$(id -g) && docker-compose up --build
       # args:
@@ -45,9 +45,9 @@ services:
       # - -debug=validation
 
   btc-simnet-node2:
-    build:
-      context: ../.
-      dockerfile: Dockerfile
+    # build:
+    #   context: ../.
+    #   dockerfile: Dockerfile
       ## TO share volumes and avoid permission issues with chain data, fill that args with id -u and id -g
       ## export UID=$(id -u) && export GID=$(id -g) && docker-compose up --build
       # args:
@@ -83,9 +83,9 @@ services:
       # - -debug=validation
 
   btc-simnet-node3:
-    build:
-      context: ../.
-      dockerfile: Dockerfile
+    # build:
+    #   context: ../.
+    #   dockerfile: Dockerfile
       ## TO share volumes and avoid permission issues with chain data, fill that args with id -u and id -g
       ## export UID=$(id -u) && export GID=$(id -g) && docker-compose up --build
       # args:
