@@ -1,3 +1,7 @@
+# THIS BRANCH USE A NOT OFFICIAL DOCKER IMAGE, INSTEAD OF BUILDING IT
+https://hub.docker.com/r/bitcoin/bitcoin
+
+
 # BTC Simchain
 
 This uses the latest bitcoincore version at the time of writing v29.0, but dockerfile is tied to `x86_64-linux-gnu` platform to build the image, modify this for your architecture or use `ruimarinho/bitcoin-core` if you don't mind using older versions.
@@ -26,12 +30,6 @@ This container could be stopped after funding if the user want to control the mi
 Spammer `btc-simnet-spammer` this container runs a simple rust program that will spam transactions, so the blocks are not empty. It will spam the amount of transactions from configuration for each miner, resulting in 2x that amount, per block. I will not spam again if a new block is not mined but be aware that spamming many transactions might cause the block to be mined before all of them are included in next block, the rest will be in the mempool and join then next batch. The user should try with settings combinations to achieve the needed scenery. This spamming feature can also be disabled by configuration.
 
 ## How to run
-
-### Build
-Bitcoin node needs a spacial builder, other container could be built directly by the docker-compose
-```bash
-./build.sh
-```
 
 ### Config
 ```bash
