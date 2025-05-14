@@ -1,3 +1,5 @@
+# IF you prefer to use an external docker image instead fo building it, see this branch [external-docker-image](https://github.com/danielemiliogarcia/simchain/tree/external-docker-image)
+
 # BTC Simchain
 
 This uses the latest bitcoincore version at the time of writing v29.0, but dockerfile is tied to `x86_64-linux-gnu` platform to build the image, modify this for your architecture or use `ruimarinho/bitcoin-core` if you don't mind using older versions.
