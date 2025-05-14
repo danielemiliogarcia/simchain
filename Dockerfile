@@ -20,22 +20,21 @@ RUN apt-get clean \
   && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Set environment variables for Bitcoin Core
-ARG TARGETPLATFORM
 ARG BITCOIN_VERSION
 ENV BITCOIN_DATA=/home/bitcoin/.bitcoin
 ENV PATH=/opt/bitcoin-${BITCOIN_VERSION}/bin:$PATH
 
-# TODO, set platform at runtime, obtain from the host machine
-# FIXED HARDCODED TARGET PLATFORM
-ENV TARGETPLATFORM=x86_64-linux-gnu
-
-# Determine the correct TARGETPLATFORM
-RUN set -ex \
-  && if [ "${TARGETPLATFORM}" = "linux/amd64" ]; then export TARGETPLATFORM=x86_64-linux-gnu; fi \
-  && if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then export TARGETPLATFORM=aarch64-linux-gnu; fi \
-  && if [ "${TARGETPLATFORM}" = "linux/arm/v7" ]; then export TARGETPLATFORM=arm-linux-gnueabihf; fi
-
-
+RUN set -eux; \
+  ARCH="$(uname -m)"; \
+  case "$ARCH" in \
+    x86_64) PLATFORM="x86_64-linux-gnu" ;; \
+    aarch64) PLATFORM="aarch64-linux-gnu" ;; \
+    armv7l) PLATFORM="arm-linux-gnueabihf" ;; \
+    riscv64) PLATFORM="riscv64-linux-gnu" ;; \
+    ppc64|ppc64le) PLATFORM="powerpc64-linux-gnu" ;; \
+    *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
+  esac; \
+  echo "$PLATFORM" > /tmp/bitcoin-platform
 
 # TODO import GPG keys and verify binaries
 
@@ -72,7 +71,9 @@ RUN set -ex \
 #   done
 
 # Download Bitcoin Core, server is failing, use mirror
-RUN curl -SLO https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/bitcoin-${BITCOIN_VERSION}-${TARGETPLATFORM}.tar.gz \
+RUN set -eux; \
+  TARGETPLATFORM="$(cat /tmp/bitcoin-platform)"; \
+  curl -SLO https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/bitcoin-${BITCOIN_VERSION}-${TARGETPLATFORM}.tar.gz \
   && curl -SLO https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/SHA256SUMS \
   && curl -SLO https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/SHA256SUMS.asc
 
@@ -86,10 +87,14 @@ RUN curl -SLO https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/bitcoi
 # RUN gpg --verify SHA256SUMS.asc SHA256SUMS
 
 # Check the SHA256SUM of the downloaded tarball
-RUN grep " bitcoin-${BITCOIN_VERSION}-${TARGETPLATFORM}.tar.gz" SHA256SUMS
+RUN set -eux; \
+  TARGETPLATFORM="$(cat /tmp/bitcoin-platform)"; \
+  grep " bitcoin-${BITCOIN_VERSION}-${TARGETPLATFORM}.tar.gz" SHA256SUMS
 
 # Validate the SHA256 checksum
-RUN grep " bitcoin-${BITCOIN_VERSION}-${TARGETPLATFORM}.tar.gz" SHA256SUMS | sha256sum -c -
+RUN set -eux; \
+  TARGETPLATFORM="$(cat /tmp/bitcoin-platform)"; \
+  grep " bitcoin-${BITCOIN_VERSION}-${TARGETPLATFORM}.tar.gz" SHA256SUMS | sha256sum -c -
 
 
 # Extract the Bitcoin Core binaries
