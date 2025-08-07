@@ -25,5 +25,10 @@ while true; do
 done
 
 
+# get utxos
 docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass scantxoutset start '["addr(bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr)"]'
+
+# get total balance
+docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=bituser -rpcpassword=bitpass scantxoutset start '["addr(bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr)"]' | jq '[.unspents[].amount] | add'
+
 
