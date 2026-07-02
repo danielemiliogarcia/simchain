@@ -3,7 +3,6 @@ version: '3.9'
 networks:
   btc-simnet-network:
     name: btc-simnet-network
-    driver: bridge
 
 services:
   btc-simnet-node1:
