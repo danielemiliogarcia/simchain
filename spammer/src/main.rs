@@ -12,20 +12,22 @@ fn get_new_wallet_address(client: &Client) -> Address {
 
 fn send_spam_tx(from: &Client, to_address: &Address, count: u64) {
     for _ in 0..count {
-        let _ = from.send_to_address(&to_address, Amount::from_sat(500), None, None, None, None, None, None);
+        let _ = from.send_to_address(&to_address, Amount::from_sat(540), None, None, None, None, None, None);
     }
 }
 
 fn main() {
     let enable_spam = env::var("ENABLE_SPAM").unwrap_or_else(|_| "false".to_string()) == "true";
     let spam_per_miner_per_block: u64 = env::var("SPAM_PER_MINER_PER_BLOCK").expect("SPAM_PER_MINER_PER_BLOCK missing").parse().unwrap();
+    let rpc_user: String = env::var("BTC_RPC_USER").expect("BTC_RPC_USER missing").parse().unwrap();
+    let rpc_pass: String = env::var("BTC_RPC_PASS").expect("BTC_RPC_PASS missing").parse().unwrap();
 
     println!("Waiting for nodes to be ready");
     thread::sleep(Duration::from_millis(200));
 
-    let node1 = create_client("http://btc-simnet-node1:18443", "bituser", "bitpass");
-    let node2 = create_client("http://btc-simnet-node2:18443", "bituser", "bitpass");
-    let node3 = create_client("http://btc-simnet-node3:18443", "bituser", "bitpass");
+    let node1 = create_client("http://btc-simnet-node1:18443", &rpc_user, &rpc_pass);
+    let node2 = create_client("http://btc-simnet-node2:18443", &rpc_user, &rpc_pass);
+    let node3 = create_client("http://btc-simnet-node3:18443", &rpc_user, &rpc_pass);
 
     println!("Waiting the chain to reach 102 blocks");
     while node1.get_block_count().unwrap() < 102 {
