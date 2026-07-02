@@ -31,8 +31,8 @@ services:
       MEMPOOL_BACKEND: "none"
       CORE_RPC_HOST: "btc-simnet-node1" # "172.17.0.1" # host.docker.internal # For Docker Desktop
       CORE_RPC_PORT: "18443"
-      CORE_RPC_USERNAME: "bituser"
-      CORE_RPC_PASSWORD: "bitpass"
+      CORE_RPC_USERNAME: ${BTC_RPC_USER}
+      CORE_RPC_PASSWORD: ${BTC_RPC_PASS}
       DATABASE_ENABLED: "true"
       DATABASE_HOST: "db"
       DATABASE_DATABASE: "mempool"

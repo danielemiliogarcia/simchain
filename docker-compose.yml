@@ -25,14 +25,15 @@ services:
     command:
       - -printtoconsole
       - -regtest=1
+      - -server=1
       - -rpcallowip=0.0.0.0/0
       - -rpcbind=0.0.0.0
-      - -rpcuser=bituser
-      - -rpcpassword=bitpass
+      - -rpcuser=${BTC_RPC_USER}
+      - -rpcpassword=${BTC_RPC_PASS}
       - -fallbackfee=0.0001
       - -minrelaytxfee=0.00001
       - -maxtxfee=10000000
-      - -disablewallet=1
+      # - -disablewallet=1
       - -port=18444
       - -rpcport=18443
       - -txindex
@@ -65,8 +66,8 @@ services:
       - -regtest=1
       - -rpcallowip=0.0.0.0/0
       - -rpcbind=0.0.0.0
-      - -rpcuser=bituser
-      - -rpcpassword=bitpass
+      - -rpcuser=${BTC_RPC_USER}
+      - -rpcpassword=${BTC_RPC_PASS}
       - -fallbackfee=0.0001
       - -minrelaytxfee=0.00001
       - -maxtxfee=10000000
@@ -100,8 +101,8 @@ services:
       - -regtest=1
       - -rpcallowip=0.0.0.0/0
       - -rpcbind=0.0.0.0
-      - -rpcuser=bituser
-      - -rpcpassword=bitpass
+      - -rpcuser=${BTC_RPC_USER}
+      - -rpcpassword=${BTC_RPC_PASS}
       - -fallbackfee=0.0001
       - -minrelaytxfee=0.00001
       - -maxtxfee=10000000
@@ -130,6 +131,8 @@ services:
     environment:
       - USER_ADDRESS=${USER_ADDRESS}
       - BLOCK_INTERVAL_SECS=${BLOCK_INTERVAL_SECS}
+      - BTC_RPC_USER=${BTC_RPC_USER}
+      - BTC_RPC_PASS=${BTC_RPC_PASS}
 
   btc-simnet-spammer:
     build:
@@ -145,4 +148,6 @@ services:
     environment:
       - ENABLE_SPAM=${ENABLE_SPAM}
       - SPAM_PER_MINER_PER_BLOCK=${SPAM_PER_MINER_PER_BLOCK}
+      - BTC_RPC_USER=${BTC_RPC_USER}
+      - BTC_RPC_PASS=${BTC_RPC_PASS}
 
