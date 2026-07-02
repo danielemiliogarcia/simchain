@@ -3,12 +3,12 @@ version: '3.8'
 networks:
   btc-simnet-network:
     name: btc-simnet-network
-    driver: bridge
+    external: true
 
 services:
 
   web:
-    image: mempool/frontend:latest
+    image: mempool/frontend:v3.3.1
     container_name: regtest-web
     environment:
       FRONTEND_HTTP_PORT: "8080"
@@ -25,14 +25,17 @@ services:
       - btc-simnet-network
 
   api:
-    image: mempool/backend:latest
+    image: mempool/backend:v3.3.1
     container_name: regtest-api
     environment:
-      MEMPOOL_BACKEND: "none"
+      MEMPOOL_BACKEND: "electrum"
+      ELECTRUM_HOST: "electrs"
+      ELECTRUM_PORT: "60001"
+      ELECTRUM_TLS_ENABLED: "false"
       CORE_RPC_HOST: "btc-simnet-node1" # "172.17.0.1" # host.docker.internal # For Docker Desktop
       CORE_RPC_PORT: "18443"
-      CORE_RPC_USERNAME: "bituser"
-      CORE_RPC_PASSWORD: "bitpass"
+      CORE_RPC_USERNAME: ${BTC_RPC_USER}
+      CORE_RPC_PASSWORD: ${BTC_RPC_PASS}
       DATABASE_ENABLED: "true"
       DATABASE_HOST: "db"
       DATABASE_DATABASE: "mempool"
@@ -41,6 +44,7 @@ services:
       STATISTICS_ENABLED: "true"
     depends_on:
       - db
+      - electrs
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 5s
@@ -64,4 +68,17 @@ services:
       - btc-simnet-network
 
 
+  electrs:
+    image: mempool/electrs:v3.3.0
+    container_name: regtest-electrs
+    command:
+      - --network=regtest
+      - --daemon-rpc-addr=btc-simnet-node1:18443
+      - --electrum-rpc-addr=0.0.0.0:60001
+      - --http-addr=0.0.0.0:3000
+      - --cookie=${BTC_RPC_USER}:${BTC_RPC_PASS}
+      - --jsonrpc-import
+      - --db-dir=/tmp/electrs-db
+    networks:
+      - btc-simnet-network
 

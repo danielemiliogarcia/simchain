@@ -15,9 +15,12 @@ fn main() {
     let user_address = env::var("USER_ADDRESS").expect("USER_ADDRESS missing");
     let interval_secs: u64 = env::var("BLOCK_INTERVAL_SECS").expect("BLOCK_INTERVAL_SECS missing").parse().unwrap();
 
-    // let node1 = create_client("http://btc-simnet-node1:18443", "bituser", "bitpass");
-    let node2 = create_client("http://btc-simnet-node2:18443", "bituser", "bitpass");
-    let node3 = create_client("http://btc-simnet-node3:18443", "bituser", "bitpass");
+    let rpc_user: String = env::var("BTC_RPC_USER").expect("BTC_RPC_USER missing").parse().unwrap();
+    let rpc_pass: String = env::var("BTC_RPC_PASS").expect("BTC_RPC_PASS missing").parse().unwrap();
+
+    // let node1 = create_client("http://btc-simnet-node1:18443", rpc_user, rpc_user);
+    let node2 = create_client("http://btc-simnet-node2:18443", &rpc_user, &rpc_pass);
+    let node3 = create_client("http://btc-simnet-node3:18443", &rpc_user, &rpc_pass);
 
     // Initial funding blocks
     let user_address: Address<NetworkUnchecked> = user_address.parse().expect("Invalid Bitcoin address");
