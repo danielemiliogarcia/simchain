@@ -93,6 +93,15 @@ docker compose logs -ft btc-simnet-mining-controller
 # Spammer logs
 docker compose logs -ft btc-simnet-spammer
 
+# Reorg simulator logs in auto mode (one-shot runs print to the terminal)
+docker compose logs -ft btc-simnet-reorg
+
+# bitcoind logs (node1 = the user-facing endpoint; same for node2/node3)
+docker compose logs -ft btc-simnet-node1
+
+# Everything at once
+docker compose logs -ft
+
 # Tear down (regtest keeps no volumes; the chain resets on next up)
 docker compose down
 ```
