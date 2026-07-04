@@ -71,11 +71,12 @@ BTC_IMAGE=bitcoin/bitcoin:29.0   # default if unset
 To use the locally built image instead (arch auto-detected, checksum-verified binaries):
 
 ```bash
-./build.sh                                # builds simchainbitcoinnode:<BITCOIN_VERSION>
+./build-bitcoin.sh                        # builds simchainbitcoinnode:<BITCOIN_VERSION>
 echo "BTC_IMAGE=simchainbitcoinnode:29.0" >> .env
 ```
 
-`build.sh` reads `BITCOIN_VERSION` from `.env` (default 29.0).
+`build-bitcoin.sh` reads `BITCOIN_VERSION` from `.env` (default 29.0). It only builds
+the bitcoin node image; the Rust tool images are built by compose itself.
 
 ## How to run
 
@@ -117,10 +118,11 @@ With `mempool` or `all-tools`, browse the explorer at
 The reorg simulator (a Rust container using only bitcoind RPC calls) invalidates the last
 *N* blocks on a miner node and mines *N+1* replacements, so the new chain is strictly
 longer and **the whole network reorgs to it**. Transactions from the orphaned blocks fall
-back to the mempool and are re-mined into the replacement blocks, like the winning chain
-of a real reorg, so reorged blocks are not empty. If the orphaned blocks carried no txs,
-it injects `REORG_INJECT_TXS` wallet transactions before mining the replacements. It
-prints each block's hash and tx count before/after plus a replaced-blocks summary.
+back to the mempool and are re-mined into the replacement blocks (same txids), like the
+winning chain of a real reorg, so reorged blocks are not empty. Only if the orphaned
+blocks carried no txs (e.g. `ENABLE_SPAM=false`), it injects `REORG_INJECT_TXS` fresh
+wallet transactions per empty replacement block. It prints each block's hash and tx
+count before/after plus a replaced-blocks summary.
 
 One-shot (container runs, reorgs, dies):
 

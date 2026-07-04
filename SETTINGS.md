@@ -15,8 +15,8 @@ cp .env.full.example .env   # everything tweakable
 
 | Variable | Default | Description |
 |---|---|---|
-| `BTC_IMAGE` | `bitcoin/bitcoin:29.0` | Docker image used by the 3 nodes. Default is pulled from the registry (no build needed). Set `simchainbitcoinnode:29.0` to use the locally built image (`./build.sh`). |
-| `BITCOIN_VERSION` | `29.0` | Bitcoin Core version downloaded by `./build.sh` when building the local image. Not used by compose. |
+| `BTC_IMAGE` | `bitcoin/bitcoin:29.0` | Docker image used by the 3 nodes. Default is pulled from the registry (no build needed). Set `simchainbitcoinnode:29.0` to use the locally built image (`./build-bitcoin.sh`). |
+| `BITCOIN_VERSION` | `29.0` | Bitcoin Core version downloaded by `./build-bitcoin.sh` when building the local image. Not used by compose. |
 
 ## RPC credentials
 
@@ -43,6 +43,18 @@ Shared by all nodes and every tool (mining controller, spammer, reorg, electrs, 
 | `NODE2_P2P_PORT` | `28444` | Host port for node2 P2P. |
 
 Node3 is intentionally not exposed to the host.
+
+## Container-internal RPC endpoints
+
+URLs the helper tools (mining controller, spammer) use to reach the nodes inside the
+compose network. Only change them if you rename the node services or point the tools
+at other nodes.
+
+| Variable | Default | Description |
+|---|---|---|
+| `NODE1_RPC_URL` | `http://btc-simnet-node1:18443` | Node1 RPC endpoint (the spammer watches it for new blocks). |
+| `NODE2_RPC_URL` | `http://btc-simnet-node2:18443` | Node2 RPC endpoint (mining controller and spammer). |
+| `NODE3_RPC_URL` | `http://btc-simnet-node3:18443` | Node3 RPC endpoint (mining controller and spammer). |
 
 ## Node policy
 
@@ -93,11 +105,14 @@ The three fee settings look similar but act at different points of a transaction
 | `REORG_MODE` | `once` | `once` = single reorg then exit. `auto` = reorg every `AUTO_REORG_EVERY_BLOCKS`. |
 | `AUTO_REORG_EVERY_BLOCKS` | `20` | Auto mode cadence (x); must be greater than `REORG_DEPTH` (y). |
 | `REORG_NODE` | `btc-simnet-node3` | Node used to fork the chain (a hidden miner is realistic). |
+| `REORG_NODE_RPC_PORT` | `18443` | RPC port of `REORG_NODE` inside the compose network. |
 | `REORG_MINE_ADDRESS` | `bcrt1qtmjq...tf3rr` | Address receiving the replacement block rewards. |
-| `REORG_INJECT_TXS` | `5` | If the orphaned blocks carried no txs, send this many wallet txs before mining replacements so they are not empty. `0` disables. |
+| `REORG_INJECT_TXS` | `5` | Fallback only: if the orphaned blocks carried no txs (e.g. `ENABLE_SPAM=false`), send this many fresh wallet txs per empty replacement block. `0` disables. To make injected blocks as full as spammed ones, set it near 2x `SPAM_PER_MINER_PER_BLOCK`. |
 
 Orphaned transactions return to the mempool automatically and are re-mined into the
-replacement blocks, so reorged blocks carry the same real transactions as the old chain.
+replacement blocks (same txids), like the winning chain of a real reorg, so the
+replacements are normally as full as the blocks they replace; injection only kicks in
+when there was nothing to re-mine.
 
 ## Tools: electrs (profiles `electrs`, `mempool`, `all-tools`)
 

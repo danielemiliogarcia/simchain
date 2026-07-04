@@ -1,6 +1,13 @@
 ## Limitations and future enhancements
 
 ### BitcoinCore containers
+- Update the Bitcoin Core version: bump both the registry image default
+  (`BTC_IMAGE=bitcoin/bitcoin:29.0` in compose/docs) and the local build default
+  (`BITCOIN_VERSION=29.0` in `build-bitcoin.sh` / `.env`) to the latest release.
+  When bumping, also review the Rust tools' `bitcoincore-rpc` crate: the tools use
+  the `bitcoin` crate it re-exports, so upgrading `bitcoincore-rpc` is the only dep
+  change needed, and each `bitcoincore-rpc` release documents the newest Core
+  version it is tested against. Re-test bootstrap, spam and reorg flows after.
 - Download PGP signatures and verify the downloaded binaries: the SHA256 checksum is
   verified, but SHA256SUMS comes from the same server as the tarball, so this proves
   integrity, not authenticity (the GPG key import block exists in the Dockerfile,
@@ -23,8 +30,8 @@
   node policy parameters (`-minrelaytxfee` for the mempool floor, `-blockmintxfee`
   for the miner's inclusion floor) so blocks fill up and transactions genuinely
   compete for block space
-- The five proposed features below: ZMQ, Poisson block timing, fee-market simulation,
-  scenario engine, network partitions
+- The six proposed features below: ZMQ, Poisson block timing, fee-market simulation,
+  scenario engine, network partitions, reorgs that drop transactions
 
 ---
 
@@ -34,7 +41,7 @@ Simchain's purpose is to simulate the Bitcoin chain on regtest while staying as 
 mainnet reality as regtest allows: multiple P2P-connected nodes, rotating miners, a
 non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus five bigger proposed features with their
+limitations and future enhancements, plus six bigger proposed features with their
 rationale and an implementation plan.
 
 ## 1. ZMQ notifications on node1 and node2
@@ -163,6 +170,60 @@ nodes during the window), which no instantaneous regtest network shows.
    with settings `PARTITION_NODE`, `PARTITION_BLOCKS`.
 
 Effort: phase 1 small; phase 2 medium (needs NET_ADMIN and per-node sidecars).
+
+---
+
+## 6. Reorgs that drop transactions (confirmation-loss testing)
+
+**What:** Two related additions to the reorg simulator:
+
+1. **`REORG_REMINE_ORPHANED=false`**: mine the replacement blocks *without* the
+   orphaned transactions (empty or inject-only blocks), leaving them in the mempool.
+2. **Automated double-spend of orphaned spam txs**: for a configurable fraction of the
+   orphaned *wallet-owned* (spam) transactions, include a conflicting transaction
+   (same inputs, different output) in the replacement blocks so the originals become
+   permanently invalid and can never re-confirm.
+
+**Why it's a nice-to-have (the use case):** Today the simulator re-mines the orphaned
+transactions into the replacement blocks (same txids), so a reorg only changes block
+hashes/heights — a user's transaction never *loses* confirmations. But the scariest
+real-world reorg scenario is exactly the opposite, and it is what exchanges, custody
+watchers, indexers and payment processors need to test: *"my deposit had N
+confirmations, a reorg happened, and now my transaction is not in the chain anymore."*
+Downstream code must notice the confirmation count dropping back to 0 (or the tx
+conflicting entirely) and un-credit / re-queue / alert accordingly. Neither case can be
+produced by simchain today.
+
+The two additions map to the two real outcomes:
+
+- **Temporary drop (addition 1):** the excluded transactions fall back to the mempool
+  and re-confirm in a later block, confirmed → 0-conf → confirmed again. This tests
+  "did my code notice the confirmation count drop below its threshold?" (Stop the
+  mining controller after the reorg to keep them unconfirmed indefinitely.)
+- **Permanent drop (addition 2):** a double-spend in the winning chain kills the
+  original transaction forever — the classic double-spend attack an exchange fears.
+  This can only be automated for wallet-owned spam transactions: the user's own
+  transactions are signed with external keys the reorg node does not hold, so a user
+  wanting *their* tx permanently dropped must broadcast the conflicting tx themselves
+  (RBF replacement of their own tx after running addition 1).
+
+**Implementation plan:**
+1. In `reorg/src/main.rs::do_reorg`, when `REORG_REMINE_ORPHANED=false`, skip the
+   returned-tx chunking and mine every replacement block with `generateblock` and an
+   explicit transaction list (empty, or only the injected txids). `generateblock` must
+   be used for *all* replacement blocks in this mode: `generatetoaddress` would vacuum
+   the mempool — orphaned txs included — right back into the new chain.
+2. Wire `REORG_REMINE_ORPHANED` (default `true`, current behavior) through
+   docker-compose.yml, `.env.full.example` and SETTINGS.md like the other settings.
+3. For the double-spend mode: pick orphaned txs that spend the reorg node's wallet
+   UTXOs, build conflicting raw txs (`createrawtransaction` on the same inputs to a
+   fresh wallet address, `signrawtransactionwithwallet`), and pass them to
+   `generateblock` in the replacement blocks. Setting sketch:
+   `REORG_DOUBLE_SPEND_PCT=0..100` (default 0).
+4. Log which txids were excluded/conflicted so tests can assert on them.
+
+Effort: addition 1 small (a flag and a branch in existing logic); addition 2 medium
+(raw-tx construction, only meaningful with spam enabled).
 
 ---
 

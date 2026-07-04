@@ -16,8 +16,9 @@ use std::{
 // to it. invalidateblock returns the orphaned blocks' transactions to the
 // mempool, so the replacement blocks carry the same real transactions, like
 // the winning chain of a real reorg. If the mempool ends up empty (orphaned
-// blocks had no txs), up to REORG_INJECT_TXS transactions are sent from the
-// reorg node's wallet so replacement blocks are not empty.
+// blocks had no txs), REORG_INJECT_TXS fresh transactions are sent from the
+// reorg node's wallet before each empty replacement block so they are not
+// empty.
 //
 // Modes (REORG_MODE):
 //   once (default) - one reorg and exit. Depth: argv[1], or REORG_DEPTH, or 3.

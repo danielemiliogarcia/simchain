@@ -24,7 +24,7 @@ networks:
 services:
   btc-simnet-node1:
     # Default: official registry image. Set BTC_IMAGE=simchainbitcoinnode:29.0
-    # in .env to use the locally built one (./build.sh).
+    # in .env to use the locally built one (./build-bitcoin.sh).
     image: ${BTC_IMAGE:-bitcoin/bitcoin:29.0}
     container_name: btc-simnet-node1
     restart: unless-stopped
@@ -149,6 +149,8 @@ services:
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
       - NODE2_WALLET_NAME=${NODE2_WALLET_NAME:-node2}
       - NODE3_WALLET_NAME=${NODE3_WALLET_NAME:-node3}
+      - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
+      - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
 
   btc-simnet-spammer:
     build:
@@ -173,6 +175,9 @@ services:
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
       - NODE2_WALLET_NAME=${NODE2_WALLET_NAME:-node2}
       - NODE3_WALLET_NAME=${NODE3_WALLET_NAME:-node3}
+      - NODE1_RPC_URL=${NODE1_RPC_URL:-http://btc-simnet-node1:18443}
+      - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
+      - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
 
   # ---------------------------------------------------------------------------
   # Reorg simulator (profile: reorg), one-shot by default, dies when done.
@@ -194,6 +199,7 @@ services:
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
       - REORG_NODE=${REORG_NODE:-btc-simnet-node3}
+      - REORG_NODE_RPC_PORT=${REORG_NODE_RPC_PORT:-18443}
       - REORG_DEPTH=${REORG_DEPTH:-3}
       - REORG_MODE=${REORG_MODE:-once}
       - AUTO_REORG_EVERY_BLOCKS=${AUTO_REORG_EVERY_BLOCKS:-20}

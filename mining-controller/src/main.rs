@@ -52,10 +52,10 @@ fn main() {
     let wallet2_name = env_or("NODE2_WALLET_NAME", "node2");
     let wallet3_name = env_or("NODE3_WALLET_NAME", "node3");
 
-    let node2_url = "http://btc-simnet-node2:18443";
-    let node3_url = "http://btc-simnet-node3:18443";
-    let node2 = create_client(node2_url, &rpc_user, &rpc_pass);
-    let node3 = create_client(node3_url, &rpc_user, &rpc_pass);
+    let node2_url = env_or("NODE2_RPC_URL", "http://btc-simnet-node2:18443");
+    let node3_url = env_or("NODE3_RPC_URL", "http://btc-simnet-node3:18443");
+    let node2 = create_client(&node2_url, &rpc_user, &rpc_pass);
+    let node3 = create_client(&node3_url, &rpc_user, &rpc_pass);
 
     let user_address: Address<NetworkUnchecked> = user_address.parse().expect("Invalid Bitcoin address");
     let user_address = user_address.require_network(Network::Regtest).unwrap();
@@ -68,8 +68,8 @@ fn main() {
     // blocks 3 and 4 to the user address, then 100 more blocks. At height
     // 104 all four coinbases are mature: the user has the 2x50 BTC, and each
     // miner wallet has one mature reward to fund the spammer from the start.
-    let (_wallet2, addr2) = setup_wallet(node2_url, &rpc_user, &rpc_pass, &node2, &wallet2_name);
-    let (_wallet3, addr3) = setup_wallet(node3_url, &rpc_user, &rpc_pass, &node3, &wallet3_name);
+    let (_wallet2, addr2) = setup_wallet(&node2_url, &rpc_user, &rpc_pass, &node2, &wallet2_name);
+    let (_wallet3, addr3) = setup_wallet(&node3_url, &rpc_user, &rpc_pass, &node3, &wallet3_name);
 
     println!("Node 2 => Mining block 1 to its own wallet address {addr2}");
     let _ = node2.generate_to_address(1, &addr2).unwrap();

@@ -105,11 +105,15 @@ fn main() {
     let wallet2_name = env_or("NODE2_WALLET_NAME", "node2");
     let wallet3_name = env_or("NODE3_WALLET_NAME", "node3");
 
-    let node1 = create_client("http://btc-simnet-node1:18443", &rpc_user, &rpc_pass);
+    let node1_url = env_or("NODE1_RPC_URL", "http://btc-simnet-node1:18443");
+    let node2_url = env_or("NODE2_RPC_URL", "http://btc-simnet-node2:18443");
+    let node3_url = env_or("NODE3_RPC_URL", "http://btc-simnet-node3:18443");
+
+    let node1 = create_client(&node1_url, &rpc_user, &rpc_pass);
     // Wallet-scoped clients: they keep working even if the user loads extra
     // wallets on the nodes (the generic RPC path breaks with more than one)
-    let wallet2 = create_client(&format!("http://btc-simnet-node2:18443/wallet/{wallet2_name}"), &rpc_user, &rpc_pass);
-    let wallet3 = create_client(&format!("http://btc-simnet-node3:18443/wallet/{wallet3_name}"), &rpc_user, &rpc_pass);
+    let wallet2 = create_client(&format!("{node2_url}/wallet/{wallet2_name}"), &rpc_user, &rpc_pass);
+    let wallet3 = create_client(&format!("{node3_url}/wallet/{wallet3_name}"), &rpc_user, &rpc_pass);
 
     wait_for_funds(&wallet2, &wallet2_name);
     wait_for_funds(&wallet3, &wallet3_name);
