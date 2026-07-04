@@ -103,7 +103,7 @@ docker compose logs -ft btc-simnet-node1
 docker compose logs -ft
 
 # Tear down (regtest keeps no volumes; the chain resets on next up)
-docker compose down
+docker compose --profile all-tools down
 ```
 
 ### Profiles
