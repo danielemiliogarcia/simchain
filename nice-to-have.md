@@ -19,7 +19,7 @@
 ### Rust containers
 - Use multistage builds in the Dockerfiles: build with `rust:latest`, copy only the
   binary into a slim runtime image (each tool image is currently ~2.6GB)
-- Retries/idempotency for RPC calls (see [review.md](./review.md))
+- Retries/idempotency for RPC calls (findings 1 and 2 below)
 
 ### Simulations
 - Per-node policies: give each node different bitcoind parameters (mempool size,
@@ -32,6 +32,115 @@
   compete for block space
 - The six proposed features below: ZMQ, Poisson block timing, fee-market simulation,
   scenario engine, network partitions, reorgs that drop transactions
+
+### Code review findings (2026-07-04)
+
+Open findings from the last full code review, kept here so this is the single tracking
+document. Everything the review found fixed has been dropped; the items below were
+re-verified against the code on the review date.
+
+Accepted decisions (not defects, recorded so they are not re-reported):
+
+- **RPC bound on all host interfaces** (`-rpcallowip=0.0.0.0/0` + unrestricted port
+  binding): intentional, reaching the simnet from another machine is a wanted use case.
+- **Plaintext RPC credentials on the bitcoind command line** (visible in
+  `docker inspect`/`ps`): acceptable for a throwaway regtest; documented with a warning
+  in SETTINGS.md not to replicate in production.
+
+Findings, ordered by severity:
+
+1. **No RPC retries; transient errors are panics** (controller and spammer). Every call
+   is `.unwrap()`: a node hiccup mid-run kills the process permanently, and neither
+   service has a compose `restart` policy, so mining or spam silently stops. The reorg
+   tool is the exception (Results, retry loop, long RPC timeout) and can serve as the
+   template. Note the coupling with finding 2: adding `restart: on-failure` to the
+   controller alone would produce a crash loop.
+
+2. **Controller bootstrap is not idempotent.** `setup_wallet` calls
+   `create_wallet(...).unwrap()` (`mining-controller/src/main.rs:39`); if the container
+   restarts after the wallets exist it panics forever. Try `load_wallet`/`listwallets`
+   first, or ignore the "already exists" error.
+
+3. **Rust tool images are single-stage `rust:latest`** (~2.6 GB each; the Dockerfiles'
+   own TODO). Multistage build, copy the binary into a slim runtime. Also listed under
+   "Rust containers" above.
+
+4. **Binary authenticity is not verified** in the bitcoin node image: SHA256SUMS comes
+   from the same server as the tarball, GPG verification is commented out. Integrity
+   yes, authenticity no. Also listed under "BitcoinCore containers" above.
+
+5. **Dockerfile cleanup**: `RUN echo "UID/GID"` debug layers still present
+   (Dockerfile:7-8), several mergeable `RUN` steps, duplicate `bitcoind -version`
+   layers (120 and 122). Also listed under "BitcoinCore containers" above.
+
+6. **Spammer↔controller implicit wallet contract (minor).** The spammer depends on
+   wallets the controller creates, but `wait_for_funds` polls `get_balances` and
+   tolerates a missing wallet indefinitely, so the contract no longer crashes anything;
+   it just waits forever (one log line) if funding logic changes. Acceptable; a
+   periodic "still waiting" log would make a misconfiguration visible.
+
+7. **The forced reorg can lose the race against the mining controller.** The reorg tool
+   mines exactly `depth+1` replacement blocks, one more than it invalidated, while the
+   controller keeps mining the old chain on the other node every
+   `BLOCK_INTERVAL_SECS`. If the controller lands a block during the reorg window, the
+   old chain ties or stays ahead and the rest of the network never reorgs, while the
+   tool still prints a success-looking summary (the replaced-blocks diff would be
+   empty). Options: after mining the replacements, poll another node until it adopts
+   the new tip and mine extra blocks until it does; or document that reliable reorgs
+   need the controller stopped (or a `BLOCK_INTERVAL_SECS` comfortably larger than the
+   reorg duration).
+
+8. **No `Cargo.lock` is committed for any of the three tools** (all three
+   `.gitignore`s exclude it; `git ls-files` confirms none tracked). Each fresh clone or
+   image rebuild resolves dependencies anew, so two builds of the same commit can ship
+   different dependency versions, the opposite of what a reproducible test network
+   wants. Lockfiles should be committed for binary crates: drop `Cargo.lock` from the
+   three `.gitignore`s and commit the locks.
+
+9. **No root `.dockerignore` for the bitcoin node image build.** `build-bitcoin.sh`
+   uses the repo root as build context; the context upload includes `.git` and the
+   three Rust `target/` directories (easily GBs after local builds). The tool contexts
+   have `.dockerignore`s; the root does not. Add one with at least `.git`, `*/target/`.
+
+10. **`generateblock` fallback vacuums the mempool** (`reorg/src/main.rs:185-188`). If
+    one tx-slice is rejected, the code falls back to `generate_to_address`, which mines
+    the *entire* mempool into that block; every later chunk then references
+    already-mined txids, so subsequent `generateblock` calls fail too and the remaining
+    replacements degrade to empty/inject-only blocks. Logged, but surprising: after a
+    fallback, later iterations could skip their (now stale) chunks deliberately.
+
+11. **Bitcoin node base image is `debian:bullseye-slim`** (oldstable; security support
+    ends mid-2026). The official `bitcoin/bitcoin` images are bookworm-based. Bump to
+    `bookworm-slim` next time the image is touched.
+
+12. **`btc-simnet-reorg` gates on the wrong node when `REORG_NODE` is overridden.**
+    compose hardcodes `depends_on: btc-simnet-node3: service_healthy` while the target
+    node is configurable; with `REORG_NODE=btc-simnet-node2` the one-shot run waits on
+    node3's health instead. Harmless today (the tool also polls its node's RPC), worth
+    a comment or depending on all nodes.
+
+13. **Inconsistent required-vs-default env handling across the tools.** The controller
+    `expect`s `USER_ADDRESS`/`BLOCK_INTERVAL_SECS`/credentials, the spammer `expect`s
+    `SPAM_PER_MINER_PER_BLOCK`/credentials, yet sibling settings in the same files use
+    `env_or` defaults, and the reorg tool defaults everything. Invisible under compose
+    (it always passes them), but running a tool standalone panics on some vars and
+    silently defaults others. Pick one policy (defaults everywhere matches the
+    "runs with no .env" philosophy).
+
+14. **No Cargo workspace; helpers duplicated three times.** `env_or`/`create_client`
+    are copy-pasted per tool, and compose builds three independent dependency graphs
+    serially (three `target/` dirs, three lock states). A workspace with one shared
+    util crate, or a single multi-binary crate with three Dockerfile targets, would cut
+    build time and future drift.
+
+15. **`REORG_MINE_ADDRESS` default equals `USER_ADDRESS` default**, so replacement-block
+    coinbases credit the user address: after a reorg (plus maturity) the "exactly
+    2×50 BTC" user balance quietly grows. Fine if intended; either document it in
+    SETTINGS.md or default to a separate throwaway address.
+
+16. Nit: `inject_transactions` uses `wallets[0]` (first loaded wallet) on the reorg
+    node instead of the known `NODE3_WALLET_NAME`; arbitrary if extra wallets are
+    loaded on that node.
 
 ---
 
@@ -233,6 +342,3 @@ Effort: addition 1 small (a flag and a branch in existing logic); addition 2 med
   tests from it without re-mining 102 blocks each time.
 - **RBF/CPFP traffic in the spammer**, a fraction of spam txs opt into RBF and later get
   fee-bumped, exercising replacement handling downstream.
-- **Multi-wallet RPC paths**, wallet-scoped RPC URLs (`/wallet/<name>`) in controller and
-  spammer so users can load extra wallets on node2 without breaking the tooling
-  (see review.md #12/#15).
