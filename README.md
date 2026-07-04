@@ -162,3 +162,14 @@ Tune `REORG_DEPTH`, `AUTO_REORG_EVERY_BLOCKS`, `REORG_NODE`, `REORG_MINE_ADDRESS
 
 All known limitations, future enhancements and proposed features live in
 [nice-to-have.md](./nice-to-have.md).
+
+# Trouble shotting
+
+stopping the containers instead of removing may cause an error
+```
+JsonRpc(Rpc(RpcError { code: -4, message: "Wallet file verification failed. Failed to create database path '/home/bitcoin/.bitcoin/regtest/wallets/node2'. Database already exists.", data: None }))
+```
+
+remove the containers with `docker compose --profile all-tools down`
+
+this might be fixed in future versions, supporting snapshots, and continues

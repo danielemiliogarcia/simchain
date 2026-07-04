@@ -1,16 +1,3 @@
-
-FIX
-
-btc-simnet-mining-controller  | 2026-07-04T22:02:11.032362415Z called `Result::unwrap()` on an `Err` value: JsonRpc(Rpc(RpcError { code: -4, message: "Wallet file verification failed. Failed to create database path '/home/bitcoin/.bitcoin/regtest/wallets/node2'. Database already exists.", data: None }))
-
-at second run.
-
-temporal fix
-
-docker compose --profile all-tools down --rmi all --volumes --remove-orphans
-
-may be recreate wallets feature?
-
 ## Limitations and future enhancements
 
 ### BitcoinCore containers
