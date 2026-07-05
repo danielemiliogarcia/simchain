@@ -18,11 +18,13 @@ The network consists of 3 well-connected nodes plus helper containers:
   no hot wallet online, so you manage your own keys in an external wallet, obtain the
   outpoints of your addresses' UTxOs and submit externally signed raw transactions; mining
   is not under your control. It never mines. Set `NODE1_DISABLE_WALLET=0` in `.env` if you
-  need a wallet on it.
+  need a wallet on it. Publishes all ZMQ topics on host ports 28332-28336
+  (see [ZMQ notifications](#zmq-notifications)).
 - **Node 2 `btc-simnet-node2`**, exposed to the host (RPC 28443). Simulates an owned node
   with internal wallet enabled, useful to stack an ordinals wallet or any layer-2 node on
-  top that needs internal wallet management (be aware: no ZMQ enabled yet). This node is a
-  miner.
+  top that needs internal wallet management. Publishes all ZMQ topics on host ports
+  38332-38336, so ZMQ consumers like LND/CLN can use it as their bitcoind backend. This
+  node is a miner.
 - **Node 3 `btc-simnet-node3`**, NOT exposed to the host. Simulates a node connected via
   p2p but inaccessible to the user. This node is a miner.
 - **Mining controller `btc-simnet-mining-controller`**, bootstraps the chain: block 1
@@ -38,7 +40,9 @@ The network consists of 3 well-connected nodes plus helper containers:
   UTXOs, otherwise the 25-tx unconfirmed-chain mempool limit would cap spam at 25 txs
   per wallet per block. If you spam many
   transactions, some may stay in the mempool and join the next batch, tune the settings
-  to achieve the scenario you need, or disable with `ENABLE_SPAM=false`.
+  to achieve the scenario you need, or disable with `ENABLE_SPAM=false`. With
+  `ENABLE_SPAM_REPLACES=true` every spam tx signals RBF and a few per batch get
+  fee-bumped, so the mempool carries real BIP125 replacements (see SETTINGS.md).
 - **Reorg simulator `btc-simnet-reorg`** *(profile `reorg`, on demand)*, a Rust tool
   (same stack as the other tools, pure RPC calls) that forces chain reorganizations.
   See [Simulating reorgs](#simulating-reorgs).
@@ -68,7 +72,10 @@ By default the stack pulls the official registry image, no build step needed:
 BTC_IMAGE=bitcoin/bitcoin:29.0   # default if unset
 ```
 
-To use the locally built image instead (arch auto-detected, checksum-verified binaries):
+To use the locally built image instead (arch auto-detected; binaries are
+checksum-verified and the SHA256SUMS file's GPG signature is checked against the
+Bitcoin Core builder keys from
+[bitcoin-core/guix.sigs](https://github.com/bitcoin-core/guix.sigs)):
 
 ```bash
 ./build-bitcoin.sh                        # builds simchainbitcoinnode:<BITCOIN_VERSION>
@@ -81,7 +88,7 @@ the bitcoin node image; the Rust tool images are built by compose itself.
 ## How to run
 
 ```bash
-docker compose up
+docker compose --profile all-tools up -d
 ```
 
 That's it (with the default registry image there is nothing to build). Useful follow-ups:
@@ -122,6 +129,25 @@ One compose file serves every combination via
 With `mempool` or `all-tools`, browse the explorer at
 [http://localhost:1080/](http://localhost:1080/) (port: `MEMPOOL_WEB_PORT`).
 
+## ZMQ notifications
+
+node1 and node2 publish all five bitcoind ZMQ topics (`rawblock`, `rawtx`, `hashblock`,
+`hashtx`, `sequence`): node1 on host ports 28332-28336, node2 on 38332-38336 (all
+remappable, see [SETTINGS.md](./SETTINGS.md)). Anything that consumes bitcoind ZMQ
+(LND/CLN, indexers, custody watchers) can point at the simnet, and reorg delivery can be
+exercised with the reorg simulator. Smoke test (needs `pip install pyzmq`):
+
+```bash
+python3 -c "
+import zmq
+s = zmq.Context().socket(zmq.SUB)
+s.connect('tcp://127.0.0.1:28332')      # node1 rawblock
+s.setsockopt_string(zmq.SUBSCRIBE, '')
+topic, body, seq = s.recv_multipart()   # blocks until the next block is mined
+print(topic, len(body), 'bytes')
+"
+```
+
 ## Simulating reorgs
 
 The reorg simulator (a Rust container using only bitcoind RPC calls) invalidates the last
@@ -132,6 +158,11 @@ winning chain of a real reorg, so reorged blocks are not empty. Only if the orph
 blocks carried no txs (e.g. `ENABLE_SPAM=false`), it injects `REORG_INJECT_TXS` fresh
 wallet transactions per empty replacement block. It prints each block's hash and tx
 count before/after plus a replaced-blocks summary.
+
+The reorg is race-safe against the mining controller: after mining the replacements the
+tool polls a witness node (`REORG_WITNESS_NODE`, default node1) and, if the miners kept
+extending the old chain in the meantime, mines extra blocks until the network adopts the
+new chain.
 
 One-shot (container runs, reorgs, dies):
 
@@ -148,8 +179,9 @@ with x > y enforced:
 REORG_MODE=auto docker compose --profile reorg up btc-simnet-reorg
 ```
 
-Tune `REORG_DEPTH`, `AUTO_REORG_EVERY_BLOCKS`, `REORG_NODE`, `REORG_MINE_ADDRESS` and
-`REORG_INJECT_TXS` in `.env` (see [SETTINGS.md](./SETTINGS.md)).
+Tune `REORG_DEPTH`, `AUTO_REORG_EVERY_BLOCKS`, `REORG_NODE`, `REORG_MINE_ADDRESS`,
+`REORG_INJECT_TXS`, `REORG_WALLET_NAME` and `REORG_WITNESS_NODE` in `.env`
+(see [SETTINGS.md](./SETTINGS.md)).
 
 ## Documents
 
@@ -165,11 +197,17 @@ All known limitations, future enhancements and proposed features live in
 
 # Trouble shotting
 
-stopping the containers instead of removing may cause an error
+Stopping the containers (`docker compose stop`) and starting them again used to crash
+the mining controller with:
+
 ```
 JsonRpc(Rpc(RpcError { code: -4, message: "Wallet file verification failed. Failed to create database path '/home/bitcoin/.bitcoin/regtest/wallets/node2'. Database already exists.", data: None }))
 ```
 
-remove the containers with `docker compose --profile all-tools down`
+Fixed: the controller now loads the existing wallets and skips the funding sequence when
+the chain is already bootstrapped (height >= 104), so `stop`/`start` resumes cleanly
+where it left off.
 
-this might be fixed in future versions, supporting snapshots, and continues
+To reset the chain from scratch, remove the containers instead:
+`docker compose --profile all-tools down` (regtest keeps no volumes; everything resets
+on the next `up`).

@@ -44,6 +44,29 @@ Shared by all nodes and every tool (mining controller, spammer, reorg, electrs, 
 
 Node3 is intentionally not exposed to the host.
 
+## ZMQ notifications (node1 and node2)
+
+node1 and node2 publish all five bitcoind ZMQ topics (`rawblock`, `rawtx`,
+`hashblock`, `hashtx`, `sequence`), so ZMQ consumers (LND/CLN Lightning nodes,
+ordinals indexers, block explorers, custody watchers) can run against the simnet,
+including through reorgs. The variables below only change the **host** port
+mappings; inside the compose network both nodes always publish on 28332-28336.
+
+| Variable | Default | Description |
+|---|---|---|
+| `NODE1_ZMQ_RAWBLOCK_PORT` | `28332` | Host port for node1 `rawblock` (full serialized block). |
+| `NODE1_ZMQ_RAWTX_PORT` | `28333` | Host port for node1 `rawtx` (full serialized tx). |
+| `NODE1_ZMQ_HASHBLOCK_PORT` | `28334` | Host port for node1 `hashblock`. |
+| `NODE1_ZMQ_HASHTX_PORT` | `28335` | Host port for node1 `hashtx`. |
+| `NODE1_ZMQ_SEQUENCE_PORT` | `28336` | Host port for node1 `sequence` (mempool add/remove + block connect/disconnect, the reorg-aware topic). |
+| `NODE2_ZMQ_RAWBLOCK_PORT` | `38332` | Host port for node2 `rawblock`. |
+| `NODE2_ZMQ_RAWTX_PORT` | `38333` | Host port for node2 `rawtx`. |
+| `NODE2_ZMQ_HASHBLOCK_PORT` | `38334` | Host port for node2 `hashblock`. |
+| `NODE2_ZMQ_HASHTX_PORT` | `38335` | Host port for node2 `hashtx`. |
+| `NODE2_ZMQ_SEQUENCE_PORT` | `38336` | Host port for node2 `sequence`. |
+
+Smoke test: see the ZMQ section in the README.
+
 ## Container-internal RPC endpoints
 
 URLs the helper tools (mining controller, spammer) use to reach the nodes inside the
@@ -96,6 +119,8 @@ The three fee settings look similar but act at different points of a transaction
 | `ENABLE_SPAM` | `true` | Spam transactions after each block so blocks are not empty. |
 | `SPAM_PER_MINER_PER_BLOCK` | `50` | Txs per miner per block (2 miners → up to 2x this per block). Excess waits in the mempool. |
 | `SPAM_FANOUT_UTXOS` | `50` | On startup the spammer splits each wallet into this many UTXOs. The mempool caps unconfirmed chains at 25 txs, so without the split a wallet can never place more than 25 txs per block. `0` disables. |
+| `ENABLE_SPAM_REPLACES` | `false` | `true` or `1`: every spam tx signals RBF (BIP125) and, right after each batch, the newest `SPAM_REPLACES_PER_MINER_PER_BLOCK` txs per miner are fee-bumped with `bumpfee`, so the mempool carries real replacements (old txid evicted, new txid appears) for downstream code to handle. `false`/`0`: exactly today's behavior. |
+| `SPAM_REPLACES_PER_MINER_PER_BLOCK` | `5` | How many of each miner's spam txs are fee-bumped per block when `ENABLE_SPAM_REPLACES` is on. The newest txs are bumped (a tx with unconfirmed descendants cannot be replaced). |
 
 ## Reorg simulator (profile `reorg`)
 
@@ -106,8 +131,10 @@ The three fee settings look similar but act at different points of a transaction
 | `AUTO_REORG_EVERY_BLOCKS` | `20` | Auto mode cadence (x); must be greater than `REORG_DEPTH` (y). |
 | `REORG_NODE` | `btc-simnet-node3` | Node used to fork the chain (a hidden miner is realistic). |
 | `REORG_NODE_RPC_PORT` | `18443` | RPC port of `REORG_NODE` inside the compose network. |
-| `REORG_MINE_ADDRESS` | `bcrt1qtmjq...tf3rr` | Address receiving the replacement block rewards. |
+| `REORG_MINE_ADDRESS` | `bcrt1qtmjq...tf3rr` | Address receiving the replacement block rewards. **The default is the same address as `USER_ADDRESS`'s default** (intentional), so after a reorg plus 100 blocks of maturity the user balance grows beyond the bootstrap 2x50 BTC. Set a separate throwaway address if your test asserts exact user balances. |
 | `REORG_INJECT_TXS` | `5` | Fallback only: if the orphaned blocks carried no txs (e.g. `ENABLE_SPAM=false`), send this many fresh wallet txs per empty replacement block. `0` disables. To make injected blocks as full as spammed ones, set it near 2x `SPAM_PER_MINER_PER_BLOCK`. |
+| `REORG_WALLET_NAME` | `NODE3_WALLET_NAME` (`node3`) | Wallet used to send the `REORG_INJECT_TXS` transactions on the reorg node. Falls back to the first loaded wallet if it is not loaded. |
+| `REORG_WITNESS_NODE` | `btc-simnet-node1` | Node polled after mining the replacements to confirm the whole network adopted the new chain. If the mining controller extended the old chain during the reorg window (tie), extra blocks are mined (up to 10) until the witness follows the new tip. `none` disables the check. |
 
 Orphaned transactions return to the mempool automatically and are re-mined into the
 replacement blocks (same txids), like the winning chain of a real reorg, so the
