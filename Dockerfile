@@ -36,40 +36,6 @@ RUN set -eux; \
   esac; \
   echo "$PLATFORM" > /tmp/bitcoin-platform
 
-# TODO import GPG keys and verify binaries
-
-# Import GPG keys
-# RUN for key in \
-#     152812300785C96444D3334D17565732E08E5E41 \
-#     0AD83877C1F0CD1EE9BD660AD7CC770B81FD22A8 \
-#     590B7292695AFFA5B672CBB2E13FC145CD3F4304 \
-#     CFB16E21C950F67FA95E558F2EEB9F5CC09526C1 \
-#     F4FC70F07310028424EFC20A8E4256593F177720 \
-#     D1DBF2C4B96F2DEBF4C16654410108112E7EA81F \
-#     287AE4CA1187C68C08B49CB2D11BD4F33F1DB499 \
-#     9DEAE0DC7063249FB05474681E4AED62986CD25D \
-#     3EB0DEE6004A13BE5A0CC758BF2978B068054311 \
-#     ED9BDF7AD6A55E232E84524257FF9BDBCC301009 \
-#     28E72909F1717FE9607754F8A7BEB2621678D37D \
-#     79D00BAC68B56D422F945A8F8E3A8F3247DBCBBF \
-#     637DB1E23370F84AFF88CCE03152347D07DA627C \
-#     1A3E761F19D2CC7785C5502EA291A2C45D0C504A \
-#     E86AE73439625BBEE306AAE6B66D427F873CB1A3 \
-#     670BC460DC8BF5EEF1C3BC74B14CC9F833238F85 \
-#     F19F5FF2B0589EC341220045BA03F4DBE0C63FB4 \
-#     F2CFC4ABD0B99D837EEBB7D09B79B45691DB4173 \
-#     C388F6961FB972A95678E327F62711DBDCA8AE56 \
-#     6A8F9C266528E25AEB1D7731C2371D91CB716EA7 \
-#     E61773CD6E01040E2F1BD78CE7E2984B6289C93A \
-#   ; do \
-#     gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key" || \
-#     gpg --batch --keyserver keys.openpgp.org --recv-keys "$key" || \
-#     gpg --batch --keyserver pgp.mit.edu --recv-keys "$key" || \
-#     gpg --batch --keyserver ha.pool.sks-keyservers.net --recv-keys "$key" || \
-#     gpg --batch --keyserver keyserver.pgp.com --recv-keys "$key" || \
-#     gpg --batch --keyserver hkp://p80.pool.sks-keyservers.net:80 --recv-keys "$key"; \
-#   done
-
 # Download Bitcoin Core, server is failing, use mirror
 RUN set -eux; \
   TARGETPLATFORM="$(cat /tmp/bitcoin-platform)"; \
@@ -82,9 +48,17 @@ RUN set -eux; \
 #   && curl -SLO https://bitcoin.org/bin/bitcoin-core-${BITCOIN_VERSION}/SHA256SUMS \
 #   && curl -SLO https://bitcoin.org/bin/bitcoin-core-${BITCOIN_VERSION}/SHA256SUMS.asc
 
-# TODO
-# Verify the SHA256SUMS file with the GPG signature
-# RUN gpg --verify SHA256SUMS.asc SHA256SUMS
+# Verify SHA256SUMS is signed by the Bitcoin Core release signers: import
+# the builder keys from the bitcoin-core/guix.sigs repo (no flaky
+# keyservers) and check the detached signature. gpg exits non-zero (failing
+# the build) unless at least one good signature is found; signatures from
+# builders whose key is not in the repo only produce warnings.
+RUN set -eux; \
+  curl -SL https://github.com/bitcoin-core/guix.sigs/archive/refs/heads/main.tar.gz \
+    | tar -xz -C /tmp guix.sigs-main/builder-keys; \
+  gpg --batch --import /tmp/guix.sigs-main/builder-keys/*.gpg; \
+  gpg --batch --verify SHA256SUMS.asc SHA256SUMS; \
+  rm -rf /tmp/guix.sigs-main /root/.gnupg
 
 # Check the SHA256SUM of the downloaded tarball
 RUN set -eux; \

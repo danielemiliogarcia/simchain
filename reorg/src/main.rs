@@ -17,8 +17,13 @@ use std::{
 // mempool, so the replacement blocks carry the same real transactions, like
 // the winning chain of a real reorg. If the mempool ends up empty (orphaned
 // blocks had no txs), REORG_INJECT_TXS fresh transactions are sent from the
-// reorg node's wallet before each empty replacement block so they are not
-// empty.
+// reorg node's wallet (REORG_WALLET_NAME) before each empty replacement
+// block so they are not empty.
+//
+// After mining the replacements, a witness node (REORG_WITNESS_NODE, "none"
+// disables) is polled until it adopts the new chain; if the mining
+// controller kept extending the old chain in the meantime, extra blocks are
+// mined until the new chain wins network-wide.
 //
 // Modes (REORG_MODE):
 //   once (default) - one reorg and exit. Depth: argv[1], or REORG_DEPTH, or 3.
@@ -81,10 +86,17 @@ fn print_blocks(blocks: &[(u64, String, usize)]) {
 }
 
 /// If a wallet is loaded on the reorg node, send `count` transactions to
-/// itself so the replacement blocks are not empty.
+/// itself so the replacement blocks are not empty. Prefers REORG_WALLET_NAME
+/// (the wallet the controller created on the reorg node); falls back to the
+/// first loaded wallet if that one is not loaded.
 fn inject_transactions(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Client, count: u64) {
+    let preferred = env_or("REORG_WALLET_NAME", "node3");
     let wallet_name = match node.list_wallets() {
-        Ok(wallets) if !wallets.is_empty() => wallets[0].clone(),
+        Ok(wallets) if wallets.contains(&preferred) => preferred,
+        Ok(wallets) if !wallets.is_empty() => {
+            println!("Wallet '{preferred}' not loaded on the reorg node, using '{}' instead", wallets[0]);
+            wallets[0].clone()
+        }
         _ => {
             println!("No wallet loaded on the reorg node, replacement blocks may be empty");
             return;
@@ -121,6 +133,46 @@ fn inject_transactions(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Cli
     }
 }
 
+/// The mining controller may extend the old chain on the other miner while
+/// the replacements are being mined; if it lands a block, depth+1 new blocks
+/// only tie and the network never reorgs. Poll a witness node until it adopts
+/// the reorg node's tip, mining one extra block per round to outpace the old
+/// chain. Gives up (with a warning) after `max_extra` extra blocks.
+fn ensure_network_adopts(
+    node: &Client,
+    witness: &Client,
+    witness_name: &str,
+    mine_address: &Address,
+    max_extra: u64,
+) -> Result<(), bitcoincore_rpc::Error> {
+    for extra in 0..=max_extra {
+        let tip = node.get_best_block_hash()?;
+        // Give the new chain a moment to propagate before mining more.
+        for _ in 0..12 {
+            match witness.get_best_block_hash() {
+                Ok(hash) if hash == tip => {
+                    if extra > 0 {
+                        println!("Network adopted the new chain after {extra} extra block(s)");
+                    }
+                    return Ok(());
+                }
+                Ok(_) => thread::sleep(Duration::from_millis(250)),
+                Err(e) => {
+                    println!("Witness node '{witness_name}' unreachable ({e}), cannot verify the network reorged");
+                    return Ok(());
+                }
+            }
+        }
+        if extra == max_extra {
+            break;
+        }
+        println!("'{witness_name}' is still on the old chain (miners kept extending it), mining 1 extra block...");
+        node.generate_to_address(1, mine_address)?;
+    }
+    println!("WARNING: the network did not adopt the new chain after {max_extra} extra blocks");
+    Ok(())
+}
+
 fn do_reorg(
     node: &Client,
     rpc_url: &str,
@@ -129,6 +181,7 @@ fn do_reorg(
     depth: u64,
     mine_address: &Address,
     inject_txs: u64,
+    witness: Option<(&Client, &str)>,
 ) -> Result<(), bitcoincore_rpc::Error> {
     let tip = node.get_block_count()?;
     if tip < depth + 1 {
@@ -209,7 +262,12 @@ fn do_reorg(
         }
     }
 
-    // Let the new chain propagate before reporting.
+    // Make sure the rest of the network actually switched to the new chain
+    // before declaring success (the controller may have kept mining the old
+    // one), then let it propagate before reporting.
+    if let Some((witness, witness_name)) = witness {
+        ensure_network_adopts(node, witness, witness_name, mine_address, 10)?;
+    }
     thread::sleep(Duration::from_secs(2));
 
     println!("\n--- Last {} blocks AFTER reorg ---", depth + 3);
@@ -257,9 +315,21 @@ fn main() {
     let node = create_client(&rpc_url, &rpc_user, &rpc_pass);
     wait_for_node(&node, &node_name);
 
+    // Witness node: another node polled after the reorg to confirm the whole
+    // network adopted the new chain (node1 never mines, ideal witness).
+    // REORG_WITNESS_NODE=none disables the check.
+    let witness_name = env_or("REORG_WITNESS_NODE", "btc-simnet-node1");
+    let witness_client;
+    let witness: Option<(&Client, &str)> = if witness_name == "none" || witness_name == node_name {
+        None
+    } else {
+        witness_client = create_client(&format!("http://{witness_name}:{rpc_port}"), &rpc_user, &rpc_pass);
+        Some((&witness_client, witness_name.as_str()))
+    };
+
     match mode.as_str() {
         "once" => {
-            if let Err(e) = do_reorg(&node, &rpc_url, &rpc_user, &rpc_pass, depth, &mine_address, inject_txs) {
+            if let Err(e) = do_reorg(&node, &rpc_url, &rpc_user, &rpc_pass, depth, &mine_address, inject_txs, witness) {
                 eprintln!("Reorg failed: {e}");
                 process::exit(1);
             }
@@ -274,7 +344,7 @@ fn main() {
             loop {
                 match node.get_block_count() {
                     Ok(tip) if tip >= last + every => {
-                        if let Err(e) = do_reorg(&node, &rpc_url, &rpc_user, &rpc_pass, depth, &mine_address, inject_txs) {
+                        if let Err(e) = do_reorg(&node, &rpc_url, &rpc_user, &rpc_pass, depth, &mine_address, inject_txs, witness) {
                             eprintln!("Reorg failed: {e}");
                         }
                         last = node.get_block_count().unwrap_or(tip);

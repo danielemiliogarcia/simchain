@@ -1,4 +1,4 @@
-use bitcoincore_rpc::{bitcoin::{Address, Amount, Network}, Auth, Client, RpcApi};
+use bitcoincore_rpc::{bitcoin::{Address, Amount, Network, Txid}, Auth, Client, RpcApi};
 use serde_json::json;
 use std::{env, thread, time::Duration};
 
@@ -68,16 +68,18 @@ fn fan_out(wallet: &Client, name: &str, count: u64) {
 
 // Send `count` txs and report how many actually made it, so empty blocks
 // are noticed (a silent wallet error would defeat the spammer's purpose).
-fn send_spam_tx(from: &Client, to_address: &Address, count: u64) -> u64 {
+// Returns the accepted txids so a fraction of them can be fee-bumped.
+fn send_spam_tx(from: &Client, to_address: &Address, count: u64, replaceable: bool) -> Vec<Txid> {
     // 546 sats is the dust limit for P2PKH outputs, the highest floor among
     // the common output types (bech32 is 294), so this amount is safely
     // above dust no matter what address type receives it.
     let amount = Amount::from_sat(546);
-    let mut sent = 0;
+    let mut txids = Vec::new();
     let mut first_error: Option<String> = None;
+    let replaceable = if replaceable { Some(true) } else { None };
     for _ in 0..count {
-        match from.send_to_address(&to_address, amount, None, None, None, None, None, None) {
-            Ok(_) => sent += 1,
+        match from.send_to_address(&to_address, amount, None, None, None, replaceable, None, None) {
+            Ok(txid) => txids.push(txid),
             Err(e) => {
                 if first_error.is_none() {
                     first_error = Some(e.to_string());
@@ -86,22 +88,56 @@ fn send_spam_tx(from: &Client, to_address: &Address, count: u64) -> u64 {
         }
     }
     if let Some(error) = first_error {
-        println!("WARNING: only {sent}/{count} spam txs accepted, first error: {error}");
+        println!("WARNING: only {}/{count} spam txs accepted, first error: {error}", txids.len());
     }
-    sent
+    txids
+}
+
+// Fee-bump (RBF) up to `count` of the just-sent spam txs, so the mempool
+// carries real BIP125 replacements for downstream code to handle. Bump
+// newest-first: the latest txs are the tips of the unconfirmed chains, and
+// a tx with in-wallet descendants cannot be bumped.
+fn bump_spam_txs(wallet: &Client, label: &str, txids: &[Txid], count: u64) {
+    let mut bumped = 0;
+    let mut first_error: Option<String> = None;
+    for txid in txids.iter().rev() {
+        if bumped >= count {
+            break;
+        }
+        match wallet.call::<serde_json::Value>("bumpfee", &[json!(txid.to_string())]) {
+            Ok(_) => bumped += 1,
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(error) if bumped < count => {
+            println!("{label} => Fee-bumped (RBF) {bumped}/{count} spam txs, first error: {error}")
+        }
+        _ => println!("{label} => Fee-bumped (RBF) {bumped} spam txs"),
+    }
 }
 
 fn main() {
-    let enable_spam = env_or("ENABLE_SPAM", "false") == "true";
+    // Every setting has a default matching docker-compose.yml, so the tool
+    // also runs standalone with no environment at all.
+    let enable_spam = env_or("ENABLE_SPAM", "true") == "true";
     if !enable_spam {
         println!("ENABLE_SPAM is not 'true', nothing to do, exiting");
         return;
     }
 
-    let spam_per_miner_per_block: u64 = env::var("SPAM_PER_MINER_PER_BLOCK").expect("SPAM_PER_MINER_PER_BLOCK missing").parse().unwrap();
+    let spam_per_miner_per_block: u64 = env_or("SPAM_PER_MINER_PER_BLOCK", "50").parse().expect("SPAM_PER_MINER_PER_BLOCK must be a positive integer");
     let fanout_utxos: u64 = env_or("SPAM_FANOUT_UTXOS", "50").parse().expect("SPAM_FANOUT_UTXOS must be a positive integer");
-    let rpc_user = env::var("BTC_RPC_USER").expect("BTC_RPC_USER missing");
-    let rpc_pass = env::var("BTC_RPC_PASS").expect("BTC_RPC_PASS missing");
+    // RBF traffic: when enabled ("true" or "1") every spam tx signals BIP125
+    // and the newest few of each batch get fee-bumped right after sending.
+    let enable_replaces = matches!(env_or("ENABLE_SPAM_REPLACES", "false").as_str(), "true" | "1");
+    let replaces_per_miner: u64 = env_or("SPAM_REPLACES_PER_MINER_PER_BLOCK", "5").parse().expect("SPAM_REPLACES_PER_MINER_PER_BLOCK must be a non-negative integer");
+    let rpc_user = env_or("BTC_RPC_USER", "foo");
+    let rpc_pass = env_or("BTC_RPC_PASS", "rpcpassword");
     let wallet2_name = env_or("NODE2_WALLET_NAME", "node2");
     let wallet3_name = env_or("NODE3_WALLET_NAME", "node3");
 
@@ -134,9 +170,13 @@ fn main() {
             spammed_at_block_height = current_block_height;
             // spam transactions cross wallet
             println!("Node 2 => Spamming {spam_per_miner_per_block} transactions to address {addr3}");
-            send_spam_tx(&wallet2, &addr3, spam_per_miner_per_block);
+            let txids2 = send_spam_tx(&wallet2, &addr3, spam_per_miner_per_block, enable_replaces);
             println!("Node 3 => Spamming {spam_per_miner_per_block} transactions to address {addr2}");
-            send_spam_tx(&wallet3, &addr2, spam_per_miner_per_block);
+            let txids3 = send_spam_tx(&wallet3, &addr2, spam_per_miner_per_block, enable_replaces);
+            if enable_replaces {
+                bump_spam_txs(&wallet2, "Node 2", &txids2, replaces_per_miner);
+                bump_spam_txs(&wallet3, "Node 3", &txids3, replaces_per_miner);
+            }
         }
         thread::sleep(Duration::from_millis(200));
     }

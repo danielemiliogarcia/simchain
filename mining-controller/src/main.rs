@@ -35,8 +35,20 @@ fn wait_for_height(client: &Client, height: u64) {
 // Create the wallet and return a wallet-scoped client plus a fresh address.
 // A wallet-scoped URL keeps working even if the user loads extra wallets on
 // the node later (the generic RPC path breaks with more than one wallet).
+// Restart-safe: if the wallet already exists on disk it is loaded instead,
+// and if it is already loaded it is used as-is.
 fn setup_wallet(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Client, wallet_name: &str) -> (Client, Address) {
-    let _ = node.create_wallet(wallet_name, None, None, None, None).unwrap();
+    if let Err(create_err) = node.create_wallet(wallet_name, None, None, None, None) {
+        match node.load_wallet(wallet_name) {
+            Ok(_) => println!("Wallet '{wallet_name}' already exists, loaded it"),
+            Err(load_err) if load_err.to_string().contains("already loaded") => {
+                println!("Wallet '{wallet_name}' already loaded, reusing it");
+            }
+            Err(load_err) => {
+                panic!("wallet '{wallet_name}': create failed ({create_err}), load failed ({load_err})")
+            }
+        }
+    }
     let wallet = create_client(&format!("{rpc_url}/wallet/{wallet_name}"), rpc_user, rpc_pass);
     let address = wallet.get_new_address(None, None).unwrap();
     let address = address.require_network(Network::Regtest).unwrap();
@@ -44,11 +56,13 @@ fn setup_wallet(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Client, wa
 }
 
 fn main() {
-    let user_address = env::var("USER_ADDRESS").expect("USER_ADDRESS missing");
-    let interval_secs: u64 = env::var("BLOCK_INTERVAL_SECS").expect("BLOCK_INTERVAL_SECS missing").parse().unwrap();
+    // Every setting has a default matching docker-compose.yml, so the tool
+    // also runs standalone with no environment at all.
+    let user_address = env_or("USER_ADDRESS", "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr");
+    let interval_secs: u64 = env_or("BLOCK_INTERVAL_SECS", "15").parse().expect("BLOCK_INTERVAL_SECS must be a positive integer");
 
-    let rpc_user = env::var("BTC_RPC_USER").expect("BTC_RPC_USER missing");
-    let rpc_pass = env::var("BTC_RPC_PASS").expect("BTC_RPC_PASS missing");
+    let rpc_user = env_or("BTC_RPC_USER", "foo");
+    let rpc_pass = env_or("BTC_RPC_PASS", "rpcpassword");
     let wallet2_name = env_or("NODE2_WALLET_NAME", "node2");
     let wallet3_name = env_or("NODE3_WALLET_NAME", "node3");
 
@@ -71,43 +85,50 @@ fn main() {
     let (_wallet2, addr2) = setup_wallet(&node2_url, &rpc_user, &rpc_pass, &node2, &wallet2_name);
     let (_wallet3, addr3) = setup_wallet(&node3_url, &rpc_user, &rpc_pass, &node3, &wallet3_name);
 
-    println!("Node 2 => Mining block 1 to its own wallet address {addr2}");
-    let _ = node2.generate_to_address(1, &addr2).unwrap();
+    // Restart-safe: if the chain is already past the bootstrap height the
+    // funding already happened, re-running it would fund the user again.
     let mut height = node2.get_block_count().unwrap();
-    println!("Waiting for network sync, so blocks do not compete and stack on each other");
-    wait_for_height(&node3, height);
+    if height >= 104 {
+        println!("Chain already bootstrapped (height {height}), skipping the funding sequence");
+    } else {
+        println!("Node 2 => Mining block 1 to its own wallet address {addr2}");
+        let _ = node2.generate_to_address(1, &addr2).unwrap();
+        height = node2.get_block_count().unwrap();
+        println!("Waiting for network sync, so blocks do not compete and stack on each other");
+        wait_for_height(&node3, height);
 
-    println!("Node 3 => Mining block 2 to its own wallet address {addr3}");
-    let _ = node3.generate_to_address(1, &addr3).unwrap();
-    height = node3.get_block_count().unwrap();
-    wait_for_height(&node2, height);
+        println!("Node 3 => Mining block 2 to its own wallet address {addr3}");
+        let _ = node3.generate_to_address(1, &addr3).unwrap();
+        height = node3.get_block_count().unwrap();
+        wait_for_height(&node2, height);
 
-    println!("Funding user address {user_address} with blocks 3 and 4");
-    println!("Node 2 => Mining a block to address {user_address}");
-    let _ = node2.generate_to_address(1, &user_address).unwrap();
-    height = node2.get_block_count().unwrap();
-    wait_for_height(&node3, height);
+        println!("Funding user address {user_address} with blocks 3 and 4");
+        println!("Node 2 => Mining a block to address {user_address}");
+        let _ = node2.generate_to_address(1, &user_address).unwrap();
+        height = node2.get_block_count().unwrap();
+        wait_for_height(&node3, height);
 
-    println!("Node 3 => Mining a block to address {user_address}");
-    let _ = node3.generate_to_address(1, &user_address).unwrap();
-    height = node3.get_block_count().unwrap();
-    wait_for_height(&node2, height);
-    println!("New block height: {height}");
+        println!("Node 3 => Mining a block to address {user_address}");
+        let _ = node3.generate_to_address(1, &user_address).unwrap();
+        height = node3.get_block_count().unwrap();
+        wait_for_height(&node2, height);
+        println!("New block height: {height}");
 
-    // 100 more blocks so blocks 1-4 mature (block 4 matures at height 104)
-    println!("Node 2 => Mining 50 blocks to address {addr2}");
-    node2.generate_to_address(50, &addr2).unwrap();
-    height = node2.get_block_count().unwrap();
-    println!("Waiting network to sync");
-    wait_for_height(&node3, height);
-    println!("New block height: {height}");
+        // 100 more blocks so blocks 1-4 mature (block 4 matures at height 104)
+        println!("Node 2 => Mining 50 blocks to address {addr2}");
+        node2.generate_to_address(50, &addr2).unwrap();
+        height = node2.get_block_count().unwrap();
+        println!("Waiting network to sync");
+        wait_for_height(&node3, height);
+        println!("New block height: {height}");
 
-    println!("Node 3 => Mining 50 blocks to address {addr3}");
-    node3.generate_to_address(50, &addr3).unwrap();
-    height = node3.get_block_count().unwrap();
-    println!("Waiting network to sync");
-    wait_for_height(&node2, height);
-    println!("New block height: {height}");
+        println!("Node 3 => Mining 50 blocks to address {addr3}");
+        node3.generate_to_address(50, &addr3).unwrap();
+        height = node3.get_block_count().unwrap();
+        println!("Waiting network to sync");
+        wait_for_height(&node2, height);
+        println!("New block height: {height}");
+    }
 
     println!("\nActual block height: {}", node2.get_block_count().unwrap());
 

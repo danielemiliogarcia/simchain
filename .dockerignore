@@ -1,0 +1,7 @@
+# Build context for build-bitcoin.sh (repo root). The bitcoin node image
+# only needs the Dockerfile and the entrypoint script; keep everything else
+# (.git, the Rust target/ dirs - GBs after local builds) out of the upload.
+# The Rust tool images use their own contexts and .dockerignore files.
+*
+!Dockerfile
+!docker-entrypoint.sh
