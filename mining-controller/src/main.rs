@@ -1,5 +1,11 @@
-use bitcoincore_rpc::{bitcoin::{address::NetworkUnchecked, Address, Network}, Auth, Client, RpcApi};
+use bitcoincore_rpc::{bitcoin::{address::NetworkUnchecked, Address, BlockHash, Network}, Auth, Client, RpcApi};
+use std::collections::{BTreeMap, HashSet};
 use std::{env, thread, time::Duration};
+
+// How many recent blocks to remember for reorg analysis. Reorgs deeper than
+// this window are still detected, but the fork point is then reported as the
+// bottom of the window (the same rule chainwatch.sh uses).
+const REORG_WINDOW: u64 = 100;
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
@@ -53,6 +59,100 @@ fn setup_wallet(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Client, wa
     let address = wallet.get_new_address(None, None).unwrap();
     let address = address.require_network(Network::Regtest).unwrap();
     (wallet, address)
+}
+
+// The controller's view of the recent chain: the hash it last observed at
+// each height, plus the set of hashes it mined itself. Comparing the node's
+// chain against `seen` exposes reorgs (and their fork point), and any block
+// missing from `own` was mined by someone else -- the reorg simulator, a
+// manual generate call, etc.
+struct ChainView {
+    seen: BTreeMap<u64, BlockHash>,
+    own: HashSet<BlockHash>,
+}
+
+impl ChainView {
+    fn new() -> Self {
+        ChainView { seen: BTreeMap::new(), own: HashSet::new() }
+    }
+
+    fn record(&mut self, height: u64, hash: BlockHash, mined_by_us: bool) {
+        self.seen.insert(height, hash);
+        if mined_by_us {
+            self.own.insert(hash);
+        }
+        // Keep both collections bounded to the reorg window.
+        let floor = height.saturating_sub(REORG_WINDOW);
+        while let Some((&h, _)) = self.seen.first_key_value() {
+            if h >= floor {
+                break;
+            }
+            if let Some(old) = self.seen.remove(&h) {
+                self.own.remove(&old);
+            }
+        }
+    }
+
+    // Walk down from `below` to the highest recorded height whose hash still
+    // matches the node's chain: the fork point (last common block).
+    fn find_fork(&self, node: &Client, below: u64) -> u64 {
+        for (&h, hash) in self.seen.range(..=below).rev() {
+            if node.get_block_hash(h).ok().as_ref() == Some(hash) {
+                return h;
+            }
+        }
+        // Nothing matches: the reorg is deeper than the window.
+        self.seen.first_key_value().map_or(0, |(&h, _)| h.saturating_sub(1))
+    }
+}
+
+// Reconcile the node's chain with the controller's recorded view and return
+// the node's current tip. A rewritten block triggers a REORG report with the
+// fork point, the replaced range and the new tip; every walked block the
+// controller did not mine itself is flagged EXTERNAL.
+fn sync_view(view: &mut ChainView, node: &Client, last: u64) -> u64 {
+    let tip = match node.get_block_count() {
+        Ok(t) => t,
+        Err(_) => return last,
+    };
+    let base = last.min(tip);
+
+    // If the hash recorded at min(last, tip) still matches, the chain only
+    // grew; otherwise history at or below that height was rewritten.
+    let reorged = match view.seen.get(&base) {
+        Some(hash) => node.get_block_hash(base).ok().as_ref() != Some(hash),
+        None => false,
+    };
+
+    let from = if reorged {
+        let fork = view.find_fork(node, base);
+        println!(
+            "REORG detected: blocks [{}..{}] replaced; forked at [{}], new tip [{}], mining continues on the new chain",
+            fork + 1, last, fork, tip
+        );
+        // Forget the replaced blocks (and drop them from `own`: a replaced
+        // block of ours is no longer on the chain). The walk below records
+        // their replacements.
+        let stale = view.seen.split_off(&(fork + 1));
+        for hash in stale.values() {
+            view.own.remove(hash);
+        }
+        fork + 1
+    } else {
+        last + 1
+    };
+
+    for h in from..=tip {
+        // A block can vanish mid-walk if another reorg lands right now; stop
+        // and let the next round re-sync.
+        let Ok(hash) = node.get_block_hash(h) else { break };
+        let mined_by_us = view.own.contains(&hash);
+        if !mined_by_us {
+            println!("EXTERNAL block [{h}] {hash} (not mined by this controller)");
+        }
+        view.record(h, hash, mined_by_us);
+    }
+    tip
 }
 
 fn main() {
@@ -163,22 +263,49 @@ fn main() {
     println!("To list UTXOs, use scantxoutset or list_unspent from bdk crate");
     println!("\n//////////////////////////////////////////////////////////////////\n");
 
-    // Continuous mining loop
+    // Continuous mining loop. The controller remembers the recent chain --
+    // heights, hashes, and which blocks it mined itself -- so a reorg (the
+    // reorg simulator rewriting recent blocks) is reported with its full
+    // extent: fork point, replaced range and new tip, with the replacement
+    // blocks flagged EXTERNAL because someone else mined them. Like a real
+    // miner the controller keeps mining on whatever tip the node reports --
+    // generate_to_address already does that -- so detection only makes the
+    // events visible here; nothing needs to be controlled.
+    let mut view = ChainView::new();
+    let mut last = node2.get_block_count().unwrap();
+    // Seed the view with the recent chain so even the first reorg gets an
+    // accurate fork point. Bootstrap blocks are seeded as not-ours, which is
+    // harmless: seeded heights are never re-walked unless a reorg replaces
+    // them, and replacement blocks are external by definition.
+    for h in last.saturating_sub(REORG_WINDOW)..=last {
+        if let Ok(hash) = node2.get_block_hash(h) {
+            view.record(h, hash, false);
+        }
+    }
+
     let mut toggle = true;
     loop {
         let start_time = std::time::Instant::now();
 
-        if toggle {
-            let _ = node2.generate_to_address(1, &addr2).unwrap();
-            height = node2.get_block_count().unwrap();
-            println!("Node 2 => Mined 1 block [{height}] to address {addr2}");
-            wait_for_height(&node3, height);
+        let (miner, other, addr, name) = if toggle {
+            (&node2, &node3, &addr2, "Node 2")
         } else {
-            let _ = node3.generate_to_address(1, &addr3).unwrap();
-            height = node3.get_block_count().unwrap();
-            println!("Node 3 => Mined 1 block [{height}] to address {addr3}");
-            wait_for_height(&node2, height);
-        }
+            (&node3, &node2, &addr3, "Node 3")
+        };
+
+        // Catch up with the node before mining: report any reorg and any
+        // externally mined blocks that appeared since the last round.
+        last = sync_view(&mut view, miner, last);
+
+        let mined = miner.generate_to_address(1, addr).unwrap();
+        // Identify the new block by the hash generate returned instead of
+        // the tip counter, which races with blocks arriving from elsewhere.
+        let hash = mined[0];
+        let mined_height = miner.get_block_header_info(&hash).unwrap().height as u64;
+        println!("{name} => Mined 1 block [{mined_height}] {hash} to address {addr}");
+        view.record(mined_height, hash, true);
+        last = last.max(mined_height);
+        wait_for_height(other, mined_height);
 
         toggle = !toggle;
 

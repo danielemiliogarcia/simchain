@@ -78,10 +78,23 @@ flowchart TB
         rg["reorg simulator<br/>profile: reorg, on demand"]
     end
 
+    %% Invisible waypoints pull the host arrows apart so each port label
+    %% sits near the host boxes in open space instead of tangling with the
+    %% other arrows.
+    zmq1(( )):::waypoint
+    rpc2a(( )):::waypoint
+    rpc2(( )):::waypoint
+    zmq2(( )):::waypoint
+
     user ==>|"RPC localhost:18443"| n1
-    user -.->|"RPC localhost:28443"| n2
-    zmqc -.->|"ZMQ 28332-28336"| n1
-    zmqc -.->|"ZMQ 38332-38336"| n2
+    zmqc -.-|"ZMQ 28332-28336"| zmq1
+    zmq1 -.-> n1
+
+    user -.- rpc2a
+    rpc2a -.-|"RPC localhost:28443"| rpc2
+    rpc2 -.-> n2
+    zmqc -.-|"ZMQ 38332-38336"| zmq2
+    zmq2 -.-> n2
 
     n1 <-->|P2P| n2
     n1 <-->|P2P| n3
@@ -94,6 +107,8 @@ flowchart TB
     sp -->|"RPC: wallet spam"| n3
     rg -->|"RPC: invalidate + re-mine"| n3
     rg -.->|"witness poll"| n1
+
+    classDef waypoint width:0px,height:0px,fill:none,stroke:none
 ```
 
 With the `electrs` / `mempool` / `all-tools` [profiles](#profiles), the explorer stack
@@ -223,6 +238,14 @@ The reorg is race-safe against the mining controller: after mining the replaceme
 tool polls a witness node (`REORG_WITNESS_NODE`, default node1) and, if the miners kept
 extending the old chain in the meantime, mines extra blocks until the network adopts the
 new chain.
+
+The mining controller observes reorgs like a real miner would: it keeps mining on
+whatever tip its node reports (so it follows the winning chain automatically) while
+remembering the recent chain and which blocks it mined itself. When history is rewritten
+it logs a `REORG detected` line with the fork point, the replaced range and the new tip
+(the same shape chainwatch reports), and every block it did not mine itself -- the reorg
+replacements, or anything generated outside the controller -- is flagged with an
+`EXTERNAL block` line, which also explains any height jumps in its log.
 
 One-shot (container runs, reorgs, dies):
 
