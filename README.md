@@ -49,6 +49,74 @@ The network consists of 3 well-connected nodes plus helper containers:
 - **Tools** *(profiles)*, [mempool.space](https://github.com/mempool/mempool) explorer
   and/or [electrs](https://github.com/mempool/electrs). See [Profiles](#profiles).
 
+## Network topology
+
+All containers join a single Docker network (`btc-simnet-network`). The three bitcoind
+nodes form a full P2P mesh (`-addnode`, port 18444). The user lives on the host and
+talks to **node1**, the non-mining full node, over RPC on `localhost:18443`, exactly like
+talking to a 3rd-party production endpoint (node2's RPC on `localhost:28443` is also
+exposed, for the "owned node" scenarios).
+
+```mermaid
+flowchart TB
+    subgraph host["Host machine"]
+        user["User / your tests<br/>external wallet, signs raw txs"]
+        zmqc["ZMQ consumers<br/>LND / CLN / indexers / watchers"]
+    end
+
+    subgraph net["Docker network: btc-simnet-network"]
+        subgraph mesh["bitcoind nodes — full P2P mesh (port 18444)"]
+            n1["node1 — full node, never mines<br/>txindex, wallet disabled<br/>production-like endpoint"]
+            n2["node2 — miner<br/>wallet enabled, owned node"]
+            n3["node3 — miner<br/>not exposed to host"]
+        end
+        mc["mining-controller<br/>bootstrap + round-robin mining"]
+        sp["spammer<br/>fills blocks with txs"]
+        rg["reorg simulator<br/>profile: reorg, on demand"]
+    end
+
+    user ==>|"RPC localhost:18443"| n1
+    user -.->|"RPC localhost:28443"| n2
+    zmqc -.->|"ZMQ 28332-28336"| n1
+    zmqc -.->|"ZMQ 38332-38336"| n2
+
+    n1 <-->|P2P| n2
+    n1 <-->|P2P| n3
+    n2 <-->|P2P| n3
+
+    mc -->|"RPC: mine block"| n2
+    mc -->|"RPC: mine block"| n3
+    sp -->|"RPC: watch height"| n1
+    sp -->|"RPC: wallet spam"| n2
+    sp -->|"RPC: wallet spam"| n3
+    rg -->|"RPC: invalidate + re-mine"| n3
+    rg -.->|"witness poll"| n1
+```
+
+With the `electrs` / `mempool` / `all-tools` [profiles](#profiles), the explorer stack
+also joins the network and indexes the chain through node1:
+
+```mermaid
+flowchart LR
+    browser["Browser<br/>localhost:1080"]
+    electrum["Electrum clients<br/>localhost:60001"]
+
+    subgraph net["btc-simnet-network (tool profiles)"]
+        mweb["mempool-web"]
+        mapi["mempool-api"]
+        mdb["mempool-db<br/>MariaDB"]
+        el["electrs"]
+        n1["node1"]
+    end
+
+    browser --> mweb --> mapi
+    electrum -.-> el
+    mapi -->|"electrum :60001"| el
+    mapi -->|"core RPC :18443"| n1
+    mapi --> mdb
+    el -->|"RPC :18443"| n1
+```
+
 ## Configuration
 
 Everything is driven by `.env`, and **every setting has a default**, the stack runs with
@@ -129,24 +197,6 @@ One compose file serves every combination via
 With `mempool` or `all-tools`, browse the explorer at
 [http://localhost:1080/](http://localhost:1080/) (port: `MEMPOOL_WEB_PORT`).
 
-## ZMQ notifications
-
-node1 and node2 publish all five bitcoind ZMQ topics (`rawblock`, `rawtx`, `hashblock`,
-`hashtx`, `sequence`): node1 on host ports 28332-28336, node2 on 38332-38336 (all
-remappable, see [SETTINGS.md](./SETTINGS.md)). Anything that consumes bitcoind ZMQ
-(LND/CLN, indexers, custody watchers) can point at the simnet, and reorg delivery can be
-exercised with the reorg simulator. Smoke test (needs `pip install pyzmq`):
-
-```bash
-python3 -c "
-import zmq
-s = zmq.Context().socket(zmq.SUB)
-s.connect('tcp://127.0.0.1:28332')      # node1 rawblock
-s.setsockopt_string(zmq.SUBSCRIBE, '')
-topic, body, seq = s.recv_multipart()   # blocks until the next block is mined
-print(topic, len(body), 'bytes')
-"
-```
 
 ## Simulating reorgs
 
@@ -182,6 +232,25 @@ REORG_MODE=auto docker compose --profile reorg up btc-simnet-reorg
 Tune `REORG_DEPTH`, `AUTO_REORG_EVERY_BLOCKS`, `REORG_NODE`, `REORG_MINE_ADDRESS`,
 `REORG_INJECT_TXS`, `REORG_WALLET_NAME` and `REORG_WITNESS_NODE` in `.env`
 (see [SETTINGS.md](./SETTINGS.md)).
+
+## ZMQ notifications
+
+node1 and node2 publish all five bitcoind ZMQ topics (`rawblock`, `rawtx`, `hashblock`,
+`hashtx`, `sequence`): node1 on host ports 28332-28336, node2 on 38332-38336 (all
+remappable, see [SETTINGS.md](./SETTINGS.md)). Anything that consumes bitcoind ZMQ
+(LND/CLN, indexers, custody watchers) can point at the simnet, and reorg delivery can be
+exercised with the reorg simulator. Smoke test (needs `pip install pyzmq`):
+
+```bash
+python3 -c "
+import zmq
+s = zmq.Context().socket(zmq.SUB)
+s.connect('tcp://127.0.0.1:28332')      # node1 rawblock
+s.setsockopt_string(zmq.SUBSCRIBE, '')
+topic, body, seq = s.recv_multipart()   # blocks until the next block is mined
+print(topic, len(body), 'bytes')
+"
+```
 
 ## Documents
 
