@@ -78,13 +78,7 @@ Findings, ordered by severity:
    ends mid-2026). The official `bitcoin/bitcoin` images are bookworm-based. Bump to
    `bookworm-slim` next time the image is touched.
 
-7. **`btc-simnet-reorg` gates on the wrong node when `REORG_NODE` is overridden.**
-   compose hardcodes `depends_on: btc-simnet-node3: service_healthy` while the target
-   node is configurable; with `REORG_NODE=btc-simnet-node2` the one-shot run waits on
-   node3's health instead. Harmless today (the tool also polls its node's RPC), worth
-   a comment or depending on all nodes.
-
-8. **No Cargo workspace; helpers duplicated three times.** `env_or`/`create_client`
+7. **No Cargo workspace; helpers duplicated three times.** `env_or`/`create_client`
    are copy-pasted per tool, and compose builds three independent dependency graphs
    serially (three `target/` dirs, three lock states). A workspace with one shared
    util crate, or a single multi-binary crate with three Dockerfile targets, would cut

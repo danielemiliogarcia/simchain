@@ -222,6 +222,9 @@ services:
     container_name: btc-simnet-reorg
     restart: "no"
     depends_on:
+    # user can specify a different reorg node, default is node3
+      btc-simnet-node2:
+        condition: service_healthy
       btc-simnet-node3:
         condition: service_healthy
     networks:
