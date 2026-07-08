@@ -2,12 +2,14 @@
 set -e
 
 
-if [ -n "${UID+x}" ] && [ "${UID}" != "0" ]; then
-  usermod -u "$UID" bitcoin
+# PUID/PGID (not UID/GID: bash pre-sets those as readonly shell variables,
+# so values passed with -e UID=... never reach this script)
+if [ -n "${PUID+x}" ] && [ "${PUID}" != "0" ]; then
+  usermod -u "$PUID" bitcoin
 fi
 
-if [ -n "${GID+x}" ] && [ "${GID}" != "0" ]; then
-  groupmod -g "$GID" bitcoin
+if [ -n "${PGID+x}" ] && [ "${PGID}" != "0" ]; then
+  groupmod -g "$PGID" bitcoin
 fi
 
 echo "$0: assuming uid:gid for bitcoin:bitcoin of $(id -u bitcoin):$(id -g bitcoin)"

@@ -1,4 +1,22 @@
-version: '3.9'
+# Simchain: single compose file, driven by .env (every ${VAR:-default} below
+# has a working default, so it runs with no .env at all).
+#
+# Profiles:
+#   (none) / "basic"  -> 3 nodes + mining controller + spammer
+#   electrs           -> basic + electrs
+#   mempool           -> basic + electrs + mempool.space explorer
+#                        (mempool-web/mempool-api/mempool-db)
+#   all-tools         -> basic + every tool above
+#   reorg             -> reorg simulator (run on demand, see README)
+#
+# Examples:
+#   docker compose up
+#   docker compose --profile mempool up
+#   docker compose run --rm btc-simnet-reorg 3
+#
+# Each node is declared in full on purpose (no YAML anchors), so that in the
+# future different nodes can run different bitcoind versions/images and
+# per-node policies, like in a real network.
 
 networks:
   btc-simnet-network:
@@ -6,36 +24,53 @@ networks:
 
 services:
   btc-simnet-node1:
-    # build:
-    #   context: ../.
-    #   dockerfile: Dockerfile
-      ## TO share volumes and avoid permission issues with chain data, fill that args with id -u and id -g
-      ## export UID=$(id -u) && export GID=$(id -g) && docker-compose up --build
-      # args:
-      #   UID: ${UID}   # Pass host UID
-      #   GID: ${GID}   # Pass host GID
-    image: simchainbitcoinnode:29.0
+    # Default: official registry image. Set BTC_IMAGE=simchainbitcoinnode:29.0
+    # in .env to use the locally built one (./build-bitcoin.sh).
+    image: ${BTC_IMAGE:-bitcoin/bitcoin:29.0}
     container_name: btc-simnet-node1
+    restart: unless-stopped
     ports:
-      - "18443:18443"
-      - "18444:18444"
+      - "${NODE1_RPC_PORT:-18443}:18443"
+      - "${NODE1_P2P_PORT:-18444}:18444"
+      - "${NODE1_ZMQ_RAWBLOCK_PORT:-28332}:28332"
+      - "${NODE1_ZMQ_RAWTX_PORT:-28333}:28333"
+      - "${NODE1_ZMQ_HASHBLOCK_PORT:-28334}:28334"
+      - "${NODE1_ZMQ_HASHTX_PORT:-28335}:28335"
+      - "${NODE1_ZMQ_SEQUENCE_PORT:-28336}:28336"
     networks:
       - btc-simnet-network
+    environment:
+      - BTC_RPC_USER=${BTC_RPC_USER:-foo}
+      - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
+    healthcheck:
+      test: ["CMD-SHELL", "bitcoin-cli -regtest -rpcuser=$${BTC_RPC_USER} -rpcpassword=$${BTC_RPC_PASS} getblockcount"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
     command:
       - -printtoconsole
       - -regtest=1
       - -server=1
       - -rpcallowip=0.0.0.0/0
       - -rpcbind=0.0.0.0
-      - -rpcuser=${BTC_RPC_USER}
-      - -rpcpassword=${BTC_RPC_PASS}
-      - -fallbackfee=0.0001
-      - -minrelaytxfee=0.00001
-      - -maxtxfee=10000000
-      # - -disablewallet=1
+      - -rpcuser=${BTC_RPC_USER:-foo}
+      - -rpcpassword=${BTC_RPC_PASS:-rpcpassword}
+      - -fallbackfee=${FALLBACK_FEE:-0.0001}
+      - -minrelaytxfee=${MIN_RELAY_TX_FEE:-0.00001}
+      - -maxtxfee=${MAX_TX_FEE:-10000000}
+      # Wallet disabled by default: node1 mimics a 3rd-party production
+      # endpoint, the user manages keys externally and submits signed raw txs
+      - -disablewallet=${NODE1_DISABLE_WALLET:-1}
       - -port=18444
       - -rpcport=18443
       - -txindex
+      # ZMQ publishers (all five topics), so ZMQ consumers (LND/CLN,
+      # indexers, watchers) can run against the simnet
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+      - -zmqpubhashblock=tcp://0.0.0.0:28334
+      - -zmqpubhashtx=tcp://0.0.0.0:28335
+      - -zmqpubsequence=tcp://0.0.0.0:28336
       - -addnode=btc-simnet-node2:18444
       - -addnode=btc-simnet-node3:18444
       # - -debug=1
@@ -45,108 +80,264 @@ services:
       # - -debug=validation
 
   btc-simnet-node2:
-    # build:
-    #   context: ../.
-    #   dockerfile: Dockerfile
-      ## TO share volumes and avoid permission issues with chain data, fill that args with id -u and id -g
-      ## export UID=$(id -u) && export GID=$(id -g) && docker-compose up --build
-      # args:
-      #   UID: ${UID}   # Pass host UID
-      #   GID: ${GID}   # Pass host GID
-    image: simchainbitcoinnode:29.0
+    image: ${BTC_IMAGE:-bitcoin/bitcoin:29.0}
     container_name: btc-simnet-node2
+    restart: unless-stopped
     ports:
-      - "28443:18443"
-      - "28444:18444"
+      - "${NODE2_RPC_PORT:-28443}:18443"
+      - "${NODE2_P2P_PORT:-28444}:18444"
+      - "${NODE2_ZMQ_RAWBLOCK_PORT:-38332}:28332"
+      - "${NODE2_ZMQ_RAWTX_PORT:-38333}:28333"
+      - "${NODE2_ZMQ_HASHBLOCK_PORT:-38334}:28334"
+      - "${NODE2_ZMQ_HASHTX_PORT:-38335}:28335"
+      - "${NODE2_ZMQ_SEQUENCE_PORT:-38336}:28336"
     networks:
       - btc-simnet-network
+    environment:
+      - BTC_RPC_USER=${BTC_RPC_USER:-foo}
+      - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
+    healthcheck:
+      test: ["CMD-SHELL", "bitcoin-cli -regtest -rpcuser=$${BTC_RPC_USER} -rpcpassword=$${BTC_RPC_PASS} getblockcount"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
     command:
       - -printtoconsole
       - -regtest=1
       - -rpcallowip=0.0.0.0/0
       - -rpcbind=0.0.0.0
-      - -rpcuser=${BTC_RPC_USER}
-      - -rpcpassword=${BTC_RPC_PASS}
-      - -fallbackfee=0.0001
-      - -minrelaytxfee=0.00001
-      - -maxtxfee=10000000
-      # - -disablewallet=1
+      - -rpcuser=${BTC_RPC_USER:-foo}
+      - -rpcpassword=${BTC_RPC_PASS:-rpcpassword}
+      - -fallbackfee=${FALLBACK_FEE:-0.0001}
+      - -minrelaytxfee=${MIN_RELAY_TX_FEE:-0.00001}
+      - -maxtxfee=${MAX_TX_FEE:-10000000}
       - -port=18444
       - -rpcport=18443
       - -txindex
+      # ZMQ publishers (all five topics), so wallet/L2 stacks on the owned
+      # node (LND, ordinals indexers, ...) can consume notifications
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+      - -zmqpubhashblock=tcp://0.0.0.0:28334
+      - -zmqpubhashtx=tcp://0.0.0.0:28335
+      - -zmqpubsequence=tcp://0.0.0.0:28336
       - -addnode=btc-simnet-node1:18444
       - -addnode=btc-simnet-node3:18444
-      # - -debug=1
-      # - -debug=rpc
-      # - -debug=net
-      # - -debug=mempool
-      # - -debug=validation
 
   btc-simnet-node3:
-    # build:
-    #   context: ../.
-    #   dockerfile: Dockerfile
-      ## TO share volumes and avoid permission issues with chain data, fill that args with id -u and id -g
-      ## export UID=$(id -u) && export GID=$(id -g) && docker-compose up --build
-      # args:
-      #   UID: ${UID}   # Pass host UID
-      #   GID: ${GID}   # Pass host GID
-    image: simchainbitcoinnode:29.0
+    image: ${BTC_IMAGE:-bitcoin/bitcoin:29.0}
     container_name: btc-simnet-node3
+    restart: unless-stopped
     networks:
       - btc-simnet-network
+    environment:
+      - BTC_RPC_USER=${BTC_RPC_USER:-foo}
+      - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
+    healthcheck:
+      test: ["CMD-SHELL", "bitcoin-cli -regtest -rpcuser=$${BTC_RPC_USER} -rpcpassword=$${BTC_RPC_PASS} getblockcount"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
     command:
       - -printtoconsole
       - -regtest=1
       - -rpcallowip=0.0.0.0/0
       - -rpcbind=0.0.0.0
-      - -rpcuser=${BTC_RPC_USER}
-      - -rpcpassword=${BTC_RPC_PASS}
-      - -fallbackfee=0.0001
-      - -minrelaytxfee=0.00001
-      - -maxtxfee=10000000
-      # - -disablewallet=1
+      - -rpcuser=${BTC_RPC_USER:-foo}
+      - -rpcpassword=${BTC_RPC_PASS:-rpcpassword}
+      - -fallbackfee=${FALLBACK_FEE:-0.0001}
+      - -minrelaytxfee=${MIN_RELAY_TX_FEE:-0.00001}
+      - -maxtxfee=${MAX_TX_FEE:-10000000}
       - -port=18444
       - -rpcport=18443
       - -txindex
       - -addnode=btc-simnet-node1:18444
       - -addnode=btc-simnet-node2:18444
-      # - -debug=1
-      # - -debug=rpc
-      # - -debug=net
-      # - -debug=mempool
-      # - -debug=validation
 
   btc-simnet-mining-controller:
     build:
       context: ./mining-controller
     container_name: btc-simnet-mining-controller
     depends_on:
-      - btc-simnet-node1
-      - btc-simnet-node2
-      - btc-simnet-node3
+      btc-simnet-node1:
+        condition: service_healthy
+      btc-simnet-node2:
+        condition: service_healthy
+      btc-simnet-node3:
+        condition: service_healthy
     networks:
       - btc-simnet-network
     environment:
-      - USER_ADDRESS=${USER_ADDRESS}
-      - BLOCK_INTERVAL_SECS=${BLOCK_INTERVAL_SECS}
-      - BTC_RPC_USER=${BTC_RPC_USER}
-      - BTC_RPC_PASS=${BTC_RPC_PASS}
+      - USER_ADDRESS=${USER_ADDRESS:-bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr}
+      - BLOCK_INTERVAL_SECS=${BLOCK_INTERVAL_SECS:-15}
+      - BTC_RPC_USER=${BTC_RPC_USER:-foo}
+      - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
+      - NODE2_WALLET_NAME=${NODE2_WALLET_NAME:-node2}
+      - NODE3_WALLET_NAME=${NODE3_WALLET_NAME:-node3}
+      - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
+      - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
 
   btc-simnet-spammer:
     build:
       context: ./spammer
     container_name: btc-simnet-spammer
     depends_on:
-      - btc-simnet-node1
-      - btc-simnet-node2
-      - btc-simnet-node3
-      - btc-simnet-mining-controller
+      btc-simnet-node1:
+        condition: service_healthy
+      btc-simnet-node2:
+        condition: service_healthy
+      btc-simnet-node3:
+        condition: service_healthy
+      btc-simnet-mining-controller:
+        condition: service_started
     networks:
       - btc-simnet-network
     environment:
-      - ENABLE_SPAM=${ENABLE_SPAM}
-      - SPAM_PER_MINER_PER_BLOCK=${SPAM_PER_MINER_PER_BLOCK}
-      - BTC_RPC_USER=${BTC_RPC_USER}
-      - BTC_RPC_PASS=${BTC_RPC_PASS}
+      - ENABLE_SPAM=${ENABLE_SPAM:-true}
+      - SPAM_PER_MINER_PER_BLOCK=${SPAM_PER_MINER_PER_BLOCK:-50}
+      - SPAM_FANOUT_UTXOS=${SPAM_FANOUT_UTXOS:-50}
+      - ENABLE_SPAM_REPLACES=${ENABLE_SPAM_REPLACES:-false}
+      - SPAM_REPLACES_PER_MINER_PER_BLOCK=${SPAM_REPLACES_PER_MINER_PER_BLOCK:-5}
+      - BTC_RPC_USER=${BTC_RPC_USER:-foo}
+      - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
+      - NODE2_WALLET_NAME=${NODE2_WALLET_NAME:-node2}
+      - NODE3_WALLET_NAME=${NODE3_WALLET_NAME:-node3}
+      - NODE1_RPC_URL=${NODE1_RPC_URL:-http://btc-simnet-node1:18443}
+      - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
+      - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
 
+  # ---------------------------------------------------------------------------
+  # Reorg simulator (profile: reorg), one-shot by default, dies when done.
+  #   docker compose run --rm btc-simnet-reorg [depth]
+  #   docker compose run --rm btc-simnet-reorg [depth] empty   # chaos: empty blocks
+  # The optional `empty` argument mines empty replacement blocks (orphaned txs
+  # stay unconfirmed) instead of re-mining them; it is a per-run choice, not a
+  # setting, so real and empty reorgs can be interleaved on the same chain.
+  # Continuous mode: REORG_MODE=auto docker compose --profile reorg up btc-simnet-reorg
+  # ---------------------------------------------------------------------------
+  btc-simnet-reorg:
+    profiles: ["reorg"]
+    build:
+      context: ./reorg
+    container_name: btc-simnet-reorg
+    restart: "no"
+    depends_on:
+      btc-simnet-node3:
+        condition: service_healthy
+    networks:
+      - btc-simnet-network
+    environment:
+      - BTC_RPC_USER=${BTC_RPC_USER:-foo}
+      - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
+      - REORG_NODE=${REORG_NODE:-btc-simnet-node3}
+      - REORG_NODE_RPC_PORT=${REORG_NODE_RPC_PORT:-18443}
+      - REORG_DEPTH=${REORG_DEPTH:-3}
+      - REORG_MODE=${REORG_MODE:-once}
+      - AUTO_REORG_EVERY_BLOCKS=${AUTO_REORG_EVERY_BLOCKS:-20}
+      - REORG_MINE_ADDRESS=${REORG_MINE_ADDRESS:-bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr}
+      # Fresh txs the reorg node mines into the winning chain, modelling a node
+      # that saw transactions its peers have not yet (0 disables; ignored for
+      # `empty` reorgs).
+      - REORG_ADDS_NEW_TXS=${REORG_ADDS_NEW_TXS:-5}
+      # Wallet used for REORG_ADDS_NEW_TXS (follows the controller-created
+      # wallet on the default reorg node)
+      - REORG_WALLET_NAME=${REORG_WALLET_NAME:-${NODE3_WALLET_NAME:-node3}}
+      # Node polled after the reorg to confirm the network adopted the new
+      # chain (extra blocks are mined until it does); "none" disables
+      - REORG_WITNESS_NODE=${REORG_WITNESS_NODE:-btc-simnet-node1}
+
+  # ---------------------------------------------------------------------------
+  # Tools: electrs (profiles: electrs, mempool, all-tools)
+  # ---------------------------------------------------------------------------
+  electrs:
+    profiles: ["electrs", "mempool", "all-tools"]
+    image: ${ELECTRS_IMAGE:-mempool/electrs:v3.3.0}
+    container_name: regtest-electrs
+    depends_on:
+      btc-simnet-node1:
+        condition: service_healthy
+    ports:
+      - "${ELECTRS_ELECTRUM_PORT:-60001}:60001"
+      - "${ELECTRS_HTTP_PORT:-3000}:3000"
+    command:
+      - --network=regtest
+      - --daemon-rpc-addr=btc-simnet-node1:18443
+      - --electrum-rpc-addr=0.0.0.0:60001
+      - --http-addr=0.0.0.0:3000
+      - --cookie=${BTC_RPC_USER:-foo}:${BTC_RPC_PASS:-rpcpassword}
+      - --jsonrpc-import
+      - --db-dir=/tmp/electrs-db
+    networks:
+      - btc-simnet-network
+
+  # ---------------------------------------------------------------------------
+  # Tools: mempool.space explorer (profiles: mempool, all-tools)
+  # Browse http://localhost:${MEMPOOL_WEB_PORT:-1080}/
+  # ---------------------------------------------------------------------------
+  mempool-web:
+    profiles: ["mempool", "all-tools"]
+    image: ${MEMPOOL_FRONTEND_IMAGE:-mempool/frontend:v3.3.1}
+    container_name: mempool-web
+    environment:
+      FRONTEND_HTTP_PORT: "8080"
+      BACKEND_MAINNET_HTTP_HOST: "mempool-api"
+    depends_on:
+      - mempool-api
+    user: "1000:1000"
+    restart: always
+    stop_grace_period: 10s
+    command: "./wait-for mempool-db:3306 --timeout=720 -- nginx -g 'daemon off;'"
+    ports:
+      - "${MEMPOOL_WEB_PORT:-1080}:8080"
+    networks:
+      - btc-simnet-network
+
+  mempool-api:
+    profiles: ["mempool", "all-tools"]
+    image: ${MEMPOOL_BACKEND_IMAGE:-mempool/backend:v3.3.1}
+    container_name: mempool-api
+    environment:
+      MEMPOOL_BACKEND: "electrum"
+      ELECTRUM_HOST: "electrs"
+      ELECTRUM_PORT: "60001"
+      ELECTRUM_TLS_ENABLED: "false"
+      CORE_RPC_HOST: "btc-simnet-node1"
+      CORE_RPC_PORT: "18443"
+      CORE_RPC_USERNAME: ${BTC_RPC_USER:-foo}
+      CORE_RPC_PASSWORD: ${BTC_RPC_PASS:-rpcpassword}
+      DATABASE_ENABLED: "true"
+      DATABASE_HOST: "mempool-db"
+      DATABASE_DATABASE: "mempool"
+      DATABASE_USERNAME: ${MEMPOOL_DB_USER:-mempool}
+      DATABASE_PASSWORD: ${MEMPOOL_DB_PASS:-mempool}
+      STATISTICS_ENABLED: "true"
+    depends_on:
+      mempool-db:
+        condition: service_healthy
+      electrs:
+        condition: service_started
+    user: "1000:1000"
+    restart: on-failure
+    stop_grace_period: 5s
+    command: "./wait-for-it.sh mempool-db:3306 --timeout=720 --strict -- ./start.sh"
+    networks:
+      - btc-simnet-network
+
+  mempool-db:
+    profiles: ["mempool", "all-tools"]
+    image: ${MARIADB_IMAGE:-mariadb:10.5.8}
+    container_name: mempool-db
+    environment:
+      MYSQL_DATABASE: "mempool"
+      MYSQL_USER: ${MEMPOOL_DB_USER:-mempool}
+      MYSQL_PASSWORD: ${MEMPOOL_DB_PASS:-mempool}
+      MYSQL_ROOT_PASSWORD: ${MEMPOOL_DB_ROOT_PASS:-admin}
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: always
+    stop_grace_period: 10s
+    networks:
+      - btc-simnet-network
