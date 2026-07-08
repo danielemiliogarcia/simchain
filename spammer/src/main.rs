@@ -29,36 +29,65 @@ fn wait_for_funds(wallet: &Client, name: &str) {
     }
 }
 
-// Split the wallet funds into `count` separate UTXOs. The mempool limits a
-// chain of unconfirmed transactions to 25, so a wallet spending from a
-// single UTXO can never place more than 25 txs per block. With `count`
-// independent UTXOs the wallet can build `count` parallel chains and reach
-// any realistic SPAM_PER_MINER_PER_BLOCK value.
-fn fan_out(wallet: &Client, name: &str, count: u64) {
-    let unspent = wallet.list_unspent(Some(1), None, None, None, None).unwrap();
-    if unspent.len() as u64 >= count {
-        println!("Wallet '{name}' already has {} UTXOs, no fan-out needed", unspent.len());
+// A fan-out UTXO is ~0.1 BTC. Count only confirmed UTXOs in this band as
+// "spammable": it excludes the 546-sat dust the wallet receives from the other
+// miner's cross-wallet spam (below the floor) and the large coinbase / change
+// UTXOs (above the ceiling), so the count reflects the pool of independent
+// branches actually available to spam from, not a wallet clogged with dust.
+const SPAMMABLE_MIN_BTC: f64 = 0.001;
+const SPAMMABLE_MAX_BTC: f64 = 0.5;
+
+fn spammable_utxos(wallet: &Client) -> u64 {
+    let min = Amount::from_btc(SPAMMABLE_MIN_BTC).unwrap();
+    let max = Amount::from_btc(SPAMMABLE_MAX_BTC).unwrap();
+    wallet
+        .list_unspent(Some(1), None, None, None, None)
+        .unwrap()
+        .iter()
+        .filter(|u| u.amount >= min && u.amount <= max)
+        .count() as u64
+}
+
+// Keep the wallet supplied with independent fan-out UTXOs. The mempool limits a
+// chain of unconfirmed transactions to 25, so a wallet spending from a single
+// UTXO can never place more than 25 txs per block; `target` independent UTXOs
+// let it build that many parallel chains. When the spammable pool drops below
+// `need` -- at startup (only coinbases exist), or after a reorg un-confirms the
+// wallet's recent change, or when incoming dust is all that is left -- split
+// confirmed funds into `target` fresh UTXOs. A cheap no-op (one list_unspent)
+// when the pool is healthy, so it is safe to call every block.
+fn ensure_fanout(wallet: &Client, name: &str, need: u64, target: u64) {
+    if spammable_utxos(wallet) >= need {
         return;
     }
 
     let trusted = wallet.get_balances().unwrap().mine.trusted.to_btc();
-    // 0.1 BTC per branch funds years of dust spam; scale down if the wallet
-    // is smaller than count * 0.1 (keep 20% margin for fees)
-    let per_output = (trusted * 0.8 / count as f64).min(0.1);
+    // 0.1 BTC per branch funds years of dust spam; scale down if the wallet is
+    // smaller than target * 0.1 (keep 20% margin for fees).
+    let per_output = (trusted * 0.8 / target as f64).min(0.1);
     let per_output = (per_output * 1e8).floor() / 1e8;
+    if per_output <= 0.0 {
+        // Funds are tied up in unconfirmed spam; a block will free them.
+        println!("Wallet '{name}' has no confirmed funds to fan out yet, deferring");
+        return;
+    }
 
-    println!("Splitting wallet '{name}' funds into {count} UTXOs of {per_output} BTC each");
+    println!("Wallet '{name}' low on spammable UTXOs, splitting funds into {target} UTXOs of {per_output} BTC each");
     let mut outputs = serde_json::Map::new();
-    while outputs.len() < count as usize {
+    while outputs.len() < target as usize {
         let address = get_new_wallet_address(wallet);
         outputs.insert(address.to_string(), json!(per_output));
     }
-    let txid: String = wallet.call("sendmany", &[json!(""), json!(outputs)]).unwrap();
-    println!("Fan-out tx {txid} sent, waiting for it to confirm...");
+    match wallet.call::<String>("sendmany", &[json!(""), json!(outputs)]) {
+        Ok(txid) => println!("Fan-out tx {txid} sent, waiting for it to confirm..."),
+        Err(e) => {
+            println!("Wallet '{name}' fan-out failed ({e}), retrying next block");
+            return;
+        }
+    }
 
     loop {
-        let confirmed = wallet.list_unspent(Some(1), None, None, None, None).unwrap();
-        if confirmed.len() as u64 >= count {
+        if spammable_utxos(wallet) >= need {
             break;
         }
         thread::sleep(Duration::from_millis(500));
@@ -154,13 +183,11 @@ fn main() {
     wait_for_funds(&wallet2, &wallet2_name);
     wait_for_funds(&wallet3, &wallet3_name);
 
-    if fanout_utxos > 0 {
-        fan_out(&wallet2, &wallet2_name, fanout_utxos);
-        fan_out(&wallet3, &wallet3_name, fanout_utxos);
-    }
-
     let addr2 = get_new_wallet_address(&wallet2);
     let addr3 = get_new_wallet_address(&wallet3);
+
+    // Cover a block's spam, but never require more branches than we fan out to.
+    let fanout_need = spam_per_miner_per_block.min(fanout_utxos);
 
     // In a loop, if a new block is detected, spam transactions
     let mut spammed_at_block_height = 0;
@@ -168,6 +195,12 @@ fn main() {
         let current_block_height = node1.get_block_count().unwrap();
         if current_block_height > spammed_at_block_height {
             spammed_at_block_height = current_block_height;
+            // Top up the independent-UTXO pool if it ran low (fans out on the
+            // first block, then only after a reorg or dust build-up depletes it).
+            if fanout_utxos > 0 {
+                ensure_fanout(&wallet2, &wallet2_name, fanout_need, fanout_utxos);
+                ensure_fanout(&wallet3, &wallet3_name, fanout_need, fanout_utxos);
+            }
             // spam transactions cross wallet
             println!("Node 2 => Spamming {spam_per_miner_per_block} transactions to address {addr3}");
             let txids2 = send_spam_tx(&wallet2, &addr3, spam_per_miner_per_block, enable_replaces);

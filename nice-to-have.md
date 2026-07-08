@@ -74,27 +74,17 @@ Findings, ordered by severity:
    wants. Lockfiles should be committed for binary crates: drop `Cargo.lock` from the
    three `.gitignore`s and commit the locks.
 
-6. **`generateblock` fallback vacuums the mempool** (`reorg/src/main.rs`, `do_reorg`).
-   If one tx-slice is rejected, the code falls back to `generate_to_address`, which
-   mines the *entire* mempool into that block; every later chunk then references
-   already-mined txids, so subsequent `generateblock` calls fail too and the remaining
-   replacements degrade to empty/inject-only blocks. Logged, but surprising: after a
-   fallback, later iterations could skip their (now stale) chunks deliberately.
-   `ENABLE_SPAM_REPLACES` makes the first rejection much more likely: the wallets
-   rebroadcast the fee-bumped versions of orphaned spam txs, which evict the returned
-   originals from the mempool, so chunks reference already-replaced txids.
-
-7. **Bitcoin node base image is `debian:bullseye-slim`** (oldstable; security support
+6. **Bitcoin node base image is `debian:bullseye-slim`** (oldstable; security support
    ends mid-2026). The official `bitcoin/bitcoin` images are bookworm-based. Bump to
    `bookworm-slim` next time the image is touched.
 
-8. **`btc-simnet-reorg` gates on the wrong node when `REORG_NODE` is overridden.**
+7. **`btc-simnet-reorg` gates on the wrong node when `REORG_NODE` is overridden.**
    compose hardcodes `depends_on: btc-simnet-node3: service_healthy` while the target
    node is configurable; with `REORG_NODE=btc-simnet-node2` the one-shot run waits on
    node3's health instead. Harmless today (the tool also polls its node's RPC), worth
    a comment or depending on all nodes.
 
-9. **No Cargo workspace; helpers duplicated three times.** `env_or`/`create_client`
+8. **No Cargo workspace; helpers duplicated three times.** `env_or`/`create_client`
    are copy-pasted per tool, and compose builds three independent dependency graphs
    serially (three `target/` dirs, three lock states). A workspace with one shared
    util crate, or a single multi-binary crate with three Dockerfile targets, would cut
@@ -220,12 +210,15 @@ Effort: phase 1 small; phase 2 medium (needs NET_ADMIN and per-node sidecars).
 
 **What:** Two related additions to the reorg simulator:
 
-1. **`REORG_REMINE_ORPHANED=false`**: mine the replacement blocks *without* the
-   orphaned transactions (empty or inject-only blocks), leaving them in the mempool.
-2. **Automated double-spend of orphaned spam txs**: for a configurable fraction of the
-   orphaned *wallet-owned* (spam) transactions, include a conflicting transaction
-   (same inputs, different output) in the replacement blocks so the originals become
-   permanently invalid and can never re-confirm.
+1. ~~**Mine the replacement blocks *without* the orphaned transactions**~~ **(DONE):**
+   the `empty` CLI argument (`./simulate-reorg.sh <depth> empty`) mines empty
+   replacement blocks and leaves the orphaned txs in the mempool — the temporary-drop
+   scenario below. Chosen per run rather than via an env var so real and empty reorgs
+   can be interleaved on the same chain.
+2. **Automated double-spend of orphaned spam txs** (still open): for a configurable
+   fraction of the orphaned *wallet-owned* (spam) transactions, include a conflicting
+   transaction (same inputs, different output) in the replacement blocks so the
+   originals become permanently invalid and can never re-confirm.
 
 **Why it's a nice-to-have (the use case):** Today the simulator re-mines the orphaned
 transactions into the replacement blocks (same txids), so a reorg only changes block
@@ -234,15 +227,16 @@ real-world reorg scenario is exactly the opposite, and it is what exchanges, cus
 watchers, indexers and payment processors need to test: *"my deposit had N
 confirmations, a reorg happened, and now my transaction is not in the chain anymore."*
 Downstream code must notice the confirmation count dropping back to 0 (or the tx
-conflicting entirely) and un-credit / re-queue / alert accordingly. Neither case can be
-produced by simchain today.
+conflicting entirely) and un-credit / re-queue / alert accordingly. The temporary-drop
+case now exists (addition 1, the `empty` mode); the permanent-drop case (addition 2)
+cannot be produced by simchain today.
 
 The two additions map to the two real outcomes:
 
-- **Temporary drop (addition 1):** the excluded transactions fall back to the mempool
-  and re-confirm in a later block, confirmed → 0-conf → confirmed again. This tests
-  "did my code notice the confirmation count drop below its threshold?" (Stop the
-  mining controller after the reorg to keep them unconfirmed indefinitely.)
+- **Temporary drop (addition 1, done):** the excluded transactions fall back to the
+  mempool and re-confirm in a later block, confirmed → 0-conf → confirmed again. This
+  tests "did my code notice the confirmation count drop below its threshold?" (Stop the
+  mining controller after the `empty` reorg to keep them unconfirmed indefinitely.)
 - **Permanent drop (addition 2):** a double-spend in the winning chain kills the
   original transaction forever — the classic double-spend attack an exchange fears.
   This can only be automated for wallet-owned spam transactions: the user's own
@@ -251,22 +245,19 @@ The two additions map to the two real outcomes:
   (RBF replacement of their own tx after running addition 1).
 
 **Implementation plan:**
-1. In `reorg/src/main.rs::do_reorg`, when `REORG_REMINE_ORPHANED=false`, skip the
-   returned-tx chunking and mine every replacement block with `generateblock` and an
-   explicit transaction list (empty, or only the injected txids). `generateblock` must
-   be used for *all* replacement blocks in this mode: `generatetoaddress` would vacuum
-   the mempool — orphaned txs included — right back into the new chain.
-2. Wire `REORG_REMINE_ORPHANED` (default `true`, current behavior) through
-   docker-compose.yml, `.env.full.example` and SETTINGS.md like the other settings.
-3. For the double-spend mode: pick orphaned txs that spend the reorg node's wallet
+1. ~~Skip re-mining and mine empty replacement blocks with `generateblock`.~~ **Done:**
+   `do_reorg`'s `empty` branch mines every replacement block (and any race-winning extra
+   block) with `generateblock`, never `generatetoaddress`, so the orphaned txs are not
+   vacuumed back into the new chain.
+2. For the double-spend mode: pick orphaned txs that spend the reorg node's wallet
    UTXOs, build conflicting raw txs (`createrawtransaction` on the same inputs to a
    fresh wallet address, `signrawtransactionwithwallet`), and pass them to
    `generateblock` in the replacement blocks. Setting sketch:
    `REORG_DOUBLE_SPEND_PCT=0..100` (default 0).
-4. Log which txids were excluded/conflicted so tests can assert on them.
+3. Log which txids were conflicted so tests can assert on them.
 
-Effort: addition 1 small (a flag and a branch in existing logic); addition 2 medium
-(raw-tx construction, only meaningful with spam enabled).
+Effort: addition 1 done; addition 2 medium (raw-tx construction, only meaningful with
+spam enabled).
 
 
 ---

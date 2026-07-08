@@ -28,5 +28,8 @@ docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcp
 # one-shot reorg of the last 3 blocks
 ./simulate-reorg.sh 3
 
+# chaos reorg: replace them with empty blocks (orphaned txs stay unconfirmed)
+./simulate-reorg.sh 3 empty
+
 # continuous reorgs: every AUTO_REORG_EVERY_BLOCKS blocks, reorg REORG_DEPTH blocks
 REORG_MODE=auto docker compose --profile reorg up btc-simnet-reorg

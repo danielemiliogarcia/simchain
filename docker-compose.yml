@@ -209,6 +209,10 @@ services:
   # ---------------------------------------------------------------------------
   # Reorg simulator (profile: reorg), one-shot by default, dies when done.
   #   docker compose run --rm btc-simnet-reorg [depth]
+  #   docker compose run --rm btc-simnet-reorg [depth] empty   # chaos: empty blocks
+  # The optional `empty` argument mines empty replacement blocks (orphaned txs
+  # stay unconfirmed) instead of re-mining them; it is a per-run choice, not a
+  # setting, so real and empty reorgs can be interleaved on the same chain.
   # Continuous mode: REORG_MODE=auto docker compose --profile reorg up btc-simnet-reorg
   # ---------------------------------------------------------------------------
   btc-simnet-reorg:
@@ -231,8 +235,11 @@ services:
       - REORG_MODE=${REORG_MODE:-once}
       - AUTO_REORG_EVERY_BLOCKS=${AUTO_REORG_EVERY_BLOCKS:-20}
       - REORG_MINE_ADDRESS=${REORG_MINE_ADDRESS:-bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr}
-      - REORG_INJECT_TXS=${REORG_INJECT_TXS:-5}
-      # Wallet used for REORG_INJECT_TXS (follows the controller-created
+      # Fresh txs the reorg node mines into the winning chain, modelling a node
+      # that saw transactions its peers have not yet (0 disables; ignored for
+      # `empty` reorgs).
+      - REORG_ADDS_NEW_TXS=${REORG_ADDS_NEW_TXS:-5}
+      # Wallet used for REORG_ADDS_NEW_TXS (follows the controller-created
       # wallet on the default reorg node)
       - REORG_WALLET_NAME=${REORG_WALLET_NAME:-${NODE3_WALLET_NAME:-node3}}
       # Node polled after the reorg to confirm the network adopted the new

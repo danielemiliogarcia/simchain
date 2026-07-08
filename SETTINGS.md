@@ -118,7 +118,7 @@ The three fee settings look similar but act at different points of a transaction
 |---|---|---|
 | `ENABLE_SPAM` | `true` | Spam transactions after each block so blocks are not empty. |
 | `SPAM_PER_MINER_PER_BLOCK` | `50` | Txs per miner per block (2 miners → up to 2x this per block). Excess waits in the mempool. |
-| `SPAM_FANOUT_UTXOS` | `50` | On startup the spammer splits each wallet into this many UTXOs. The mempool caps unconfirmed chains at 25 txs, so without the split a wallet can never place more than 25 txs per block. `0` disables. |
+| `SPAM_FANOUT_UTXOS` | `50` | The spammer keeps each wallet split into this many independent UTXOs, replenishing when the pool runs low (startup, or after a reorg un-confirms the wallet's change). The mempool caps unconfirmed chains at 25 txs, so without the split a wallet can never place more than 25 txs per block. `0` disables. |
 | `ENABLE_SPAM_REPLACES` | `false` | `true` or `1`: every spam tx signals RBF (BIP125) and, right after each batch, the newest `SPAM_REPLACES_PER_MINER_PER_BLOCK` txs per miner are fee-bumped with `bumpfee`, so the mempool carries real replacements (old txid evicted, new txid appears) for downstream code to handle. `false`/`0`: exactly today's behavior. |
 | `SPAM_REPLACES_PER_MINER_PER_BLOCK` | `5` | How many of each miner's spam txs are fee-bumped per block when `ENABLE_SPAM_REPLACES` is on. The newest txs are bumped (a tx with unconfirmed descendants cannot be replaced). |
 
@@ -127,19 +127,23 @@ The three fee settings look similar but act at different points of a transaction
 | Variable | Default | Description |
 |---|---|---|
 | `REORG_DEPTH` | `3` | How many blocks to orphan per reorg. CLI argument overrides it: `./simulate-reorg.sh 5`. |
+| _(CLI only)_ `empty` | off | Per-run argument, not an env var: `./simulate-reorg.sh 3 empty` mines empty replacement blocks (chaos reorg) and leaves the orphaned txs unconfirmed, instead of re-mining them. Chosen per run so real and empty reorgs can be interleaved on the same chain. |
 | `REORG_MODE` | `once` | `once` = single reorg then exit. `auto` = reorg every `AUTO_REORG_EVERY_BLOCKS`. |
 | `AUTO_REORG_EVERY_BLOCKS` | `20` | Auto mode cadence (x); must be greater than `REORG_DEPTH` (y). |
 | `REORG_NODE` | `btc-simnet-node3` | Node used to fork the chain (a hidden miner is realistic). |
 | `REORG_NODE_RPC_PORT` | `18443` | RPC port of `REORG_NODE` inside the compose network. |
 | `REORG_MINE_ADDRESS` | `bcrt1qtmjq...tf3rr` | Address receiving the replacement block rewards. **The default is the same address as `USER_ADDRESS`'s default** (intentional), so after a reorg plus 100 blocks of maturity the user balance grows beyond the bootstrap 2x50 BTC. Set a separate throwaway address if your test asserts exact user balances. |
-| `REORG_INJECT_TXS` | `5` | Fallback only: if the orphaned blocks carried no txs (e.g. `ENABLE_SPAM=false`), send this many fresh wallet txs per empty replacement block. `0` disables. To make injected blocks as full as spammed ones, set it near 2x `SPAM_PER_MINER_PER_BLOCK`. |
-| `REORG_WALLET_NAME` | `NODE3_WALLET_NAME` (`node3`) | Wallet used to send the `REORG_INJECT_TXS` transactions on the reorg node. Falls back to the first loaded wallet if it is not loaded. |
+| `REORG_ADDS_NEW_TXS` | `5` | Fresh wallet txs seeded into the reorg node's mempool before mining, modelling a node that received transactions its peers have not yet seen; they are mined into the winning chain alongside the returned txs. `0` disables. Ignored for `empty` reorgs. To match spammed block fullness, set it near 2x `SPAM_PER_MINER_PER_BLOCK`. |
+| `REORG_WALLET_NAME` | `NODE3_WALLET_NAME` (`node3`) | Wallet used to send the `REORG_ADDS_NEW_TXS` transactions on the reorg node. Falls back to the first loaded wallet if it is not loaded. |
 | `REORG_WITNESS_NODE` | `btc-simnet-node1` | Node polled after mining the replacements to confirm the whole network adopted the new chain. If the mining controller extended the old chain during the reorg window (tie), extra blocks are mined (up to 10) until the witness follows the new tip. `none` disables the check. |
 
-Orphaned transactions return to the mempool automatically and are re-mined into the
-replacement blocks (same txids), like the winning chain of a real reorg, so the
-replacements are normally as full as the blocks they replace; injection only kicks in
-when there was nothing to re-mine.
+Orphaned transactions return to the mempool automatically. The replacement blocks are
+filled by re-reading the mempool live and mining slices of it with `generateblock`, like
+the winning chain of a real reorg, so the replacements are normally as full as the blocks
+they replace. Reading the mempool fresh for each block means an RBF replacement that
+evicts an orphaned tx mid-reorg (e.g. with `ENABLE_SPAM_REPLACES=true`) is picked up
+automatically instead of leaving the block referencing a stale txid — no single rejection
+can cascade the rest of the run to empty blocks.
 
 ## Tools: electrs (profiles `electrs`, `mempool`, `all-tools`)
 

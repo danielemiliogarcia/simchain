@@ -28,12 +28,15 @@ The network consists of 3 well-connected nodes plus helper containers:
 - **Node 3 `btc-simnet-node3`**, NOT exposed to the host. Simulates a node connected via
   p2p but inaccessible to the user. This node is a miner.
 - **Mining controller `btc-simnet-mining-controller`**, bootstraps the chain: block 1
-  goes to node2's wallet, block 2 to node3's wallet (so each miner has a mature reward to
-  fund the spammer), blocks 3 and 4 fund the user address (2 UTxOs of 50 BTC = 100 BTC),
-  then 100 more blocks are mined so all four coinbases mature (bootstrap ends at height
-  104). After that it asks each miner to mine 1 block in a round-robin manner every
-  `BLOCK_INTERVAL_SECS`. Stop this container after funding if you want to control mining
-  manually.
+  goes to node2's wallet, block 2 to node3's wallet, blocks 3 and 4 fund the user address
+  (2 UTxOs of 50 BTC = 100 BTC), then two 50-block funding batches (to node2 then node3)
+  and two 50-block maturity batches, ending at height **204**. Because coinbase maturity
+  is 100 blocks and node3 is funded last (heights 55-104, maturing 155-204), burying to
+  204 leaves **both miner wallets fully liquid at handoff** (~51 mature coinbases,
+  ~2550 BTC each) so the spammer never starves; the maturity batches keep maturing during
+  the run (heights 205-304). After that it asks each miner to mine 1 block in a round-robin
+  manner every `BLOCK_INTERVAL_SECS`. Stop this container after funding if you want to
+  control mining manually.
 - **Spammer `btc-simnet-spammer`**, spams `SPAM_PER_MINER_PER_BLOCK` transactions from
   each miner per block (2x total per block), so blocks are not empty. On startup it waits
   for the wallet funds to mature and splits them into `SPAM_FANOUT_UTXOS` independent
@@ -203,11 +206,18 @@ With `mempool` or `all-tools`, browse the explorer at
 The reorg simulator (a Rust container using only bitcoind RPC calls) invalidates the last
 *N* blocks on a miner node and mines *N+1* replacements, so the new chain is strictly
 longer and **the whole network reorgs to it**. Transactions from the orphaned blocks fall
-back to the mempool and are re-mined into the replacement blocks (same txids), like the
-winning chain of a real reorg, so reorged blocks are not empty. Only if the orphaned
-blocks carried no txs (e.g. `ENABLE_SPAM=false`), it injects `REORG_INJECT_TXS` fresh
-wallet transactions per empty replacement block. It prints each block's hash and tx
-count before/after plus a replaced-blocks summary.
+back to the mempool; each replacement block is filled by re-reading the mempool live and
+mining a slice of it with `generateblock`, like the winning chain of a real reorg, so
+reorged blocks are not empty. Reading the mempool fresh for each block means an RBF
+replacement that evicts an orphaned tx mid-reorg (e.g. with `ENABLE_SPAM_REPLACES=true`)
+is picked up automatically. On top of the returned txs it seeds `REORG_ADDS_NEW_TXS` fresh
+wallet transactions into the mempool first, modelling a node that received transactions
+its peers have not yet seen. It prints each block's hash and tx count before/after plus a
+replaced-blocks summary.
+
+Pass `empty` to mine **empty** replacement blocks instead (a chaos reorg that leaves the
+orphaned txs unconfirmed): `./simulate-reorg.sh 3 empty`. It is a per-run argument, not a
+setting, so a real reorg and an empty one can be issued against the same running chain.
 
 The reorg is race-safe against the mining controller: after mining the replacements the
 tool polls a witness node (`REORG_WITNESS_NODE`, default node1) and, if the miners kept
@@ -220,6 +230,7 @@ One-shot (container runs, reorgs, dies):
 ./simulate-reorg.sh 3
 # equivalent to:
 docker compose run --rm btc-simnet-reorg 3     # depth defaults to REORG_DEPTH (3)
+./simulate-reorg.sh 3 empty                    # chaos: mine empty replacement blocks
 ```
 
 Continuous, every `AUTO_REORG_EVERY_BLOCKS` (x) blocks, reorg `REORG_DEPTH` (y) blocks,
@@ -230,7 +241,7 @@ REORG_MODE=auto docker compose --profile reorg up btc-simnet-reorg
 ```
 
 Tune `REORG_DEPTH`, `AUTO_REORG_EVERY_BLOCKS`, `REORG_NODE`, `REORG_MINE_ADDRESS`,
-`REORG_INJECT_TXS`, `REORG_WALLET_NAME` and `REORG_WITNESS_NODE` in `.env`
+`REORG_ADDS_NEW_TXS`, `REORG_WALLET_NAME` and `REORG_WITNESS_NODE` in `.env`
 (see [SETTINGS.md](./SETTINGS.md)).
 
 ## ZMQ notifications
@@ -274,7 +285,7 @@ JsonRpc(Rpc(RpcError { code: -4, message: "Wallet file verification failed. Fail
 ```
 
 Fixed: the controller now loads the existing wallets and skips the funding sequence when
-the chain is already bootstrapped (height >= 104), so `stop`/`start` resumes cleanly
+the chain is already bootstrapped (height >= 204), so `stop`/`start` resumes cleanly
 where it left off.
 
 To reset the chain from scratch, remove the containers instead:

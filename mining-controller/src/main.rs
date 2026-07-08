@@ -79,16 +79,21 @@ fn main() {
     wait_for_rpc(&node3, "node3");
 
     // Bootstrap plan: block 1 to node2's wallet, block 2 to node3's wallet,
-    // blocks 3 and 4 to the user address, then 100 more blocks. At height
-    // 104 all four coinbases are mature: the user has the 2x50 BTC, and each
-    // miner wallet has one mature reward to fund the spammer from the start.
+    // blocks 3 and 4 to the user address, then two 50-block funding batches
+    // (to node2 then node3), then two 50-block maturity batches. The chain
+    // ends at height 204. Coinbase maturity is 100 blocks, and node3's funding
+    // batch is mined last (heights 55-104, maturing 155-204), so burying to
+    // height 204 leaves BOTH miner wallets fully liquid at handoff (~51 mature
+    // coinbases, ~2550 BTC each) instead of a single mature reward. The
+    // maturity batches also go to the miner wallets, so their coinbases keep
+    // maturing during the run (heights 205-304), sustaining long sessions.
     let (_wallet2, addr2) = setup_wallet(&node2_url, &rpc_user, &rpc_pass, &node2, &wallet2_name);
     let (_wallet3, addr3) = setup_wallet(&node3_url, &rpc_user, &rpc_pass, &node3, &wallet3_name);
 
     // Restart-safe: if the chain is already past the bootstrap height the
     // funding already happened, re-running it would fund the user again.
     let mut height = node2.get_block_count().unwrap();
-    if height >= 104 {
+    if height >= 204 {
         println!("Chain already bootstrapped (height {height}), skipping the funding sequence");
     } else {
         println!("Node 2 => Mining block 1 to its own wallet address {addr2}");
@@ -114,15 +119,36 @@ fn main() {
         wait_for_height(&node2, height);
         println!("New block height: {height}");
 
-        // 100 more blocks so blocks 1-4 mature (block 4 matures at height 104)
-        println!("Node 2 => Mining 50 blocks to address {addr2}");
+        // Funding batches: 50 blocks to each miner wallet (node2 h5-54,
+        // node3 h55-104). These also mature blocks 1-4 (block 4 matures at
+        // height 104).
+        println!("Node 2 => Mining 50 funding blocks to address {addr2}");
         node2.generate_to_address(50, &addr2).unwrap();
         height = node2.get_block_count().unwrap();
         println!("Waiting network to sync");
         wait_for_height(&node3, height);
         println!("New block height: {height}");
 
-        println!("Node 3 => Mining 50 blocks to address {addr3}");
+        println!("Node 3 => Mining 50 funding blocks to address {addr3}");
+        node3.generate_to_address(50, &addr3).unwrap();
+        height = node3.get_block_count().unwrap();
+        println!("Waiting network to sync");
+        wait_for_height(&node2, height);
+        println!("New block height: {height}");
+
+        // Maturity batches: 100 more blocks (to height 204) so the funding
+        // batches above pass coinbase maturity before the spammer starts.
+        // node3's funding (h55-104) matures at h155-204, so 100 blocks are
+        // needed, not 50. Mined to the miner wallets so they keep maturing
+        // during the run (h205-304).
+        println!("Node 2 => Mining 50 maturity blocks to address {addr2}");
+        node2.generate_to_address(50, &addr2).unwrap();
+        height = node2.get_block_count().unwrap();
+        println!("Waiting network to sync");
+        wait_for_height(&node3, height);
+        println!("New block height: {height}");
+
+        println!("Node 3 => Mining 50 maturity blocks to address {addr3}");
         node3.generate_to_address(50, &addr3).unwrap();
         height = node3.get_block_count().unwrap();
         println!("Waiting network to sync");
