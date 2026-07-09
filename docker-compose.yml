@@ -199,6 +199,12 @@ services:
       - btc-simnet-network
     environment:
       - ENABLE_SPAM=${ENABLE_SPAM:-true}
+      # true = raw engine (spammer signs its own txs, immune to wallet
+      # fatigue); false = original node-wallet engine (sendtoaddress/sendmany)
+      - USE_RAW_TX_SPAM=${USE_RAW_TX_SPAM:-true}
+      # The raw engine pays exactly this rate (the wallet engine ends up at
+      # the same one via the estimator fallback): one fee price-level knob.
+      - FALLBACK_FEE=${FALLBACK_FEE:-0.0001}
       - SPAM_TXS_PER_BLOCK=${SPAM_TXS_PER_BLOCK:-100}
       - SPAM_SENDMANY_OUTPUTS=${SPAM_SENDMANY_OUTPUTS:-0}
       - SPAM_FANOUT_UTXOS=${SPAM_FANOUT_UTXOS:-50}

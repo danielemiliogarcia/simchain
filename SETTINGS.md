@@ -103,15 +103,19 @@ The three fee settings look similar but act at different points of a transaction
 
 ### The fee market: what spam pays, and how to set a price floor
 
-The spammer never sets an explicit fee rate. Every send lets the sending node's
-wallet choose: the wallet asks its own fee estimator, the estimator has no data on a
-fresh chain, and the wallet falls back to `FALLBACK_FEE`. With the defaults every
-spam tx pays ~10 sat/vB — the uniform rate visible in the explorer.
+Both spam engines pay the same rate; they just reach it differently. The raw engine
+(`USE_RAW_TX_SPAM=true`, the default) sets `FALLBACK_FEE` explicitly on every
+transaction it builds — no estimator involved at all. The wallet engine never sets
+a fee: every send lets the sending node's wallet choose, the wallet asks its own
+fee estimator, the estimator has no data on a fresh chain, and the wallet falls
+back to `FALLBACK_FEE`. With the defaults every spam tx pays ~10 sat/vB — the
+uniform rate visible in the explorer.
 
-The estimator never escapes that level. Once it has data, its only data is the spam
-itself, and all of it confirmed at the fallback rate — so it recommends that same
-rate back and the spam keeps paying it. `FALLBACK_FEE` is therefore not just a
-bootstrap value: it sets the simnet's price level permanently.
+Under the wallet engine the estimator never escapes that level either. Once it has
+data, its only data is the spam itself, and all of it confirmed at the fallback
+rate — so it recommends that same rate back and the spam keeps paying it.
+`FALLBACK_FEE` is therefore not just a bootstrap value: it sets the simnet's price
+level permanently, whichever engine is active.
 
 That makes it a one-line **economic fee floor**. Combine a
 [full-blocks recipe](#full-blocks) with, say, `FALLBACK_FEE=0.001` (100 sat/vB) and
@@ -122,9 +126,12 @@ blocks keep passing it over — exactly how mainnet feels in a high-fee period. 
 floor only exists while spam keeps blocks full; with partial blocks everything
 confirms and the floor vanishes.
 
-The cost is mostly recycled, not burned: node2/node3 pay the spam fees *and* mine
-the blocks, so the fees return to the same wallets as coinbase after the 100-block
-maturity. Only the 546-sat burn outputs really leave the wallets.
+The cost is mostly recycled, not burned: the spam fees end up in the blocks that
+node2/node3 mine, so they return to the miner wallets as coinbase after the
+100-block maturity. Under the wallet engine the wallets pay those fees directly;
+under the raw engine they come out of the engine's own funds, which it pulled from
+the miner wallets in the first place (and pulls again when its pool drains). Either
+way, only the 546-sat burn outputs really leave the loop.
 
 **When the floor leaks: packing granularity.** Block assembly walks the mempool by
 descending feerate, and when the next spam tx does not fit the space left in the
@@ -167,6 +174,7 @@ fee-market simulation).
 | Variable | Default | Description |
 |---|---|---|
 | `ENABLE_SPAM` | `true` | Spam transactions after each block so blocks are not empty. |
+| `USE_RAW_TX_SPAM` | `true` | Selects the spam engine. `true`: **raw engine** — the spammer holds its own keys, tracks its own UTXO set in memory, signs every tx locally and submits with `sendrawtransaction`. The node wallets are bypassed, so the send rate stays flat forever (no wallet fatigue) and every tx pays exactly `FALLBACK_FEE`. `false`: **node-wallet engine** — spam is sent with `sendtoaddress`/`sendmany` on the miner wallets, so bitcoind does coin selection and signing (wallet-realistic traffic, the original behavior); throughput is bound by the wallet lock and degrades as wallet history grows (see [Full blocks](#full-blocks)). All other spam knobs apply to both engines. |
 | `SPAM_TXS_PER_BLOCK` | `100` | Total spam txs offered per block — the number a block explorer shows per block (plus coinbase) as long as blocks are not already full; excess waits in the mempool. The spammer splits it across the miner wallets (currently node2 and node3) — how many miners exist is its responsibility, not the user's. Replaces the deprecated `SPAM_PER_MINER_PER_BLOCK` (still honored standalone: its value × 2). |
 | `SPAM_SENDMANY_OUTPUTS` | `0` | `0`: sequential mode — one `sendtoaddress` RPC per tx, txs arrive at the mempool one by one like real p2p traffic. `N > 0`: batch mode — each spam tx is a single `sendmany` with N outputs (exchange-payout-shaped), so one RPC places N payments; needed to fill consensus-size blocks on short intervals (see [Full blocks](#full-blocks)). |
 | `SPAM_FANOUT_UTXOS` | `50` | The spammer keeps each wallet split into this many independent UTXOs, replenishing when the pool runs low (startup, or after a reorg un-confirms the wallet's change). The mempool caps unconfirmed chains at 25 txs, so without the split a wallet can never place more than 25 txs per block. `0` disables. |
@@ -178,7 +186,10 @@ fee-market simulation).
 The nodes keep Bitcoin Core's consensus-default block weight (4M WU, ~7,100 small
 spam txs), so filling blocks is purely a question of feeding the mempool fast enough.
 A 1-in/2-out spam tx is ~561 WU; sequential sending is bound by RPC round-trips
-(~22 accepted tx/s on a mid-range desktop). Two ready-made setups:
+(~22 accepted tx/s on a mid-range desktop). The measured numbers in this section
+were taken with the wallet engine (`USE_RAW_TX_SPAM=false`); the raw engine
+(default) is substantially faster at the same settings — check your real cycle time
+in the `Spam cycle done in ...` log line. Two ready-made setups:
 
 Fast full blocks, under 1 minute each (batch mode):
 
@@ -207,9 +218,10 @@ check the real cycle time in `docker logs btc-simnet-spammer` (the
 If the cycle time *grows* over the session instead, that is wallet fatigue:
 bitcoind keeps the whole wallet tx history in memory and scans it on every send
 (measured: ~13s cycle fresh → ~67s after ~50 full blocks). It is inherent to
-wallet-based spam; the resets are a stack restart (`docker compose down -v`) or
-lowering the offered tx count, and the structural fix is the raw-tx spam engine
-proposed in `nice-to-have.md`.
+wallet-based spam, i.e. to `USE_RAW_TX_SPAM=false`; the raw engine (default) is
+immune — its bookkeeping is a constant-size in-memory UTXO set, so switching back
+to it is the structural fix. Wallet-engine resets: a stack restart
+(`docker compose down -v`) or lowering the offered tx count.
 
 Sequential p2p-like arrival (`SPAM_SENDMANY_OUTPUTS=0`), full blocks:
 
