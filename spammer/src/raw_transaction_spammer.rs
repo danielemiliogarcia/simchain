@@ -12,6 +12,19 @@
 //! wallet, its own fan-outs, its own change), so the in-memory set is updated
 //! locally on each send and stays at a constant size. Chain scans
 //! (scantxoutset) are only a recovery path: startup and reorgs.
+//!
+//! Two ways to make each tx "fat" enough to fill blocks fast:
+//!   - output mode (default): many 546-sat burn outputs (SPAM_SENDMANY_OUTPUTS),
+//!     the shape of exchange-payout traffic. Weight comes from outputs, each of
+//!     which is a UTXO-set insert for every node -- realistic, but the most
+//!     expensive kind of weight for the nodes.
+//!   - data mode (SPAM_TX_DATA_BYTES > 0): one OP_RETURN output carrying N bytes
+//!     of data. An OP_RETURN output is provably unspendable, so it never enters
+//!     the UTXO set: pure block weight at near-zero node cost. ~11 max-size txs
+//!     fill a 4M WU block instead of ~1130, so the nodes do a fraction of the
+//!     per-tx work. Trade-off: terrible fee-floor granularity and a low tx
+//!     count -- for load/throughput/mempool-bloat demos, not floor testing.
+//!     Needs Bitcoin Core 30+ (large OP_RETURN standard by default).
 
 use crate::common;
 use bitcoincore_rpc::{
@@ -20,6 +33,7 @@ use bitcoincore_rpc::{
         consensus::encode::serialize_hex,
         ecdsa,
         hashes::{sha256, Hash},
+        script::PushBytesBuf,
         secp256k1::{All, Message, PublicKey, Secp256k1, SecretKey},
         sighash::{EcdsaSighashType, SighashCache},
         transaction::Version,
@@ -75,11 +89,18 @@ pub struct RawSpammer {
     address: Address,
     script_pubkey: ScriptBuf,
     fee_rate_sat_vb: f64,
-    // The outputs of every spam tx: one burn script in sequential mode,
-    // SPAM_SENDMANY_OUTPUTS of them in batch mode (same burn addresses as the
-    // wallet engine). Change to self is appended as the LAST output, so the
-    // change vout is always burn_scripts.len().
+    // The outputs of every spam tx in OUTPUT mode: one burn script in
+    // sequential mode, SPAM_SENDMANY_OUTPUTS of them in batch mode (same burn
+    // addresses as the wallet engine). Change to self is the LAST output, so
+    // the change vout is burn_scripts.len(). Unused in data mode.
     burn_scripts: Vec<ScriptBuf>,
+    // DATA mode (data_bytes > 0): every spam tx carries this one OP_RETURN
+    // output (data_script, value 0) instead of the burn outputs, with change
+    // to self appended after it (change vout 1). Built once, since the data
+    // payload is constant -- the txs differ by their inputs, which is what
+    // makes their txids unique.
+    data_bytes: usize,
+    data_script: ScriptBuf,
     utxos: Vec<Utxo>,
     cursor: usize,
 }
@@ -92,6 +113,7 @@ impl RawSpammer {
         label: &str,
         fee_rate_sat_vb: f64,
         sendmany_outputs: u64,
+        data_bytes: u64,
     ) -> Self {
         // Deterministic key (hash of a fixed tag): the same address across
         // restarts, so a restarted spammer recovers its previous coins with
@@ -111,7 +133,20 @@ impl RawSpammer {
                 .map(|i| common::burn_address(i).script_pubkey())
                 .collect()
         };
+        let data_bytes = data_bytes as usize;
+        let data_script = if data_bytes > 0 {
+            let mut payload = PushBytesBuf::new();
+            payload
+                .extend_from_slice(&vec![0xab_u8; data_bytes])
+                .expect("data payload within push-size limit");
+            ScriptBuf::new_op_return(payload)
+        } else {
+            ScriptBuf::new()
+        };
         println!("{label} => Raw spam engine address: {address}");
+        if data_bytes > 0 {
+            println!("{label} => Raw engine in DATA mode: one {data_bytes}-byte OP_RETURN per tx");
+        }
         RawSpammer {
             node,
             wallet,
@@ -124,6 +159,8 @@ impl RawSpammer {
             script_pubkey,
             fee_rate_sat_vb,
             burn_scripts,
+            data_bytes,
+            data_script,
             utxos: Vec::new(),
             cursor: 0,
         }
@@ -139,11 +176,83 @@ impl RawSpammer {
         Amount::from_sat((vsize as f64 * self.fee_rate_sat_vb).ceil() as u64)
     }
 
-    // What one spam tx costs a branch: burns + fee + a change output that
-    // must stay above dust.
+    // Fee for one spam tx. Output mode: fee_for over the burn outputs + change.
+    // Data mode: the OP_RETURN output's full base size dominates the vsize
+    // (1 input ~68 vB, 1 change output 31 vB, ~11 vB overhead, plus the data).
+    fn spam_tx_fee(&self) -> Amount {
+        if self.data_bytes == 0 {
+            return self.fee_for(1, self.burn_scripts.len() + 1);
+        }
+        // scriptPubKey = OP_RETURN + minimal pushdata prefix + data; the tx
+        // serializer prefixes the whole scriptPubKey with a length varint.
+        let push_prefix = match self.data_bytes {
+            0..=75 => 1,      // direct OP_PUSHBYTES_N
+            76..=255 => 2,    // OP_PUSHDATA1 + len
+            256..=65535 => 3, // OP_PUSHDATA2 + len
+            _ => 5,           // OP_PUSHDATA4 + len
+        };
+        let script_len = 1 + push_prefix + self.data_bytes;
+        let varint = if script_len < 253 {
+            1
+        } else if script_len < 65536 {
+            3
+        } else {
+            5
+        };
+        let op_return_out = 8 + varint + script_len;
+        let vsize = 11 + 68 + 31 + op_return_out;
+        Amount::from_sat((vsize as f64 * self.fee_rate_sat_vb).ceil() as u64)
+    }
+
+    // Total value of the non-change outputs: dust burns in output mode, zero in
+    // data mode (the OP_RETURN carries no value; the "spend" is the fee).
+    fn spam_burn_total(&self) -> Amount {
+        if self.data_bytes == 0 {
+            Amount::from_sat(DUST_SAT * self.burn_scripts.len() as u64)
+        } else {
+            Amount::ZERO
+        }
+    }
+
+    // Which output index carries the change (the branch's next tip): after the
+    // burn outputs in output mode, after the single OP_RETURN in data mode.
+    fn change_vout(&self) -> u32 {
+        if self.data_bytes == 0 {
+            self.burn_scripts.len() as u32
+        } else {
+            1
+        }
+    }
+
+    // The outputs of one spam tx for the given change amount, change last so
+    // change_vout() locates it. Output mode: dust burns then change. Data mode:
+    // the OP_RETURN then change.
+    fn spam_outputs(&self, change: Amount) -> Vec<TxOut> {
+        let mut outputs: Vec<TxOut> = if self.data_bytes == 0 {
+            self.burn_scripts
+                .iter()
+                .map(|script| TxOut {
+                    value: Amount::from_sat(DUST_SAT),
+                    script_pubkey: script.clone(),
+                })
+                .collect()
+        } else {
+            vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: self.data_script.clone(),
+            }]
+        };
+        outputs.push(TxOut {
+            value: change,
+            script_pubkey: self.script_pubkey.clone(),
+        });
+        outputs
+    }
+
+    // What one spam tx costs a branch: non-change outputs + fee + a change
+    // output that must stay above dust.
     fn per_tx_required(&self) -> Amount {
-        let n = self.burn_scripts.len();
-        Amount::from_sat(DUST_SAT * n as u64) + self.fee_for(1, n + 1) + MIN_CHANGE
+        self.spam_burn_total() + self.spam_tx_fee() + MIN_CHANGE
     }
 
     fn usable_branches(&self, required: Amount) -> u64 {
@@ -356,7 +465,7 @@ impl RawSpammer {
     // change, replacing it would orphan that child -- and the tip check is
     // simply "is this tx's change outpoint still in our UTXO set".
     fn bump_spam_txs(&mut self, sent: &[SentSpam], count: u64) {
-        let change_vout = self.burn_scripts.len() as u32;
+        let change_vout = self.change_vout();
         let mut bumped = 0;
         let mut first_error: Option<String> = None;
         for s in sent.iter().rev() {
@@ -373,18 +482,7 @@ impl RawSpammer {
             if new_change < MIN_CHANGE {
                 continue;
             }
-            let mut outputs: Vec<TxOut> = self
-                .burn_scripts
-                .iter()
-                .map(|script| TxOut {
-                    value: Amount::from_sat(DUST_SAT),
-                    script_pubkey: script.clone(),
-                })
-                .collect();
-            outputs.push(TxOut {
-                value: new_change,
-                script_pubkey: self.script_pubkey.clone(),
-            });
+            let outputs = self.spam_outputs(new_change);
             match self.send_tx(std::slice::from_ref(&s.spent), outputs, true) {
                 Ok(txid) => {
                     self.utxos[idx] = Utxo {
@@ -425,7 +523,12 @@ impl RawSpammer {
         self.ensure_funds(fanout_need, fanout_target);
 
         let n_burns = self.burn_scripts.len();
-        if n_burns == 1 {
+        if self.data_bytes > 0 {
+            println!(
+                "{} => Raw-spamming {share} txs carrying a {}-byte OP_RETURN each",
+                self.label, self.data_bytes
+            );
+        } else if n_burns == 1 {
             println!(
                 "{} => Raw-spamming {share} transactions to a burn address",
                 self.label
@@ -438,8 +541,9 @@ impl RawSpammer {
         }
 
         let required = self.per_tx_required();
-        let fee = self.fee_for(1, n_burns + 1);
-        let burn_total = Amount::from_sat(DUST_SAT * n_burns as u64);
+        let fee = self.spam_tx_fee();
+        let burn_total = self.spam_burn_total();
+        let change_vout = self.change_vout();
 
         let mut txids: Vec<Txid> = Vec::new();
         let mut sent: Vec<SentSpam> = Vec::new();
@@ -458,23 +562,12 @@ impl RawSpammer {
             };
             let branch = self.utxos[idx];
             let change = branch.amount - burn_total - fee;
-            let mut outputs: Vec<TxOut> = self
-                .burn_scripts
-                .iter()
-                .map(|script| TxOut {
-                    value: Amount::from_sat(DUST_SAT),
-                    script_pubkey: script.clone(),
-                })
-                .collect();
-            outputs.push(TxOut {
-                value: change,
-                script_pubkey: self.script_pubkey.clone(),
-            });
+            let outputs = self.spam_outputs(change);
             match self.send_tx(std::slice::from_ref(&branch), outputs, replaceable) {
                 Ok(txid) => {
                     // The branch's new tip is this tx's change output.
                     self.utxos[idx] = Utxo {
-                        outpoint: OutPoint::new(txid, n_burns as u32),
+                        outpoint: OutPoint::new(txid, change_vout),
                         amount: change,
                     };
                     sent.push(SentSpam {

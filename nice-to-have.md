@@ -1,13 +1,13 @@
 ## Limitations and future enhancements
 
 ### BitcoinCore containers
-- Update the Bitcoin Core version: bump both the registry image default
-  (`BTC_IMAGE=bitcoin/bitcoin:29.0` in compose/docs) and the local build default
-  (`BITCOIN_VERSION=29.0` in `build-bitcoin.sh` / `.env`) to the latest release.
-  When bumping, also review the Rust tools' `bitcoincore-rpc` crate: the tools use
-  the `bitcoin` crate it re-exports, so upgrading `bitcoincore-rpc` is the only dep
-  change needed, and each `bitcoincore-rpc` release documents the newest Core
-  version it is tested against. Re-test bootstrap, spam and reorg flows after.
+- ~~Update the Bitcoin Core version~~ **Done:** bumped the registry image default
+  and the local build default to `31.1` (compose, `.env*`, `build-bitcoin.sh`, docs).
+  Core 30+ was needed for the spammer's data mode (large OP_RETURN standard by
+  default). Bootstrap, both spam engines and mempool acceptance re-tested live on
+  `/Satoshi:31.1.0/`. The `bitcoincore-rpc` crate is still `0.19.0` and works
+  unchanged against 31.1 (the RPCs used are stable); bump it only if a newer RPC is
+  needed.
 - Build from sources instead of downloading binaries
 - Clean up the Dockerfile: drop the debug `RUN echo UID/GID` layers and merge related
   `RUN` steps to reduce image layers
@@ -258,7 +258,19 @@ spam enabled).
 
 ---
 
-## 6. Raw-transaction spam engine (bypass the wallet)
+## 6. Raw-transaction spam engine (bypass the wallet) — **DONE**
+
+**Done:** shipped as `USE_RAW_TX_SPAM` (default `true`), in
+`spammer/src/raw_transaction_spammer.rs`. The engine holds a deterministic P2WPKH key
+per miner node, tracks its UTXO set in memory, signs locally and submits with
+`sendrawtransaction`; it self-funds by pulling from the miner wallet and recovers via
+`scantxoutset` on restart/reorg. Cycle time went from ~13s (wallet engine) to
+sub-second and stays flat (no wallet fatigue). The node-wallet engine is preserved
+verbatim as `node_wallet_spammer.rs`, selectable with `USE_RAW_TX_SPAM=false`.
+It also unlocked **data mode** (`SPAM_TX_DATA_BYTES`): OP_RETURN-stuffed txs that fill
+blocks with pure weight at near-zero node cost (measured node CPU ~100% → ~2% at the
+same full-block rate, no UTXO-set growth) — see SETTINGS.md "Full blocks". The original
+proposal follows for history.
 
 **What:** A spam mode where the spammer manages its own keys and UTXO set, builds and
 signs transactions in Rust (`bitcoin` crate) and submits them with

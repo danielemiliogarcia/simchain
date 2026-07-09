@@ -156,7 +156,7 @@ documented with its default in **[SETTINGS.md](./SETTINGS.md)**.
 By default the stack pulls the official registry image, no build step needed:
 
 ```bash
-BTC_IMAGE=bitcoin/bitcoin:29.0   # default if unset
+BTC_IMAGE=bitcoin/bitcoin:31.1   # default if unset
 ```
 
 To use the locally built image instead (arch auto-detected; binaries are
@@ -166,10 +166,10 @@ Bitcoin Core builder keys from
 
 ```bash
 ./build-bitcoin.sh                        # builds simchainbitcoinnode:<BITCOIN_VERSION>
-echo "BTC_IMAGE=simchainbitcoinnode:29.0" >> .env
+echo "BTC_IMAGE=simchainbitcoinnode:31.1" >> .env
 ```
 
-`build-bitcoin.sh` reads `BITCOIN_VERSION` from `.env` (default 29.0). It only builds
+`build-bitcoin.sh` reads `BITCOIN_VERSION` from `.env` (default 31.1). It only builds
 the bitcoin node image; the Rust tool images are built by compose itself.
 
 ## How to run

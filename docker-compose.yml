@@ -24,9 +24,9 @@ networks:
 
 services:
   btc-simnet-node1:
-    # Default: official registry image. Set BTC_IMAGE=simchainbitcoinnode:29.0
+    # Default: official registry image. Set BTC_IMAGE=simchainbitcoinnode:31.1
     # in .env to use the locally built one (./build-bitcoin.sh).
-    image: ${BTC_IMAGE:-bitcoin/bitcoin:29.0}
+    image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node1
     restart: unless-stopped
     ports:
@@ -80,7 +80,7 @@ services:
       # - -debug=validation
 
   btc-simnet-node2:
-    image: ${BTC_IMAGE:-bitcoin/bitcoin:29.0}
+    image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node2
     restart: unless-stopped
     ports:
@@ -125,7 +125,7 @@ services:
       - -addnode=btc-simnet-node3:18444
 
   btc-simnet-node3:
-    image: ${BTC_IMAGE:-bitcoin/bitcoin:29.0}
+    image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node3
     restart: unless-stopped
     networks:
@@ -207,6 +207,11 @@ services:
       - FALLBACK_FEE=${FALLBACK_FEE:-0.0001}
       - SPAM_TXS_PER_BLOCK=${SPAM_TXS_PER_BLOCK:-100}
       - SPAM_SENDMANY_OUTPUTS=${SPAM_SENDMANY_OUTPUTS:-0}
+      # Raw engine only: >0 makes each tx carry one OP_RETURN of this many bytes
+      # instead of burn outputs -- pure block weight, no UTXO-set growth, so a
+      # handful of fat txs fill a block and the nodes stay near-idle. Needs
+      # Core 30+ (large OP_RETURN standard by default). 0 = output-based spam.
+      - SPAM_TX_DATA_BYTES=${SPAM_TX_DATA_BYTES:-0}
       - SPAM_FANOUT_UTXOS=${SPAM_FANOUT_UTXOS:-50}
       - ENABLE_SPAM_REPLACES=${ENABLE_SPAM_REPLACES:-false}
       - SPAM_REPLACES_PER_MINER_PER_BLOCK=${SPAM_REPLACES_PER_MINER_PER_BLOCK:-5}

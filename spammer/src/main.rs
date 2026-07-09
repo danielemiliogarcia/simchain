@@ -75,6 +75,23 @@ fn main() {
     let sendmany_outputs: u64 = env_or("SPAM_SENDMANY_OUTPUTS", "0")
         .parse()
         .expect("SPAM_SENDMANY_OUTPUTS must be a non-negative integer");
+    // Raw engine only: 0 = output-based fatness (burn outputs, above). N > 0 =
+    // DATA mode -- each spam tx carries one OP_RETURN of N bytes instead of the
+    // burn outputs, so blocks fill with a handful of fat data txs at a fraction
+    // of the per-tx node cost (no UTXO-set growth). ~11 max-size txs fill a
+    // block. Capped just under the 100k vB standard-tx limit. Needs Core 30+.
+    const MAX_DATA_BYTES: u64 = 98_000;
+    let tx_data_bytes: u64 = {
+        let requested: u64 = env_or("SPAM_TX_DATA_BYTES", "0")
+            .parse()
+            .expect("SPAM_TX_DATA_BYTES must be a non-negative integer");
+        if requested > MAX_DATA_BYTES {
+            println!("WARNING: SPAM_TX_DATA_BYTES={requested} exceeds the {MAX_DATA_BYTES}-byte standard-tx limit, clamping to {MAX_DATA_BYTES}");
+            MAX_DATA_BYTES
+        } else {
+            requested
+        }
+    };
     // RBF traffic: when enabled ("true" or "1") every spam tx signals BIP125
     // and the newest few of each batch get fee-bumped right after sending.
     let enable_replaces = matches!(
@@ -133,6 +150,7 @@ fn main() {
             "Node 2",
             fee_rate_sat_vb,
             sendmany_outputs,
+            tx_data_bytes,
         );
         let mut engine3 = RawSpammer::new(
             create_client(&node3_url, &rpc_user, &rpc_pass),
@@ -141,6 +159,7 @@ fn main() {
             "Node 3",
             fee_rate_sat_vb,
             sendmany_outputs,
+            tx_data_bytes,
         );
         // The raw engine always needs a branch pool (a single UTXO caps the
         // whole engine at one 25-tx unconfirmed chain), so 0 means 1 branch

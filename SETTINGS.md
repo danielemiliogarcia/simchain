@@ -13,8 +13,8 @@ cp .env.full.example .env   # everything tweakable
 
 | Variable | Default | Description |
 |---|---|---|
-| `BTC_IMAGE` | `bitcoin/bitcoin:29.0` | Docker image used by the 3 nodes. Default is pulled from the registry (no build needed). Set `simchainbitcoinnode:29.0` to use the locally built image (`./build-bitcoin.sh`). |
-| `BITCOIN_VERSION` | `29.0` | Bitcoin Core version downloaded by `./build-bitcoin.sh` when building the local image. Not used by compose. |
+| `BTC_IMAGE` | `bitcoin/bitcoin:31.1` | Docker image used by the 3 nodes. Default is pulled from the registry (no build needed). Set `simchainbitcoinnode:31.1` to use the locally built image (`./build-bitcoin.sh`). |
+| `BITCOIN_VERSION` | `31.1` | Bitcoin Core version downloaded by `./build-bitcoin.sh` when building the local image. Not used by compose. |
 
 ## RPC credentials
 
@@ -177,6 +177,7 @@ fee-market simulation).
 | `USE_RAW_TX_SPAM` | `true` | Selects the spam engine. `true`: **raw engine** — the spammer holds its own keys, tracks its own UTXO set in memory, signs every tx locally and submits with `sendrawtransaction`. The node wallets are bypassed, so the send rate stays flat forever (no wallet fatigue) and every tx pays exactly `FALLBACK_FEE`. `false`: **node-wallet engine** — spam is sent with `sendtoaddress`/`sendmany` on the miner wallets, so bitcoind does coin selection and signing (wallet-realistic traffic, the original behavior); throughput is bound by the wallet lock and degrades as wallet history grows (see [Full blocks](#full-blocks)). All other spam knobs apply to both engines. |
 | `SPAM_TXS_PER_BLOCK` | `100` | Total spam txs offered per block — the number a block explorer shows per block (plus coinbase) as long as blocks are not already full; excess waits in the mempool. The spammer splits it across the miner wallets (currently node2 and node3) — how many miners exist is its responsibility, not the user's. Replaces the deprecated `SPAM_PER_MINER_PER_BLOCK` (still honored standalone: its value × 2). |
 | `SPAM_SENDMANY_OUTPUTS` | `0` | `0`: sequential mode — one `sendtoaddress` RPC per tx, txs arrive at the mempool one by one like real p2p traffic. `N > 0`: batch mode — each spam tx is a single `sendmany` with N outputs (exchange-payout-shaped), so one RPC places N payments; needed to fill consensus-size blocks on short intervals (see [Full blocks](#full-blocks)). |
+| `SPAM_TX_DATA_BYTES` | `0` | Raw engine only. `0`: fatness comes from outputs (`SPAM_SENDMANY_OUTPUTS`). `N > 0`: **data mode** — each spam tx carries one OP_RETURN of N bytes instead of the burn outputs. An OP_RETURN is provably unspendable, so it never enters the UTXO set: the tx is pure block weight at near-zero node cost. ~11 max-size (90k-byte) txs fill a 4M WU block vs ~1130 in output mode, so the nodes do a fraction of the per-tx work and the UTXO set barely grows (measured: node CPU ~100% → ~2% at the same full-block rate). Capped just under the 100k-vB standard-tx limit; needs Core 30+. Trade-off: worst-case fee-floor granularity and a low tx count — for cheap block-filling / mempool-bloat, not floor testing. See [Full blocks](#full-blocks). |
 | `SPAM_FANOUT_UTXOS` | `50` | The spammer keeps each wallet split into this many independent UTXOs, replenishing when the pool runs low (startup, or after a reorg un-confirms the wallet's change). The mempool caps unconfirmed chains at 25 txs, so without the split a wallet can never place more than 25 txs per block. `0` disables. |
 | `ENABLE_SPAM_REPLACES` | `false` | `true` or `1`: every spam tx signals RBF (BIP125) and, right after each batch, the newest `SPAM_REPLACES_PER_MINER_PER_BLOCK` txs per miner are fee-bumped with `bumpfee`, so the mempool carries real replacements (old txid evicted, new txid appears) for downstream code to handle. `false`/`0`: exactly today's behavior. |
 | `SPAM_REPLACES_PER_MINER_PER_BLOCK` | `5` | How many of each miner's spam txs are fee-bumped per block when `ENABLE_SPAM_REPLACES` is on. The newest txs are bumped (a tx with unconfirmed descendants cannot be replaced). |
@@ -234,6 +235,31 @@ SPAM_FANOUT_UTXOS=200         # 4000 txs per wallet need >= 160 independent 25-t
 With shorter sequential intervals blocks fill proportionally
 (`fill ≈ interval × send_rate / 7100`), so expect ~5.5–7 minutes per full block
 depending on machine speed.
+
+Data mode — full blocks with the nodes near-idle (raw engine, Core 30+):
+
+```bash
+SPAM_TX_DATA_BYTES=90000      # one OP_RETURN of 90k bytes per tx (~90k vB)
+SPAM_TXS_PER_BLOCK=16         # ~11 fill a block; 16 over-offers so blocks stay full
+SPAM_FANOUT_UTXOS=20          # only ~8 txs/node/block, so a small branch pool suffices
+```
+
+The other fill recipes make blocks heavy with *transactions* — the exact thing that
+loads a node (signature checks, mempool package math, and, in output/batch mode, a
+UTXO-set insert per output: measured ~31k new UTXOs per full block). Data mode makes
+each tx heavy with *data* instead: an OP_RETURN output is provably unspendable, so it
+never enters the UTXO set. About 11 max-size (90k-byte) txs fill a 4M WU block, versus
+~1130 in batch mode, so the per-tx work collapses. Measured on the same machine that
+sat pegged at ~100% node CPU under batch spam: **~2% node CPU** in data mode, blocks
+still 99% full, the send cycle under a second. It is the way to run *fast* full blocks
+(short `BLOCK_INTERVAL_SECS`) without the nodes — or your machine — becoming the limit.
+
+Two costs to know. Fee-floor granularity is at its worst: a block filled by ~11 giant
+txs leaves ~90k-vB gaps, so a cheap tiny transaction sails straight in — data mode is
+the opposite of a fee floor (see [The fee market](#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor)).
+And the explorer shows a *low tx count* (~12/block) even though the block is full by
+weight. So data mode is for cheaply filling blocks and bloating the mempool, not for
+realistic-looking traffic or floor testing — use batch or sequential mode for those.
 
 Full blocks also unlock a real confirmation floor: raise `FALLBACK_FEE` and the spam
 outbids every cheaper transaction — see
