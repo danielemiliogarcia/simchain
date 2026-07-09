@@ -1,4 +1,10 @@
-use bitcoincore_rpc::{bitcoin::{hashes::{hash160, Hash}, Address, Amount, Network, ScriptBuf, Txid, WPubkeyHash}, jsonrpc, Client, RpcApi};
+use bitcoincore_rpc::{
+    bitcoin::{
+        hashes::{hash160, Hash},
+        Address, Amount, Network, ScriptBuf, Txid, WPubkeyHash,
+    },
+    jsonrpc, Client, RpcApi,
+};
 use serde_json::json;
 use std::{env, thread, time::Duration};
 
@@ -139,7 +145,16 @@ fn send_spam_tx(from: &Client, to_address: &Address, count: u64, replaceable: bo
     let mut first_error: Option<String> = None;
     let replaceable = if replaceable { Some(true) } else { None };
     for _ in 0..count {
-        match from.send_to_address(&to_address, amount, None, None, None, replaceable, None, None) {
+        match from.send_to_address(
+            &to_address,
+            amount,
+            None,
+            None,
+            None,
+            replaceable,
+            None,
+            None,
+        ) {
             Ok(txid) => txids.push(txid),
             Err(e) => {
                 if first_error.is_none() {
@@ -149,7 +164,10 @@ fn send_spam_tx(from: &Client, to_address: &Address, count: u64, replaceable: bo
         }
     }
     if let Some(error) = first_error {
-        println!("WARNING: only {}/{count} spam txs accepted, first error: {error}", txids.len());
+        println!(
+            "WARNING: only {}/{count} spam txs accepted, first error: {error}",
+            txids.len()
+        );
     }
     txids
 }
@@ -160,14 +178,26 @@ fn send_spam_tx(from: &Client, to_address: &Address, count: u64, replaceable: bo
 // only needs the keys of ONE tx to be distinct -- which is also what real
 // exchange-payout traffic looks like. Reports partial acceptance like
 // send_spam_tx and returns the txids so a fraction can be fee-bumped.
-fn send_spam_batch(from: &Client, to_addresses: &[Address], count: u64, replaceable: bool) -> Vec<Txid> {
+fn send_spam_batch(
+    from: &Client,
+    to_addresses: &[Address],
+    count: u64,
+    replaceable: bool,
+) -> Vec<Txid> {
     let mut amounts = serde_json::Map::new();
     for address in to_addresses {
         amounts.insert(address.to_string(), json!(0.00000546));
     }
     // sendmany positional params: dummy, amounts, minconf, comment,
     // subtractfeefrom, replaceable
-    let params = [json!(""), json!(amounts), json!(1), json!(""), json!([]), json!(replaceable)];
+    let params = [
+        json!(""),
+        json!(amounts),
+        json!(1),
+        json!(""),
+        json!([]),
+        json!(replaceable),
+    ];
     let mut txids = Vec::new();
     let mut first_error: Option<String> = None;
     for _ in 0..count {
@@ -181,7 +211,10 @@ fn send_spam_batch(from: &Client, to_addresses: &[Address], count: u64, replacea
         }
     }
     if let Some(error) = first_error {
-        println!("WARNING: only {}/{count} sendmany batches accepted, first error: {error}", txids.len());
+        println!(
+            "WARNING: only {}/{count} sendmany batches accepted, first error: {error}",
+            txids.len()
+        );
     }
     txids
 }
@@ -236,7 +269,10 @@ fn spam_round(
         ensure_fanout(wallet, wallet_name, fanout_need, fanout_utxos);
     }
     let txids = if !batch_addrs.is_empty() {
-        println!("{label} => Spamming {share} sendmany batches of {} outputs to burn addresses", batch_addrs.len());
+        println!(
+            "{label} => Spamming {share} sendmany batches of {} outputs to burn addresses",
+            batch_addrs.len()
+        );
         send_spam_batch(wallet, batch_addrs, share, replaceable)
     } else {
         println!("{label} => Spamming {share} transactions to address {seq_addr}");
@@ -262,10 +298,14 @@ fn main() {
     // it across the miner wallets is this tool's job, not the user's; the
     // legacy per-miner variable is still honored so old .env files keep working.
     let spam_txs_per_block: u64 = match env::var("SPAM_TXS_PER_BLOCK") {
-        Ok(v) => v.parse().expect("SPAM_TXS_PER_BLOCK must be a positive integer"),
+        Ok(v) => v
+            .parse()
+            .expect("SPAM_TXS_PER_BLOCK must be a positive integer"),
         Err(_) => match env::var("SPAM_PER_MINER_PER_BLOCK") {
             Ok(v) => {
-                let per_miner: u64 = v.parse().expect("SPAM_PER_MINER_PER_BLOCK must be a positive integer");
+                let per_miner: u64 = v
+                    .parse()
+                    .expect("SPAM_PER_MINER_PER_BLOCK must be a positive integer");
                 println!("WARNING: SPAM_PER_MINER_PER_BLOCK is deprecated, set SPAM_TXS_PER_BLOCK (total per block) instead; using {}", per_miner * MINER_COUNT);
                 per_miner * MINER_COUNT
             }
@@ -275,18 +315,27 @@ fn main() {
     // node2 takes the odd remainder so the two shares always sum to the total
     let spam2 = spam_txs_per_block.div_ceil(MINER_COUNT);
     let spam3 = spam_txs_per_block / MINER_COUNT;
-    let fanout_utxos: u64 = env_or("SPAM_FANOUT_UTXOS", "50").parse().expect("SPAM_FANOUT_UTXOS must be a positive integer");
+    let fanout_utxos: u64 = env_or("SPAM_FANOUT_UTXOS", "50")
+        .parse()
+        .expect("SPAM_FANOUT_UTXOS must be a positive integer");
     // 0 = sequential mode: one sendtoaddress RPC per tx, so txs reach the
     // mempool one by one like p2p traffic on a real network. N > 0 = batch
     // mode: each spam tx is a single sendmany with N outputs, so one RPC call
     // places N payments -- the only way to FILL blocks on short intervals,
     // since sequential sending is bound by RPC round-trips (see SETTINGS.md
     // "Full blocks" for ready-made values).
-    let sendmany_outputs: u64 = env_or("SPAM_SENDMANY_OUTPUTS", "0").parse().expect("SPAM_SENDMANY_OUTPUTS must be a non-negative integer");
+    let sendmany_outputs: u64 = env_or("SPAM_SENDMANY_OUTPUTS", "0")
+        .parse()
+        .expect("SPAM_SENDMANY_OUTPUTS must be a non-negative integer");
     // RBF traffic: when enabled ("true" or "1") every spam tx signals BIP125
     // and the newest few of each batch get fee-bumped right after sending.
-    let enable_replaces = matches!(env_or("ENABLE_SPAM_REPLACES", "false").as_str(), "true" | "1");
-    let replaces_per_miner: u64 = env_or("SPAM_REPLACES_PER_MINER_PER_BLOCK", "5").parse().expect("SPAM_REPLACES_PER_MINER_PER_BLOCK must be a non-negative integer");
+    let enable_replaces = matches!(
+        env_or("ENABLE_SPAM_REPLACES", "false").as_str(),
+        "true" | "1"
+    );
+    let replaces_per_miner: u64 = env_or("SPAM_REPLACES_PER_MINER_PER_BLOCK", "5")
+        .parse()
+        .expect("SPAM_REPLACES_PER_MINER_PER_BLOCK must be a non-negative integer");
     let rpc_user = env_or("BTC_RPC_USER", "foo");
     let rpc_pass = env_or("BTC_RPC_PASS", "rpcpassword");
     let wallet2_name = env_or("NODE2_WALLET_NAME", "node2");
@@ -299,8 +348,16 @@ fn main() {
     let node1 = create_client(&node1_url, &rpc_user, &rpc_pass);
     // Wallet-scoped clients: they keep working even if the user loads extra
     // wallets on the nodes (the generic RPC path breaks with more than one)
-    let wallet2 = create_client(&format!("{node2_url}/wallet/{wallet2_name}"), &rpc_user, &rpc_pass);
-    let wallet3 = create_client(&format!("{node3_url}/wallet/{wallet3_name}"), &rpc_user, &rpc_pass);
+    let wallet2 = create_client(
+        &format!("{node2_url}/wallet/{wallet2_name}"),
+        &rpc_user,
+        &rpc_pass,
+    );
+    let wallet3 = create_client(
+        &format!("{node3_url}/wallet/{wallet3_name}"),
+        &rpc_user,
+        &rpc_pass,
+    );
 
     wait_for_funds(&wallet2, &wallet2_name);
     wait_for_funds(&wallet3, &wallet3_name);
@@ -328,9 +385,38 @@ fn main() {
             // node at the same time.
             let cycle_start = std::time::Instant::now();
             let (txids2, txids3) = thread::scope(|s| {
-                let t2 = s.spawn(|| spam_round(&wallet2, &wallet2_name, "Node 2", spam2, fanout_need, fanout_utxos, &seq_addr, &batch_addrs, enable_replaces, replaces_per_miner));
-                let t3 = s.spawn(|| spam_round(&wallet3, &wallet3_name, "Node 3", spam3, fanout_need, fanout_utxos, &seq_addr, &batch_addrs, enable_replaces, replaces_per_miner));
-                (t2.join().expect("node2 spam thread panicked"), t3.join().expect("node3 spam thread panicked"))
+                let t2 = s.spawn(|| {
+                    spam_round(
+                        &wallet2,
+                        &wallet2_name,
+                        "Node 2",
+                        spam2,
+                        fanout_need,
+                        fanout_utxos,
+                        &seq_addr,
+                        &batch_addrs,
+                        enable_replaces,
+                        replaces_per_miner,
+                    )
+                });
+                let t3 = s.spawn(|| {
+                    spam_round(
+                        &wallet3,
+                        &wallet3_name,
+                        "Node 3",
+                        spam3,
+                        fanout_need,
+                        fanout_utxos,
+                        &seq_addr,
+                        &batch_addrs,
+                        enable_replaces,
+                        replaces_per_miner,
+                    )
+                });
+                (
+                    t2.join().expect("node2 spam thread panicked"),
+                    t3.join().expect("node3 spam thread panicked"),
+                )
             });
             println!(
                 "Spam cycle done in {:.1}s ({} txs accepted)",

@@ -1,4 +1,7 @@
-use bitcoincore_rpc::{bitcoin::{address::NetworkUnchecked, Address, BlockHash, Network}, jsonrpc, Client, RpcApi};
+use bitcoincore_rpc::{
+    bitcoin::{address::NetworkUnchecked, Address, BlockHash, Network},
+    jsonrpc, Client, RpcApi,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::{env, thread, time::Duration};
 
@@ -60,7 +63,13 @@ fn wait_for_height(client: &Client, height: u64) {
 // the node later (the generic RPC path breaks with more than one wallet).
 // Restart-safe: if the wallet already exists on disk it is loaded instead,
 // and if it is already loaded it is used as-is.
-fn setup_wallet(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Client, wallet_name: &str) -> (Client, Address) {
+fn setup_wallet(
+    rpc_url: &str,
+    rpc_user: &str,
+    rpc_pass: &str,
+    node: &Client,
+    wallet_name: &str,
+) -> (Client, Address) {
     if let Err(create_err) = node.create_wallet(wallet_name, None, None, None, None) {
         match node.load_wallet(wallet_name) {
             Ok(_) => println!("Wallet '{wallet_name}' already exists, loaded it"),
@@ -72,7 +81,11 @@ fn setup_wallet(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Client, wa
             }
         }
     }
-    let wallet = create_client(&format!("{rpc_url}/wallet/{wallet_name}"), rpc_user, rpc_pass);
+    let wallet = create_client(
+        &format!("{rpc_url}/wallet/{wallet_name}"),
+        rpc_user,
+        rpc_pass,
+    );
     let address = wallet.get_new_address(None, None).unwrap();
     let address = address.require_network(Network::Regtest).unwrap();
     (wallet, address)
@@ -90,7 +103,10 @@ struct ChainView {
 
 impl ChainView {
     fn new() -> Self {
-        ChainView { seen: BTreeMap::new(), own: HashSet::new() }
+        ChainView {
+            seen: BTreeMap::new(),
+            own: HashSet::new(),
+        }
     }
 
     fn record(&mut self, height: u64, hash: BlockHash, mined_by_us: bool) {
@@ -119,7 +135,9 @@ impl ChainView {
             }
         }
         // Nothing matches: the reorg is deeper than the window.
-        self.seen.first_key_value().map_or(0, |(&h, _)| h.saturating_sub(1))
+        self.seen
+            .first_key_value()
+            .map_or(0, |(&h, _)| h.saturating_sub(1))
     }
 }
 
@@ -162,7 +180,9 @@ fn sync_view(view: &mut ChainView, node: &Client, last: u64) -> u64 {
     for h in from..=tip {
         // A block can vanish mid-walk if another reorg lands right now; stop
         // and let the next round re-sync.
-        let Ok(hash) = node.get_block_hash(h) else { break };
+        let Ok(hash) = node.get_block_hash(h) else {
+            break;
+        };
         let mined_by_us = view.own.contains(&hash);
         if !mined_by_us {
             println!("EXTERNAL block [{h}] {hash} (not mined by this controller)");
@@ -175,8 +195,13 @@ fn sync_view(view: &mut ChainView, node: &Client, last: u64) -> u64 {
 fn main() {
     // Every setting has a default matching docker-compose.yml, so the tool
     // also runs standalone with no environment at all.
-    let user_address = env_or("USER_ADDRESS", "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr");
-    let interval_secs: u64 = env_or("BLOCK_INTERVAL_SECS", "15").parse().expect("BLOCK_INTERVAL_SECS must be a positive integer");
+    let user_address = env_or(
+        "USER_ADDRESS",
+        "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr",
+    );
+    let interval_secs: u64 = env_or("BLOCK_INTERVAL_SECS", "15")
+        .parse()
+        .expect("BLOCK_INTERVAL_SECS must be a positive integer");
 
     let rpc_user = env_or("BTC_RPC_USER", "foo");
     let rpc_pass = env_or("BTC_RPC_PASS", "rpcpassword");
@@ -188,7 +213,8 @@ fn main() {
     let node2 = create_client(&node2_url, &rpc_user, &rpc_pass);
     let node3 = create_client(&node3_url, &rpc_user, &rpc_pass);
 
-    let user_address: Address<NetworkUnchecked> = user_address.parse().expect("Invalid Bitcoin address");
+    let user_address: Address<NetworkUnchecked> =
+        user_address.parse().expect("Invalid Bitcoin address");
     let user_address = user_address.require_network(Network::Regtest).unwrap();
 
     println!("Waiting for nodes to be ready");
@@ -216,16 +242,20 @@ fn main() {
     // mid-batch cannot misassign funds.
     // (target height, miner, sync witness, reward address, label)
     let stages: [(u64, &Client, &Client, &Address, &str); 8] = [
-        (1,   &node2, &node3, &addr2,        "node2 wallet block"),
-        (2,   &node3, &node2, &addr3,        "node3 wallet block"),
-        (3,   &node2, &node3, &user_address, "user funding block 3"),
-        (4,   &node3, &node2, &user_address, "user funding block 4"),
-        (54,  &node2, &node3, &addr2,        "node2 funding batch"),
-        (104, &node3, &node2, &addr3,        "node3 funding batch"),
-        (154, &node2, &node3, &addr2,        "node2 maturity batch"),
-        (204, &node3, &node2, &addr3,        "node3 maturity batch"),
+        (1, &node2, &node3, &addr2, "node2 wallet block"),
+        (2, &node3, &node2, &addr3, "node3 wallet block"),
+        (3, &node2, &node3, &user_address, "user funding block 3"),
+        (4, &node3, &node2, &user_address, "user funding block 4"),
+        (54, &node2, &node3, &addr2, "node2 funding batch"),
+        (104, &node3, &node2, &addr3, "node3 funding batch"),
+        (154, &node2, &node3, &addr2, "node2 maturity batch"),
+        (204, &node3, &node2, &addr3, "node3 maturity batch"),
     ];
-    assert_eq!(stages[stages.len() - 1].0, BOOTSTRAP_END, "stage table must end at BOOTSTRAP_END");
+    assert_eq!(
+        stages[stages.len() - 1].0,
+        BOOTSTRAP_END,
+        "stage table must end at BOOTSTRAP_END"
+    );
 
     let mut height = node2.get_block_count().unwrap();
     if height >= BOOTSTRAP_END {
@@ -237,7 +267,10 @@ fn main() {
         if height >= target {
             continue;
         }
-        println!("Bootstrap => Mining {} block(s) to address {addr} ({label}, up to height {target})", target - height);
+        println!(
+            "Bootstrap => Mining {} block(s) to address {addr} ({label}, up to height {target})",
+            target - height
+        );
         miner.generate_to_address(target - height, addr).unwrap();
         height = miner.get_block_count().unwrap();
         // Wait for the other node to sync before the next stage mines on
@@ -246,7 +279,10 @@ fn main() {
         println!("New block height: {height}");
     }
 
-    println!("\nActual block height: {}", node2.get_block_count().unwrap());
+    println!(
+        "\nActual block height: {}",
+        node2.get_block_count().unwrap()
+    );
 
     println!("\n//////////////////////////////////////////////////////////////////\n");
     println!("Funds in address {user_address} are mature and ready to spend.");
