@@ -1,4 +1,4 @@
-use bitcoincore_rpc::{bitcoin::{Address, Amount, Network, Txid}, Auth, Client, RpcApi};
+use bitcoincore_rpc::{bitcoin::{hashes::{hash160, Hash}, Address, Amount, Network, ScriptBuf, Txid, WPubkeyHash}, Auth, Client, RpcApi};
 use serde_json::json;
 use std::{env, thread, time::Duration};
 
@@ -13,6 +13,20 @@ fn create_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Client {
 fn get_new_wallet_address(wallet: &Client) -> Address {
     let address = wallet.get_new_address(None, None).unwrap();
     address.require_network(Network::Regtest).unwrap()
+}
+
+// Spam destinations are burn addresses (P2WPKH over the hash of a fixed tag,
+// no known key), not wallet addresses. Dust paid to a wallet address lands in
+// that wallet, and bitcoind's coin selection scans every UTXO on each send:
+// the old cross-wallet spam grew each miner wallet by one UTXO per spam
+// output (~18k per full block in batch mode) until the send cycle no longer
+// fit inside the block interval. Burning the dust keeps the wallets lean --
+// they only accumulate their own change -- at the cost of slowly draining
+// them (~0.16 BTC per full block against a ~2550 BTC bootstrap balance).
+fn burn_address(index: u64) -> Address {
+    let hash = hash160::Hash::hash(format!("simchain-spam-burn-{index}").as_bytes());
+    let script = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_raw_hash(hash));
+    Address::from_script(&script, Network::Regtest).unwrap()
 }
 
 // Wait until the wallet exists and has at least 1 BTC of trusted (confirmed,
@@ -30,12 +44,17 @@ fn wait_for_funds(wallet: &Client, name: &str) {
 }
 
 // A fan-out UTXO is ~0.1 BTC. Count only confirmed UTXOs in this band as
-// "spammable": it excludes the 546-sat dust the wallet receives from the other
-// miner's cross-wallet spam (below the floor) and the large coinbase / change
-// UTXOs (above the ceiling), so the count reflects the pool of independent
-// branches actually available to spam from, not a wallet clogged with dust.
+// "spammable": it excludes any 546-sat dust the wallet may receive (below the
+// floor) and the large coinbase / change UTXOs (above the ceiling), so the
+// count reflects the pool of independent branches actually available to spam
+// from, not a wallet clogged with dust.
 const SPAMMABLE_MIN_BTC: f64 = 0.001;
 const SPAMMABLE_MAX_BTC: f64 = 0.5;
+
+// Wallets the spam is split across (node2 and node3). If a miner is ever
+// added or removed, updating this constant keeps SPAM_TXS_PER_BLOCK meaning
+// "total txs per block" for the user.
+const MINER_COUNT: u64 = 2;
 
 fn spammable_utxos(wallet: &Client) -> u64 {
     let min = Amount::from_btc(SPAMMABLE_MIN_BTC).unwrap();
@@ -122,6 +141,38 @@ fn send_spam_tx(from: &Client, to_address: &Address, count: u64, replaceable: bo
     txids
 }
 
+// Batch mode: send `count` txs of `to_addresses.len()` outputs each, one
+// sendmany RPC per tx (546 sats per output, same dust-safe amount as the
+// sequential mode). The same address set is reused for every batch -- sendmany
+// only needs the keys of ONE tx to be distinct -- which is also what real
+// exchange-payout traffic looks like. Reports partial acceptance like
+// send_spam_tx and returns the txids so a fraction can be fee-bumped.
+fn send_spam_batch(from: &Client, to_addresses: &[Address], count: u64, replaceable: bool) -> Vec<Txid> {
+    let mut amounts = serde_json::Map::new();
+    for address in to_addresses {
+        amounts.insert(address.to_string(), json!(0.00000546));
+    }
+    // sendmany positional params: dummy, amounts, minconf, comment,
+    // subtractfeefrom, replaceable
+    let params = [json!(""), json!(amounts), json!(1), json!(""), json!([]), json!(replaceable)];
+    let mut txids = Vec::new();
+    let mut first_error: Option<String> = None;
+    for _ in 0..count {
+        match from.call::<String>("sendmany", &params) {
+            Ok(txid) => txids.push(txid.parse().expect("bitcoind returned an invalid txid")),
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        println!("WARNING: only {}/{count} sendmany batches accepted, first error: {error}", txids.len());
+    }
+    txids
+}
+
 // Fee-bump (RBF) up to `count` of the just-sent spam txs, so the mempool
 // carries real BIP125 replacements for downstream code to handle. Bump
 // newest-first: the latest txs are the tips of the unconfirmed chains, and
@@ -159,8 +210,32 @@ fn main() {
         return;
     }
 
-    let spam_per_miner_per_block: u64 = env_or("SPAM_PER_MINER_PER_BLOCK", "50").parse().expect("SPAM_PER_MINER_PER_BLOCK must be a positive integer");
+    // Total spam txs offered per block: the number a block explorer shows per
+    // block (plus coinbase) as long as blocks are not already full. Splitting
+    // it across the miner wallets is this tool's job, not the user's; the
+    // legacy per-miner variable is still honored so old .env files keep working.
+    let spam_txs_per_block: u64 = match env::var("SPAM_TXS_PER_BLOCK") {
+        Ok(v) => v.parse().expect("SPAM_TXS_PER_BLOCK must be a positive integer"),
+        Err(_) => match env::var("SPAM_PER_MINER_PER_BLOCK") {
+            Ok(v) => {
+                let per_miner: u64 = v.parse().expect("SPAM_PER_MINER_PER_BLOCK must be a positive integer");
+                println!("WARNING: SPAM_PER_MINER_PER_BLOCK is deprecated, set SPAM_TXS_PER_BLOCK (total per block) instead; using {}", per_miner * MINER_COUNT);
+                per_miner * MINER_COUNT
+            }
+            Err(_) => 100,
+        },
+    };
+    // node2 takes the odd remainder so the two shares always sum to the total
+    let spam2 = spam_txs_per_block.div_ceil(MINER_COUNT);
+    let spam3 = spam_txs_per_block / MINER_COUNT;
     let fanout_utxos: u64 = env_or("SPAM_FANOUT_UTXOS", "50").parse().expect("SPAM_FANOUT_UTXOS must be a positive integer");
+    // 0 = sequential mode: one sendtoaddress RPC per tx, so txs reach the
+    // mempool one by one like p2p traffic on a real network. N > 0 = batch
+    // mode: each spam tx is a single sendmany with N outputs, so one RPC call
+    // places N payments -- the only way to FILL blocks on short intervals,
+    // since sequential sending is bound by RPC round-trips (see SETTINGS.md
+    // "Full blocks" for ready-made values).
+    let sendmany_outputs: u64 = env_or("SPAM_SENDMANY_OUTPUTS", "0").parse().expect("SPAM_SENDMANY_OUTPUTS must be a non-negative integer");
     // RBF traffic: when enabled ("true" or "1") every spam tx signals BIP125
     // and the newest few of each batch get fee-bumped right after sending.
     let enable_replaces = matches!(env_or("ENABLE_SPAM_REPLACES", "false").as_str(), "true" | "1");
@@ -183,11 +258,17 @@ fn main() {
     wait_for_funds(&wallet2, &wallet2_name);
     wait_for_funds(&wallet3, &wallet3_name);
 
-    let addr2 = get_new_wallet_address(&wallet2);
-    let addr3 = get_new_wallet_address(&wallet3);
+    // Sequential mode target: one shared burn address -- reusing a single
+    // address is exactly what real dust spam looks like.
+    let seq_addr = burn_address(0);
+
+    // Batch mode address pool: one fixed set of burn addresses, generated once
+    // and shared by both miners' sendmany calls (the keys only need to be
+    // distinct within one tx). Empty (and unused) in sequential mode.
+    let batch_addrs: Vec<Address> = (1..=sendmany_outputs).map(burn_address).collect();
 
     // Cover a block's spam, but never require more branches than we fan out to.
-    let fanout_need = spam_per_miner_per_block.min(fanout_utxos);
+    let fanout_need = spam2.min(fanout_utxos);
 
     // In a loop, if a new block is detected, spam transactions
     let mut spammed_at_block_height = 0;
@@ -201,11 +282,20 @@ fn main() {
                 ensure_fanout(&wallet2, &wallet2_name, fanout_need, fanout_utxos);
                 ensure_fanout(&wallet3, &wallet3_name, fanout_need, fanout_utxos);
             }
-            // spam transactions cross wallet
-            println!("Node 2 => Spamming {spam_per_miner_per_block} transactions to address {addr3}");
-            let txids2 = send_spam_tx(&wallet2, &addr3, spam_per_miner_per_block, enable_replaces);
-            println!("Node 3 => Spamming {spam_per_miner_per_block} transactions to address {addr2}");
-            let txids3 = send_spam_tx(&wallet3, &addr2, spam_per_miner_per_block, enable_replaces);
+            // spam transactions to burn addresses
+            let (txids2, txids3) = if sendmany_outputs > 0 {
+                println!("Node 2 => Spamming {spam2} sendmany batches of {sendmany_outputs} outputs to burn addresses");
+                let txids2 = send_spam_batch(&wallet2, &batch_addrs, spam2, enable_replaces);
+                println!("Node 3 => Spamming {spam3} sendmany batches of {sendmany_outputs} outputs to burn addresses");
+                let txids3 = send_spam_batch(&wallet3, &batch_addrs, spam3, enable_replaces);
+                (txids2, txids3)
+            } else {
+                println!("Node 2 => Spamming {spam2} transactions to address {seq_addr}");
+                let txids2 = send_spam_tx(&wallet2, &seq_addr, spam2, enable_replaces);
+                println!("Node 3 => Spamming {spam3} transactions to address {seq_addr}");
+                let txids3 = send_spam_tx(&wallet3, &seq_addr, spam3, enable_replaces);
+                (txids2, txids3)
+            };
             if enable_replaces {
                 bump_spam_txs(&wallet2, "Node 2", &txids2, replaces_per_miner);
                 bump_spam_txs(&wallet3, "Node 3", &txids3, replaces_per_miner);
