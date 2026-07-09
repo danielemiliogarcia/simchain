@@ -46,12 +46,14 @@ Accepted decisions (not defects, recorded so they are not re-reported):
 Findings, ordered by severity:
 
 1. **No RPC retries; transient errors are panics** (controller and spammer). Every call
-   is `.unwrap()`: a node hiccup mid-run kills the process permanently, and neither
-   service has a compose `restart` policy, so mining or spam silently stops. The reorg
-   tool is the exception (Results, retry loop, long RPC timeout) and can serve as the
-   template. The controller bootstrap is now restart-safe (wallets are loaded if they
-   exist, funding is skipped once the chain is bootstrapped), so adding
-   `restart: on-failure` to both services is a cheap interim mitigation.
+   is `.unwrap()`: a node hiccup mid-run kills the process. The reorg tool is the
+   exception (Results, retry loop) and can serve as the template.
+   Mitigations in place: both services use the reorg tool's 300s RPC timeout (the
+   default 15s died with `WouldBlock` whenever a loaded node answered slowly), both
+   have compose `restart: on-failure`, and the controller bootstrap resumes exactly
+   from any height (stage table with fixed target heights; wallets are loaded if
+   they exist). Remaining work is retrying transient errors in-process instead of
+   crashing into a restart.
 
 2. **Rust tool images are single-stage `rust:latest`** (~2.6 GB each; the Dockerfiles'
    own TODO). Multistage build, copy the binary into a slim runtime. Also listed under
@@ -260,6 +262,8 @@ spam enabled).
 
 - use a rust logging tool instead of print
 - use a rust error managing tool
+- use config module to read env, and serve configs
+- parallelize spammer per node
 
 ---
 

@@ -1,13 +1,26 @@
-use bitcoincore_rpc::{bitcoin::{hashes::{hash160, Hash}, Address, Amount, Network, ScriptBuf, Txid, WPubkeyHash}, Auth, Client, RpcApi};
+use bitcoincore_rpc::{bitcoin::{hashes::{hash160, Hash}, Address, Amount, Network, ScriptBuf, Txid, WPubkeyHash}, jsonrpc, Client, RpcApi};
 use serde_json::json;
 use std::{env, thread, time::Duration};
+
+// A node busy with a big mempool or mid-block-assembly can take longer than
+// the default 15s RPC timeout (a large sendmany alone can), and the client
+// then dies on a WouldBlock socket error. Generous timeout instead; healthy
+// calls are unaffected.
+const RPC_TIMEOUT_SECS: u64 = 300;
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
 fn create_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Client {
-    Client::new(rpc_url, Auth::UserPass(rpc_user.to_string(), rpc_pass.to_string())).unwrap()
+    let (user, pass) = (rpc_user.to_string(), Some(rpc_pass.to_string()));
+    let transport = jsonrpc::simple_http::SimpleHttpTransport::builder()
+        .url(rpc_url)
+        .expect("invalid RPC url")
+        .auth(user, pass)
+        .timeout(Duration::from_secs(RPC_TIMEOUT_SECS))
+        .build();
+    Client::from_jsonrpc(jsonrpc::client::Client::with_transport(transport))
 }
 
 fn get_new_wallet_address(wallet: &Client) -> Address {

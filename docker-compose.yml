@@ -158,6 +158,9 @@ services:
     build:
       context: ./mining-controller
     container_name: btc-simnet-mining-controller
+    # A crash (e.g. an RPC hiccup) must not stop the chain: the bootstrap is
+    # stage-resumable, so restarting mid-run (even mid-bootstrap) is safe.
+    restart: on-failure
     depends_on:
       btc-simnet-node1:
         condition: service_healthy
@@ -181,6 +184,8 @@ services:
     build:
       context: ./spammer
     container_name: btc-simnet-spammer
+    # Stateless between cycles: safe to restart after a crash, spam resumes.
+    restart: on-failure
     depends_on:
       btc-simnet-node1:
         condition: service_healthy
