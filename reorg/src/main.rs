@@ -42,7 +42,10 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn create_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Client {
@@ -71,7 +74,10 @@ fn wait_for_node(node: &Client, name: &str) {
 }
 
 /// (height, hash, tx count) for the last `count` blocks, tip first.
-fn last_blocks(node: &Client, count: u64) -> Result<Vec<(u64, String, usize)>, bitcoincore_rpc::Error> {
+fn last_blocks(
+    node: &Client,
+    count: u64,
+) -> Result<Vec<(u64, String, usize)>, bitcoincore_rpc::Error> {
     let tip = node.get_block_count()?;
     let mut blocks = Vec::new();
     for i in 0..count {
@@ -105,7 +111,10 @@ fn inject_transactions(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Cli
     let wallet_name = match node.list_wallets() {
         Ok(wallets) if wallets.contains(&preferred) => preferred,
         Ok(wallets) if !wallets.is_empty() => {
-            println!("Wallet '{preferred}' not loaded on the reorg node, using '{}' instead", wallets[0]);
+            println!(
+                "Wallet '{preferred}' not loaded on the reorg node, using '{}' instead",
+                wallets[0]
+            );
             wallets[0].clone()
         }
         _ => {
@@ -113,7 +122,11 @@ fn inject_transactions(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Cli
             return;
         }
     };
-    let wallet = create_client(&format!("{rpc_url}/wallet/{wallet_name}"), rpc_user, rpc_pass);
+    let wallet = create_client(
+        &format!("{rpc_url}/wallet/{wallet_name}"),
+        rpc_user,
+        rpc_pass,
+    );
     let address = match wallet.get_new_address(None, None) {
         Ok(a) => match a.require_network(Network::Regtest) {
             Ok(a) => a,
@@ -123,13 +136,24 @@ fn inject_transactions(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Cli
             }
         },
         Err(e) => {
-            println!("Could not get an address from wallet '{wallet_name}' ({e}), skipping tx injection");
+            println!(
+                "Could not get an address from wallet '{wallet_name}' ({e}), skipping tx injection"
+            );
             return;
         }
     };
     let mut sent = 0;
     for _ in 0..count {
-        match wallet.send_to_address(&address, Amount::from_sat(1000), None, None, None, None, None, None) {
+        match wallet.send_to_address(
+            &address,
+            Amount::from_sat(1000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ) {
             Ok(_) => sent += 1,
             Err(e) => {
                 println!("Tx injection stopped after {sent} txs: {e}");
@@ -198,7 +222,10 @@ fn ensure_network_adopts(
 fn live_mempool_topo(node: &Client) -> Result<Vec<Txid>, bitcoincore_rpc::Error> {
     let mut entries: Vec<(u64, Txid)> = Vec::new();
     for txid in node.get_raw_mempool()? {
-        let ancestors = node.get_mempool_entry(&txid).map(|e| e.ancestor_count).unwrap_or(0);
+        let ancestors = node
+            .get_mempool_entry(&txid)
+            .map(|e| e.ancestor_count)
+            .unwrap_or(0);
         entries.push((ancestors, txid));
     }
     entries.sort_by_key(|(ancestors, _)| *ancestors);
@@ -212,11 +239,21 @@ fn live_mempool_topo(node: &Client) -> Result<Vec<Txid>, bitcoincore_rpc::Error>
 /// re-filter to what is still in the mempool and retry once; if nothing valid
 /// remains (or the rejection was not about a missing tx), mine a real empty
 /// block. Never drains the mempool.
-fn mine_exact(node: &Client, mine_address: &Address, txids: &[Txid]) -> Result<(), bitcoincore_rpc::Error> {
+fn mine_exact(
+    node: &Client,
+    mine_address: &Address,
+    txids: &[Txid],
+) -> Result<(), bitcoincore_rpc::Error> {
     let list: Vec<String> = txids.iter().map(|t| t.to_string()).collect();
-    match node.call::<serde_json::Value>("generateblock", &[json!(mine_address.to_string()), json!(list)]) {
+    match node.call::<serde_json::Value>(
+        "generateblock",
+        &[json!(mine_address.to_string()), json!(list)],
+    ) {
         Ok(_) => return Ok(()),
-        Err(e) => println!("generateblock rejected {} tx(s) ({e}), re-filtering to the live mempool...", list.len()),
+        Err(e) => println!(
+            "generateblock rejected {} tx(s) ({e}), re-filtering to the live mempool...",
+            list.len()
+        ),
     }
 
     let live: HashSet<Txid> = node.get_raw_mempool()?.into_iter().collect();
@@ -232,11 +269,23 @@ fn mine_exact(node: &Client, mine_address: &Address, txids: &[Txid]) -> Result<(
     // untouched txs stay in the mempool for the next block's sweep.
     let dropped = list.len() - filtered.len();
     if !filtered.is_empty() && dropped > 0 {
-        println!("  dropped {dropped} stale tx(s), mining the remaining {}", filtered.len());
-        node.call::<serde_json::Value>("generateblock", &[json!(mine_address.to_string()), json!(filtered)])?;
+        println!(
+            "  dropped {dropped} stale tx(s), mining the remaining {}",
+            filtered.len()
+        );
+        node.call::<serde_json::Value>(
+            "generateblock",
+            &[json!(mine_address.to_string()), json!(filtered)],
+        )?;
     } else {
-        println!("  mining an empty block, {} tx(s) left for the next block", filtered.len());
-        node.call::<serde_json::Value>("generateblock", &[json!(mine_address.to_string()), json!(Vec::<String>::new())])?;
+        println!(
+            "  mining an empty block, {} tx(s) left for the next block",
+            filtered.len()
+        );
+        node.call::<serde_json::Value>(
+            "generateblock",
+            &[json!(mine_address.to_string()), json!(Vec::<String>::new())],
+        )?;
     }
     Ok(())
 }
@@ -333,7 +382,10 @@ fn do_reorg(
         }
     }
 
-    println!("\n=== Reorg done: blocks from height {target_height} replaced, new tip {} ===", node.get_block_count()?);
+    println!(
+        "\n=== Reorg done: blocks from height {target_height} replaced, new tip {} ===",
+        node.get_block_count()?
+    );
     Ok(())
 }
 
@@ -343,11 +395,15 @@ fn main() {
     let node_name = env_or("REORG_NODE", "btc-simnet-node3");
     let rpc_port = env_or("REORG_NODE_RPC_PORT", "18443");
     let mode = env_or("REORG_MODE", "once");
-    let every: u64 = env_or("AUTO_REORG_EVERY_BLOCKS", "20").parse().expect("AUTO_REORG_EVERY_BLOCKS must be a positive integer");
+    let every: u64 = env_or("AUTO_REORG_EVERY_BLOCKS", "20")
+        .parse()
+        .expect("AUTO_REORG_EVERY_BLOCKS must be a positive integer");
     // Brand-new txs the reorg node mines into the winning chain, modelling a
     // node that received transactions its peers have not yet seen. Seeded into
     // the mempool before mining (0 disables). Ignored in empty mode.
-    let adds_new_txs: u64 = env_or("REORG_ADDS_NEW_TXS", "5").parse().expect("REORG_ADDS_NEW_TXS must be a non-negative integer");
+    let adds_new_txs: u64 = env_or("REORG_ADDS_NEW_TXS", "5")
+        .parse()
+        .expect("REORG_ADDS_NEW_TXS must be a non-negative integer");
 
     // CLI arguments, order-independent, forwarded through simulate-reorg.sh:
     //   <depth>          the first bare number, else REORG_DEPTH
@@ -360,16 +416,25 @@ fn main() {
     let depth: u64 = cli_args
         .iter()
         .find_map(|a| a.parse::<u64>().ok())
-        .unwrap_or_else(|| env_or("REORG_DEPTH", "3").parse().expect("REORG_DEPTH must be a positive integer"));
+        .unwrap_or_else(|| {
+            env_or("REORG_DEPTH", "3")
+                .parse()
+                .expect("REORG_DEPTH must be a positive integer")
+        });
     if depth < 1 {
         eprintln!("Reorg depth must be at least 1");
         process::exit(1);
     }
 
-    let mine_address: Address<NetworkUnchecked> = env_or("REORG_MINE_ADDRESS", "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr")
-        .parse()
-        .expect("Invalid REORG_MINE_ADDRESS");
-    let mine_address = mine_address.require_network(Network::Regtest).expect("REORG_MINE_ADDRESS must be a regtest address");
+    let mine_address: Address<NetworkUnchecked> = env_or(
+        "REORG_MINE_ADDRESS",
+        "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr",
+    )
+    .parse()
+    .expect("Invalid REORG_MINE_ADDRESS");
+    let mine_address = mine_address
+        .require_network(Network::Regtest)
+        .expect("REORG_MINE_ADDRESS must be a regtest address");
 
     let rpc_url = format!("http://{node_name}:{rpc_port}");
     let node = create_client(&rpc_url, &rpc_user, &rpc_pass);
@@ -383,20 +448,36 @@ fn main() {
     let witness: Option<(&Client, &str)> = if witness_name == "none" || witness_name == node_name {
         None
     } else {
-        witness_client = create_client(&format!("http://{witness_name}:{rpc_port}"), &rpc_user, &rpc_pass);
+        witness_client = create_client(
+            &format!("http://{witness_name}:{rpc_port}"),
+            &rpc_user,
+            &rpc_pass,
+        );
         Some((&witness_client, witness_name.as_str()))
     };
 
     match mode.as_str() {
         "once" => {
-            if let Err(e) = do_reorg(&node, &rpc_url, &rpc_user, &rpc_pass, depth, &mine_address, adds_new_txs, empty_mode, witness) {
+            if let Err(e) = do_reorg(
+                &node,
+                &rpc_url,
+                &rpc_user,
+                &rpc_pass,
+                depth,
+                &mine_address,
+                adds_new_txs,
+                empty_mode,
+                witness,
+            ) {
                 eprintln!("Reorg failed: {e}");
                 process::exit(1);
             }
         }
         "auto" => {
             if every <= depth {
-                eprintln!("AUTO_REORG_EVERY_BLOCKS ({every}) must be greater than REORG_DEPTH ({depth})");
+                eprintln!(
+                    "AUTO_REORG_EVERY_BLOCKS ({every}) must be greater than REORG_DEPTH ({depth})"
+                );
                 process::exit(1);
             }
             let mut last = node.get_block_count().expect("get_block_count failed");
@@ -404,7 +485,17 @@ fn main() {
             loop {
                 match node.get_block_count() {
                     Ok(tip) if tip >= last + every => {
-                        if let Err(e) = do_reorg(&node, &rpc_url, &rpc_user, &rpc_pass, depth, &mine_address, adds_new_txs, empty_mode, witness) {
+                        if let Err(e) = do_reorg(
+                            &node,
+                            &rpc_url,
+                            &rpc_user,
+                            &rpc_pass,
+                            depth,
+                            &mine_address,
+                            adds_new_txs,
+                            empty_mode,
+                            witness,
+                        ) {
                             eprintln!("Reorg failed: {e}");
                         }
                         last = node.get_block_count().unwrap_or(tip);

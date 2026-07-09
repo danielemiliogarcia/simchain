@@ -158,6 +158,9 @@ services:
     build:
       context: ./mining-controller
     container_name: btc-simnet-mining-controller
+    # A crash (e.g. an RPC hiccup) must not stop the chain: the bootstrap is
+    # stage-resumable, so restarting mid-run (even mid-bootstrap) is safe.
+    restart: on-failure
     depends_on:
       btc-simnet-node1:
         condition: service_healthy
@@ -181,6 +184,8 @@ services:
     build:
       context: ./spammer
     container_name: btc-simnet-spammer
+    # Stateless between cycles: safe to restart after a crash, spam resumes.
+    restart: on-failure
     depends_on:
       btc-simnet-node1:
         condition: service_healthy
@@ -194,7 +199,8 @@ services:
       - btc-simnet-network
     environment:
       - ENABLE_SPAM=${ENABLE_SPAM:-true}
-      - SPAM_PER_MINER_PER_BLOCK=${SPAM_PER_MINER_PER_BLOCK:-50}
+      - SPAM_TXS_PER_BLOCK=${SPAM_TXS_PER_BLOCK:-100}
+      - SPAM_SENDMANY_OUTPUTS=${SPAM_SENDMANY_OUTPUTS:-0}
       - SPAM_FANOUT_UTXOS=${SPAM_FANOUT_UTXOS:-50}
       - ENABLE_SPAM_REPLACES=${ENABLE_SPAM_REPLACES:-false}
       - SPAM_REPLACES_PER_MINER_PER_BLOCK=${SPAM_REPLACES_PER_MINER_PER_BLOCK:-5}
@@ -222,6 +228,9 @@ services:
     container_name: btc-simnet-reorg
     restart: "no"
     depends_on:
+    # user can specify a different reorg node, default is node3
+      btc-simnet-node2:
+        condition: service_healthy
       btc-simnet-node3:
         condition: service_healthy
     networks:

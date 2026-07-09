@@ -46,12 +46,14 @@ Accepted decisions (not defects, recorded so they are not re-reported):
 Findings, ordered by severity:
 
 1. **No RPC retries; transient errors are panics** (controller and spammer). Every call
-   is `.unwrap()`: a node hiccup mid-run kills the process permanently, and neither
-   service has a compose `restart` policy, so mining or spam silently stops. The reorg
-   tool is the exception (Results, retry loop, long RPC timeout) and can serve as the
-   template. The controller bootstrap is now restart-safe (wallets are loaded if they
-   exist, funding is skipped once the chain is bootstrapped), so adding
-   `restart: on-failure` to both services is a cheap interim mitigation.
+   is `.unwrap()`: a node hiccup mid-run kills the process. The reorg tool is the
+   exception (Results, retry loop) and can serve as the template.
+   Mitigations in place: both services use the reorg tool's 300s RPC timeout (the
+   default 15s died with `WouldBlock` whenever a loaded node answered slowly), both
+   have compose `restart: on-failure`, and the controller bootstrap resumes exactly
+   from any height (stage table with fixed target heights; wallets are loaded if
+   they exist). Remaining work is retrying transient errors in-process instead of
+   crashing into a restart.
 
 2. **Rust tool images are single-stage `rust:latest`** (~2.6 GB each; the Dockerfiles'
    own TODO). Multistage build, copy the binary into a slim runtime. Also listed under
@@ -78,13 +80,7 @@ Findings, ordered by severity:
    ends mid-2026). The official `bitcoin/bitcoin` images are bookworm-based. Bump to
    `bookworm-slim` next time the image is touched.
 
-7. **`btc-simnet-reorg` gates on the wrong node when `REORG_NODE` is overridden.**
-   compose hardcodes `depends_on: btc-simnet-node3: service_healthy` while the target
-   node is configurable; with `REORG_NODE=btc-simnet-node2` the one-shot run waits on
-   node3's health instead. Harmless today (the tool also polls its node's RPC), worth
-   a comment or depending on all nodes.
-
-8. **No Cargo workspace; helpers duplicated three times.** `env_or`/`create_client`
+7. **No Cargo workspace; helpers duplicated three times.** `env_or`/`create_client`
    are copy-pasted per tool, and compose builds three independent dependency graphs
    serially (three `target/` dirs, three lock states). A workspace with one shared
    util crate, or a single multi-binary crate with three Dockerfile targets, would cut
@@ -266,6 +262,7 @@ spam enabled).
 
 - use a rust logging tool instead of print
 - use a rust error managing tool
+- use config module to read env, and serve configs
 
 ---
 

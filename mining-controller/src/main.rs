@@ -1,4 +1,7 @@
-use bitcoincore_rpc::{bitcoin::{address::NetworkUnchecked, Address, BlockHash, Network}, Auth, Client, RpcApi};
+use bitcoincore_rpc::{
+    bitcoin::{address::NetworkUnchecked, Address, BlockHash, Network},
+    jsonrpc, Client, RpcApi,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::{env, thread, time::Duration};
 
@@ -7,12 +10,29 @@ use std::{env, thread, time::Duration};
 // bottom of the window (the same rule chainwatch.sh uses).
 const REORG_WINDOW: u64 = 100;
 
+// Height at which the bootstrap sequence (funding + coinbase maturity) ends.
+const BOOTSTRAP_END: u64 = 204;
+
+// A node assembling a full 4M WU block under spam load can take longer than
+// the default 15s RPC timeout; the client then dies on a WouldBlock socket
+// error while the node quietly finishes the call. Generous timeout instead:
+// a healthy call is unaffected, and a node that needs this long is wedged
+// enough that crashing (and restarting) is the right outcome.
+const RPC_TIMEOUT_SECS: u64 = 300;
+
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
 fn create_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Client {
-    Client::new(rpc_url, Auth::UserPass(rpc_user.to_string(), rpc_pass.to_string())).unwrap()
+    let (user, pass) = (rpc_user.to_string(), Some(rpc_pass.to_string()));
+    let transport = jsonrpc::simple_http::SimpleHttpTransport::builder()
+        .url(rpc_url)
+        .expect("invalid RPC url")
+        .auth(user, pass)
+        .timeout(Duration::from_secs(RPC_TIMEOUT_SECS))
+        .build();
+    Client::from_jsonrpc(jsonrpc::client::Client::with_transport(transport))
 }
 
 fn wait_for_rpc(client: &Client, name: &str) {
@@ -43,7 +63,13 @@ fn wait_for_height(client: &Client, height: u64) {
 // the node later (the generic RPC path breaks with more than one wallet).
 // Restart-safe: if the wallet already exists on disk it is loaded instead,
 // and if it is already loaded it is used as-is.
-fn setup_wallet(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Client, wallet_name: &str) -> (Client, Address) {
+fn setup_wallet(
+    rpc_url: &str,
+    rpc_user: &str,
+    rpc_pass: &str,
+    node: &Client,
+    wallet_name: &str,
+) -> (Client, Address) {
     if let Err(create_err) = node.create_wallet(wallet_name, None, None, None, None) {
         match node.load_wallet(wallet_name) {
             Ok(_) => println!("Wallet '{wallet_name}' already exists, loaded it"),
@@ -55,7 +81,11 @@ fn setup_wallet(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Client, wa
             }
         }
     }
-    let wallet = create_client(&format!("{rpc_url}/wallet/{wallet_name}"), rpc_user, rpc_pass);
+    let wallet = create_client(
+        &format!("{rpc_url}/wallet/{wallet_name}"),
+        rpc_user,
+        rpc_pass,
+    );
     let address = wallet.get_new_address(None, None).unwrap();
     let address = address.require_network(Network::Regtest).unwrap();
     (wallet, address)
@@ -73,7 +103,10 @@ struct ChainView {
 
 impl ChainView {
     fn new() -> Self {
-        ChainView { seen: BTreeMap::new(), own: HashSet::new() }
+        ChainView {
+            seen: BTreeMap::new(),
+            own: HashSet::new(),
+        }
     }
 
     fn record(&mut self, height: u64, hash: BlockHash, mined_by_us: bool) {
@@ -102,7 +135,9 @@ impl ChainView {
             }
         }
         // Nothing matches: the reorg is deeper than the window.
-        self.seen.first_key_value().map_or(0, |(&h, _)| h.saturating_sub(1))
+        self.seen
+            .first_key_value()
+            .map_or(0, |(&h, _)| h.saturating_sub(1))
     }
 }
 
@@ -145,7 +180,9 @@ fn sync_view(view: &mut ChainView, node: &Client, last: u64) -> u64 {
     for h in from..=tip {
         // A block can vanish mid-walk if another reorg lands right now; stop
         // and let the next round re-sync.
-        let Ok(hash) = node.get_block_hash(h) else { break };
+        let Ok(hash) = node.get_block_hash(h) else {
+            break;
+        };
         let mined_by_us = view.own.contains(&hash);
         if !mined_by_us {
             println!("EXTERNAL block [{h}] {hash} (not mined by this controller)");
@@ -158,8 +195,13 @@ fn sync_view(view: &mut ChainView, node: &Client, last: u64) -> u64 {
 fn main() {
     // Every setting has a default matching docker-compose.yml, so the tool
     // also runs standalone with no environment at all.
-    let user_address = env_or("USER_ADDRESS", "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr");
-    let interval_secs: u64 = env_or("BLOCK_INTERVAL_SECS", "15").parse().expect("BLOCK_INTERVAL_SECS must be a positive integer");
+    let user_address = env_or(
+        "USER_ADDRESS",
+        "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr",
+    );
+    let interval_secs: u64 = env_or("BLOCK_INTERVAL_SECS", "15")
+        .parse()
+        .expect("BLOCK_INTERVAL_SECS must be a positive integer");
 
     let rpc_user = env_or("BTC_RPC_USER", "foo");
     let rpc_pass = env_or("BTC_RPC_PASS", "rpcpassword");
@@ -171,7 +213,8 @@ fn main() {
     let node2 = create_client(&node2_url, &rpc_user, &rpc_pass);
     let node3 = create_client(&node3_url, &rpc_user, &rpc_pass);
 
-    let user_address: Address<NetworkUnchecked> = user_address.parse().expect("Invalid Bitcoin address");
+    let user_address: Address<NetworkUnchecked> =
+        user_address.parse().expect("Invalid Bitcoin address");
     let user_address = user_address.require_network(Network::Regtest).unwrap();
 
     println!("Waiting for nodes to be ready");
@@ -181,82 +224,65 @@ fn main() {
     // Bootstrap plan: block 1 to node2's wallet, block 2 to node3's wallet,
     // blocks 3 and 4 to the user address, then two 50-block funding batches
     // (to node2 then node3), then two 50-block maturity batches. The chain
-    // ends at height 204. Coinbase maturity is 100 blocks, and node3's funding
-    // batch is mined last (heights 55-104, maturing 155-204), so burying to
-    // height 204 leaves BOTH miner wallets fully liquid at handoff (~51 mature
-    // coinbases, ~2550 BTC each) instead of a single mature reward. The
-    // maturity batches also go to the miner wallets, so their coinbases keep
-    // maturing during the run (heights 205-304), sustaining long sessions.
+    // ends at height BOOTSTRAP_END (204). Coinbase maturity is 100 blocks,
+    // and node3's funding batch is mined last (heights 55-104, maturing
+    // 155-204), so burying to height 204 leaves BOTH miner wallets fully
+    // liquid at handoff (~51 mature coinbases, ~2550 BTC each) instead of a
+    // single mature reward. The maturity batches also go to the miner
+    // wallets, so their coinbases keep maturing during the run (heights
+    // 205-304), sustaining long sessions.
     let (_wallet2, addr2) = setup_wallet(&node2_url, &rpc_user, &rpc_pass, &node2, &wallet2_name);
     let (_wallet3, addr3) = setup_wallet(&node3_url, &rpc_user, &rpc_pass, &node3, &wallet3_name);
 
-    // Restart-safe: if the chain is already past the bootstrap height the
-    // funding already happened, re-running it would fund the user again.
+    // Each stage ends at a fixed height, so the sequence is resumable: on
+    // restart a completed stage is skipped (height already >= its target)
+    // and an interrupted batch mines only its missing remainder -- the chain
+    // never gets extra blocks and the user is never funded twice. Coinbase
+    // pays the stage address no matter which node mines, so resuming
+    // mid-batch cannot misassign funds.
+    // (target height, miner, sync witness, reward address, label)
+    let stages: [(u64, &Client, &Client, &Address, &str); 8] = [
+        (1, &node2, &node3, &addr2, "node2 wallet block"),
+        (2, &node3, &node2, &addr3, "node3 wallet block"),
+        (3, &node2, &node3, &user_address, "user funding block 3"),
+        (4, &node3, &node2, &user_address, "user funding block 4"),
+        (54, &node2, &node3, &addr2, "node2 funding batch"),
+        (104, &node3, &node2, &addr3, "node3 funding batch"),
+        (154, &node2, &node3, &addr2, "node2 maturity batch"),
+        (204, &node3, &node2, &addr3, "node3 maturity batch"),
+    ];
+    assert_eq!(
+        stages[stages.len() - 1].0,
+        BOOTSTRAP_END,
+        "stage table must end at BOOTSTRAP_END"
+    );
+
     let mut height = node2.get_block_count().unwrap();
-    if height >= 204 {
+    if height >= BOOTSTRAP_END {
         println!("Chain already bootstrapped (height {height}), skipping the funding sequence");
-    } else {
-        println!("Node 2 => Mining block 1 to its own wallet address {addr2}");
-        let _ = node2.generate_to_address(1, &addr2).unwrap();
-        height = node2.get_block_count().unwrap();
-        println!("Waiting for network sync, so blocks do not compete and stack on each other");
-        wait_for_height(&node3, height);
-
-        println!("Node 3 => Mining block 2 to its own wallet address {addr3}");
-        let _ = node3.generate_to_address(1, &addr3).unwrap();
-        height = node3.get_block_count().unwrap();
-        wait_for_height(&node2, height);
-
-        println!("Funding user address {user_address} with blocks 3 and 4");
-        println!("Node 2 => Mining a block to address {user_address}");
-        let _ = node2.generate_to_address(1, &user_address).unwrap();
-        height = node2.get_block_count().unwrap();
-        wait_for_height(&node3, height);
-
-        println!("Node 3 => Mining a block to address {user_address}");
-        let _ = node3.generate_to_address(1, &user_address).unwrap();
-        height = node3.get_block_count().unwrap();
-        wait_for_height(&node2, height);
-        println!("New block height: {height}");
-
-        // Funding batches: 50 blocks to each miner wallet (node2 h5-54,
-        // node3 h55-104). These also mature blocks 1-4 (block 4 matures at
-        // height 104).
-        println!("Node 2 => Mining 50 funding blocks to address {addr2}");
-        node2.generate_to_address(50, &addr2).unwrap();
-        height = node2.get_block_count().unwrap();
-        println!("Waiting network to sync");
-        wait_for_height(&node3, height);
-        println!("New block height: {height}");
-
-        println!("Node 3 => Mining 50 funding blocks to address {addr3}");
-        node3.generate_to_address(50, &addr3).unwrap();
-        height = node3.get_block_count().unwrap();
-        println!("Waiting network to sync");
-        wait_for_height(&node2, height);
-        println!("New block height: {height}");
-
-        // Maturity batches: 100 more blocks (to height 204) so the funding
-        // batches above pass coinbase maturity before the spammer starts.
-        // node3's funding (h55-104) matures at h155-204, so 100 blocks are
-        // needed, not 50. Mined to the miner wallets so they keep maturing
-        // during the run (h205-304).
-        println!("Node 2 => Mining 50 maturity blocks to address {addr2}");
-        node2.generate_to_address(50, &addr2).unwrap();
-        height = node2.get_block_count().unwrap();
-        println!("Waiting network to sync");
-        wait_for_height(&node3, height);
-        println!("New block height: {height}");
-
-        println!("Node 3 => Mining 50 maturity blocks to address {addr3}");
-        node3.generate_to_address(50, &addr3).unwrap();
-        height = node3.get_block_count().unwrap();
-        println!("Waiting network to sync");
-        wait_for_height(&node2, height);
+    } else if height > 0 {
+        println!("Resuming interrupted bootstrap at height {height}");
+    }
+    for (target, miner, witness, addr, label) in stages {
+        if height >= target {
+            continue;
+        }
+        println!(
+            "Bootstrap => Mining {} block(s) to address {addr} ({label}, up to height {target})",
+            target - height
+        );
+        miner.generate_to_address(target - height, addr).unwrap();
+        height = miner.get_block_count().unwrap();
+        // Wait for the other node to sync before the next stage mines on
+        // top, so blocks do not compete and stack on each other.
+        wait_for_height(witness, height);
         println!("New block height: {height}");
     }
 
-    println!("\nActual block height: {}", node2.get_block_count().unwrap());
+    println!(
+        "\nActual block height: {}",
+        node2.get_block_count().unwrap()
+    );
 
     println!("\n//////////////////////////////////////////////////////////////////\n");
     println!("Funds in address {user_address} are mature and ready to spend.");
