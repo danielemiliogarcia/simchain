@@ -150,9 +150,10 @@ dust UTXOs (~18k) until the send cycle no longer fit any interval (measured: 54s
 fresh → 15+ min after ~2h). Burned dust never enters a wallet; the miners only keep
 their own change, so the cycle time stays flat. The cost is a slow drain, ~0.16 BTC
 per full block against a ~2550 BTC bootstrap balance — thousands of blocks of margin.
-If blocks still come out partial, check the real cycle time with
-`docker logs -t btc-simnet-spammer` (gap between the two `Spamming ...` lines of one
-round) and keep `BLOCK_INTERVAL_SECS` above it.
+The spammer works both wallets in parallel (one thread per miner node), so the
+cycle is bound by the slower half, not the sum. If blocks still come out partial,
+check the real cycle time in `docker logs btc-simnet-spammer` (the
+`Spam cycle done in ...` line each round) and keep `BLOCK_INTERVAL_SECS` above it.
 
 Sequential p2p-like arrival (`SPAM_SENDMANY_OUTPUTS=0`), full blocks:
 

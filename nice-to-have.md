@@ -263,7 +263,6 @@ spam enabled).
 - use a rust logging tool instead of print
 - use a rust error managing tool
 - use config module to read env, and serve configs
-- parallelize spammer per node
 
 ---
 

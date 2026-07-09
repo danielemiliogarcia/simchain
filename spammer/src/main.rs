@@ -214,6 +214,40 @@ fn bump_spam_txs(wallet: &Client, label: &str, txids: &[Txid], count: u64) {
     }
 }
 
+// One wallet's full spam round: top up the fan-out pool if it ran low, send
+// this wallet's share of the block's spam, then fee-bump its own txs when RBF
+// traffic is enabled. Each wallet lives on its own node, so running one round
+// per thread gives two independent RPC pipelines against two independent
+// bitcoind processes and roughly halves the send cycle compared to spamming
+// the wallets one after the other.
+fn spam_round(
+    wallet: &Client,
+    wallet_name: &str,
+    label: &str,
+    share: u64,
+    fanout_need: u64,
+    fanout_utxos: u64,
+    seq_addr: &Address,
+    batch_addrs: &[Address],
+    replaceable: bool,
+    replaces: u64,
+) -> Vec<Txid> {
+    if fanout_utxos > 0 {
+        ensure_fanout(wallet, wallet_name, fanout_need, fanout_utxos);
+    }
+    let txids = if !batch_addrs.is_empty() {
+        println!("{label} => Spamming {share} sendmany batches of {} outputs to burn addresses", batch_addrs.len());
+        send_spam_batch(wallet, batch_addrs, share, replaceable)
+    } else {
+        println!("{label} => Spamming {share} transactions to address {seq_addr}");
+        send_spam_tx(wallet, seq_addr, share, replaceable)
+    };
+    if replaceable {
+        bump_spam_txs(wallet, label, &txids, replaces);
+    }
+    txids
+}
+
 fn main() {
     // Every setting has a default matching docker-compose.yml, so the tool
     // also runs standalone with no environment at all.
@@ -289,30 +323,20 @@ fn main() {
         let current_block_height = node1.get_block_count().unwrap();
         if current_block_height > spammed_at_block_height {
             spammed_at_block_height = current_block_height;
-            // Top up the independent-UTXO pool if it ran low (fans out on the
-            // first block, then only after a reorg or dust build-up depletes it).
-            if fanout_utxos > 0 {
-                ensure_fanout(&wallet2, &wallet2_name, fanout_need, fanout_utxos);
-                ensure_fanout(&wallet3, &wallet3_name, fanout_need, fanout_utxos);
-            }
-            // spam transactions to burn addresses
-            let (txids2, txids3) = if sendmany_outputs > 0 {
-                println!("Node 2 => Spamming {spam2} sendmany batches of {sendmany_outputs} outputs to burn addresses");
-                let txids2 = send_spam_batch(&wallet2, &batch_addrs, spam2, enable_replaces);
-                println!("Node 3 => Spamming {spam3} sendmany batches of {sendmany_outputs} outputs to burn addresses");
-                let txids3 = send_spam_batch(&wallet3, &batch_addrs, spam3, enable_replaces);
-                (txids2, txids3)
-            } else {
-                println!("Node 2 => Spamming {spam2} transactions to address {seq_addr}");
-                let txids2 = send_spam_tx(&wallet2, &seq_addr, spam2, enable_replaces);
-                println!("Node 3 => Spamming {spam3} transactions to address {seq_addr}");
-                let txids3 = send_spam_tx(&wallet3, &seq_addr, spam3, enable_replaces);
-                (txids2, txids3)
-            };
-            if enable_replaces {
-                bump_spam_txs(&wallet2, "Node 2", &txids2, replaces_per_miner);
-                bump_spam_txs(&wallet3, "Node 3", &txids3, replaces_per_miner);
-            }
+            // One thread per wallet: fan-out top-up, this block's spam and
+            // the wallet's own RBF bumps, both wallets working their own
+            // node at the same time.
+            let cycle_start = std::time::Instant::now();
+            let (txids2, txids3) = thread::scope(|s| {
+                let t2 = s.spawn(|| spam_round(&wallet2, &wallet2_name, "Node 2", spam2, fanout_need, fanout_utxos, &seq_addr, &batch_addrs, enable_replaces, replaces_per_miner));
+                let t3 = s.spawn(|| spam_round(&wallet3, &wallet3_name, "Node 3", spam3, fanout_need, fanout_utxos, &seq_addr, &batch_addrs, enable_replaces, replaces_per_miner));
+                (t2.join().expect("node2 spam thread panicked"), t3.join().expect("node3 spam thread panicked"))
+            });
+            println!(
+                "Spam cycle done in {:.1}s ({} txs accepted)",
+                cycle_start.elapsed().as_secs_f32(),
+                txids2.len() + txids3.len()
+            );
         }
         thread::sleep(Duration::from_millis(200));
     }
