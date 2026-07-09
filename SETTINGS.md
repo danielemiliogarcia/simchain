@@ -98,10 +98,49 @@ The three fee settings look similar but act at different points of a transaction
 
 | Variable | Default | Description |
 |---|---|---|
-| `MIN_RELAY_TX_FEE` | `0.00001` | Node mempool/relay floor (feerate, BTC/kvB). |
-| `FALLBACK_FEE` | `0.0001` | Wallet feerate when estimation has no data (BTC/kvB). |
+| `MIN_RELAY_TX_FEE` | `0.00001` | Node mempool/relay floor (feerate, BTC/kvB). Keep at the mainnet default; see [The fee market](#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor) for why it is the wrong knob for a fee floor. |
+| `FALLBACK_FEE` | `0.0001` | Wallet feerate when estimation has no data (BTC/kvB). Also the simnet's whole price level: all spam pays this rate, so raising it sets an economic fee floor — see [The fee market](#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor). |
 | `MAX_TX_FEE` | `10000000` | Wallet cap on the total fee of one tx (whole BTC). |
 | `NODE1_DISABLE_WALLET` | `1` | node1 has no wallet by default: it mimics a 3rd-party production endpoint with no hot wallet online, so the user manages keys externally and submits signed raw transactions. Set `0` to enable the wallet. |
+
+### The fee market: what spam pays, and how to set a price floor
+
+The spammer never sets an explicit fee rate. Every send lets the sending node's
+wallet choose: the wallet asks its own fee estimator, the estimator has no data on a
+fresh chain, and the wallet falls back to `FALLBACK_FEE`. With the defaults every
+spam tx pays ~10 sat/vB — the uniform rate visible in the explorer.
+
+The estimator never escapes that level. Once it has data, its only data is the spam
+itself, and all of it confirmed at the fallback rate — so it recommends that same
+rate back and the spam keeps paying it. `FALLBACK_FEE` is therefore not just a
+bootstrap value: it sets the simnet's price level permanently.
+
+That makes it a one-line **economic fee floor**. Combine a
+[full-blocks recipe](#full-blocks) with, say, `FALLBACK_FEE=0.001` (100 sat/vB) and
+the background traffic outbids anything cheaper: a user transaction paying more than
+the spam rate jumps the queue and confirms next block; one paying less still relays
+fine (the relay floor stays at 1 sat/vB), sits visibly in the mempool, and full
+blocks keep passing it over — exactly how mainnet feels in a high-fee period. The
+floor only exists while spam keeps blocks full; with partial blocks everything
+confirms and the floor vanishes.
+
+The cost is mostly recycled, not burned: node2/node3 pay the spam fees *and* mine
+the blocks, so the fees return to the same wallets as coinbase after the 100-block
+maturity. Only the 546-sat burn outputs really leave the wallets.
+
+**Do not use `MIN_RELAY_TX_FEE` as the floor.** The wallets would cope — Bitcoin
+Core clamps every wallet send to `max(-mintxfee, -minrelaytxfee)`, so spam would
+still relay — but the semantics are wrong twice. It is policy drift: mainnet's
+relay floor is 1 sat/vB, and raising it makes the simnet's nodes stop behaving like
+mainnet nodes. And it turns the floor into a hard reject: a cheap user transaction
+bounces at node1 with `min relay fee not met` instead of waiting in the mempool
+like it would on mainnet. Fee pressure should come from traffic (tooling), not from
+node policy.
+
+Limitation: all spam sits in one fee bucket at whatever level you set — fee
+histograms stay flat and `estimatesmartfee` just echoes the level. A spread of fee
+rates with real competition inside a block is a proposed feature (nice-to-have:
+fee-market simulation).
 
 ## Mining controller
 
@@ -166,6 +205,21 @@ SPAM_FANOUT_UTXOS=200         # 4000 txs per wallet need >= 160 independent 25-t
 With shorter sequential intervals blocks fill proportionally
 (`fill ≈ interval × send_rate / 7100`), so expect ~5.5–7 minutes per full block
 depending on machine speed.
+
+Full blocks also unlock a real confirmation floor: raise `FALLBACK_FEE` and the spam
+outbids every cheaper transaction — see
+[The fee market](#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor).
+
+### Market pressure floor to 100 sats/vB
+full blocks with 100 sats/vb every tx
+```bash
+BLOCK_INTERVAL_SECS=15
+ENABLE_SPAM=true
+SPAM_TXS_PER_BLOCK=250
+SPAM_SENDMANY_OUTPUTS=250
+FALLBACK_FEE=0.001
+
+```
 
 ## Reorg simulator (profile `reorg`)
 
