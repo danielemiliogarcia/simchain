@@ -1,9 +1,7 @@
 # Simchain Settings Reference
 
 Every setting is read from `.env` by `docker-compose.yml`, and **every one has a
-default**, so a missing variable (or no `.env` file at all) still works.
-
-- `.env.example`, short template with the most used settings.
+default**, so a missing variable (or no `.env` file at all) still works.- `.env.example`, short template with the most used settings.
 - `.env.full.example`, complete template with everything below.
 
 ```bash
@@ -128,6 +126,19 @@ The cost is mostly recycled, not burned: node2/node3 pay the spam fees *and* min
 the blocks, so the fees return to the same wallets as coinbase after the 100-block
 maturity. Only the 546-sat burn outputs really leave the wallets.
 
+**When the floor leaks: packing granularity.** Block assembly walks the mempool by
+descending feerate, and when the next spam tx does not fit the space left in the
+block it keeps scanning down the ladder for anything that does. A tiny transaction
+fits anywhere — so it rides the leftover gap into the next block even while paying
+far below the floor. The gap is roughly one spam tx: ~20k WU with
+`SPAM_SENDMANY_OUTPUTS=160`, ~127k WU at 1000, ~380k WU at 3000 (hundreds of small
+txs slip through per block). The rule: **the floor holds for a transaction only if
+the spam backlog contains transactions as small as it.** Sequential spam (~561 WU
+per tx) makes the floor airtight; big batches are for throughput and mempool-bloat
+demos and actively break floor testing. If you are testing a fee-bumping engine on
+a small transaction, use the sequential recipe (or see the hybrid-spam proposal in
+`nice-to-have.md`, which combines batch bulk with small gap-sealing txs).
+
 **Do not use `MIN_RELAY_TX_FEE` as the floor.** The wallets would cope — Bitcoin
 Core clamps every wallet send to `max(-mintxfee, -minrelaytxfee)`, so spam would
 still relay — but the semantics are wrong twice. It is policy drift: mainnet's
@@ -193,6 +204,12 @@ The spammer works both wallets in parallel (one thread per miner node), so the
 cycle is bound by the slower half, not the sum. If blocks still come out partial,
 check the real cycle time in `docker logs btc-simnet-spammer` (the
 `Spam cycle done in ...` line each round) and keep `BLOCK_INTERVAL_SECS` above it.
+If the cycle time *grows* over the session instead, that is wallet fatigue:
+bitcoind keeps the whole wallet tx history in memory and scans it on every send
+(measured: ~13s cycle fresh → ~67s after ~50 full blocks). It is inherent to
+wallet-based spam; the resets are a stack restart (`docker compose down -v`) or
+lowering the offered tx count, and the structural fix is the raw-tx spam engine
+proposed in `nice-to-have.md`.
 
 Sequential p2p-like arrival (`SPAM_SENDMANY_OUTPUTS=0`), full blocks:
 
@@ -263,3 +280,7 @@ can cascade the rest of the run to empty blocks.
 | `MEMPOOL_DB_USER` | `mempool` | Explorer DB user. |
 | `MEMPOOL_DB_PASS` | `mempool` | Explorer DB password. |
 | `MEMPOOL_DB_ROOT_PASS` | `admin` | Explorer DB root password. |
+
+# Mempool space picture with market pressure floor at 1000 sats/vB
+
+![Red chain diagram](img/red-chain.png)

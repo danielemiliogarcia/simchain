@@ -26,8 +26,9 @@
   node policy parameters (`-minrelaytxfee` for the mempool floor, `-blockmintxfee`
   for the miner's inclusion floor) so blocks fill up and transactions genuinely
   compete for block space
-- The five proposed features below: Poisson block timing, fee-market simulation,
-  scenario engine, network partitions, reorgs that drop transactions
+- The seven proposed features below: Poisson block timing, fee-market simulation,
+  scenario engine, network partitions, reorgs that drop transactions, raw-tx
+  spam engine, hybrid spam (batch bulk + gap-sealing small txs)
 
 ### Code review findings (2026-07-04)
 
@@ -94,7 +95,7 @@ Simchain's purpose is to simulate the Bitcoin chain on regtest while staying as 
 mainnet reality as regtest allows: multiple P2P-connected nodes, rotating miners, a
 non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus five bigger proposed features with their
+limitations and future enhancements, plus seven bigger proposed features with their
 rationale and an implementation plan.
 
 ## 1. Realistic block timing and hashrate distribution
@@ -255,6 +256,70 @@ The two additions map to the two real outcomes:
 Effort: addition 1 done; addition 2 medium (raw-tx construction, only meaningful with
 spam enabled).
 
+---
+
+## 6. Raw-transaction spam engine (bypass the wallet)
+
+**What:** A spam mode where the spammer manages its own keys and UTXO set, builds and
+signs transactions in Rust (`bitcoin` crate) and submits them with
+`sendrawtransaction` (or `submitpackage`), instead of asking the node wallets via
+`sendtoaddress`/`sendmany`.
+
+**Why it's a nice-to-have:** Every wallet-based send pays for coin selection, change
+handling and signing inside bitcoind, serialized per wallet by the wallet lock — that
+is the current throughput ceiling (~13s per 4M WU cycle with two wallets in
+parallel), and the cost grows with the wallet's tx history (measured: ~13s fresh,
+~67s after ~50 full blocks; a wallet-rotation mitigation was prototyped and
+reverted — a raw engine removes the cause instead of resetting it). Pre-built raw
+transactions skip the wallet entirely; the ceiling becomes
+mempool acceptance itself (hundreds to thousands of tx/s), which is how real spam
+waves and stress tests (e.g. the 2015/2017 mainnet spam) actually operated. Unlocks:
+filling blocks at very short intervals, deep mempool backlogs on demand, exact
+control of tx shape (inputs, outputs, feerate, RBF flags) per transaction — the
+building block the fee-market feature (2) needs anyway.
+
+**Implementation plan:**
+1. Fund the engine once from a miner wallet: send N UTXOs to addresses derived from
+   a spammer-owned key (single WIF or simple derivation, no descriptor machinery).
+2. Track the UTXO set in memory (txid:vout, amount, script); refresh from
+   `scantxoutset`/ZMQ on startup or after a reorg.
+3. Build txs with the `bitcoin` crate (P2WPKH inputs, burn outputs, explicit fee),
+   sign locally, `sendrawtransaction` in a tight loop or `submitpackage` per chain.
+4. Reuse the existing knobs (`SPAM_TXS_PER_BLOCK`, outputs per tx, RBF flag) plus a
+   mode switch, e.g. `SPAM_ENGINE=wallet|raw` (default `wallet`, current behavior).
+
+Effort: medium-large (key handling, UTXO bookkeeping, reorg recovery), contained in
+the spammer.
+
+---
+
+## 7. Hybrid spam: batch bulk + small gap-sealing txs
+
+**What:** Make batch and sequential spam additive instead of either/or: each cycle
+sends the usual `sendmany` batches for bulk block weight, plus a configurable number
+of small (~561 WU) `sendtoaddress` txs at the same fee level. Setting sketch:
+`SPAM_SMALL_TXS_PER_BLOCK=0..n` (0 = current behavior).
+
+**Why it's a nice-to-have:** The fee floor (see SETTINGS.md "The fee market") leaks
+with batch-only spam. Block assembly fills leftover space with whatever fits, and the
+leftover gap is roughly one batch tx (~20k WU at 160 outputs) — so a tiny transaction
+paying below the floor still confirms next block through the gap, which breaks the
+main floor use case: testing a fee-bumping engine that should have to outbid the spam.
+The floor only holds for a transaction if the spam backlog contains transactions as
+small as it. Hybrid spam keeps the batch throughput (blocks fill fast on short
+intervals) while a tail of floor-priced small txs seals the gaps, so a cheap tiny
+transaction genuinely waits until bumped.
+
+**Implementation plan:**
+1. In `spam_round`, after `send_spam_batch`, also call `send_spam_tx` for
+   `SPAM_SMALL_TXS_PER_BLOCK / MINER_COUNT` txs (both already exist and return txids).
+2. Keep the small txs on the same wallets/fan-out pool; they are dust-sized, so the
+   extra weight (~0.03% of a block per 100 txs) and cost are negligible.
+3. Document in SETTINGS.md "Full blocks" and "The fee market" as the recipe for
+   floor-tight full blocks at short intervals.
+
+Effort: small (both send paths already exist; one setting, a few lines in the
+spammer loop).
 
 ---
 
