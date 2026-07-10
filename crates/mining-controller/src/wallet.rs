@@ -2,15 +2,13 @@
 
 use anyhow::{anyhow, Context};
 use bitcoincore_rpc::{bitcoin::Address, Client, RpcApi};
-use simchain_common::{create_wallet_client, require_regtest_address, rpc_retry};
+use simchain_common::{create_wallet_client, require_regtest_address, rpc_retry, RpcUrl};
 
 /// Create the mining wallet and return a wallet-scoped client plus a fresh
 /// address. A wallet-scoped URL keeps working even if users load extra wallets
 /// on the node. Restart-safe: an existing wallet is loaded or reused.
 pub fn setup_wallet(
-    rpc_url: &str,
-    rpc_user: &str,
-    rpc_pass: &str,
+    rpc_url: &RpcUrl,
     node: &Client,
     wallet_name: &str,
 ) -> anyhow::Result<(Client, Address)> {
@@ -27,8 +25,8 @@ pub fn setup_wallet(
             }
         }
     }
-    let wallet = create_wallet_client(rpc_url, wallet_name, rpc_user, rpc_pass)
-        .context("build wallet-scoped mining client")?;
+    let wallet =
+        create_wallet_client(rpc_url, wallet_name).context("build wallet-scoped mining client")?;
     let address = rpc_retry("get new mining wallet address", || {
         wallet.get_new_address(None, None)
     });

@@ -8,11 +8,13 @@ mod raw_transaction_spammer;
 mod runner;
 mod wallet;
 
-use config::Config;
+use config::SpamConfig;
 use simchain_common::init_tracing;
 
 fn main() -> anyhow::Result<()> {
+    let _ = dotenvy::dotenv();
     init_tracing("simchain_spammer=info,info");
+    let _ = SpamConfig::init()?;
 
-    runner::run(Config::from_env().as_ref())
+    runner::run()
 }

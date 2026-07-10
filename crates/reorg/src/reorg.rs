@@ -3,7 +3,7 @@
 
 use crate::{
     chain::{last_blocks, live_mempool_topo, mine_exact, print_blocks},
-    config::Config,
+    config::ReorgConfig,
     wallet::inject_transactions,
 };
 use bitcoincore_rpc::{bitcoin::Address, Client, RpcApi};
@@ -71,11 +71,8 @@ fn ensure_network_adopts(
 /// Force a chain reorganization by invalidating the last configured number of
 /// blocks and mining one additional replacement block, making the new branch
 /// strictly longer than the one it replaces.
-pub fn run(
-    node: &Client,
-    config: &Config,
-    witness: Option<(&Client, &str)>,
-) -> Result<(), bitcoincore_rpc::Error> {
+pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoincore_rpc::Error> {
+    let config = ReorgConfig::global();
     let tip = node.get_block_count()?;
     if tip < config.depth + 1 {
         tracing::warn!(
@@ -126,7 +123,7 @@ pub fn run(
         // Seed the mempool with brand-new txs this node "saw first" so the
         // winning chain carries them alongside the returned txs.
         if config.adds_new_txs > 0 {
-            inject_transactions(config, node, config.adds_new_txs);
+            inject_transactions(node, config.adds_new_txs);
         }
 
         // Re-mine the live mempool, spread evenly across the replacement

@@ -198,12 +198,6 @@ reproduce with the "tx per block" knob. Pairs well with the shipped Poisson bloc
 
 ---
 
-## Tech debt
-
-- use config module to read env, and serve configs
-
----
-
 ## Honorable mentions
 
 - **Chain snapshot/restore**, named volumes + tar helper to save a chain state and rerun
