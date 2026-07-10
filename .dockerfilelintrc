@@ -1,0 +1,4 @@
+rules:
+  # False positives in this repo for multi-stage FROM aliases and required labels.
+  required_params: off
+  label_invalid: off

@@ -1,1 +1,11 @@
 .env
+
+# Rust build artifacts. The workspace uses a single target/ at the repo root;
+# the broad `target/` guards against stray per-crate target dirs too.
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is intentionally committed: the three tools are binaries for a
+# reproducible test network, so the lockfile is tracked (do NOT ignore it).

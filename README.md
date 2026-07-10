@@ -34,9 +34,11 @@ The network consists of 3 well-connected nodes plus helper containers:
   is 100 blocks and node3 is funded last (heights 55-104, maturing 155-204), burying to
   204 leaves **both miner wallets fully liquid at handoff** (~51 mature coinbases,
   ~2550 BTC each) so the spammer never starves; the maturity batches keep maturing during
-  the run (heights 205-304). After that it asks each miner to mine 1 block in a round-robin
-  manner every `BLOCK_INTERVAL_SECS`. Stop this container after funding if you want to
-  control mining manually.
+  the run (heights 205-304). After that the miner nodes produce blocks with bounded
+  exponential timing by default (15-second underlying mean, clamped to 10–20 seconds)
+  and strict miner alternation. Timing can be switched to fixed and miner selection can
+  be weighted independently. Stop this container after funding if you want to control
+  mining manually.
 - **Spammer `btc-simnet-spammer`**, fills blocks so they are not empty. By default
   (raw engine) it can run in DATA/HYBRID mode — OP_RETURN data txs of varied sizes that
   fill blocks at near-zero node cost, kept `SPAM_FILL_BLOCK_RATIO` blocks deep — or in
@@ -80,7 +82,7 @@ flowchart TB
             n2["node2 — miner<br/>wallet enabled, owned node"]
             n3["node3 — miner<br/>not exposed to host"]
         end
-        mc["mining-controller<br/>bootstrap + round-robin mining"]
+        mc["mining-controller<br/>bootstrap + configurable mining"]
         sp["spammer<br/>fills blocks with txs"]
         rg["reorg simulator<br/>profile: reorg, on demand"]
     end
@@ -155,7 +157,7 @@ cp .env.full.example .env
 
 Every setting (node image, credentials, host ports, fee policy, user address, block
 interval, spam volume, reorg behavior, tool images/ports, explorer DB credentials) is
-documented with its default in **[SETTINGS.md](./SETTINGS.md)**.
+documented with its default in **[SETTINGS.md](./docs/SETTINGS.md)**.
 
 ### Choosing the bitcoin node image
 
@@ -205,6 +207,49 @@ docker compose logs -ft
 # Tear down (regtest keeps no volumes; the chain resets on next up)
 docker compose --profile all-tools down
 ```
+
+### Retuning a live chain (block cadence, fee floor, block fill)
+
+Settings consumed by the mining controller and the spammer can be changed **without
+restarting the whole stack**: the nodes keep running and the chain is preserved, only
+the tool containers are replaced. This is the quickest way to experiment with mining
+cadence, the fee floor or how full blocks are, on a chain that is already bootstrapped
+and funded.
+
+1. Edit `.env`. For example:
+   - Mining cadence: `BLOCK_INTERVAL_MEAN_SECS`, `BLOCK_INTERVAL_MODE`,
+     `BLOCK_INTERVAL_MIN_SECS`/`MAX_SECS`, `MINER_WEIGHTS` (mining controller).
+   - Fee floor and block filling: `FALLBACK_FEE`, `SPAM_FILL_BLOCK_RATIO`,
+     `SPAM_FLOOR_POOL_TXS`, `SPAM_TX_DATA_MAX_BYTES`/`MIN_BYTES`, `ENABLE_SPAM`,
+     `ENABLE_SPAM_REPLACES` (spammer).
+2. Recreate only the affected service(s), both:
+
+   ```bash
+   docker compose up -d --force-recreate btc-simnet-mining-controller btc-simnet-spammer
+   ```
+
+   or just the one you changed:
+
+   ```bash
+   docker compose up -d --force-recreate btc-simnet-spammer
+   ```
+
+This is safe mid-run: `--force-recreate` only replaces the services named on the
+command line (the node dependencies are left running, so the chain, wallets and
+mempool survive). The mining controller sees the chain is already bootstrapped
+(height >= 204), skips the funding sequence and resumes mining with the new cadence;
+the spammer is stateless between cycles and resumes with the new fill/fee settings.
+
+Caveats:
+
+- Settings consumed by the **nodes** (`BTC_IMAGE`, host ports, `MIN_RELAY_TX_FEE`,
+  ZMQ ports, ...) do require recreating the nodes, and node containers keep the chain
+  in their filesystem, so that resets the chain: use a full
+  `docker compose --profile all-tools down` / `up`.
+- `FALLBACK_FEE` is shared: the spammer prices its floor fills with it, and the nodes
+  take it as `-fallbackfee` (wallet-side fallback). A spammer-only recreate moves the
+  spam fee floor immediately; the nodes keep the old wallet fallback until a full
+  restart, which is usually irrelevant.
 
 ### Profiles
 
@@ -272,13 +317,13 @@ REORG_MODE=auto docker compose --profile reorg up btc-simnet-reorg
 
 Tune `REORG_DEPTH`, `AUTO_REORG_EVERY_BLOCKS`, `REORG_NODE`, `REORG_MINE_ADDRESS`,
 `REORG_ADDS_NEW_TXS`, `REORG_WALLET_NAME` and `REORG_WITNESS_NODE` in `.env`
-(see [SETTINGS.md](./SETTINGS.md)).
+(see [SETTINGS.md](./docs/SETTINGS.md)).
 
 ## ZMQ notifications
 
 node1 and node2 publish all five bitcoind ZMQ topics (`rawblock`, `rawtx`, `hashblock`,
 `hashtx`, `sequence`): node1 on host ports 28332-28336, node2 on 38332-38336 (all
-remappable, see [SETTINGS.md](./SETTINGS.md)). Anything that consumes bitcoind ZMQ
+remappable, see [SETTINGS.md](./docs/SETTINGS.md)). Anything that consumes bitcoind ZMQ
 (LND/CLN, indexers, custody watchers) can point at the simnet, and reorg delivery can be
 exercised with the reorg simulator. Smoke test (needs `pip install pyzmq`):
 
@@ -293,17 +338,67 @@ print(topic, len(body), 'bytes')
 "
 ```
 
+## Repository structure
+
+The three Rust tools live in a single Cargo workspace at the repo root, sharing one
+`target/` dir, one dependency resolution, and one committed `Cargo.lock` so every build
+of a given commit ships identical dependency versions.
+
+| Path | Purpose |
+|---|---|
+| [crates/simchain-common](crates/simchain-common) | Shared helpers: RPC client construction (`create_client`) and env lookup (`env_or`), used by all three tools |
+| [crates/mining-controller](crates/mining-controller) | Bootstraps the chain and drives configurable mining (`btc-simnet-mining-controller`) |
+| [crates/spammer](crates/spammer) | Fills blocks with transactions (`btc-simnet-spammer`) |
+| [crates/reorg](crates/reorg) | Forces chain reorganizations on demand (`btc-simnet-reorg`) |
+
+`Cargo.lock` is committed on purpose: these are binaries for a reproducible test
+network, so the lockfile is tracked (unlike a library crate, which would leave it to
+the consumer).
+
+### Embedding under a parent workspace
+
+The workspace is deliberately embeddable. There is **no `[workspace.dependencies]`
+table** — each crate declares its own dependencies, so a parent workspace's version
+pins can never conflict with a shared table here. If you embed this repo inside an
+upper-level Cargo workspace, that workspace must exclude this directory to avoid
+nested-workspace errors:
+
+```toml
+[workspace]
+exclude = ["path/to/simchain"]
+```
+
+### Local development
+
+All `cargo` commands run from the repo root. Project aliases live in
+[.cargo/config.toml](.cargo/config.toml) (Cargo discovers it by walking up from any
+crate directory):
+
+| Alias | Expands to | Purpose |
+|---|---|---|
+| `cargo ba` | `cargo test --no-run --all-targets --benches` | Build all targets (prefer over `cargo build`) |
+| `cargo bar` | `cargo ba --release` | Same, release mode |
+| `cargo tt` | `cargo test -- --test-threads=1` | Run tests serially |
+| `cargo ca` | `cargo clippy --all-targets -- -D warnings` | Lint; warnings are errors |
+| `cargo fa` / `cargo fac` | `cargo fmt --all` / `--check` | Format / check formatting |
+
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs `cargo ba`, clippy
+(`-D warnings`), `cargo fmt --check`, and the test suite on every pull request, all
+with `--locked` so a stale `Cargo.lock` fails the build. The three tool Docker images
+build from one shared [tools.Dockerfile](tools.Dockerfile) (one builder stage, three
+targets), also with `--locked`.
+
 ## Documents
 
-- [SETTINGS.md](./SETTINGS.md), every setting, its default and what it does.
-- [nice-to-have.md](./nice-to-have.md), all limitations, future enhancements and
+- [SETTINGS.md](./docs/SETTINGS.md), every setting, its default and what it does.
+- [nice-to-have.md](./docs/nice-to-have.md), all limitations, future enhancements and
   proposed features with rationale and implementation plans.
 - [runbook.txt](./runbook.txt), handy `bitcoin-cli` one-liners against the simnet.
 
 ## Limitations and future enhancements
 
 All known limitations, future enhancements and proposed features live in
-[nice-to-have.md](./nice-to-have.md).
+[nice-to-have.md](./docs/nice-to-have.md).
 
 # Trouble shotting
 
