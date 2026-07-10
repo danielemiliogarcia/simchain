@@ -143,6 +143,26 @@ fn parse_interval_bounds(min: &str, max: &str) -> IntervalBounds {
     IntervalBounds { min, max }
 }
 
+// A mean outside the clamp range pins nearly every interval to a boundary --
+// almost certainly a leftover bound after the mean was changed, not intent.
+// Poisson mode only: fixed mode ignores the bounds, and the full-block recipes
+// legitimately combine a long fixed interval with the default bounds.
+fn validate_poisson_mean(mean_secs: u64, bounds: IntervalBounds) {
+    let mean = mean_secs as f64;
+    if let Some(min) = bounds.min {
+        assert!(
+            mean >= min,
+            "BLOCK_INTERVAL_MEAN_SECS ({mean_secs}) is below BLOCK_INTERVAL_MIN_SECS ({min}): nearly every interval would clamp to the minimum. Raise the mean, lower the bound, or use fixed mode"
+        );
+    }
+    if let Some(max) = bounds.max {
+        assert!(
+            mean <= max,
+            "BLOCK_INTERVAL_MEAN_SECS ({mean_secs}) exceeds BLOCK_INTERVAL_MAX_SECS ({max}): nearly every interval would clamp to the maximum. Lower the mean, raise the bound, or use fixed mode"
+        );
+    }
+}
+
 fn parse_miner_weights(value: &str) -> Option<MinerWeights> {
     if value.trim().is_empty() {
         return None;
@@ -374,6 +394,9 @@ fn main() {
         &env_or("BLOCK_INTERVAL_MIN_SECS", "10"),
         &env_or("BLOCK_INTERVAL_MAX_SECS", "20"),
     );
+    if poisson {
+        validate_poisson_mean(mean_secs, interval_bounds);
+    }
     let miner_weights = parse_miner_weights(&env_or("MINER_WEIGHTS", ""));
     // Parse a supplied seed even when stochastic modes are disabled, so a typo
     // cannot lie dormant until a mode is enabled later.
@@ -644,6 +667,26 @@ mod tests {
         assert_eq!(bounds.apply(0.1), 2.5);
         assert_eq!(bounds.apply(7.0), 7.0);
         assert_eq!(bounds.apply(20.0), 10.0);
+    }
+
+    #[test]
+    fn accepts_poisson_mean_within_bounds() {
+        validate_poisson_mean(15, parse_interval_bounds("10", "20"));
+        validate_poisson_mean(15, parse_interval_bounds("", ""));
+        validate_poisson_mean(10, parse_interval_bounds("10", "20"));
+        validate_poisson_mean(20, parse_interval_bounds("10", "20"));
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds BLOCK_INTERVAL_MAX_SECS")]
+    fn rejects_poisson_mean_above_max() {
+        validate_poisson_mean(60, parse_interval_bounds("10", "20"));
+    }
+
+    #[test]
+    #[should_panic(expected = "is below BLOCK_INTERVAL_MIN_SECS")]
+    fn rejects_poisson_mean_below_min() {
+        validate_poisson_mean(5, parse_interval_bounds("10", "20"));
     }
 
     #[test]

@@ -37,7 +37,11 @@ controller-side scheduling, so there is no relay/mempool policy-drift concern.
    so this behavior is visible and must not be interpreted as a sampler defect. With a
    bound configured, arrivals form a bounded renewal process rather than a mathematically
    pure Poisson process; `poisson` refers to the underlying exponential sampler. Empty
-   bounds retain exact Poisson-process behavior.
+   bounds retain exact Poisson-process behavior. In Poisson mode the mean must lie within
+   the configured bounds: a mean outside the clamp range would pin nearly every interval
+   to a boundary, which is almost always a leftover bound after changing the mean, so
+   startup fails instead. Fixed mode skips this check — it ignores the bounds, and the
+   full-block recipes legitimately pair a long fixed interval with the default bounds.
 5. **`MINING_RNG_SEED`** — optional u64. Same seed → identical interval sequence and
    miner picks. Unset → seeded from system time nanos. The resolved seed is always
    logged at startup when any stochastic mode is active, so any run can be replayed
@@ -50,9 +54,10 @@ controller-side scheduling, so there is no relay/mempool policy-drift concern.
    versions, which would silently break seed reproducibility on a dependency bump.
    SplitMix64 is public-domain, 3 lines of arithmetic, and stable forever.
 7. **Fail fast on bad config.** Unknown `BLOCK_INTERVAL_MODE`, malformed or reversed
-   interval bounds, non-positive mean, malformed `MINER_WEIGHTS` (not exactly 2
-   comma-separated non-negative integers, both zero, or overflowing total), or malformed
-   `MINING_RNG_SEED` causes a startup panic with a clear message.
+   interval bounds, non-positive mean, a Poisson mean outside the configured bounds,
+   malformed `MINER_WEIGHTS` (not exactly 2 comma-separated non-negative integers, both
+   zero, or overflowing total), or malformed `MINING_RNG_SEED` causes a startup panic
+   with a clear message.
 8. **Bootstrap untouched.** The staged funding sequence (heights 1–204) keeps its
    deterministic miner assignment; the new modes apply only to the continuous mining
    loop after bootstrap.
@@ -312,7 +317,8 @@ BLOCK_INTERVAL_MAX_SECS=20
 6. **Seed replay:** two runs with `MINING_RNG_SEED=42` (and the reorg simulator +
    spammer idle or identical) → the sequence of `TIMING` samples and miner picks in
    the logs is identical.
-7. **Fail-fast:** invalid mode, reversed/malformed bounds, zero mean, malformed weights,
+7. **Fail-fast:** invalid mode, reversed/malformed bounds, zero mean, a Poisson mean
+   outside the bounds (e.g. mean 60 with the default 10–20 clamp), malformed weights,
    and malformed seed each crash at startup with the expected message.
 8. **Interplay smoke test:** poisson + weights + spammer + reorg simulator all on for
    a while; REORG/EXTERNAL detection lines still appear and mining continues (the

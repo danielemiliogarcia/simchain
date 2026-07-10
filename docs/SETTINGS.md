@@ -166,7 +166,7 @@ wider spread of fee rates with real competition inside a block is a proposed fea
 | Variable | Default | Description |
 |---|---|---|
 | `USER_ADDRESS` | `bcrt1qtmjq...tf3rr` | Address funded at startup with 2 coinbase UTxOs of 50 BTC (matured). Generate your own, see the helper gists linked in `.env.full.example`. |
-| `BLOCK_INTERVAL_MEAN_SECS` | `15` | Exact seconds between blocks in fixed mode; exponential distribution mean before bounds are applied in Poisson mode. Must be a positive integer. |
+| `BLOCK_INTERVAL_MEAN_SECS` | `15` | Exact seconds between blocks in fixed mode; exponential distribution mean before bounds are applied in Poisson mode. Must be a positive integer, and in Poisson mode must lie within the configured bounds (startup fails otherwise). |
 | `BLOCK_INTERVAL_MODE` | `poisson` | `poisson` samples each full block-to-block interval from an exponential distribution, then applies the minimum and maximum. `fixed` always uses `BLOCK_INTERVAL_MEAN_SECS`. |
 | `BLOCK_INTERVAL_MIN_SECS` | `10` | Poisson lower clamp in seconds; fractional values are accepted. Set empty for zero. Validated but does not affect fixed mode. |
 | `BLOCK_INTERVAL_MAX_SECS` | `20` | Poisson upper clamp in seconds; fractional values are accepted. Set empty for unbounded. Must be greater than zero and no lower than `BLOCK_INTERVAL_MIN_SECS`. Validated but does not affect fixed mode. |
@@ -186,6 +186,11 @@ probability mass at each configured boundary and changes the observed mean;
 With either bound set, the resulting arrival process is therefore a bounded renewal
 process, not a mathematically pure Poisson process; `poisson` describes the underlying
 exponential sampler. Leave both bounds empty when exact Poisson-process behavior matters.
+In Poisson mode the mean must lie within the bounds — a mean outside the clamp range
+would pin nearly every interval to a boundary, which is almost always a leftover bound
+after changing the mean, so the controller refuses to start. Fixed mode skips this check
+(it ignores the bounds entirely), which is why the full-block recipes below can set a
+long fixed interval while `.env` keeps the default bounds.
 
 ## Spammer
 
@@ -254,8 +259,9 @@ is longer. A block after a short gap uses the standing floor pool and whatever t
 previous cycle left in the mempool, so it may be partially filled. This is expected and
 intentionally mirrors mainnet backlog drawdown after closely spaced blocks. Set
 `BLOCK_INTERVAL_MIN_SECS` when a test requires a guaranteed preparation window, or raise
-the mean or standing mempool depth for fuller blocks more often. Use fixed mode if every
-cycle must receive exactly the same amount of time.
+the mean (together with `BLOCK_INTERVAL_MAX_SECS` — the mean must stay within the
+bounds) or the standing mempool depth for fuller blocks more often. Use fixed mode if
+every cycle must receive exactly the same amount of time.
 
 Sequential p2p-like arrival (`SPAM_SENDMANY_OUTPUTS=0`), full blocks:
 
