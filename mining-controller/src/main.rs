@@ -3,6 +3,7 @@ use bitcoincore_rpc::{
     jsonrpc, Client, RpcApi,
 };
 use std::collections::{BTreeMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, thread, time::Duration};
 
 // How many recent blocks to remember for reorg analysis. Reorgs deeper than
@@ -19,6 +20,174 @@ const BOOTSTRAP_END: u64 = 204;
 // a healthy call is unaffected, and a node that needs this long is wedged
 // enough that crashing (and restarting) is the right outcome.
 const RPC_TIMEOUT_SECS: u64 = 300;
+
+// SplitMix64 is small, seedable, and has a stable stream across builds. Using it
+// directly keeps MINING_RNG_SEED reproducible without adding an RNG dependency
+// whose standard generator may change between crate versions.
+struct Rng(u64);
+
+impl Rng {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    // Uniform in [0, 1), using the top 53 bits (the f64 mantissa width).
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1_u64 << 53) as f64
+    }
+
+    fn next_exp(&mut self, mean: f64) -> f64 {
+        -mean * (1.0 - self.next_f64()).ln()
+    }
+
+    // Rejection sampling avoids the small bias introduced by `random % upper`.
+    fn next_below(&mut self, upper: u64) -> u64 {
+        debug_assert!(upper > 0);
+        let threshold = upper.wrapping_neg() % upper;
+        loop {
+            let value = self.next_u64();
+            if value >= threshold {
+                return value % upper;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MinerWeights {
+    node2: u64,
+    node3: u64,
+    total: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct IntervalBounds {
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+impl IntervalBounds {
+    fn apply(self, sample: f64) -> f64 {
+        let above_min = self.min.map_or(sample, |min| sample.max(min));
+        self.max.map_or(above_min, |max| above_min.min(max))
+    }
+
+    fn description(self) -> String {
+        match (self.min, self.max) {
+            (None, None) => "unbounded".to_string(),
+            (Some(min), None) => format!("[{min}s, unbounded)"),
+            (None, Some(max)) => format!("[0s, {max}s]"),
+            (Some(min), Some(max)) => format!("[{min}s, {max}s]"),
+        }
+    }
+}
+
+fn parse_mean_secs(value: &str) -> u64 {
+    let seconds: u64 = value
+        .parse()
+        .expect("BLOCK_INTERVAL_MEAN_SECS must be a positive integer");
+    assert!(
+        seconds > 0,
+        "BLOCK_INTERVAL_MEAN_SECS must be a positive integer"
+    );
+    seconds
+}
+
+fn parse_interval_mode(value: &str) -> bool {
+    match value {
+        "fixed" => false,
+        "poisson" => true,
+        _ => panic!("BLOCK_INTERVAL_MODE must be 'fixed' or 'poisson', got '{value}'"),
+    }
+}
+
+fn parse_interval_bound(key: &str, value: &str) -> Option<f64> {
+    if value.trim().is_empty() {
+        return None;
+    }
+
+    let seconds: f64 = value
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("{key} must be a non-negative finite number"));
+    assert!(
+        seconds.is_finite() && seconds >= 0.0,
+        "{key} must be a non-negative finite number"
+    );
+    assert!(
+        Duration::try_from_secs_f64(seconds).is_ok(),
+        "{key} is too large to represent as a duration"
+    );
+    Some(seconds)
+}
+
+fn parse_interval_bounds(min: &str, max: &str) -> IntervalBounds {
+    let min = parse_interval_bound("BLOCK_INTERVAL_MIN_SECS", min);
+    let max = parse_interval_bound("BLOCK_INTERVAL_MAX_SECS", max);
+    if let Some(max) = max {
+        assert!(
+            max > 0.0,
+            "BLOCK_INTERVAL_MAX_SECS must be greater than zero"
+        );
+    }
+    if let (Some(min), Some(max)) = (min, max) {
+        assert!(
+            min <= max,
+            "BLOCK_INTERVAL_MIN_SECS must not exceed BLOCK_INTERVAL_MAX_SECS"
+        );
+    }
+    IntervalBounds { min, max }
+}
+
+fn parse_miner_weights(value: &str) -> Option<MinerWeights> {
+    if value.trim().is_empty() {
+        return None;
+    }
+
+    let parts: Vec<&str> = value.split(',').collect();
+    assert!(
+        parts.len() == 2,
+        "MINER_WEIGHTS must have exactly 2 entries (node2,node3), got {}",
+        parts.len()
+    );
+    let parse = |part: &str| {
+        part.trim()
+            .parse::<u64>()
+            .expect("MINER_WEIGHTS must be two non-negative integers, e.g. 70,30")
+    };
+    let node2 = parse(parts[0]);
+    let node3 = parse(parts[1]);
+    let total = node2
+        .checked_add(node3)
+        .expect("MINER_WEIGHTS entries must not overflow u64 when added");
+    assert!(total > 0, "MINER_WEIGHTS must not be 0,0");
+
+    Some(MinerWeights {
+        node2,
+        node3,
+        total,
+    })
+}
+
+fn parse_rng_seed(value: &str) -> Option<u64> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value.trim().parse().expect("MINING_RNG_SEED must be a u64"))
+    }
+}
+
+fn entropy_seed() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the Unix epoch")
+        .as_nanos() as u64;
+    nanos ^ (u64::from(std::process::id()).rotate_left(32))
+}
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
@@ -47,8 +216,8 @@ fn wait_for_rpc(client: &Client, name: &str) {
     }
 }
 
-// Poll until the node reports at least `height`, so blocks do not compete
-// and stack on each other when mining alternates between nodes.
+// Poll until the non-mining node reports at least `height`, so the next round
+// starts from a shared tip whether mining switches nodes or repeats a winner.
 fn wait_for_height(client: &Client, height: u64) {
     loop {
         match client.get_block_count() {
@@ -199,9 +368,19 @@ fn main() {
         "USER_ADDRESS",
         "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr",
     );
-    let interval_secs: u64 = env_or("BLOCK_INTERVAL_SECS", "15")
-        .parse()
-        .expect("BLOCK_INTERVAL_SECS must be a positive integer");
+    let mean_secs = parse_mean_secs(&env_or("BLOCK_INTERVAL_MEAN_SECS", "15"));
+    let poisson = parse_interval_mode(&env_or("BLOCK_INTERVAL_MODE", "poisson"));
+    let interval_bounds = parse_interval_bounds(
+        &env_or("BLOCK_INTERVAL_MIN_SECS", "10"),
+        &env_or("BLOCK_INTERVAL_MAX_SECS", "20"),
+    );
+    let miner_weights = parse_miner_weights(&env_or("MINER_WEIGHTS", ""));
+    // Parse a supplied seed even when stochastic modes are disabled, so a typo
+    // cannot lie dormant until a mode is enabled later.
+    let configured_seed = parse_rng_seed(&env_or("MINING_RNG_SEED", ""));
+    let stochastic = poisson || miner_weights.is_some();
+    let seed = configured_seed.unwrap_or_else(entropy_seed);
+    let mut rng = Rng(seed);
 
     let rpc_user = env_or("BTC_RPC_USER", "foo");
     let rpc_pass = env_or("BTC_RPC_PASS", "rpcpassword");
@@ -309,11 +488,45 @@ fn main() {
         }
     }
 
+    let bounds_description = interval_bounds.description();
+    let interval_description = if poisson {
+        format!("poisson mean={mean_secs}s, bounds={}", bounds_description)
+    } else {
+        format!("fixed {mean_secs}s")
+    };
+    let weights_description = match miner_weights {
+        Some(weights) => format!("{},{} (node2,node3)", weights.node2, weights.node3),
+        None => "alternate".to_string(),
+    };
+    if stochastic {
+        println!(
+            "Mining config: interval={interval_description}, weights={weights_description}, rng_seed={seed}"
+        );
+    } else {
+        println!("Mining config: interval={interval_description}, weights={weights_description}");
+    }
+
     let mut toggle = true;
     loop {
         let start_time = std::time::Instant::now();
 
-        let (miner, other, addr, name) = if toggle {
+        let target = if poisson {
+            let sampled = rng.next_exp(mean_secs as f64);
+            let target_secs = interval_bounds.apply(sampled);
+            println!(
+                "TIMING sampled interval {sampled:.2}s, target {target_secs:.2}s (poisson, mean {mean_secs}s, bounds={})",
+                bounds_description
+            );
+            Duration::from_secs_f64(target_secs)
+        } else {
+            Duration::from_secs(mean_secs)
+        };
+
+        let pick_node2 = match miner_weights {
+            Some(weights) => rng.next_below(weights.total) < weights.node2,
+            None => toggle,
+        };
+        let (miner, other, addr, name) = if pick_node2 {
             (&node2, &node3, &addr2, "Node 2")
         } else {
             (&node3, &node2, &addr3, "Node 3")
@@ -336,8 +549,148 @@ fn main() {
         toggle = !toggle;
 
         let elapsed = start_time.elapsed();
-        if elapsed < Duration::from_secs(interval_secs) {
-            thread::sleep(Duration::from_secs(interval_secs) - elapsed);
+        if elapsed < target {
+            thread::sleep(target - elapsed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splitmix64_stream_is_stable() {
+        let mut rng = Rng(0);
+        assert_eq!(rng.next_u64(), 0xE220_A839_7B1D_CDAF);
+        assert_eq!(rng.next_u64(), 0x6E78_9E6A_A1B9_65F4);
+        assert_eq!(rng.next_u64(), 0x06C4_5D18_8009_454F);
+    }
+
+    #[test]
+    fn exponential_samples_have_expected_shape() {
+        let mean = 5.0;
+        let count = 100_000;
+        let mut rng = Rng(42);
+        let samples: Vec<f64> = (0..count).map(|_| rng.next_exp(mean)).collect();
+        let actual_mean = samples.iter().sum::<f64>() / count as f64;
+        let variance = samples
+            .iter()
+            .map(|sample| (sample - actual_mean).powi(2))
+            .sum::<f64>()
+            / count as f64;
+        let coefficient_of_variation = variance.sqrt() / actual_mean;
+
+        assert!((actual_mean - mean).abs() < 0.05);
+        assert!((coefficient_of_variation - 1.0).abs() < 0.03);
+        assert!(samples.iter().any(|sample| *sample < 1.0));
+        assert!(samples.iter().any(|sample| *sample > 15.0));
+    }
+
+    #[test]
+    fn weighted_draw_is_reproducible_and_proportional() {
+        let mut first = Rng(42);
+        let mut replay = Rng(42);
+        let first_draws: Vec<u64> = (0..1_000).map(|_| first.next_below(100)).collect();
+        let replay_draws: Vec<u64> = (0..1_000).map(|_| replay.next_below(100)).collect();
+        assert_eq!(first_draws, replay_draws);
+
+        let node2_wins = first_draws.iter().filter(|draw| **draw < 70).count();
+        assert!((650..=750).contains(&node2_wins));
+    }
+
+    #[test]
+    fn parses_supported_configuration() {
+        assert_eq!(parse_mean_secs("15"), 15);
+        assert!(!parse_interval_mode("fixed"));
+        assert!(parse_interval_mode("poisson"));
+        assert_eq!(
+            parse_interval_bounds("", ""),
+            IntervalBounds {
+                min: None,
+                max: None,
+            }
+        );
+        assert_eq!(
+            parse_interval_bounds("0.25", "30"),
+            IntervalBounds {
+                min: Some(0.25),
+                max: Some(30.0),
+            }
+        );
+        assert_eq!(parse_miner_weights(""), None);
+        assert_eq!(parse_miner_weights("   "), None);
+        assert_eq!(
+            parse_miner_weights("70, 30"),
+            Some(MinerWeights {
+                node2: 70,
+                node3: 30,
+                total: 100,
+            })
+        );
+        assert_eq!(parse_rng_seed("42"), Some(42));
+        assert_eq!(parse_rng_seed(""), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "BLOCK_INTERVAL_MEAN_SECS must be a positive integer")]
+    fn rejects_zero_interval() {
+        parse_mean_secs("0");
+    }
+
+    #[test]
+    fn clamps_poisson_samples_to_configured_bounds() {
+        let bounds = parse_interval_bounds("2.5", "10");
+        assert_eq!(bounds.apply(0.1), 2.5);
+        assert_eq!(bounds.apply(7.0), 7.0);
+        assert_eq!(bounds.apply(20.0), 10.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "BLOCK_INTERVAL_MIN_SECS must not exceed")]
+    fn rejects_reversed_interval_bounds() {
+        parse_interval_bounds("10", "2");
+    }
+
+    #[test]
+    #[should_panic(expected = "BLOCK_INTERVAL_MAX_SECS must be greater than zero")]
+    fn rejects_zero_max_interval() {
+        parse_interval_bounds("", "0");
+    }
+
+    #[test]
+    #[should_panic(expected = "BLOCK_INTERVAL_MIN_SECS must be a non-negative finite number")]
+    fn rejects_negative_min_interval() {
+        parse_interval_bounds("-1", "");
+    }
+
+    #[test]
+    #[should_panic(expected = "BLOCK_INTERVAL_MODE must be 'fixed' or 'poisson'")]
+    fn rejects_unknown_interval_mode() {
+        parse_interval_mode("gaussian");
+    }
+
+    #[test]
+    #[should_panic(expected = "MINER_WEIGHTS must have exactly 2 entries")]
+    fn rejects_extra_miner_weight() {
+        parse_miner_weights("1,2,3");
+    }
+
+    #[test]
+    #[should_panic(expected = "MINER_WEIGHTS must not be 0,0")]
+    fn rejects_zero_miner_weights() {
+        parse_miner_weights("0,0");
+    }
+
+    #[test]
+    #[should_panic(expected = "MINER_WEIGHTS entries must not overflow u64")]
+    fn rejects_miner_weight_overflow() {
+        parse_miner_weights("18446744073709551615,1");
+    }
+
+    #[test]
+    #[should_panic(expected = "MINING_RNG_SEED must be a u64")]
+    fn rejects_invalid_seed() {
+        parse_rng_seed("not-a-number");
     }
 }

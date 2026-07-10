@@ -166,9 +166,26 @@ wider spread of fee rates with real competition inside a block is a proposed fea
 | Variable | Default | Description |
 |---|---|---|
 | `USER_ADDRESS` | `bcrt1qtmjq...tf3rr` | Address funded at startup with 2 coinbase UTxOs of 50 BTC (matured). Generate your own, see the helper gists linked in `.env.full.example`. |
-| `BLOCK_INTERVAL_SECS` | `15` | Seconds between blocks; miners (node2/node3) alternate. |
+| `BLOCK_INTERVAL_MEAN_SECS` | `15` | Exact seconds between blocks in fixed mode; exponential distribution mean before bounds are applied in Poisson mode. Must be a positive integer. |
+| `BLOCK_INTERVAL_MODE` | `poisson` | `poisson` samples each full block-to-block interval from an exponential distribution, then applies the minimum and maximum. `fixed` always uses `BLOCK_INTERVAL_MEAN_SECS`. |
+| `BLOCK_INTERVAL_MIN_SECS` | `10` | Poisson lower clamp in seconds; fractional values are accepted. Set empty for zero. Validated but does not affect fixed mode. |
+| `BLOCK_INTERVAL_MAX_SECS` | `20` | Poisson upper clamp in seconds; fractional values are accepted. Set empty for unbounded. Must be greater than zero and no lower than `BLOCK_INTERVAL_MIN_SECS`. Validated but does not affect fixed mode. |
+| `MINER_WEIGHTS` | _(empty)_ | Empty means strict node2/node3 alternation. Set two relative non-negative integer weights such as `70,30` to draw a miner independently for every block; `0,100` and `100,0` are valid. `50,50` is random selection, not alternation. |
+| `MINING_RNG_SEED` | _(empty)_ | Optional `u64` seed for reproducible Poisson intervals and weighted miner picks. When omitted, the controller derives a seed from system time and logs it. It is parsed but has no behavioral effect while both stochastic modes are off. |
 | `NODE2_WALLET_NAME` | `node2` | Wallet created on node2 by the controller, also used by the spammer. |
 | `NODE3_WALLET_NAME` | `node3` | Wallet created on node3 by the controller, also used by the spammer. |
+
+Poisson timing and weighted selection are independent: either can be enabled without
+the other. They affect only continuous mining after the deterministic bootstrap through
+height 204. A stochastic run logs its resolved seed, so setting that value on a later
+run reproduces the same random sequence for the same configuration. Bounds clamp the
+raw exponential sample rather than resampling it: values below the minimum become the
+minimum and values above the maximum become the maximum. This intentionally creates
+probability mass at each configured boundary and changes the observed mean;
+`BLOCK_INTERVAL_MEAN_SECS` remains the mean of the underlying, pre-clamp distribution.
+With either bound set, the resulting arrival process is therefore a bounded renewal
+process, not a mathematically pure Poisson process; `poisson` describes the underlying
+exponential sampler. Leave both bounds empty when exact Poisson-process behavior matters.
 
 ## Spammer
 
@@ -201,14 +218,15 @@ in the `Spam cycle done in ...` log line. Two ready-made setups:
 Fast full blocks, under 1 minute each (batch mode):
 
 ```bash
-BLOCK_INTERVAL_SECS=60
+BLOCK_INTERVAL_MODE=fixed
+BLOCK_INTERVAL_MEAN_SECS=60
 SPAM_FIXED_TXS_PER_BLOCK=360
 SPAM_SENDMANY_OUTPUTS=100     # 360 batches x ~12.7k WU ≈ 4.6M WU offered > 4M cap
 ```
 
 Measured on a mid-range desktop: blocks land at ~3.98M WU (99.7% of the cap) and the
 send cycle takes ~40–55s, so the occasional block right after a UTXO re-split comes
-out partial; use `BLOCK_INTERVAL_SECS=90` if every single block must be full.
+out partial; use `BLOCK_INTERVAL_MEAN_SECS=90` if every single block must be full.
 
 The spam outputs pay burn addresses (no known key), not wallet addresses, and that
 is what makes sustained full blocks possible: bitcoind's coin selection scans the
@@ -221,7 +239,7 @@ per full block against a ~2550 BTC bootstrap balance — thousands of blocks of 
 The spammer works both wallets in parallel (one thread per miner node), so the
 cycle is bound by the slower half, not the sum. If blocks still come out partial,
 check the real cycle time in `docker logs btc-simnet-spammer` (the
-`Spam cycle done in ...` line each round) and keep `BLOCK_INTERVAL_SECS` above it.
+`Spam cycle done in ...` line each round) and keep `BLOCK_INTERVAL_MEAN_SECS` above it.
 If the cycle time *grows* over the session instead, that is wallet fatigue:
 bitcoind keeps the whole wallet tx history in memory and scans it on every send
 (measured: ~13s cycle fresh → ~67s after ~50 full blocks). It is inherent to
@@ -230,10 +248,20 @@ immune — its bookkeeping is a constant-size in-memory UTXO set, so switching b
 to it is the structural fix. Wallet-engine resets: a stack restart
 (`docker compose down -v`) or lowering the offered tx count.
 
+With `BLOCK_INTERVAL_MODE=poisson`, `BLOCK_INTERVAL_MEAN_SECS` is only the underlying
+mean: individual gaps will routinely be shorter than the spam cycle even when the mean
+is longer. A block after a short gap uses the standing floor pool and whatever the
+previous cycle left in the mempool, so it may be partially filled. This is expected and
+intentionally mirrors mainnet backlog drawdown after closely spaced blocks. Set
+`BLOCK_INTERVAL_MIN_SECS` when a test requires a guaranteed preparation window, or raise
+the mean or standing mempool depth for fuller blocks more often. Use fixed mode if every
+cycle must receive exactly the same amount of time.
+
 Sequential p2p-like arrival (`SPAM_SENDMANY_OUTPUTS=0`), full blocks:
 
 ```bash
-BLOCK_INTERVAL_SECS=420       # ~330s minimum at 22 tx/s; 420s reserves for slower machines
+BLOCK_INTERVAL_MODE=fixed
+BLOCK_INTERVAL_MEAN_SECS=420  # ~330s minimum at 22 tx/s; 420s reserves for slower machines
 SPAM_FIXED_TXS_PER_BLOCK=8000
 SPAM_FANOUT_UTXOS=200         # 4000 txs per wallet need >= 160 independent 25-tx chains
 ```
@@ -312,7 +340,8 @@ confirms regardless.
 ### Market pressure floor to 100 sats/vB (legacy OUTPUT recipe)
 Full blocks with 100 sat/vB on every tx, using OUTPUT-mode batch spam:
 ```bash
-BLOCK_INTERVAL_SECS=15
+BLOCK_INTERVAL_MODE=fixed
+BLOCK_INTERVAL_MEAN_SECS=15
 ENABLE_SPAM=true
 SPAM_FIXED_TXS_PER_BLOCK=250
 SPAM_SENDMANY_OUTPUTS=250

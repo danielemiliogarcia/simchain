@@ -19,8 +19,8 @@
   node policy parameters (`-minrelaytxfee` for the mempool floor, `-blockmintxfee`
   for the miner's inclusion floor) so blocks fill up and transactions genuinely
   compete for block space
-- The five proposed features below: Poisson block timing, fee-market simulation,
-  scenario engine, network partitions, and reorgs that drop transactions
+- The four proposed features below: fee-market simulation, scenario engine, network
+  partitions, and reorgs that drop transactions
 
 ### Code review findings (2026-07-04)
 
@@ -88,35 +88,10 @@ Simchain's purpose is to simulate the Bitcoin chain on regtest while staying as 
 mainnet reality as regtest allows: multiple P2P-connected nodes, rotating miners, a
 non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus five bigger proposed features with their
+limitations and future enhancements, plus four bigger proposed features with their
 rationale and an implementation plan.
 
-## 1. Realistic block timing and hashrate distribution
-
-**What:** Replace the fixed `BLOCK_INTERVAL_SECS` + strict node2/node3 alternation with
-(a) Poisson-distributed block intervals (exponential inter-arrival times with the
-configured mean) and (b) weighted miner selection (e.g. `MINER_WEIGHTS=70,30`).
-
-**Why it's a nice-to-have:** On mainnet, blocks are a Poisson process: two blocks 20
-seconds apart followed by a 40-minute gap is normal, and that variance is what breaks
-naive confirmation logic, fee estimators, and timeout handling in downstream projects. A
-metronomic 15s cadence with perfect miner alternation hides an entire class of bugs.
-Weighted hashrate also makes reorg/selfish-mining scenarios meaningful (a 70% miner
-winning races is realistic; a coin-flip is not).
-
-**Implementation plan:**
-1. In `mining-controller`, add `rand`/`rand_distr` crates; sample the sleep from
-   `Exp::new(1.0 / mean)` when `BLOCK_INTERVAL_MODE=poisson` (default stays `fixed`).
-2. Pick the miner per block by sampling `MINER_WEIGHTS` (comma-separated, default `50,50`)
-   instead of toggling.
-3. Surface both as `.env` settings wired through compose with defaults; log the sampled
-   interval and chosen miner each block so tests can correlate.
-
-Effort: small-medium (contained in one Rust file).
-
----
-
-## 2. Fee-market simulation in the spammer
+## 1. Fee-market simulation in the spammer
 
 **What:** Make the spammer emit transactions with varied fee rates (sampled from a
 configurable distribution, e.g. log-normal between `SPAM_FEE_MIN`/`SPAM_FEE_MAX` sat/vB)
@@ -144,7 +119,7 @@ concrete fee-estimation or fee-bumping test need.
 
 ---
 
-## 3. Declarative scenario engine
+## 2. Declarative scenario engine
 
 **What:** A `scenario.yml` interpreted by a small controller container: an ordered list of
 steps like *"at height 150 reorg 2 blocks"*, *"pause mining 120s"*, *"burst 500 txs"*,
@@ -173,7 +148,7 @@ Effort: the largest item here, but mostly glue around already-existing capabilit
 
 ---
 
-## 4. Network partition / latency simulation
+## 3. Network partition / latency simulation
 
 **What:** Tooling to split the P2P network (e.g. isolate node3, let it mine alone, then
 reconnect) and to inject latency/packet loss between nodes, via `docker network
@@ -200,7 +175,7 @@ Effort: phase 1 small; phase 2 medium (needs NET_ADMIN and per-node sidecars).
 
 ---
 
-## 5. Reorgs that drop transactions permanently (double-spend)
+## 4. Reorgs that drop transactions permanently (double-spend)
 
 **What:** For a configurable fraction of the orphaned *wallet-owned* (spam) transactions
 in a reorg, include a conflicting transaction (same inputs, different output) in the

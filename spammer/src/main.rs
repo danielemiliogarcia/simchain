@@ -11,7 +11,7 @@ use std::{env, thread, time::Duration};
 
 // Shared block-watch loop: whenever a new block appears, run one spam cycle
 // (whatever the selected engine does) and report how long it took -- the
-// number to compare against BLOCK_INTERVAL_SECS when tuning for full blocks.
+// number to compare against BLOCK_INTERVAL_MEAN_SECS when tuning for full blocks.
 fn run_block_loop(node1: &Client, mut cycle: impl FnMut() -> usize) {
     let mut spammed_at_block_height = 0;
     loop {

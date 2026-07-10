@@ -34,9 +34,11 @@ The network consists of 3 well-connected nodes plus helper containers:
   is 100 blocks and node3 is funded last (heights 55-104, maturing 155-204), burying to
   204 leaves **both miner wallets fully liquid at handoff** (~51 mature coinbases,
   ~2550 BTC each) so the spammer never starves; the maturity batches keep maturing during
-  the run (heights 205-304). After that it asks each miner to mine 1 block in a round-robin
-  manner every `BLOCK_INTERVAL_SECS`. Stop this container after funding if you want to
-  control mining manually.
+  the run (heights 205-304). After that the miner nodes produce blocks with bounded
+  exponential timing by default (15-second underlying mean, clamped to 10–20 seconds)
+  and strict miner alternation. Timing can be switched to fixed and miner selection can
+  be weighted independently. Stop this container after funding if you want to control
+  mining manually.
 - **Spammer `btc-simnet-spammer`**, fills blocks so they are not empty. By default
   (raw engine) it can run in DATA/HYBRID mode — OP_RETURN data txs of varied sizes that
   fill blocks at near-zero node cost, kept `SPAM_FILL_BLOCK_RATIO` blocks deep — or in
@@ -80,7 +82,7 @@ flowchart TB
             n2["node2 — miner<br/>wallet enabled, owned node"]
             n3["node3 — miner<br/>not exposed to host"]
         end
-        mc["mining-controller<br/>bootstrap + round-robin mining"]
+        mc["mining-controller<br/>bootstrap + configurable mining"]
         sp["spammer<br/>fills blocks with txs"]
         rg["reorg simulator<br/>profile: reorg, on demand"]
     end
