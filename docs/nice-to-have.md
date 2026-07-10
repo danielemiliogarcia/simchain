@@ -138,6 +138,10 @@ reproduce with the "tx per block" knob.
 
 Effort: medium. Pairs well with feature 1 (bursty blocks + fee spread = realistic mempool).
 
+**Status (2026-07-10): parked** — full design in [fee-market-plan.md](fee-market-plan.md)
+(CPFP-safe per-branch fee ladder, funding-pull fix); complexity/benefit says wait for a
+concrete fee-estimation or fee-bumping test need.
+
 ---
 
 ## 3. Declarative scenario engine

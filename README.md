@@ -155,7 +155,7 @@ cp .env.full.example .env
 
 Every setting (node image, credentials, host ports, fee policy, user address, block
 interval, spam volume, reorg behavior, tool images/ports, explorer DB credentials) is
-documented with its default in **[SETTINGS.md](./SETTINGS.md)**.
+documented with its default in **[SETTINGS.md](./docs/SETTINGS.md)**.
 
 ### Choosing the bitcoin node image
 
@@ -272,13 +272,13 @@ REORG_MODE=auto docker compose --profile reorg up btc-simnet-reorg
 
 Tune `REORG_DEPTH`, `AUTO_REORG_EVERY_BLOCKS`, `REORG_NODE`, `REORG_MINE_ADDRESS`,
 `REORG_ADDS_NEW_TXS`, `REORG_WALLET_NAME` and `REORG_WITNESS_NODE` in `.env`
-(see [SETTINGS.md](./SETTINGS.md)).
+(see [SETTINGS.md](./docs/SETTINGS.md)).
 
 ## ZMQ notifications
 
 node1 and node2 publish all five bitcoind ZMQ topics (`rawblock`, `rawtx`, `hashblock`,
 `hashtx`, `sequence`): node1 on host ports 28332-28336, node2 on 38332-38336 (all
-remappable, see [SETTINGS.md](./SETTINGS.md)). Anything that consumes bitcoind ZMQ
+remappable, see [SETTINGS.md](./docs/SETTINGS.md)). Anything that consumes bitcoind ZMQ
 (LND/CLN, indexers, custody watchers) can point at the simnet, and reorg delivery can be
 exercised with the reorg simulator. Smoke test (needs `pip install pyzmq`):
 
@@ -295,15 +295,15 @@ print(topic, len(body), 'bytes')
 
 ## Documents
 
-- [SETTINGS.md](./SETTINGS.md), every setting, its default and what it does.
-- [nice-to-have.md](./nice-to-have.md), all limitations, future enhancements and
+- [SETTINGS.md](./docs/SETTINGS.md), every setting, its default and what it does.
+- [nice-to-have.md](./docs/nice-to-have.md), all limitations, future enhancements and
   proposed features with rationale and implementation plans.
 - [runbook.txt](./runbook.txt), handy `bitcoin-cli` one-liners against the simnet.
 
 ## Limitations and future enhancements
 
 All known limitations, future enhancements and proposed features live in
-[nice-to-have.md](./nice-to-have.md).
+[nice-to-have.md](./docs/nice-to-have.md).
 
 # Trouble shotting
 
