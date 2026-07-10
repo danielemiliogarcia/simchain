@@ -213,11 +213,12 @@ services:
       - SPAM_FIXED_TXS_PER_BLOCK=${SPAM_FIXED_TXS_PER_BLOCK:-100}
       # OUTPUT-mode fatness: 0 = sequential, N = batch of N burn outputs per tx.
       - SPAM_SENDMANY_OUTPUTS=${SPAM_SENDMANY_OUTPUTS:-0}
-      # DATA/HYBRID mode (raw engine, Core 30+): >0 fills blocks with OP_RETURN
-      # data txs (no UTXO-set growth, nodes stay near-idle). MAX is the biggest
-      # payload; MIN < MAX spreads tx sizes log-uniformly (0 = uniform at MAX).
-      - SPAM_TX_DATA_MAX_BYTES=${SPAM_TX_DATA_MAX_BYTES:-0}
-      - SPAM_TX_DATA_MIN_BYTES=${SPAM_TX_DATA_MIN_BYTES:-0}
+      # DATA/HYBRID mode (raw engine, Core 30+), the default: fills blocks with
+      # OP_RETURN data txs (no UTXO-set growth, nodes stay near-idle). MAX is
+      # the biggest payload; MIN < MAX spreads tx sizes log-uniformly. Set
+      # MAX=0 for the legacy OUTPUT mode (burn-output txs, UTXO-heavy).
+      - SPAM_TX_DATA_MAX_BYTES=${SPAM_TX_DATA_MAX_BYTES:-90000}
+      - SPAM_TX_DATA_MIN_BYTES=${SPAM_TX_DATA_MIN_BYTES:-250}
       # Extra minimum-size floor-priced txs per block, on top of the data fill:
       # they add a stream of small realistic-looking txs. 0 = none.
       - SPAM_SMALL_TXS_PER_BLOCK=${SPAM_SMALL_TXS_PER_BLOCK:-0}
@@ -227,7 +228,10 @@ services:
       - SPAM_FLOOR_POOL_TXS=${SPAM_FLOOR_POOL_TXS:-4000}
       # DATA/HYBRID fill target in blocks of mempool weight: 0.5 = half-full
       # blocks (floor off), 1 = full + shallow backlog, 5 = full + ~4 pending.
-      - SPAM_FILL_BLOCK_RATIO=${SPAM_FILL_BLOCK_RATIO:-1.0}
+      # Default 2: the mempool swings ~1 block between top-ups, so 2 keeps a
+      # full block of floor-priced supply at every template (airtight floor);
+      # 1 rides the trough and can leave occasional partial blocks.
+      - SPAM_FILL_BLOCK_RATIO=${SPAM_FILL_BLOCK_RATIO:-2.0}
       # Auto-size the branch pool from the fill ratio (max(12, ratio x15)).
       # false = use SPAM_FANOUT_UTXOS, erroring if below the ratio x10 minimum.
       - SPAM_FANOUT_AUTO=${SPAM_FANOUT_AUTO:-true}

@@ -78,17 +78,18 @@ fn main() {
     let sendmany_outputs: u64 = env_or("SPAM_SENDMANY_OUTPUTS", "0")
         .parse()
         .expect("SPAM_SENDMANY_OUTPUTS must be a non-negative integer");
-    // DATA/HYBRID mode (raw engine): SPAM_TX_DATA_MAX_BYTES > 0 switches the
-    // fill to OP_RETURN data txs (no UTXO-set growth, a handful fill a block).
-    // Each tx's payload is drawn log-uniformly in [MIN, MAX]; MIN = 0 (or
-    // >= MAX) makes every data tx exactly MAX. Capped just under the 100k vB
-    // standard-tx limit. Needs Core 30+. Renamed from SPAM_TX_DATA_BYTES
-    // (still honored).
+    // DATA/HYBRID mode (raw engine), the default: SPAM_TX_DATA_MAX_BYTES > 0
+    // fills blocks with OP_RETURN data txs (no UTXO-set growth, a handful
+    // fill a block). Each tx's payload is drawn log-uniformly in [MIN, MAX];
+    // MIN = 0 (or >= MAX) makes every data tx exactly MAX. Capped just under
+    // the 100k vB standard-tx limit. Needs Core 30+ (the compose default
+    // image). Set 0 for the legacy OUTPUT mode (burn-output txs, UTXO-heavy).
+    // Renamed from SPAM_TX_DATA_BYTES (still honored).
     const MAX_DATA_BYTES: u64 = 98_000;
     let data_max_bytes: u64 = {
         let requested: u64 = env::var("SPAM_TX_DATA_MAX_BYTES")
             .or_else(|_| env::var("SPAM_TX_DATA_BYTES"))
-            .unwrap_or_else(|_| "0".to_string())
+            .unwrap_or_else(|_| "90000".to_string())
             .parse()
             .expect("SPAM_TX_DATA_MAX_BYTES must be a non-negative integer");
         if requested > MAX_DATA_BYTES {
@@ -98,10 +99,10 @@ fn main() {
             requested
         }
     };
-    // Bottom of the data-size range. 0 (default) or >= MAX means uniform txs
-    // of exactly MAX; a value below MAX spreads sizes log-uniformly for a
-    // realistic mix of tx sizes. Clamped to MAX.
-    let data_min_bytes: u64 = env_or("SPAM_TX_DATA_MIN_BYTES", "0")
+    // Bottom of the data-size range. 0 or >= MAX means uniform txs of
+    // exactly MAX; a value below MAX (default 250) spreads sizes
+    // log-uniformly for a realistic mix of tx sizes. Clamped to MAX.
+    let data_min_bytes: u64 = env_or("SPAM_TX_DATA_MIN_BYTES", "250")
         .parse::<u64>()
         .expect("SPAM_TX_DATA_MIN_BYTES must be a non-negative integer")
         .min(data_max_bytes);
@@ -115,7 +116,11 @@ fn main() {
     // DATA/HYBRID fill target, measured in blocks of mempool weight: 0.5 =
     // half-full blocks (floor has no effect), 1 = full blocks + a shallow
     // backlog, 5 = full blocks + ~4 pending blocks visible in the mempool.
-    let fill_block_ratio: f64 = env_or("SPAM_FILL_BLOCK_RATIO", "1.0")
+    // Default 2: the mempool oscillates ~1 block around the target between
+    // top-ups, so 2 keeps a full block of floor-priced supply at every
+    // template and the fee floor stays airtight; 1 rides the trough and can
+    // leave the occasional partial block (floor leaks that block).
+    let fill_block_ratio: f64 = env_or("SPAM_FILL_BLOCK_RATIO", "2.0")
         .parse()
         .expect("SPAM_FILL_BLOCK_RATIO must be a number");
     // Airtight fee floor (raw DATA/HYBRID only): keep this many standalone
