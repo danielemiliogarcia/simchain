@@ -41,7 +41,11 @@ The network consists of 3 well-connected nodes plus helper containers:
   (raw engine) it can run in DATA/HYBRID mode — OP_RETURN data txs of varied sizes that
   fill blocks at near-zero node cost, kept `SPAM_FILL_BLOCK_RATIO` blocks deep — or in
   OUTPUT mode, spamming `SPAM_FIXED_TXS_PER_BLOCK` burn-output txs per block. Outputs
-  are paid to burn addresses so no wallet fills with dust. See SETTINGS.md "Spammer".
+  are paid to burn addresses so no wallet fills with dust. In DATA/HYBRID mode it also
+  maintains a standing pool of `SPAM_FLOOR_POOL_TXS` standalone ~110-vB floor-priced
+  fills, so blocks pack ~100% full and the `FALLBACK_FEE` price floor is **airtight**:
+  a below-floor tx waits in the mempool until it outbids the floor, like mainnet under
+  congestion. See SETTINGS.md "Spammer".
   On startup it waits for funds to mature and splits them into `SPAM_FANOUT_UTXOS` independent
   UTXOs, otherwise the 25-tx unconfirmed-chain mempool limit would cap spam at 25 txs
   per wallet per block. If you spam many
@@ -106,8 +110,8 @@ flowchart TB
     mc -->|"RPC: mine block"| n2
     mc -->|"RPC: mine block"| n3
     sp -->|"RPC: watch height"| n1
-    sp -->|"RPC: wallet spam"| n2
-    sp -->|"RPC: wallet spam"| n3
+    sp -->|"RPC: raw spam + floor fills"| n2
+    sp -->|"RPC: raw spam + floor fills"| n3
     rg -->|"RPC: invalidate + re-mine"| n3
     rg -.->|"witness poll"| n1
 

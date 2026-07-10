@@ -97,19 +97,20 @@ The three fee settings look similar but act at different points of a transaction
 | Variable | Default | Description |
 |---|---|---|
 | `MIN_RELAY_TX_FEE` | `0.00001` | Node mempool/relay floor (feerate, BTC/kvB). Keep at the mainnet default; see [The fee market](#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor) for why it is the wrong knob for a fee floor. |
-| `FALLBACK_FEE` | `0.0001` | Wallet feerate when estimation has no data (BTC/kvB). Also the simnet's whole price level: all spam pays this rate, so raising it sets an economic fee floor — see [The fee market](#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor). |
+| `FALLBACK_FEE` | `0.0001` | Wallet feerate when estimation has no data (BTC/kvB). Also the simnet's floor price level: floor fills pay this rate, and DATA/HYBRID bulk spam pays a tiny premium so miners use floor fills only for residual gaps. Raising it sets an economic fee floor — see [The fee market](#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor). |
 | `MAX_TX_FEE` | `10000000` | Wallet cap on the total fee of one tx (whole BTC). |
+| `BLOCK_RESERVED_WEIGHT` | `2000` | Regtest mining template reserve (`-blockreservedweight`, WU). Bitcoin Core defaults to reserving 8000 WU for mining RPC clients; `2000` is Core's minimum safety value and avoids most of the permanent ~7.4k-WU gap. Deviating from the Core default here *imitates mainnet*: real pools reserve just enough for their actual coinbase, so congested mainnet blocks pack to ~3,999,8xx WU — with the default 8000 the simnet's blocks would cap at ~3.993M WU, unlike anything on mainnet. Mining-template-only: consensus (4M WU) and relay/mempool policy are untouched, so all nodes still behave like stock mainnet nodes. |
 | `NODE1_DISABLE_WALLET` | `1` | node1 has no wallet by default: it mimics a 3rd-party production endpoint with no hot wallet online, so the user manages keys externally and submits signed raw transactions. Set `0` to enable the wallet. |
 
 ### The fee market: what spam pays, and how to set a price floor
 
-Both spam engines pay the same rate; they just reach it differently. The raw engine
-(`USE_RAW_TX_SPAM=true`, the default) sets `FALLBACK_FEE` explicitly on every
-transaction it builds — no estimator involved at all. The wallet engine never sets
-a fee: every send lets the sending node's wallet choose, the wallet asks its own
-fee estimator, the estimator has no data on a fresh chain, and the wallet falls
-back to `FALLBACK_FEE`. With the defaults every spam tx pays ~10 sat/vB — the
-uniform rate visible in the explorer.
+Both spam engines use `FALLBACK_FEE` as the price anchor; they just reach it
+differently. The raw engine (`USE_RAW_TX_SPAM=true`, the default) sets fees explicitly:
+floor fills pay `FALLBACK_FEE`, DATA/HYBRID bulk spam pays a tiny premium above it, and
+OUTPUT-mode spam pays it directly. The wallet engine never sets a fee: every send lets
+the sending node's wallet choose, the wallet asks its own fee estimator, the estimator
+has no data on a fresh chain, and the wallet falls back to `FALLBACK_FEE`. With the
+defaults, the floor is ~10 sat/vB.
 
 Under the wallet engine the estimator never escapes that level either. Once it has
 data, its only data is the spam itself, and all of it confirmed at the fallback
@@ -137,14 +138,14 @@ way, only the 546-sat burn outputs really leave the loop.
 descending feerate, and when the next spam tx does not fit the space left in the
 block it keeps scanning down the ladder for anything that does. A tiny transaction
 fits anywhere — so it rides the leftover gap into the next block even while paying
-far below the floor. The gap is roughly one spam tx: ~20k WU with
+far below the floor. The gap scales with the spam tx size: ~20k WU with
 `SPAM_SENDMANY_OUTPUTS=160`, ~127k WU at 1000, ~380k WU at 3000 (hundreds of small
 txs slip through per block). The rule: **the floor holds for a transaction only if
-the spam backlog contains transactions as small as it.** Sequential spam (~561 WU
-per tx) makes the floor airtight; big batches are for throughput and mempool-bloat
-demos and actively break floor testing. If you are testing a fee-bumping engine on
-a small transaction, use the sequential recipe (or see the hybrid-spam proposal in
-`nice-to-have.md`, which combines batch bulk with small gap-sealing txs).
+the miner can pack the residual gap with something as small, standalone and
+floor-priced.** That is exactly what the DATA/HYBRID floor fill pool provides
+(`SPAM_FLOOR_POOL_TXS`, on by default — see [The fee floor](#the-fee-floor)); in
+OUTPUT mode big batches are for throughput and mempool-bloat demos and actively
+break floor testing.
 
 **Do not use `MIN_RELAY_TX_FEE` as the floor.** The wallets would cope — Bitcoin
 Core clamps every wallet send to `max(-mintxfee, -minrelaytxfee)`, so spam would
@@ -155,10 +156,10 @@ bounces at node1 with `min relay fee not met` instead of waiting in the mempool
 like it would on mainnet. Fee pressure should come from traffic (tooling), not from
 node policy.
 
-Limitation: all spam sits in one fee bucket at whatever level you set — fee
-histograms stay flat and `estimatesmartfee` just echoes the level. A spread of fee
-rates with real competition inside a block is a proposed feature (nice-to-have:
-fee-market simulation).
+Limitation: spam still sits in a very narrow fee band around whatever level you set —
+fee histograms stay mostly flat and `estimatesmartfee` mostly echoes the level. A
+wider spread of fee rates with real competition inside a block is a proposed feature
+(nice-to-have: fee-market simulation).
 
 ## Mining controller
 
@@ -174,13 +175,13 @@ fee-market simulation).
 | Variable | Default | Description |
 |---|---|---|
 | `ENABLE_SPAM` | `true` | Spam transactions after each block so blocks are not empty. |
-| `USE_RAW_TX_SPAM` | `true` | Selects the spam engine. `true`: **raw engine** — the spammer holds its own keys, tracks its own UTXO set in memory, signs every tx locally and submits with `sendrawtransaction`. The node wallets are bypassed, so the send rate stays flat forever (no wallet fatigue) and every tx pays exactly `FALLBACK_FEE`. `false`: **node-wallet engine** — spam is sent with `sendtoaddress`/`sendmany` on the miner wallets, so bitcoind does coin selection and signing (wallet-realistic traffic, the original behavior); throughput is bound by the wallet lock and degrades as wallet history grows (see [Full blocks](#full-blocks)). All other spam knobs apply to both engines. |
+| `USE_RAW_TX_SPAM` | `true` | Selects the spam engine. `true`: **raw engine** — the spammer holds its own keys, tracks its own UTXO set in memory, signs every tx locally and submits with `sendrawtransaction`. The node wallets are bypassed, so the send rate stays flat forever (no wallet fatigue). Floor-fill txs pay exactly `FALLBACK_FEE`; DATA/HYBRID bulk spam pays a tiny premium so miners drain bulk first and keep floor fills for residual gaps; rare refill fan-outs pay above the floor so they confirm under saturation. `false`: **node-wallet engine** — spam is sent with `sendtoaddress`/`sendmany` on the miner wallets, so bitcoind does coin selection and signing (wallet-realistic traffic, the original behavior); throughput is bound by the wallet lock and degrades as wallet history grows (see [Full blocks](#full-blocks)). All other spam knobs apply to both engines. |
 | `SPAM_FIXED_TXS_PER_BLOCK` | `100` | Fixed tx count for the **OUTPUT** spam modes (sequential/batch) and the wallet engine — the number a block explorer shows per block (plus coinbase) until blocks are full; excess waits in the mempool. Split across the miner nodes for you. **Ignored in DATA/HYBRID mode**, where the fill is driven by `SPAM_FILL_BLOCK_RATIO`. Renamed from `SPAM_TXS_PER_BLOCK` (still honored); replaces the older `SPAM_PER_MINER_PER_BLOCK` (× 2). |
 | `SPAM_SENDMANY_OUTPUTS` | `0` | OUTPUT-mode fatness. `0`: sequential — one tx with a single burn output at a time, p2p-like arrival. `N > 0`: batch — each spam tx carries N burn outputs (exchange-payout-shaped). Ignored in DATA/HYBRID mode. |
 | `SPAM_TX_DATA_MAX_BYTES` | `0` | Raw engine only. `0`: OUTPUT mode (fatness from burn outputs). `N > 0`: **DATA/HYBRID mode** — the fill comes from OP_RETURN data txs (biggest payload = N). An OP_RETURN is provably unspendable, so it never enters the UTXO set: pure block weight at near-zero node cost (a handful of fat txs fill a 4M WU block vs ~1130 in output mode; measured node CPU ~100% → ~2%). Capped just under the 100k-vB standard-tx limit; needs Core 30+. Renamed from `SPAM_TX_DATA_BYTES` (still honored). See [Hybrid: varied sizes and mempool depth](#hybrid-varied-sizes-and-mempool-depth). |
 | `SPAM_TX_DATA_MIN_BYTES` | `0` | Smallest data payload. `0` (or ≥ MAX): every data tx is exactly MAX (uniform). Below MAX: each tx's size is drawn **log-uniformly** in `[MIN, MAX]` — a realistic spread, most small and a few large. |
 | `SPAM_SMALL_TXS_PER_BLOCK` | `0` | HYBRID: this many extra minimum-size (~140 vB) floor-priced txs per block, on top of the data fill. Cosmetic — they add a stream of small realistic-looking payment-shaped txs. This is **not** the fee floor; the airtight floor is `SPAM_FLOOR_POOL_TXS`. `0`: none. |
-| `SPAM_FLOOR_POOL_TXS` | `500` | **Airtight fee floor** (DATA/HYBRID mode). Keep this many standalone minimum-size (~110 vB) floor-priced fill txs *standing* in the mempool at all times, split across the miners on their own nodes. Each fill spends a **confirmed** UTXO from a dedicated second key (never unconfirmed spam change), so its ancestor package is itself and block assembly can pack any residual gap with it — blocks reach ~99.99% full, so a below-floor tx has no gap to slip into and must **outbid** the floor to confirm. Mined fills recycle their change into fresh ammo (zero net UTXO-set growth). `0`: off — the floor is then **soft** (see [The fee floor](#the-fee-floor)). Ignored in OUTPUT/wallet modes. |
+| `SPAM_FLOOR_POOL_TXS` | `4000` | **Airtight fee floor** (DATA/HYBRID mode). Keep this many standalone floor-priced ~110-vB fill txs *standing* in the mempool at all times, split across the miners and direct-relayed to the other miner. Each fill spends a **confirmed** UTXO from a dedicated second key (never unconfirmed spam change), so its ancestor package is itself and a below-floor tx must **outbid** the floor to confirm. Mined fills recycle their change into fresh ammo (zero net UTXO-set growth). `0`: off — the floor is then **soft** (see [The fee floor](#the-fee-floor)). Ignored in OUTPUT/wallet modes. |
 | `SPAM_FILL_BLOCK_RATIO` | `1.0` | DATA/HYBRID fill target, in blocks of mempool weight, measured live each block and topped up. `0.5`: half-full blocks (floor off). `1`: full blocks + a shallow backlog. `5`: full blocks + ~4 pending blocks visible in the mempool. |
 | `SPAM_FANOUT_AUTO` | `true` | DATA/HYBRID: auto-size the branch pool from the fill ratio. `true`: use `max(12, ceil(ratio × 15))` branches (a deep pool is needed to hold that many blocks of unconfirmed spam). `false`: use `SPAM_FANOUT_UTXOS`, erroring at startup if it is below the `ratio × 10` minimum. |
 | `SPAM_FANOUT_UTXOS` | `50` | The spammer keeps its funds split into this many independent UTXOs ("branches"), replenishing when the pool runs low. The mempool caps unconfirmed chains at 25 txs / 101k vB, so without the split a single UTXO can place only ~25 txs per block. In DATA/HYBRID mode this is overridden by the auto value unless `SPAM_FANOUT_AUTO=false`. `0` disables (OUTPUT/wallet only). |
@@ -261,9 +262,9 @@ plus a few small txs, and keeps the mempool a chosen number of blocks deep:
 SPAM_TX_DATA_MAX_BYTES=90000   # biggest OP_RETURN payload (cheap bulk weight)
 SPAM_TX_DATA_MIN_BYTES=250     # spread each tx's size log-uniformly in [MIN, MAX]
 SPAM_SMALL_TXS_PER_BLOCK=40    # small realistic payment-shaped txs (cosmetic)
-SPAM_FLOOR_POOL_TXS=500        # standing standalone fills → airtight floor (see below)
+SPAM_FLOOR_POOL_TXS=4000       # standing 110-vB standalone fills -> airtight floor (see below)
 SPAM_FILL_BLOCK_RATIO=2        # keep ~2 blocks of weight pending in the mempool
-FALLBACK_FEE=0.001             # 100 sat/vB price level for all spam
+FALLBACK_FEE=0.001             # 100 sat/vB floor; bulk DATA pays a small premium
 ```
 
 `SPAM_FILL_BLOCK_RATIO` is measured live each block and topped up, so it controls both
@@ -279,8 +280,9 @@ grows (only the small txs add outputs).
 ### The fee floor
 
 Raising `FALLBACK_FEE` with full blocks makes the estimator and mempool.space show a
-price floor (e.g. Low/Medium/High all at 100 sat/vB). Whether that floor is **airtight**
-against tiny below-floor transactions depends on `SPAM_FLOOR_POOL_TXS`.
+price floor (e.g. floor fills at 100 sat/vB while bulk DATA sits just above it). Whether
+that floor is **airtight** against tiny below-floor transactions depends on
+`SPAM_FLOOR_POOL_TXS`.
 
 **The problem (with `SPAM_FLOOR_POOL_TXS=0`, a soft floor).** Every data/sealer spam tx
 chains off a branch, so only a branch-count of them are *standalone* (mineable into a
@@ -292,21 +294,23 @@ gap and confirms next block — visible as the `No Priority` band at ~1–2 sat/
 `SPAM_SMALL_TXS_PER_BLOCK` gap-sealers tighten packing and raise the bar (the floor
 holds for any tx *larger* than the gap) but do not close it for the smallest txs.
 
-**The fix (`SPAM_FLOOR_POOL_TXS > 0`, default `500`, airtight).** The engine maintains a
-standing pool of standalone minimum-size (~110 vB) floor-priced fill txs *sitting in the
-mempool at all times*, from a dedicated second key. Each fill spends a **confirmed** pool
-UTXO — never unconfirmed change — so its ancestor package is itself and block assembly
-can drop it into any residual gap. With hundreds of them standing, blocks pack to within
-~110 vB of full (~99.99%), leaving no gap a real tx can fit: a below-floor tx must
-**outbid** the floor to confirm. Each block, mined fills recycle their change into fresh
-confirmed ammo, so the pool churns ~1:1 and holds at the target with **zero net
-UTXO-set growth** (self-transfers spend one output and create one) and near-idle nodes.
-The pool only applies in DATA/HYBRID mode and only while blocks are actually full
-(`SPAM_FILL_BLOCK_RATIO ≥ 1`); at `ratio < 1` blocks are partial by design and
-everything confirms regardless.
+**The fix (`SPAM_FLOOR_POOL_TXS > 0`, default `4000`, airtight).** The engine maintains a
+standing pool of standalone floor-priced ~110-vB self-transfers *sitting in the mempool
+at all times*, from a dedicated second key. Each fill spends a **confirmed** pool UTXO --
+never unconfirmed change -- so its ancestor package is itself and block assembly can
+drop many of them into residual gaps. A below-floor tx must **outbid** the floor to
+confirm.
+Each block, mined fills recycle their change into fresh confirmed ammo, so the pool churns
+~1:1 and holds at the target with **zero net UTXO-set growth** (self-transfers spend one
+output and create one) and near-idle nodes. The spammer also direct-relays floor fills to
+the other miner by RPC, so both rotating miners see the same floor inventory without
+waiting on P2P relay; bulk DATA txs stay on the owner-node path to keep cycles short. The
+pool only applies in DATA/HYBRID mode and only while blocks are actually full
+(`SPAM_FILL_BLOCK_RATIO >= 1`); at `ratio < 1` blocks are partial by design and everything
+confirms regardless.
 
-### Market pressure floor to 100 sats/vB
-full blocks with 100 sats/vb every tx
+### Market pressure floor to 100 sats/vB (legacy OUTPUT recipe)
+Full blocks with 100 sat/vB on every tx, using OUTPUT-mode batch spam:
 ```bash
 BLOCK_INTERVAL_SECS=15
 ENABLE_SPAM=true
@@ -315,6 +319,10 @@ SPAM_SENDMANY_OUTPUTS=250
 FALLBACK_FEE=0.001
 
 ```
+Kept for wallet-realistic burn-output traffic. Note the trade-offs vs the default
+DATA/HYBRID + floor-pool setup: much higher node CPU (every output is a UTXO-set
+insert), and the floor is **not** airtight for tiny transactions (no standing fill
+pool in OUTPUT mode — see [When the floor leaks](#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor)).
 
 ## Reorg simulator (profile `reorg`)
 

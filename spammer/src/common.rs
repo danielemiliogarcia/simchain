@@ -27,6 +27,10 @@ pub fn env_or(key: &str, default: &str) -> String {
 }
 
 pub fn create_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Client {
+    Client::from_jsonrpc(create_jsonrpc_client(rpc_url, rpc_user, rpc_pass))
+}
+
+pub fn create_jsonrpc_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> jsonrpc::Client {
     let (user, pass) = (rpc_user.to_string(), Some(rpc_pass.to_string()));
     let transport = jsonrpc::simple_http::SimpleHttpTransport::builder()
         .url(rpc_url)
@@ -34,7 +38,7 @@ pub fn create_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Client {
         .auth(user, pass)
         .timeout(Duration::from_secs(RPC_TIMEOUT_SECS))
         .build();
-    Client::from_jsonrpc(jsonrpc::client::Client::with_transport(transport))
+    jsonrpc::Client::with_transport(transport)
 }
 
 // Spam destinations are burn addresses (P2WPKH over the hash of a fixed tag,

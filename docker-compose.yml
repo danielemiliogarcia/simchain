@@ -58,6 +58,7 @@ services:
       - -fallbackfee=${FALLBACK_FEE:-0.0001}
       - -minrelaytxfee=${MIN_RELAY_TX_FEE:-0.00001}
       - -maxtxfee=${MAX_TX_FEE:-10000000}
+      - -blockreservedweight=${BLOCK_RESERVED_WEIGHT:-2000}
       # Wallet disabled by default: node1 mimics a 3rd-party production
       # endpoint, the user manages keys externally and submits signed raw txs
       - -disablewallet=${NODE1_DISABLE_WALLET:-1}
@@ -111,6 +112,7 @@ services:
       - -fallbackfee=${FALLBACK_FEE:-0.0001}
       - -minrelaytxfee=${MIN_RELAY_TX_FEE:-0.00001}
       - -maxtxfee=${MAX_TX_FEE:-10000000}
+      - -blockreservedweight=${BLOCK_RESERVED_WEIGHT:-2000}
       - -port=18444
       - -rpcport=18443
       - -txindex
@@ -148,6 +150,7 @@ services:
       - -fallbackfee=${FALLBACK_FEE:-0.0001}
       - -minrelaytxfee=${MIN_RELAY_TX_FEE:-0.00001}
       - -maxtxfee=${MAX_TX_FEE:-10000000}
+      - -blockreservedweight=${BLOCK_RESERVED_WEIGHT:-2000}
       - -port=18444
       - -rpcport=18443
       - -txindex
@@ -202,8 +205,8 @@ services:
       # true = raw engine (spammer signs its own txs, immune to wallet
       # fatigue); false = original node-wallet engine (sendtoaddress/sendmany)
       - USE_RAW_TX_SPAM=${USE_RAW_TX_SPAM:-true}
-      # The raw engine pays exactly this rate (the wallet engine ends up at
-      # the same one via the estimator fallback): one fee price-level knob.
+      # Floor price level. Floor fills pay exactly this; DATA/HYBRID bulk
+      # spam pays a small premium so floor fills remain residual-gap sealers.
       - FALLBACK_FEE=${FALLBACK_FEE:-0.0001}
       # Fixed tx count for OUTPUT modes (sequential/batch) and the wallet
       # engine. Ignored in DATA/HYBRID mode (fill is driven by the ratio below).
@@ -219,10 +222,9 @@ services:
       # they add a stream of small realistic-looking txs. 0 = none.
       - SPAM_SMALL_TXS_PER_BLOCK=${SPAM_SMALL_TXS_PER_BLOCK:-0}
       # Airtight fee floor (DATA/HYBRID mode): keep this many standalone
-      # minimum-size floor-priced fill txs STANDING in the mempool, so block
-      # assembly packs any residual gap with them and a below-floor tx cannot
-      # slip through. 0 = off (floor is then soft; see SETTINGS.md).
-      - SPAM_FLOOR_POOL_TXS=${SPAM_FLOOR_POOL_TXS:-500}
+      # floor-priced ~110-vB self-transfers STANDING in the mempool.
+      # 0 = off (soft floor).
+      - SPAM_FLOOR_POOL_TXS=${SPAM_FLOOR_POOL_TXS:-4000}
       # DATA/HYBRID fill target in blocks of mempool weight: 0.5 = half-full
       # blocks (floor off), 1 = full + shallow backlog, 5 = full + ~4 pending.
       - SPAM_FILL_BLOCK_RATIO=${SPAM_FILL_BLOCK_RATIO:-1.0}

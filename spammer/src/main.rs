@@ -3,7 +3,9 @@ mod node_wallet_spammer;
 mod raw_transaction_spammer;
 
 use bitcoincore_rpc::{bitcoin::Address, Client, RpcApi};
-use common::{burn_address, create_client, env_or, wait_for_funds, MINER_COUNT};
+use common::{
+    burn_address, create_client, create_jsonrpc_client, env_or, wait_for_funds, MINER_COUNT,
+};
 use raw_transaction_spammer::RawSpammer;
 use std::{env, thread, time::Duration};
 
@@ -117,13 +119,11 @@ fn main() {
         .parse()
         .expect("SPAM_FILL_BLOCK_RATIO must be a number");
     // Airtight fee floor (raw DATA/HYBRID only): keep this many standalone
-    // minimum-size (~110 vB) floor-priced fill txs STANDING in the mempool at
-    // all times, split across the miners. Each fill spends a confirmed UTXO
-    // from a dedicated pool (never unconfirmed change), so the block
-    // assembler can pack any residual gap with them and a below-floor tx has
-    // nowhere left to slip in. 0 disables (the floor is then soft: a small
-    // cheap tx can confirm through the ~12-17k vB packing gap).
-    let floor_pool_txs: u64 = env_or("SPAM_FLOOR_POOL_TXS", "500")
+    // floor-priced minimum-size fill txs STANDING in the mempool at all times,
+    // split across the miners. Each fill spends a confirmed UTXO from a
+    // dedicated pool (never unconfirmed change), so a below-floor tx has
+    // nowhere left to slip in. 0 disables (the floor is then soft).
+    let floor_pool_txs: u64 = env_or("SPAM_FLOOR_POOL_TXS", "4000")
         .parse()
         .expect("SPAM_FLOOR_POOL_TXS must be a non-negative integer");
     // Whether to auto-derive the branch pool from the fill ratio. true
@@ -140,10 +140,10 @@ fn main() {
     let replaces_per_miner: u64 = env_or("SPAM_REPLACES_PER_MINER_PER_BLOCK", "5")
         .parse()
         .expect("SPAM_REPLACES_PER_MINER_PER_BLOCK must be a non-negative integer");
-    // FALLBACK_FEE is what wallet-engine spam ends up paying (the wallet
-    // estimator has no data and falls back to it), so the raw engine pays
-    // exactly the same rate: one knob sets the simnet's fee price level for
-    // both engines. Same units as the node flag, BTC/kvB.
+    // FALLBACK_FEE is the simulated floor level. Floor fills pay exactly this;
+    // DATA/HYBRID bulk spam pays a tiny premium so miners drain bulk first and
+    // keep the floor fills for residual gaps. Same units as the node flag,
+    // BTC/kvB.
     let fallback_fee: f64 = env_or("FALLBACK_FEE", "0.0001")
         .parse()
         .expect("FALLBACK_FEE must be a number (BTC/kvB)");
@@ -176,11 +176,14 @@ fn main() {
 
     if use_raw {
         // Raw engine: one instance per miner node, each with its own key and
-        // UTXO pool, submitting to its own node -- the same two independent
-        // RPC pipelines the wallet engine gets from its two wallets. The
-        // wallet clients are only kept for funding pulls.
+        // UTXO pool. Floor-fill txs are accepted by their owner node, then
+        // relayed by RPC to the other miner so both rotating miners can
+        // template from a fresh local floor pool without waiting on P2P
+        // propagation. Bulk DATA txs stay on the owner-node path.
         let mut engine2 = RawSpammer::new(
             create_client(&node2_url, &rpc_user, &rpc_pass),
+            create_jsonrpc_client(&node2_url, &rpc_user, &rpc_pass),
+            vec![create_jsonrpc_client(&node3_url, &rpc_user, &rpc_pass)],
             wallet2,
             &wallet2_name,
             "Node 2",
@@ -191,6 +194,8 @@ fn main() {
         );
         let mut engine3 = RawSpammer::new(
             create_client(&node3_url, &rpc_user, &rpc_pass),
+            create_jsonrpc_client(&node3_url, &rpc_user, &rpc_pass),
+            vec![create_jsonrpc_client(&node2_url, &rpc_user, &rpc_pass)],
             wallet3,
             &wallet3_name,
             "Node 3",
@@ -238,7 +243,7 @@ fn main() {
             const BLOCK_VSIZE: u64 = 1_000_000;
             let meter = create_client(&node1_url, &rpc_user, &rpc_pass);
             println!(
-                "Spam engine: raw DATA/HYBRID mode, {data_min_bytes}..{data_max_bytes} byte OP_RETURN, {small_txs_per_block} gap-sealers/block, {floor_pool_txs} standing floor fills, fill {fill_block_ratio} block(s), {fee_rate_sat_vb} sat/vB"
+                "Spam engine: raw DATA/HYBRID mode, {data_min_bytes}..{data_max_bytes} byte OP_RETURN, {small_txs_per_block} gap-sealers/block, {floor_pool_txs} standing 110-vB floor fills, fill {fill_block_ratio} block(s), floor {fee_rate_sat_vb} sat/vB"
             );
             run_block_loop(&node1, move || {
                 // Measure the live mempool right after the new block drained it,

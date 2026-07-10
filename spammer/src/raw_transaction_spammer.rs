@@ -31,13 +31,13 @@
 //!
 //! The airtight fee floor comes from a third piece, the FLOOR FILL POOL
 //! (SPAM_FLOOR_POOL_TXS, DATA/HYBRID mode): a standing pool of standalone
-//! minimum-size floor-priced self-transfers kept sitting in the mempool at
-//! all times. Spam txs chain off unconfirmed change, so their ancestor
-//! packages are far too big to fit the ~12-17k vB gap block packing leaves;
-//! a fill instead spends a CONFIRMED UTXO from a dedicated second key, so
-//! its ancestor package is itself (~110 vB) and the block assembler can drop
-//! it into any residual gap. Blocks pack to within ~110 vB of full and a
-//! below-floor tx has no gap left to slip into -- it must outbid the floor.
+//! floor-priced minimum-size self-transfers kept sitting in the mempool at all
+//! times. Spam txs chain off unconfirmed change, so their ancestor packages
+//! are far too big to fit residual block gaps; a fill instead spends a
+//! CONFIRMED UTXO from a dedicated second key, so its ancestor package is
+//! itself and the block assembler can drop it into those gaps. With enough
+//! standing fills, blocks pack down to a fill-sized remainder and a below-floor
+//! tx has no gap left to slip into -- it must outbid the floor.
 //! Mined fills confirm their change, which becomes fresh pool ammo: the pool
 //! churns 1:1 with zero net UTXO-set growth.
 
@@ -56,6 +56,7 @@ use bitcoincore_rpc::{
         TxIn, TxOut, Txid, Witness,
     },
     json::ScanTxOutRequest,
+    jsonrpc::{self, Client as JsonClient},
     Client, RpcApi,
 };
 use serde_json::json;
@@ -83,11 +84,18 @@ const BRANCH_MIN_TXS: u64 = 16;
 // the change must be spendable as the next fill's input, and a taproot
 // self-transfer is bigger (~111 vB: 57.5 vB input but a 43 vB output).
 const FILL_VSIZE: u64 = 110;
+// In DATA/HYBRID mode, bulk spam pays a tiny premium over the floor fills so
+// block assembly drains bulk weight first and uses floor fills only to seal
+// residual gaps. The visible floor still comes from fills at FALLBACK_FEE.
+const BULK_FEE_PREMIUM_SAT_VB: f64 = 1.0;
+const POOL_FANOUT_CHUNK_OUTPUTS: usize = 500;
+// Fan-out/refill transactions must confirm even when floor-priced spam fills
+// every block. Paying above the floor keeps the refill path from competing
+// with the traffic it is trying to replenish.
+const FANOUT_FEE_MULTIPLIER: u64 = 2;
 
-// One funding pull for the floor pool, much smaller than the data engine's
-// FUND_PULL_MAX_BTC: the pool only ever burns fees (~0.011 BTC per block at
-// 100 sat/vB with ~100 fills mined per block), so this lasts thousands of
-// blocks.
+// One funding pull for the floor pool. Kept modest because fills only burn
+// fees and recycle their change 1:1 after confirmation.
 const POOL_PULL_MAX_BTC: f64 = 50.0;
 
 #[derive(Clone, Copy)]
@@ -121,6 +129,11 @@ struct SentSpam {
 
 pub struct RawSpammer {
     node: Client,
+    node_batch: JsonClient,
+    // Extra nodes that receive floor-fill txs directly after the owner node
+    // accepts them. Floor fills are the only txs that must be in both rotating
+    // miners' local mempools before the next template is assembled.
+    relay_nodes: Vec<JsonClient>,
     wallet: Client,
     wallet_name: String,
     label: String,
@@ -197,6 +210,8 @@ impl RawSpammer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         node: Client,
+        node_batch: JsonClient,
+        relay_nodes: Vec<JsonClient>,
         wallet: Client,
         wallet_name: &str,
         label: &str,
@@ -235,8 +250,16 @@ impl RawSpammer {
         let pool_script = pool_address.script_pubkey();
         println!("{label} => Raw spam engine address: {address}");
         println!("{label} => Floor fill-pool address: {pool_address}");
+        if !relay_nodes.is_empty() {
+            println!(
+                "{label} => Direct floor-fill RPC relay peers: {}",
+                relay_nodes.len()
+            );
+        }
         RawSpammer {
             node,
+            node_batch,
+            relay_nodes,
             wallet,
             wallet_name: wallet_name.to_string(),
             label: label.to_string(),
@@ -267,6 +290,12 @@ impl RawSpammer {
         Amount::from_sat((vsize as f64 * self.fee_rate_sat_vb).ceil() as u64)
     }
 
+    fn bulk_fee_from_vsize(&self, vsize: u64) -> Amount {
+        Amount::from_sat(
+            (vsize as f64 * (self.fee_rate_sat_vb + BULK_FEE_PREMIUM_SAT_VB)).ceil() as u64,
+        )
+    }
+
     fn shape_vsize(&self, shape: &SpamShape) -> u64 {
         match shape {
             SpamShape::Data(n) => data_tx_vsize(*n),
@@ -280,7 +309,12 @@ impl RawSpammer {
     }
 
     fn shape_fee(&self, shape: &SpamShape) -> Amount {
-        self.fee_from_vsize(self.shape_vsize(shape))
+        let vsize = self.shape_vsize(shape);
+        if self.data_max > 0 {
+            self.bulk_fee_from_vsize(vsize)
+        } else {
+            self.fee_from_vsize(vsize)
+        }
     }
 
     // Total value carried by the non-change outputs (all dust; the real cost
@@ -365,9 +399,10 @@ impl RawSpammer {
     }
 
     // Fee for the fan-out consolidation tx: many inputs, `n_out` change-style
-    // outputs, no data.
+    // outputs, no data. It deliberately pays above the simulated floor so
+    // refill transactions confirm promptly under saturation.
     fn consolidation_fee(&self, n_in: usize, n_out: usize) -> Amount {
-        self.fee_from_vsize((11 + 68 * n_in + 31 * n_out) as u64)
+        self.fee_from_vsize((11 + 68 * n_in + 31 * n_out) as u64) * FANOUT_FEE_MULTIPLIER
     }
 
     // Build, sign and broadcast one transaction spending the engine key's
@@ -390,10 +425,10 @@ impl RawSpammer {
         )
     }
 
-    // send_tx generalized over the spending key, so the same builder serves
+    // send_tx generalized over the spending key, so the same signer serves
     // both the engine key (data branches) and the floor-pool key (fills).
     // All inputs must pay `spent_script` (P2WPKH of `pubkey`).
-    fn send_signed(
+    fn signed_tx(
         &self,
         inputs: &[Utxo],
         outputs: Vec<TxOut>,
@@ -401,7 +436,7 @@ impl RawSpammer {
         spent_script: &ScriptBuf,
         secret: &SecretKey,
         pubkey: &PublicKey,
-    ) -> Result<Txid, bitcoincore_rpc::Error> {
+    ) -> Transaction {
         let sequence = if replaceable {
             Sequence::ENABLE_RBF_NO_LOCKTIME
         } else {
@@ -435,9 +470,62 @@ impl RawSpammer {
             *cache.witness_mut(i).unwrap() = Witness::p2wpkh(&signature, pubkey);
         }
         drop(cache);
+        tx
+    }
+
+    fn send_signed(
+        &self,
+        inputs: &[Utxo],
+        outputs: Vec<TxOut>,
+        replaceable: bool,
+        spent_script: &ScriptBuf,
+        secret: &SecretKey,
+        pubkey: &PublicKey,
+    ) -> Result<Txid, bitcoincore_rpc::Error> {
+        let raw_tx = serialize_hex(&self.signed_tx(
+            inputs,
+            outputs,
+            replaceable,
+            spent_script,
+            secret,
+            pubkey,
+        ));
         self.node
-            .call::<String>("sendrawtransaction", &[json!(serialize_hex(&tx)), json!(0)])
+            .call::<String>("sendrawtransaction", &[json!(&raw_tx), json!(0)])
             .map(|s| s.parse().expect("bitcoind returned an invalid txid"))
+    }
+
+    fn send_raw_batch(client: &JsonClient, raw_txs: &[String]) -> Vec<Result<Txid, String>> {
+        if raw_txs.is_empty() {
+            return Vec::new();
+        }
+        let params: Vec<_> = raw_txs
+            .iter()
+            .map(|raw| jsonrpc::arg(vec![json!(raw), json!(0)]))
+            .collect();
+        let requests: Vec<_> = params
+            .iter()
+            .map(|p| client.build_request("sendrawtransaction", Some(p.as_ref())))
+            .collect();
+
+        match client.send_batch(&requests) {
+            Ok(responses) => responses
+                .into_iter()
+                .map(|response| {
+                    let response = response.ok_or_else(|| "missing batch response".to_string())?;
+                    let txid = response.result::<String>().map_err(|e| e.to_string())?;
+                    txid.parse()
+                        .map_err(|_| "bitcoind returned an invalid txid".to_string())
+                })
+                .collect(),
+            Err(e) => raw_txs.iter().map(|_| Err(e.to_string())).collect(),
+        }
+    }
+
+    fn relay_raw_batch(&self, raw_txs: &[String]) {
+        for relay_node in &self.relay_nodes {
+            let _ = Self::send_raw_batch(relay_node, raw_txs);
+        }
     }
 
     // Confirmed, still-unspent UTXOs paying `address`, from the chain.
@@ -741,9 +829,9 @@ impl RawSpammer {
     // fill count back up to `target`. Mirrors ensure_funds: cheap in-memory
     // check when healthy, then a scantxoutset resync, then a miner-wallet
     // pull, then a consolidate + fan-out into target + 25% equal UTXOs (the
-    // buffer covers UTXOs locked under in-flight fills). Waits for the
-    // fan-out to confirm before returning: fills must spend CONFIRMED
-    // outputs only, or they stop being standalone and the floor reopens.
+    // buffer covers UTXOs locked under in-flight fills). Waits for the fan-out
+    // to confirm before returning: fills must spend CONFIRMED outputs only, or
+    // they stop being standalone and the floor reopens.
     fn ensure_pool_funds(&mut self, need: u64, target: u64) {
         let required = self.fill_fee() + MIN_CHANGE;
         if self.usable_fill_ammo(required) >= need {
@@ -756,7 +844,7 @@ impl RawSpammer {
 
         let seed_count = target + target.div_ceil(4);
         let total: Amount = self.pool_utxos.iter().map(|u| u.amount).sum();
-        let refill_floor = required * (seed_count * BRANCH_MIN_TXS);
+        let refill_floor = required * seed_count;
         if total < refill_floor {
             common::wait_for_funds(&self.wallet, &self.wallet_name);
             let trusted = self.wallet.get_balances().unwrap().mine.trusted.to_btc();
@@ -807,54 +895,105 @@ impl RawSpammer {
             "{} => Floor pool splitting {total} into {seed_count} fill UTXOs of {per_utxo}",
             self.label
         );
-        let outputs: Vec<TxOut> = (0..seed_count)
-            .map(|_| TxOut {
-                value: per_utxo,
-                script_pubkey: self.pool_script.clone(),
-            })
-            .collect();
-        let inputs = std::mem::take(&mut self.pool_utxos);
-        match self.send_signed(
-            &inputs,
-            outputs,
-            false,
-            &self.pool_script,
-            &self.pool_secret,
-            &self.pool_pubkey,
-        ) {
-            Ok(txid) => {
-                println!(
-                    "{} => Pool fan-out tx {txid} sent, waiting for it to confirm...",
-                    self.label
-                );
-                while !matches!(self.node.get_tx_out(&txid, 0, Some(false)), Ok(Some(_))) {
-                    thread::sleep(Duration::from_millis(500));
+        let mut available = std::mem::take(&mut self.pool_utxos);
+        // Spend large pool UTXOs first. During migration from an older pool
+        // there can be thousands of small confirmed UTXOs; consuming those
+        // first can make the fan-out tx itself exceed standard tx size.
+        available.sort_by_key(|u| u.amount.to_sat());
+        let mut fresh = Vec::new();
+        let mut outputs_left = seed_count as usize;
+
+        while outputs_left > 0 {
+            let n_fill = outputs_left.min(POOL_FANOUT_CHUNK_OUTPUTS);
+            let fill_value = per_utxo * n_fill as u64;
+            let mut inputs = Vec::new();
+            let mut input_total = Amount::ZERO;
+            loop {
+                let fee = self.consolidation_fee(inputs.len(), n_fill);
+                if input_total >= fill_value + fee {
+                    break;
                 }
-                self.pool_utxos = (0..seed_count)
-                    .map(|i| Utxo {
+                let Some(input) = available.pop() else {
+                    println!(
+                        "{} => Floor pool ran out of inputs mid fan-out, retrying next block",
+                        self.label
+                    );
+                    available.extend(inputs);
+                    self.pool_utxos = available;
+                    self.pool_utxos.extend(fresh);
+                    return;
+                };
+                input_total += input.amount;
+                inputs.push(input);
+            }
+
+            let fee_with_change = self.consolidation_fee(inputs.len(), n_fill + 1);
+            let change = input_total
+                .checked_sub(fill_value + fee_with_change)
+                .unwrap_or(Amount::ZERO);
+            let include_change = change >= required;
+            let mut outputs: Vec<TxOut> = (0..n_fill)
+                .map(|_| TxOut {
+                    value: per_utxo,
+                    script_pubkey: self.pool_script.clone(),
+                })
+                .collect();
+            if include_change {
+                outputs.push(TxOut {
+                    value: change,
+                    script_pubkey: self.pool_script.clone(),
+                });
+            }
+
+            match self.send_signed(
+                &inputs,
+                outputs,
+                false,
+                &self.pool_script,
+                &self.pool_secret,
+                &self.pool_pubkey,
+            ) {
+                Ok(txid) => {
+                    println!(
+                        "{} => Pool fan-out tx {txid} sent ({n_fill} fill outputs), waiting for it to confirm...",
+                        self.label
+                    );
+                    while !matches!(self.node.get_tx_out(&txid, 0, Some(false)), Ok(Some(_))) {
+                        thread::sleep(Duration::from_millis(500));
+                    }
+                    fresh.extend((0..n_fill).map(|i| Utxo {
                         outpoint: OutPoint::new(txid, i as u32),
                         amount: per_utxo,
-                    })
-                    .collect();
-                println!("{} => Pool fan-out confirmed", self.label);
-            }
-            Err(e) => {
-                println!(
-                    "{} => Floor pool fan-out failed ({e}), retrying next block",
-                    self.label
-                );
-                self.pool_resync();
+                    }));
+                    if include_change {
+                        available.push(Utxo {
+                            outpoint: OutPoint::new(txid, n_fill as u32),
+                            amount: change,
+                        });
+                    }
+                    outputs_left -= n_fill;
+                }
+                Err(e) => {
+                    println!(
+                        "{} => Floor pool fan-out failed ({e}), retrying next block",
+                        self.label
+                    );
+                    self.pool_resync();
+                    return;
+                }
             }
         }
+        self.pool_utxos = available;
+        self.pool_utxos.extend(fresh);
+        println!("{} => Pool fan-out confirmed", self.label);
     }
 
     // Keep a standing pool of `target` standalone floor-priced fills sitting
     // in this node's mempool: harvest what the last block(s) mined (their
     // change is fresh confirmed ammo), then top the standing count back up.
     // Each fill spends one CONFIRMED pool UTXO, so its ancestor package is
-    // itself (~110 vB) and the block assembler can drop it into any residual
-    // packing gap: blocks pack to within ~110 vB of full, leaving a
-    // below-floor tx no gap to slip into. Returns the number of fills sent.
+    // itself and the block assembler can drop it into residual packing gaps.
+    // Returns the number of fills sent.
     pub fn floor_round(&mut self, target: u64) -> usize {
         if target == 0 {
             return 0;
@@ -871,12 +1010,13 @@ impl RawSpammer {
         }
         self.ensure_pool_funds(need, target);
 
-        let fee = self.fill_fee();
-        let required = fee + MIN_CHANGE;
         let mut sent = 0u64;
-        let mut fails = 0;
+        let mut sent_vsize = 0u64;
         let mut first_error: Option<String> = None;
-        while sent < need && fails < 3 {
+        let mut raw_fills: Vec<(String, Amount)> = Vec::new();
+        let required = self.fill_fee() + MIN_CHANGE;
+        let fee = self.fill_fee();
+        while (raw_fills.len() as u64) < need {
             let Some(idx) = self.pool_utxos.iter().position(|u| u.amount >= required) else {
                 break;
             };
@@ -886,35 +1026,46 @@ impl RawSpammer {
                 value: change,
                 script_pubkey: self.pool_script.clone(),
             }];
-            match self.send_signed(
+            let tx = self.signed_tx(
                 &[utxo],
                 outputs,
                 false,
                 &self.pool_script,
                 &self.pool_secret,
                 &self.pool_pubkey,
-            ) {
+            );
+            raw_fills.push((serialize_hex(&tx), change));
+        }
+
+        let raw_txs: Vec<String> = raw_fills.iter().map(|(raw, _)| raw.clone()).collect();
+        let results = Self::send_raw_batch(&self.node_batch, &raw_txs);
+        let mut relays = Vec::new();
+        for ((raw_tx, change), result) in raw_fills.into_iter().zip(results) {
+            match result {
                 Ok(txid) => {
                     self.fills_inflight.push(Utxo {
                         outpoint: OutPoint::new(txid, 0),
                         amount: change,
                     });
+                    relays.push(raw_tx);
                     sent += 1;
-                    fails = 0;
+                    sent_vsize += FILL_VSIZE;
                 }
                 Err(e) => {
                     // The UTXO stays dropped either way: if our view of it
                     // was stale, the next pool resync recovers the truth.
                     if first_error.is_none() {
-                        first_error = Some(e.to_string());
+                        first_error = Some(e);
                     }
-                    fails += 1;
                 }
             }
         }
+        self.relay_raw_batch(&relays);
+
         println!(
-            "{} => Floor pool: {standing} standing + {sent} new fills (target {target})",
-            self.label
+            "{} => Floor pool: {standing} standing + {sent} new fills (~{}k vB; target {target})",
+            self.label,
+            sent_vsize / 1000
         );
         if sent < need {
             let detail = first_error
