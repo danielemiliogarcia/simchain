@@ -9,59 +9,10 @@ file.
 
 ## Intro
 
-The objective of this project is to be a tool that helps the user write blockchain
-regtest tests in such a way that the code later needs only minimal modifications (or only
-configuration, in the best case) to switch to testnet or mainnet.
+Blockchain regtest tool that helps write tests needing minimal changes to run on testnet/mainnet.
+Three P2P-connected nodes, rotating miners, non-mining user endpoint, non-empty blocks, configurable reorgs.
 
-The network consists of 3 well-connected nodes plus helper containers:
-
-- **Node 1 `btc-simnet-node1`**, exposed to the host (RPC 18443). Simulates a production
-  endpoint (`-txindex`, `-disablewallet=1`): like most 3rd-party production nodes there is
-  no hot wallet online, so you manage your own keys in an external wallet, obtain the
-  outpoints of your addresses' UTxOs and submit externally signed raw transactions; mining
-  is not under your control. It never mines. Set `NODE1_DISABLE_WALLET=0` in `.env` if you
-  need a wallet on it. Publishes all ZMQ topics on host ports 28332-28336
-  (see [ZMQ notifications](#zmq-notifications)).
-- **Node 2 `btc-simnet-node2`**, exposed to the host (RPC 28443). Simulates an owned node
-  with internal wallet enabled, useful to stack an ordinals wallet or any layer-2 node on
-  top that needs internal wallet management. Publishes all ZMQ topics on host ports
-  38332-38336, so ZMQ consumers like LND/CLN can use it as their bitcoind backend. This
-  node is a miner.
-- **Node 3 `btc-simnet-node3`**, NOT exposed to the host. Simulates a node connected via
-  p2p but inaccessible to the user. This node is a miner.
-- **Mining controller `btc-simnet-mining-controller`**, bootstraps the chain: block 1
-  goes to node2's wallet, block 2 to node3's wallet, blocks 3 and 4 fund the user address
-  (2 UTxOs of 50 BTC = 100 BTC), then two 50-block funding batches (to node2 then node3)
-  and two 50-block maturity batches, ending at height **204**. Because coinbase maturity
-  is 100 blocks and node3 is funded last (heights 55-104, maturing 155-204), burying to
-  204 leaves **both miner wallets fully liquid at handoff** (~51 mature coinbases,
-  ~2550 BTC each) so the spammer never starves; the maturity batches keep maturing during
-  the run (heights 205-304). After that the miner nodes produce blocks with bounded
-  exponential timing by default (15-second underlying mean, clamped to 10–20 seconds)
-  and strict miner alternation. Timing can be switched to fixed and miner selection can
-  be weighted independently. Stop this container after funding if you want to control
-  mining manually.
-- **Spammer `btc-simnet-spammer`**, fills blocks so they are not empty. By default
-  (raw engine) it can run in DATA/HYBRID mode — OP_RETURN data txs of varied sizes that
-  fill blocks at near-zero node cost, kept `SPAM_FILL_BLOCK_RATIO` blocks deep — or in
-  OUTPUT mode, spamming `SPAM_FIXED_TXS_PER_BLOCK` burn-output txs per block. Outputs
-  are paid to burn addresses so no wallet fills with dust. In DATA/HYBRID mode it also
-  maintains a standing pool of `SPAM_FLOOR_POOL_TXS` standalone ~110-vB floor-priced
-  fills, so blocks pack ~100% full and the `FALLBACK_FEE` price floor is **airtight**:
-  a below-floor tx waits in the mempool until it outbids the floor, like mainnet under
-  congestion. See SETTINGS.md "Spammer".
-  On startup it waits for funds to mature and splits them into `SPAM_FANOUT_UTXOS` independent
-  UTXOs, otherwise the 25-tx unconfirmed-chain mempool limit would cap spam at 25 txs
-  per wallet per block. If you spam many
-  transactions, some may stay in the mempool and join the next batch, tune the settings
-  to achieve the scenario you need, or disable with `ENABLE_SPAM=false`. With
-  `ENABLE_SPAM_REPLACES=true` every spam tx signals RBF and a few per batch get
-  fee-bumped, so the mempool carries real BIP125 replacements (see SETTINGS.md).
-- **Reorg simulator `btc-simnet-reorg`** *(profile `reorg`, on demand)*, a Rust tool
-  (same stack as the other tools, pure RPC calls) that forces chain reorganizations.
-  See [Simulating reorgs](#simulating-reorgs).
-- **Tools** *(profiles)*, [mempool.space](https://github.com/mempool/mempool) explorer
-  and/or [electrs](https://github.com/mempool/electrs). See [Profiles](#profiles).
+For detailed component descriptions, see [INTRO.md](./docs/INTRO.md).
 
 ## Network topology
 
@@ -210,48 +161,12 @@ docker compose logs -ft
 docker compose --profile all-tools down
 ```
 
-### Retuning a live chain (block cadence, fee floor, block fill)
+### Retuning a live chain
 
-Settings consumed by the mining controller and the spammer can be changed **without
-restarting the whole stack**: the nodes keep running and the chain is preserved, only
-the tool containers are replaced. This is the quickest way to experiment with mining
-cadence, the fee floor or how full blocks are, on a chain that is already bootstrapped
-and funded.
+Change mining controller and spammer settings without restarting nodes; chain state preserved, only tool containers replaced.
+Quickest way to experiment with block cadence, fee floor, and block fill on a live chain.
 
-1. Edit `.env`. For example:
-   - Mining cadence: `BLOCK_INTERVAL_MEAN_SECS`, `BLOCK_INTERVAL_MODE`,
-     `BLOCK_INTERVAL_MIN_SECS`/`MAX_SECS`, `MINER_WEIGHTS` (mining controller).
-   - Fee floor and block filling: `FALLBACK_FEE`, `SPAM_FILL_BLOCK_RATIO`,
-     `SPAM_FLOOR_POOL_TXS`, `SPAM_TX_DATA_MAX_BYTES`/`MIN_BYTES`, `ENABLE_SPAM`,
-     `ENABLE_SPAM_REPLACES` (spammer).
-2. Recreate only the affected service(s), both:
-
-   ```bash
-   docker compose up -d --force-recreate btc-simnet-mining-controller btc-simnet-spammer
-   ```
-
-   or just the one you changed:
-
-   ```bash
-   docker compose up -d --force-recreate btc-simnet-spammer
-   ```
-
-This is safe mid-run: `--force-recreate` only replaces the services named on the
-command line (the node dependencies are left running, so the chain, wallets and
-mempool survive). The mining controller sees the chain is already bootstrapped
-(height >= 204), skips the funding sequence and resumes mining with the new cadence;
-the spammer is stateless between cycles and resumes with the new fill/fee settings.
-
-Caveats:
-
-- Settings consumed by the **nodes** (`BTC_IMAGE`, host ports, `MIN_RELAY_TX_FEE`,
-  ZMQ ports, ...) do require recreating the nodes, and node containers keep the chain
-  in their filesystem, so that resets the chain: use a full
-  `docker compose --profile all-tools down` / `up`.
-- `FALLBACK_FEE` is shared: the spammer prices its floor fills with it, and the nodes
-  take it as `-fallbackfee` (wallet-side fallback). A spammer-only recreate moves the
-  spam fee floor immediately; the nodes keep the old wallet fallback until a full
-  restart, which is usually irrelevant.
+For full details and caveats, see [RETUNING.md](./docs/RETUNING.md).
 
 ### Profiles
 
@@ -272,54 +187,10 @@ With `mempool` or `all-tools`, browse the explorer at
 
 ## Simulating reorgs
 
-The reorg simulator (a Rust container using only bitcoind RPC calls) invalidates the last
-*N* blocks on a miner node and mines *N+1* replacements, so the new chain is strictly
-longer and **the whole network reorgs to it**. Transactions from the orphaned blocks fall
-back to the mempool; each replacement block is filled by re-reading the mempool live and
-mining a slice of it with `generateblock`, like the winning chain of a real reorg, so
-reorged blocks are not empty. Reading the mempool fresh for each block means an RBF
-replacement that evicts an orphaned tx mid-reorg (e.g. with `ENABLE_SPAM_REPLACES=true`)
-is picked up automatically. On top of the returned txs it seeds `REORG_ADDS_NEW_TXS` fresh
-wallet transactions into the mempool first, modelling a node that received transactions
-its peers have not yet seen. It prints each block's hash and tx count before/after plus a
-replaced-blocks summary.
+Forces chain reorgs by invalidating N blocks and mining N+1 replacements; orphaned txs fall back to mempool, new blocks rebuilt from live mempool.
+Race-safe against mining controller; supports one-shot and continuous modes with configurable depth.
 
-Pass `empty` to mine **empty** replacement blocks instead (a chaos reorg that leaves the
-orphaned txs unconfirmed): `./simulate-reorg.sh 3 empty`. It is a per-run argument, not a
-setting, so a real reorg and an empty one can be issued against the same running chain.
-
-The reorg is race-safe against the mining controller: after mining the replacements the
-tool polls a witness node (`REORG_WITNESS_NODE`, default node1) and, if the miners kept
-extending the old chain in the meantime, mines extra blocks until the network adopts the
-new chain.
-
-The mining controller observes reorgs like a real miner would: it keeps mining on
-whatever tip its node reports (so it follows the winning chain automatically) while
-remembering the recent chain and which blocks it mined itself. When history is rewritten
-it logs a `REORG detected` line with the fork point, the replaced range and the new tip
-(the same shape chainwatch reports), and every block it did not mine itself -- the reorg
-replacements, or anything generated outside the controller -- is flagged with an
-`EXTERNAL block` line, which also explains any height jumps in its log.
-
-One-shot (container runs, reorgs, dies):
-
-```bash
-./simulate-reorg.sh 3
-# equivalent to:
-docker compose run --rm btc-simnet-reorg 3     # depth defaults to REORG_DEPTH (3)
-./simulate-reorg.sh 3 empty                    # chaos: mine empty replacement blocks
-```
-
-Continuous, every `AUTO_REORG_EVERY_BLOCKS` (x) blocks, reorg `REORG_DEPTH` (y) blocks,
-with x > y enforced:
-
-```bash
-REORG_MODE=auto docker compose --profile reorg up btc-simnet-reorg
-```
-
-Tune `REORG_DEPTH`, `AUTO_REORG_EVERY_BLOCKS`, `REORG_NODE`, `REORG_MINE_ADDRESS`,
-`REORG_ADDS_NEW_TXS`, `REORG_WALLET_NAME` and `REORG_WITNESS_NODE` in `.env`
-(see [SETTINGS.md](./docs/SETTINGS.md)).
+For full details, commands, and modes, see [REORGS.md](./docs/REORGS.md).
 
 ## ZMQ notifications
 
@@ -372,6 +243,9 @@ exclude = ["path/to/simchain"]
 
 ## Documents
 
+- [INTRO.md](./docs/INTRO.md), detailed component descriptions and project objective.
+- [RETUNING.md](./docs/RETUNING.md), how to retune mining cadence, fee floor, and block fill on a live chain.
+- [REORGS.md](./docs/REORGS.md), simulating chain reorganizations, commands, and modes.
 - [SETTINGS.md](./docs/SETTINGS.md), every setting, its default and what it does.
 - [NICE-TO-HAVE.md](./docs/NICE-TO-HAVE.md), all limitations, future enhancements and
   proposed features with rationale and implementation plans.
