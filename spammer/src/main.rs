@@ -42,56 +42,85 @@ fn main() {
     // wallets (the original behavior, kept selectable).
     let use_raw = matches!(env_or("USE_RAW_TX_SPAM", "true").as_str(), "true" | "1");
 
-    // Total spam txs offered per block: the number a block explorer shows per
-    // block (plus coinbase) as long as blocks are not already full. Splitting
-    // it across the miner wallets is this tool's job, not the user's; the
-    // legacy per-miner variable is still honored so old .env files keep working.
-    let spam_txs_per_block: u64 = match env::var("SPAM_TXS_PER_BLOCK") {
+    // Fixed tx count for the OUTPUT spam modes (sequential/batch) and the
+    // wallet engine. In DATA/HYBRID mode the fill is driven by
+    // SPAM_FILL_BLOCK_RATIO instead and this is ignored. Renamed from
+    // SPAM_TXS_PER_BLOCK (still honored, as is the older per-miner variable),
+    // so no existing .env breaks.
+    let fixed_txs_per_block: u64 = match env::var("SPAM_FIXED_TXS_PER_BLOCK")
+        .or_else(|_| env::var("SPAM_TXS_PER_BLOCK"))
+    {
         Ok(v) => v
             .parse()
-            .expect("SPAM_TXS_PER_BLOCK must be a positive integer"),
+            .expect("SPAM_FIXED_TXS_PER_BLOCK must be a positive integer"),
         Err(_) => match env::var("SPAM_PER_MINER_PER_BLOCK") {
             Ok(v) => {
                 let per_miner: u64 = v
                     .parse()
                     .expect("SPAM_PER_MINER_PER_BLOCK must be a positive integer");
-                println!("WARNING: SPAM_PER_MINER_PER_BLOCK is deprecated, set SPAM_TXS_PER_BLOCK (total per block) instead; using {}", per_miner * MINER_COUNT);
+                println!("WARNING: SPAM_PER_MINER_PER_BLOCK is deprecated, set SPAM_FIXED_TXS_PER_BLOCK (total per block) instead; using {}", per_miner * MINER_COUNT);
                 per_miner * MINER_COUNT
             }
             Err(_) => 100,
         },
     };
     // node2 takes the odd remainder so the two shares always sum to the total
-    let spam2 = spam_txs_per_block.div_ceil(MINER_COUNT);
-    let spam3 = spam_txs_per_block / MINER_COUNT;
+    let fixed2 = fixed_txs_per_block.div_ceil(MINER_COUNT);
+    let fixed3 = fixed_txs_per_block / MINER_COUNT;
     let fanout_utxos: u64 = env_or("SPAM_FANOUT_UTXOS", "50")
         .parse()
         .expect("SPAM_FANOUT_UTXOS must be a positive integer");
-    // 0 = sequential mode: one tx with a single burn output at a time, so txs
-    // reach the mempool one by one like p2p traffic on a real network. N > 0
-    // = batch mode: each spam tx carries N burn outputs (the shape of real
-    // exchange-payout traffic) -- the way to FILL blocks on short intervals
-    // (see SETTINGS.md "Full blocks" for ready-made values).
+    // OUTPUT-mode fatness: 0 = sequential (one burn output per tx, p2p-like
+    // arrival), N > 0 = batch (N burn outputs per tx, exchange-payout-shaped).
+    // Ignored in DATA/HYBRID mode. (See SETTINGS.md "Full blocks".)
     let sendmany_outputs: u64 = env_or("SPAM_SENDMANY_OUTPUTS", "0")
         .parse()
         .expect("SPAM_SENDMANY_OUTPUTS must be a non-negative integer");
-    // Raw engine only: 0 = output-based fatness (burn outputs, above). N > 0 =
-    // DATA mode -- each spam tx carries one OP_RETURN of N bytes instead of the
-    // burn outputs, so blocks fill with a handful of fat data txs at a fraction
-    // of the per-tx node cost (no UTXO-set growth). ~11 max-size txs fill a
-    // block. Capped just under the 100k vB standard-tx limit. Needs Core 30+.
+    // DATA/HYBRID mode (raw engine): SPAM_TX_DATA_MAX_BYTES > 0 switches the
+    // fill to OP_RETURN data txs (no UTXO-set growth, a handful fill a block).
+    // Each tx's payload is drawn log-uniformly in [MIN, MAX]; MIN = 0 (or
+    // >= MAX) makes every data tx exactly MAX. Capped just under the 100k vB
+    // standard-tx limit. Needs Core 30+. Renamed from SPAM_TX_DATA_BYTES
+    // (still honored).
     const MAX_DATA_BYTES: u64 = 98_000;
-    let tx_data_bytes: u64 = {
-        let requested: u64 = env_or("SPAM_TX_DATA_BYTES", "0")
+    let data_max_bytes: u64 = {
+        let requested: u64 = env::var("SPAM_TX_DATA_MAX_BYTES")
+            .or_else(|_| env::var("SPAM_TX_DATA_BYTES"))
+            .unwrap_or_else(|_| "0".to_string())
             .parse()
-            .expect("SPAM_TX_DATA_BYTES must be a non-negative integer");
+            .expect("SPAM_TX_DATA_MAX_BYTES must be a non-negative integer");
         if requested > MAX_DATA_BYTES {
-            println!("WARNING: SPAM_TX_DATA_BYTES={requested} exceeds the {MAX_DATA_BYTES}-byte standard-tx limit, clamping to {MAX_DATA_BYTES}");
+            println!("WARNING: SPAM_TX_DATA_MAX_BYTES={requested} exceeds the {MAX_DATA_BYTES}-byte standard-tx limit, clamping to {MAX_DATA_BYTES}");
             MAX_DATA_BYTES
         } else {
             requested
         }
     };
+    // Bottom of the data-size range. 0 (default) or >= MAX means uniform txs
+    // of exactly MAX; a value below MAX spreads sizes log-uniformly for a
+    // realistic mix of tx sizes. Clamped to MAX.
+    let data_min_bytes: u64 = env_or("SPAM_TX_DATA_MIN_BYTES", "0")
+        .parse::<u64>()
+        .expect("SPAM_TX_DATA_MIN_BYTES must be a non-negative integer")
+        .min(data_max_bytes);
+    // HYBRID gap-sealers: this many guaranteed minimum-size (~140 vB) P2WPKH
+    // floor-priced txs per block, so any leftover block space is taken by a
+    // floor tx and a cheap user tx must OUTBID the floor, not slip through a
+    // gap. A few is plenty (they are tiny); 0 disables (floor can then leak).
+    let small_txs_per_block: u64 = env_or("SPAM_SMALL_TXS_PER_BLOCK", "0")
+        .parse()
+        .expect("SPAM_SMALL_TXS_PER_BLOCK must be a non-negative integer");
+    // DATA/HYBRID fill target, measured in blocks of mempool weight: 0.5 =
+    // half-full blocks (floor has no effect), 1 = full blocks + a shallow
+    // backlog, 5 = full blocks + ~4 pending blocks visible in the mempool.
+    let fill_block_ratio: f64 = env_or("SPAM_FILL_BLOCK_RATIO", "1.0")
+        .parse()
+        .expect("SPAM_FILL_BLOCK_RATIO must be a number");
+    // Whether to auto-derive the branch pool from the fill ratio. true
+    // (default): use max(12, ceil(ratio x 15)) branches for headroom, ignoring
+    // SPAM_FANOUT_UTXOS. false: use SPAM_FANOUT_UTXOS, hard-erroring if it is
+    // below the ratio x 10 minimum needed to hold that many blocks unconfirmed.
+    let fanout_auto = matches!(env_or("SPAM_FANOUT_AUTO", "true").as_str(), "true" | "1");
     // RBF traffic: when enabled ("true" or "1") every spam tx signals BIP125
     // and the newest few of each batch get fee-bumped right after sending.
     let enable_replaces = matches!(
@@ -140,9 +169,6 @@ fn main() {
         // UTXO pool, submitting to its own node -- the same two independent
         // RPC pipelines the wallet engine gets from its two wallets. The
         // wallet clients are only kept for funding pulls.
-        println!(
-            "Spam engine: raw transactions (USE_RAW_TX_SPAM=true), paying {fee_rate_sat_vb} sat/vB"
-        );
         let mut engine2 = RawSpammer::new(
             create_client(&node2_url, &rpc_user, &rpc_pass),
             wallet2,
@@ -150,7 +176,8 @@ fn main() {
             "Node 2",
             fee_rate_sat_vb,
             sendmany_outputs,
-            tx_data_bytes,
+            data_min_bytes,
+            data_max_bytes,
         );
         let mut engine3 = RawSpammer::new(
             create_client(&node3_url, &rpc_user, &rpc_pass),
@@ -159,41 +186,123 @@ fn main() {
             "Node 3",
             fee_rate_sat_vb,
             sendmany_outputs,
-            tx_data_bytes,
+            data_min_bytes,
+            data_max_bytes,
         );
-        // The raw engine always needs a branch pool (a single UTXO caps the
-        // whole engine at one 25-tx unconfirmed chain), so 0 means 1 branch
-        // rather than "disabled" like the wallet engine's fan-out.
-        let fanout_target = fanout_utxos.max(1);
-        let need2 = spam2.min(fanout_target);
-        let need3 = spam3.min(fanout_target);
-        run_block_loop(&node1, move || {
-            let (txids2, txids3) = thread::scope(|s| {
-                let t2 = s.spawn(|| {
-                    engine2.spam_round(
-                        spam2,
-                        need2,
-                        fanout_target,
-                        enable_replaces,
-                        replaces_per_miner,
+
+        if data_max_bytes > 0 {
+            // DATA/HYBRID mode: fill the mempool to SPAM_FILL_BLOCK_RATIO
+            // blocks of weight each block, measured live, with varied-size
+            // OP_RETURN data txs plus a guaranteed batch of gap-sealer txs.
+            //
+            // The branch pool must hold R blocks of unconfirmed spam, and each
+            // branch chain caps at ~101k vB, so it needs >= R x 10 branches.
+            let required_min = std::cmp::max(12, (fill_block_ratio * 10.0).ceil() as u64);
+            let effective_fanout = if fanout_auto {
+                let f = std::cmp::max(12, (fill_block_ratio * 15.0).ceil() as u64);
+                println!("Raw DATA/HYBRID mode: fanout auto-derived to {f} branches (SPAM_FILL_BLOCK_RATIO={fill_block_ratio} x15, min 12)");
+                f
+            } else {
+                assert!(
+                    fanout_utxos >= required_min,
+                    "SPAM_FANOUT_UTXOS={fanout_utxos} is too low for SPAM_FILL_BLOCK_RATIO={fill_block_ratio}: need >= {required_min} branches (ratio x10) to hold that many blocks of unconfirmed spam, or the mempool cannot reach the target and blocks come out partial. Raise SPAM_FANOUT_UTXOS to >= {required_min}, or set SPAM_FANOUT_AUTO=true."
+                );
+                println!("Raw DATA/HYBRID mode: fanout manual {fanout_utxos} branches (SPAM_FANOUT_AUTO=false)");
+                fanout_utxos
+            };
+            if fill_block_ratio < 1.0 && (fallback_fee - 0.0001).abs() > 1e-9 {
+                println!(
+                    "WARNING: SPAM_FILL_BLOCK_RATIO={fill_block_ratio} < 1 leaves blocks only ~{:.0}% full, so the raised FALLBACK_FEE floor will NOT hold -- cheaper txs still confirm in the unused block space (expected if you are deliberately simulating an uncongested chain).",
+                    fill_block_ratio * 100.0
+                );
+            }
+            let small2 = small_txs_per_block.div_ceil(MINER_COUNT);
+            let small3 = small_txs_per_block / MINER_COUNT;
+            // A full block is 4M WU = 1M vB; getmempoolinfo's `bytes` is the
+            // mempool's total vsize, in the same units.
+            const BLOCK_VSIZE: u64 = 1_000_000;
+            let meter = create_client(&node1_url, &rpc_user, &rpc_pass);
+            println!(
+                "Spam engine: raw DATA/HYBRID mode, {data_min_bytes}..{data_max_bytes} byte OP_RETURN, {small_txs_per_block} gap-sealers/block, fill {fill_block_ratio} block(s), {fee_rate_sat_vb} sat/vB"
+            );
+            run_block_loop(&node1, move || {
+                // Measure the live mempool right after the new block drained it,
+                // and top it back up to R blocks (plus a small reserve at R>=1
+                // so packing lands the block full). At R<1 the target is below
+                // one block, so blocks come out partial by design.
+                let mempool = meter
+                    .get_mempool_info()
+                    .map(|m| m.bytes as u64)
+                    .unwrap_or(0);
+                let reserve = if fill_block_ratio >= 1.0 {
+                    BLOCK_VSIZE / 10
+                } else {
+                    0
+                };
+                let target = (fill_block_ratio * BLOCK_VSIZE as f64) as u64 + reserve;
+                let deficit = target.saturating_sub(mempool);
+                let d2 = deficit / MINER_COUNT;
+                let d3 = deficit - d2;
+                let (r2, r3) = thread::scope(|s| {
+                    let t2 = s.spawn(|| {
+                        engine2.hybrid_round(
+                            d2,
+                            small2,
+                            effective_fanout,
+                            enable_replaces,
+                            replaces_per_miner,
+                        )
+                    });
+                    let t3 = s.spawn(|| {
+                        engine3.hybrid_round(
+                            d3,
+                            small3,
+                            effective_fanout,
+                            enable_replaces,
+                            replaces_per_miner,
+                        )
+                    });
+                    (
+                        t2.join().expect("node2 spam thread panicked"),
+                        t3.join().expect("node3 spam thread panicked"),
                     )
                 });
-                let t3 = s.spawn(|| {
-                    engine3.spam_round(
-                        spam3,
-                        need3,
-                        fanout_target,
-                        enable_replaces,
-                        replaces_per_miner,
-                    )
-                });
-                (
-                    t2.join().expect("node2 spam thread panicked"),
-                    t3.join().expect("node3 spam thread panicked"),
-                )
+                r2.0.len() + r3.0.len()
             });
-            txids2.len() + txids3.len()
-        });
+        } else {
+            // OUTPUT mode: a fixed count of burn-output txs per block.
+            println!(
+                "Spam engine: raw transactions (USE_RAW_TX_SPAM=true), OUTPUT mode, {fee_rate_sat_vb} sat/vB"
+            );
+            // The raw engine always needs a branch pool (a single UTXO caps the
+            // whole engine at one 25-tx unconfirmed chain), so 0 means 1 branch.
+            let fanout_target = fanout_utxos.max(1);
+            run_block_loop(&node1, move || {
+                let (txids2, txids3) = thread::scope(|s| {
+                    let t2 = s.spawn(|| {
+                        engine2.output_round(
+                            fixed2,
+                            fanout_target,
+                            enable_replaces,
+                            replaces_per_miner,
+                        )
+                    });
+                    let t3 = s.spawn(|| {
+                        engine3.output_round(
+                            fixed3,
+                            fanout_target,
+                            enable_replaces,
+                            replaces_per_miner,
+                        )
+                    });
+                    (
+                        t2.join().expect("node2 spam thread panicked"),
+                        t3.join().expect("node3 spam thread panicked"),
+                    )
+                });
+                txids2.len() + txids3.len()
+            });
+        }
     } else {
         println!("Spam engine: node wallets (USE_RAW_TX_SPAM=false)");
         // Sequential mode target: one shared burn address -- reusing a single
@@ -206,7 +315,7 @@ fn main() {
         let batch_addrs: Vec<Address> = (1..=sendmany_outputs).map(burn_address).collect();
 
         // Cover a block's spam, but never require more branches than we fan out to.
-        let fanout_need = spam2.min(fanout_utxos);
+        let fanout_need = fixed2.min(fanout_utxos);
 
         run_block_loop(&node1, move || {
             // One thread per wallet: fan-out top-up, this block's spam and
@@ -218,7 +327,7 @@ fn main() {
                         &wallet2,
                         &wallet2_name,
                         "Node 2",
-                        spam2,
+                        fixed2,
                         fanout_need,
                         fanout_utxos,
                         &seq_addr,
@@ -232,7 +341,7 @@ fn main() {
                         &wallet3,
                         &wallet3_name,
                         "Node 3",
-                        spam3,
+                        fixed3,
                         fanout_need,
                         fanout_utxos,
                         &seq_addr,

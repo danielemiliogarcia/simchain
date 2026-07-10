@@ -1,13 +1,6 @@
 ## Limitations and future enhancements
 
 ### BitcoinCore containers
-- ~~Update the Bitcoin Core version~~ **Done:** bumped the registry image default
-  and the local build default to `31.1` (compose, `.env*`, `build-bitcoin.sh`, docs).
-  Core 30+ was needed for the spammer's data mode (large OP_RETURN standard by
-  default). Bootstrap, both spam engines and mempool acceptance re-tested live on
-  `/Satoshi:31.1.0/`. The `bitcoincore-rpc` crate is still `0.19.0` and works
-  unchanged against 31.1 (the RPCs used are stable); bump it only if a newer RPC is
-  needed.
 - Build from sources instead of downloading binaries
 - Clean up the Dockerfile: drop the debug `RUN echo UID/GID` layers and merge related
   `RUN` steps to reduce image layers
@@ -26,9 +19,9 @@
   node policy parameters (`-minrelaytxfee` for the mempool floor, `-blockmintxfee`
   for the miner's inclusion floor) so blocks fill up and transactions genuinely
   compete for block space
-- The seven proposed features below: Poisson block timing, fee-market simulation,
-  scenario engine, network partitions, reorgs that drop transactions, raw-tx
-  spam engine, hybrid spam (batch bulk + gap-sealing small txs)
+- The six proposed features below: Poisson block timing, fee-market simulation,
+  scenario engine, network partitions, reorgs that drop transactions, and an
+  airtight fee floor (standalone-UTXO fill pool)
 
 ### Code review findings (2026-07-04)
 
@@ -95,7 +88,7 @@ Simchain's purpose is to simulate the Bitcoin chain on regtest while staying as 
 mainnet reality as regtest allows: multiple P2P-connected nodes, rotating miners, a
 non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus seven bigger proposed features with their
+limitations and future enhancements, plus six bigger proposed features with their
 rationale and an implementation plan.
 
 ## 1. Realistic block timing and hashrate distribution
@@ -203,135 +196,64 @@ Effort: phase 1 small; phase 2 medium (needs NET_ADMIN and per-node sidecars).
 
 ---
 
-## 5. Reorgs that drop transactions (confirmation-loss testing)
+## 5. Reorgs that drop transactions permanently (double-spend)
 
-**What:** Two related additions to the reorg simulator:
+**What:** For a configurable fraction of the orphaned *wallet-owned* (spam) transactions
+in a reorg, include a conflicting transaction (same inputs, different output) in the
+replacement blocks, so the originals become permanently invalid and can never
+re-confirm. Setting sketch: `REORG_DOUBLE_SPEND_PCT=0..100` (default 0).
 
-1. ~~**Mine the replacement blocks *without* the orphaned transactions**~~ **(DONE):**
-   the `empty` CLI argument (`./simulate-reorg.sh <depth> empty`) mines empty
-   replacement blocks and leaves the orphaned txs in the mempool — the temporary-drop
-   scenario below. Chosen per run rather than via an env var so real and empty reorgs
-   can be interleaved on the same chain.
-2. **Automated double-spend of orphaned spam txs** (still open): for a configurable
-   fraction of the orphaned *wallet-owned* (spam) transactions, include a conflicting
-   transaction (same inputs, different output) in the replacement blocks so the
-   originals become permanently invalid and can never re-confirm.
+**Why it's a nice-to-have (the use case):** By default the reorg simulator re-mines the
+orphaned transactions into the replacement blocks (same txids), so a reorg only changes
+block hashes/heights — a user's transaction never *loses* confirmations. The
+temporary-drop case (confirmed → 0-conf → re-confirmed) is already available through the
+`empty` reorg mode (`./simulate-reorg.sh <depth> empty`, which mines empty replacement
+blocks and leaves the orphaned txs in the mempool). But the scariest real reorg is
+*permanent*: *"my deposit had N confirmations, a reorg happened, and now my transaction
+is gone forever."* Exchanges, custody watchers, indexers and payment processors must
+notice the tx conflicting entirely and un-credit / re-queue / alert — and simchain
+cannot produce that outcome today.
 
-**Why it's a nice-to-have (the use case):** Today the simulator re-mines the orphaned
-transactions into the replacement blocks (same txids), so a reorg only changes block
-hashes/heights — a user's transaction never *loses* confirmations. But the scariest
-real-world reorg scenario is exactly the opposite, and it is what exchanges, custody
-watchers, indexers and payment processors need to test: *"my deposit had N
-confirmations, a reorg happened, and now my transaction is not in the chain anymore."*
-Downstream code must notice the confirmation count dropping back to 0 (or the tx
-conflicting entirely) and un-credit / re-queue / alert accordingly. The temporary-drop
-case now exists (addition 1, the `empty` mode); the permanent-drop case (addition 2)
-cannot be produced by simchain today.
-
-The two additions map to the two real outcomes:
-
-- **Temporary drop (addition 1, done):** the excluded transactions fall back to the
-  mempool and re-confirm in a later block, confirmed → 0-conf → confirmed again. This
-  tests "did my code notice the confirmation count drop below its threshold?" (Stop the
-  mining controller after the `empty` reorg to keep them unconfirmed indefinitely.)
-- **Permanent drop (addition 2):** a double-spend in the winning chain kills the
-  original transaction forever — the classic double-spend attack an exchange fears.
-  This can only be automated for wallet-owned spam transactions: the user's own
-  transactions are signed with external keys the reorg node does not hold, so a user
-  wanting *their* tx permanently dropped must broadcast the conflicting tx themselves
-  (RBF replacement of their own tx after running addition 1).
+This can only be automated for wallet-owned spam transactions: the user's own
+transactions are signed with external keys the reorg node does not hold, so a user
+wanting *their* tx permanently dropped must broadcast the conflicting tx themselves
+(an RBF replacement after an `empty` reorg).
 
 **Implementation plan:**
-1. ~~Skip re-mining and mine empty replacement blocks with `generateblock`.~~ **Done:**
-   `do_reorg`'s `empty` branch mines every replacement block (and any race-winning extra
-   block) with `generateblock`, never `generatetoaddress`, so the orphaned txs are not
-   vacuumed back into the new chain.
-2. For the double-spend mode: pick orphaned txs that spend the reorg node's wallet
-   UTXOs, build conflicting raw txs (`createrawtransaction` on the same inputs to a
-   fresh wallet address, `signrawtransactionwithwallet`), and pass them to
-   `generateblock` in the replacement blocks. Setting sketch:
-   `REORG_DOUBLE_SPEND_PCT=0..100` (default 0).
-3. Log which txids were conflicted so tests can assert on them.
+1. Pick orphaned txs that spend the reorg node's wallet UTXOs, build conflicting raw txs
+   (`createrawtransaction` on the same inputs to a fresh wallet address,
+   `signrawtransactionwithwallet`), and pass them to `generateblock` in the replacement
+   blocks.
+2. Log which txids were conflicted so tests can assert on them.
 
-Effort: addition 1 done; addition 2 medium (raw-tx construction, only meaningful with
-spam enabled).
+Effort: medium (raw-tx construction, only meaningful with spam enabled).
 
 ---
 
-## 6. Raw-transaction spam engine (bypass the wallet) — **DONE**
+## 6. Airtight fee floor: standalone-UTXO fill pool
 
-**Done:** shipped as `USE_RAW_TX_SPAM` (default `true`), in
-`spammer/src/raw_transaction_spammer.rs`. The engine holds a deterministic P2WPKH key
-per miner node, tracks its UTXO set in memory, signs locally and submits with
-`sendrawtransaction`; it self-funds by pulling from the miner wallet and recovers via
-`scantxoutset` on restart/reorg. Cycle time went from ~13s (wallet engine) to
-sub-second and stays flat (no wallet fatigue). The node-wallet engine is preserved
-verbatim as `node_wallet_spammer.rs`, selectable with `USE_RAW_TX_SPAM=false`.
-It also unlocked **data mode** (`SPAM_TX_DATA_BYTES`): OP_RETURN-stuffed txs that fill
-blocks with pure weight at near-zero node cost (measured node CPU ~100% → ~2% at the
-same full-block rate, no UTXO-set growth) — see SETTINGS.md "Full blocks". The original
-proposal follows for history.
+**What:** Make the current block's fill come from a pool of *standalone* confirmed
+UTXOs (each spam tx spends a confirmed UTXO, no unconfirmed ancestors), so the miner
+can pack the block to within one tiny tx of full — leaving no gap a cheap tx can use.
 
-**What:** A spam mode where the spammer manages its own keys and UTXO set, builds and
-signs transactions in Rust (`bitcoin` crate) and submits them with
-`sendrawtransaction` (or `submitpackage`), instead of asking the node wallets via
-`sendtoaddress`/`sendmany`.
+**Why it's needed:** In the shipped hybrid engine every spam tx chains off a branch,
+so only ~branch-count of them are standalone (mineable into a small gap); the rest are
+chain tips with huge ancestor packages that cannot fill a gap. And any floor-priced tx
+the engine makes gets *mined* (it pays the floor), so none persist to guard the residual
+gap. Net: blocks pack to ~98–99% and a below-floor tx confirms through the leftover
+~12–17k vB. Simply adding more sealers, more branches, or smaller data did not close it
+(tested). The fix is architectural: standalone txs, not chained ones.
 
-**Why it's a nice-to-have:** Every wallet-based send pays for coin selection, change
-handling and signing inside bitcoind, serialized per wallet by the wallet lock — that
-is the current throughput ceiling (~13s per 4M WU cycle with two wallets in
-parallel), and the cost grows with the wallet's tx history (measured: ~13s fresh,
-~67s after ~50 full blocks; a wallet-rotation mitigation was prototyped and
-reverted — a raw engine removes the cause instead of resetting it). Pre-built raw
-transactions skip the wallet entirely; the ceiling becomes
-mempool acceptance itself (hundreds to thousands of tx/s), which is how real spam
-waves and stress tests (e.g. the 2015/2017 mainnet spam) actually operated. Unlocks:
-filling blocks at very short intervals, deep mempool backlogs on demand, exact
-control of tx shape (inputs, outputs, feerate, RBF flags) per transaction — the
-building block the fee-market feature (2) needs anyway.
+**Implementation sketch:**
+1. Maintain a pool of many small *confirmed* UTXOs (separate from the data branches).
+2. Each block, spend them as standalone floor-priced txs of assorted small sizes to
+   pack the current block to ~100%; their change outputs confirm next block and
+   replenish the pool (steady state ≈ one block of standalone UTXOs regenerating).
+3. Keep chained data only for backlog *depth* beyond block 1 (it need not be standalone
+   — it is not being mined this block).
 
-**Implementation plan:**
-1. Fund the engine once from a miner wallet: send N UTXOs to addresses derived from
-   a spammer-owned key (single WIF or simple derivation, no descriptor machinery).
-2. Track the UTXO set in memory (txid:vout, amount, script); refresh from
-   `scantxoutset`/ZMQ on startup or after a reorg.
-3. Build txs with the `bitcoin` crate (P2WPKH inputs, burn outputs, explicit fee),
-   sign locally, `sendrawtransaction` in a tight loop or `submitpackage` per chain.
-4. Reuse the existing knobs (`SPAM_TXS_PER_BLOCK`, outputs per tx, RBF flag) plus a
-   mode switch, e.g. `SPAM_ENGINE=wallet|raw` (default `wallet`, current behavior).
-
-Effort: medium-large (key handling, UTXO bookkeeping, reorg recovery), contained in
-the spammer.
-
----
-
-## 7. Hybrid spam: batch bulk + small gap-sealing txs
-
-**What:** Make batch and sequential spam additive instead of either/or: each cycle
-sends the usual `sendmany` batches for bulk block weight, plus a configurable number
-of small (~561 WU) `sendtoaddress` txs at the same fee level. Setting sketch:
-`SPAM_SMALL_TXS_PER_BLOCK=0..n` (0 = current behavior).
-
-**Why it's a nice-to-have:** The fee floor (see SETTINGS.md "The fee market") leaks
-with batch-only spam. Block assembly fills leftover space with whatever fits, and the
-leftover gap is roughly one batch tx (~20k WU at 160 outputs) — so a tiny transaction
-paying below the floor still confirms next block through the gap, which breaks the
-main floor use case: testing a fee-bumping engine that should have to outbid the spam.
-The floor only holds for a transaction if the spam backlog contains transactions as
-small as it. Hybrid spam keeps the batch throughput (blocks fill fast on short
-intervals) while a tail of floor-priced small txs seals the gaps, so a cheap tiny
-transaction genuinely waits until bumped.
-
-**Implementation plan:**
-1. In `spam_round`, after `send_spam_batch`, also call `send_spam_tx` for
-   `SPAM_SMALL_TXS_PER_BLOCK / MINER_COUNT` txs (both already exist and return txids).
-2. Keep the small txs on the same wallets/fan-out pool; they are dust-sized, so the
-   extra weight (~0.03% of a block per 100 txs) and cost are negligible.
-3. Document in SETTINGS.md "Full blocks" and "The fee market" as the recipe for
-   floor-tight full blocks at short intervals.
-
-Effort: small (both send paths already exist; one setting, a few lines in the
-spammer loop).
+Effort: medium (a second UTXO-management path in the raw engine, reorg/restart
+recovery for the pool).
 
 ---
 

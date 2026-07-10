@@ -4,8 +4,7 @@
 //! entirely. This removes the two wallet-engine ceilings at once: the wallet
 //! lock (coin selection + signing serialized inside bitcoind) and wallet
 //! fatigue (coin selection cost growing with tx history), so the cycle time
-//! stays flat no matter how long the simulation runs. The throughput ceiling
-//! becomes mempool acceptance itself, which is how real spam waves operate.
+//! stays flat no matter how long the simulation runs.
 //!
 //! Bookkeeping is trivial because the engine never needs to *discover* coins:
 //! it initiates every transaction that pays it (funding pulls from a miner
@@ -13,18 +12,23 @@
 //! locally on each send and stays at a constant size. Chain scans
 //! (scantxoutset) are only a recovery path: startup and reorgs.
 //!
-//! Two ways to make each tx "fat" enough to fill blocks fast:
-//!   - output mode (default): many 546-sat burn outputs (SPAM_SENDMANY_OUTPUTS),
-//!     the shape of exchange-payout traffic. Weight comes from outputs, each of
-//!     which is a UTXO-set insert for every node -- realistic, but the most
-//!     expensive kind of weight for the nodes.
-//!   - data mode (SPAM_TX_DATA_BYTES > 0): one OP_RETURN output carrying N bytes
-//!     of data. An OP_RETURN output is provably unspendable, so it never enters
-//!     the UTXO set: pure block weight at near-zero node cost. ~11 max-size txs
-//!     fill a 4M WU block instead of ~1130, so the nodes do a fraction of the
-//!     per-tx work. Trade-off: terrible fee-floor granularity and a low tx
-//!     count -- for load/throughput/mempool-bloat demos, not floor testing.
-//!     Needs Bitcoin Core 30+ (large OP_RETURN standard by default).
+//! Two spam shapes fill blocks:
+//!   - OUTPUT mode (SPAM_TX_DATA_MAX_BYTES = 0): each tx has burn outputs
+//!     (546-sat P2WPKH), one in sequential mode or SPAM_SENDMANY_OUTPUTS in
+//!     batch mode -- exchange-payout-shaped, but every output is a UTXO-set
+//!     insert for the nodes. Driven by a fixed tx count.
+//!   - DATA/HYBRID mode (SPAM_TX_DATA_MAX_BYTES > 0): the fill comes from
+//!     OP_RETURN data txs whose payload size is drawn log-uniformly between
+//!     SPAM_TX_DATA_MIN_BYTES and _MAX_BYTES, giving a realistic spread of tx
+//!     sizes at near-zero node cost (OP_RETURN never enters the UTXO set).
+//!     Each block also gets a guaranteed batch of minimum-size P2WPKH
+//!     gap-sealer txs (SPAM_SMALL_TXS_PER_BLOCK) so leftover block space is
+//!     always taken by a floor-priced tx -- a cheap user tx then has to
+//!     *outbid* the floor, not slip through an unused gap. The engine fills to
+//!     a target of SPAM_FILL_BLOCK_RATIO blocks of mempool weight, so the same
+//!     mode does partial blocks (ratio < 1), just-full blocks (ratio 1) and a
+//!     deep visible mempool backlog (ratio > 1). Needs Bitcoin Core 30+ (large
+//!     OP_RETURN standard by default).
 
 use crate::common;
 use bitcoincore_rpc::{
@@ -46,8 +50,8 @@ use bitcoincore_rpc::{
 use serde_json::json;
 use std::{thread, time::Duration};
 
-// Same 546-sat burn outputs as the wallet engine, so both engines produce
-// identically shaped spam and drain at the same rate.
+// 546-sat burn/gap-sealer outputs: safely above the P2PKH dust floor for any
+// address type, same amount as the wallet engine so shapes match.
 const DUST_SAT: u64 = 546;
 
 // Never let a change output drop below this; below ~294 sats a P2WPKH output
@@ -69,13 +73,27 @@ struct Utxo {
     amount: Amount,
 }
 
+// The three spam-tx shapes the engine builds. The shape is enough to recompute
+// the tx's vsize, fee, non-change value and outputs, so a SentSpam only needs
+// to carry the shape to rebuild the tx for an RBF bump.
+#[derive(Clone)]
+enum SpamShape {
+    // OP_RETURN of N data bytes (value 0). DATA/HYBRID bulk fill.
+    Data(usize),
+    // One minimum-size P2WPKH burn output. HYBRID gap-sealer / small tx.
+    Sealer,
+    // The OUTPUT-mode burn outputs (1 in sequential, N in batch mode).
+    Burns,
+}
+
 // Everything needed to RBF-bump a spam tx after the fact: the input it spent
-// (sighash needs the spent amount) and what it paid.
+// (sighash needs the spent amount), what it paid, and its shape (to rebuild).
 struct SentSpam {
     txid: Txid,
     spent: Utxo,
     fee: Amount,
     change: Amount,
+    shape: SpamShape,
 }
 
 pub struct RawSpammer {
@@ -89,23 +107,54 @@ pub struct RawSpammer {
     address: Address,
     script_pubkey: ScriptBuf,
     fee_rate_sat_vb: f64,
-    // The outputs of every spam tx in OUTPUT mode: one burn script in
-    // sequential mode, SPAM_SENDMANY_OUTPUTS of them in batch mode (same burn
-    // addresses as the wallet engine). Change to self is the LAST output, so
-    // the change vout is burn_scripts.len(). Unused in data mode.
+    // OUTPUT-mode burn scripts (one, or SPAM_SENDMANY_OUTPUTS of them).
     burn_scripts: Vec<ScriptBuf>,
-    // DATA mode (data_bytes > 0): every spam tx carries this one OP_RETURN
-    // output (data_script, value 0) instead of the burn outputs, with change
-    // to self appended after it (change vout 1). Built once, since the data
-    // payload is constant -- the txs differ by their inputs, which is what
-    // makes their txids unique.
-    data_bytes: usize,
-    data_script: ScriptBuf,
+    // A single P2WPKH burn script for the minimum-size gap-sealer txs.
+    sealer_script: ScriptBuf,
+    // DATA/HYBRID mode range. data_max == 0 means OUTPUT mode. data_min == 0
+    // (or >= data_max) means every data tx is exactly data_max (uniform);
+    // 0 < data_min < data_max draws each size log-uniformly in [min, max].
+    data_min: usize,
+    data_max: usize,
+    // Monotonic counter feeding the deterministic log-uniform size draw, so
+    // sizes vary within and across blocks without an RNG dependency.
+    draw_counter: u64,
     utxos: Vec<Utxo>,
     cursor: usize,
 }
 
+// vsize of an OP_RETURN data tx: 1 P2WPKH input (~68 vB incl. witness), 1
+// change output (31 vB), ~11 vB overhead, plus the OP_RETURN output's full
+// base size (value + scriptlen varint + OP_RETURN + pushdata prefix + data).
+fn data_tx_vsize(n: usize) -> u64 {
+    let push_prefix = match n {
+        0..=75 => 1,
+        76..=255 => 2,
+        256..=65535 => 3,
+        _ => 5,
+    };
+    let script_len = 1 + push_prefix + n;
+    let varint = if script_len < 253 {
+        1
+    } else if script_len < 65536 {
+        3
+    } else {
+        5
+    };
+    let op_return_out = 8 + varint + script_len;
+    (11 + 68 + 31 + op_return_out) as u64
+}
+
+fn op_return_script(n: usize) -> ScriptBuf {
+    let mut payload = PushBytesBuf::new();
+    payload
+        .extend_from_slice(&vec![0xab_u8; n])
+        .expect("data payload within push-size limit");
+    ScriptBuf::new_op_return(payload)
+}
+
 impl RawSpammer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         node: Client,
         wallet: Client,
@@ -113,7 +162,8 @@ impl RawSpammer {
         label: &str,
         fee_rate_sat_vb: f64,
         sendmany_outputs: u64,
-        data_bytes: u64,
+        data_min: u64,
+        data_max: u64,
     ) -> Self {
         // Deterministic key (hash of a fixed tag): the same address across
         // restarts, so a restarted spammer recovers its previous coins with
@@ -133,20 +183,8 @@ impl RawSpammer {
                 .map(|i| common::burn_address(i).script_pubkey())
                 .collect()
         };
-        let data_bytes = data_bytes as usize;
-        let data_script = if data_bytes > 0 {
-            let mut payload = PushBytesBuf::new();
-            payload
-                .extend_from_slice(&vec![0xab_u8; data_bytes])
-                .expect("data payload within push-size limit");
-            ScriptBuf::new_op_return(payload)
-        } else {
-            ScriptBuf::new()
-        };
+        let sealer_script = common::burn_address(0).script_pubkey();
         println!("{label} => Raw spam engine address: {address}");
-        if data_bytes > 0 {
-            println!("{label} => Raw engine in DATA mode: one {data_bytes}-byte OP_RETURN per tx");
-        }
         RawSpammer {
             node,
             wallet,
@@ -159,88 +197,73 @@ impl RawSpammer {
             script_pubkey,
             fee_rate_sat_vb,
             burn_scripts,
-            data_bytes,
-            data_script,
+            sealer_script,
+            data_min: data_min as usize,
+            data_max: data_max as usize,
+            draw_counter: 0,
             utxos: Vec::new(),
             cursor: 0,
         }
     }
 
-    // Explicit fee, the raw engine's replacement for the wallet estimator:
-    // vsize is known from the tx shape (P2WPKH input ~68 vB, P2WPKH output
-    // 31 vB, ~11 vB fixed overhead, +2 when the output-count varint grows
-    // past 252). The 68 assumes the largest signature encoding, so the
-    // realized feerate is never below the configured one.
-    fn fee_for(&self, n_inputs: usize, n_outputs: usize) -> Amount {
-        let vsize = 11 + 68 * n_inputs + 31 * n_outputs + if n_outputs >= 253 { 2 } else { 0 };
+    fn fee_from_vsize(&self, vsize: u64) -> Amount {
         Amount::from_sat((vsize as f64 * self.fee_rate_sat_vb).ceil() as u64)
     }
 
-    // Fee for one spam tx. Output mode: fee_for over the burn outputs + change.
-    // Data mode: the OP_RETURN output's full base size dominates the vsize
-    // (1 input ~68 vB, 1 change output 31 vB, ~11 vB overhead, plus the data).
-    fn spam_tx_fee(&self) -> Amount {
-        if self.data_bytes == 0 {
-            return self.fee_for(1, self.burn_scripts.len() + 1);
-        }
-        // scriptPubKey = OP_RETURN + minimal pushdata prefix + data; the tx
-        // serializer prefixes the whole scriptPubKey with a length varint.
-        let push_prefix = match self.data_bytes {
-            0..=75 => 1,      // direct OP_PUSHBYTES_N
-            76..=255 => 2,    // OP_PUSHDATA1 + len
-            256..=65535 => 3, // OP_PUSHDATA2 + len
-            _ => 5,           // OP_PUSHDATA4 + len
-        };
-        let script_len = 1 + push_prefix + self.data_bytes;
-        let varint = if script_len < 253 {
-            1
-        } else if script_len < 65536 {
-            3
-        } else {
-            5
-        };
-        let op_return_out = 8 + varint + script_len;
-        let vsize = 11 + 68 + 31 + op_return_out;
-        Amount::from_sat((vsize as f64 * self.fee_rate_sat_vb).ceil() as u64)
-    }
-
-    // Total value of the non-change outputs: dust burns in output mode, zero in
-    // data mode (the OP_RETURN carries no value; the "spend" is the fee).
-    fn spam_burn_total(&self) -> Amount {
-        if self.data_bytes == 0 {
-            Amount::from_sat(DUST_SAT * self.burn_scripts.len() as u64)
-        } else {
-            Amount::ZERO
+    fn shape_vsize(&self, shape: &SpamShape) -> u64 {
+        match shape {
+            SpamShape::Data(n) => data_tx_vsize(*n),
+            // 1 input + 1 burn output + 1 change output + overhead
+            SpamShape::Sealer => 11 + 68 + 31 + 31,
+            SpamShape::Burns => {
+                let k = self.burn_scripts.len();
+                (11 + 68 + 31 * (k + 1) + if k + 1 >= 253 { 2 } else { 0 }) as u64
+            }
         }
     }
 
-    // Which output index carries the change (the branch's next tip): after the
-    // burn outputs in output mode, after the single OP_RETURN in data mode.
-    fn change_vout(&self) -> u32 {
-        if self.data_bytes == 0 {
-            self.burn_scripts.len() as u32
-        } else {
-            1
+    fn shape_fee(&self, shape: &SpamShape) -> Amount {
+        self.fee_from_vsize(self.shape_vsize(shape))
+    }
+
+    // Total value carried by the non-change outputs (all dust; the real cost
+    // is the fee). Data txs carry none -- the OP_RETURN has value 0.
+    fn shape_nonchange_value(&self, shape: &SpamShape) -> Amount {
+        match shape {
+            SpamShape::Data(_) => Amount::ZERO,
+            SpamShape::Sealer => Amount::from_sat(DUST_SAT),
+            SpamShape::Burns => Amount::from_sat(DUST_SAT * self.burn_scripts.len() as u64),
         }
     }
 
-    // The outputs of one spam tx for the given change amount, change last so
-    // change_vout() locates it. Output mode: dust burns then change. Data mode:
-    // the OP_RETURN then change.
-    fn spam_outputs(&self, change: Amount) -> Vec<TxOut> {
-        let mut outputs: Vec<TxOut> = if self.data_bytes == 0 {
-            self.burn_scripts
+    // Change is always the LAST output, so its vout is the number of
+    // non-change outputs before it.
+    fn shape_change_vout(&self, shape: &SpamShape) -> u32 {
+        match shape {
+            SpamShape::Data(_) => 1,
+            SpamShape::Sealer => 1,
+            SpamShape::Burns => self.burn_scripts.len() as u32,
+        }
+    }
+
+    fn build_outputs(&self, shape: &SpamShape, change: Amount) -> Vec<TxOut> {
+        let mut outputs: Vec<TxOut> = match shape {
+            SpamShape::Data(n) => vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: op_return_script(*n),
+            }],
+            SpamShape::Sealer => vec![TxOut {
+                value: Amount::from_sat(DUST_SAT),
+                script_pubkey: self.sealer_script.clone(),
+            }],
+            SpamShape::Burns => self
+                .burn_scripts
                 .iter()
                 .map(|script| TxOut {
                     value: Amount::from_sat(DUST_SAT),
                     script_pubkey: script.clone(),
                 })
-                .collect()
-        } else {
-            vec![TxOut {
-                value: Amount::ZERO,
-                script_pubkey: self.data_script.clone(),
-            }]
+                .collect(),
         };
         outputs.push(TxOut {
             value: change,
@@ -249,14 +272,45 @@ impl RawSpammer {
         outputs
     }
 
-    // What one spam tx costs a branch: non-change outputs + fee + a change
-    // output that must stay above dust.
+    // Log-uniform payload size in [data_min, data_max]: equal weight per order
+    // of magnitude, so most txs are small and a few are large, like a real
+    // mempool. Deterministic (a multiplicative hash of a running counter), so
+    // no RNG dependency; the sizes still vary within and across blocks.
+    fn draw_data_size(&mut self) -> usize {
+        if self.data_min == 0 || self.data_min >= self.data_max {
+            return self.data_max;
+        }
+        let c = self.draw_counter;
+        self.draw_counter = self.draw_counter.wrapping_add(1);
+        let h = (c as u32).wrapping_mul(2_654_435_761);
+        let frac = h as f64 / u32::MAX as f64;
+        let lo = self.data_min as f64;
+        let hi = self.data_max as f64;
+        let size = lo * (hi / lo).powf(frac);
+        (size.round() as usize).clamp(self.data_min, self.data_max)
+    }
+
+    // The biggest single tx a branch must be able to afford: a max-size data
+    // tx in DATA mode, a full burn tx in OUTPUT mode. Used to size the branch
+    // pool and to pick branches able to send.
     fn per_tx_required(&self) -> Amount {
-        self.spam_burn_total() + self.spam_tx_fee() + MIN_CHANGE
+        if self.data_max > 0 {
+            self.shape_fee(&SpamShape::Data(self.data_max)) + MIN_CHANGE
+        } else {
+            self.shape_fee(&SpamShape::Burns)
+                + self.shape_nonchange_value(&SpamShape::Burns)
+                + MIN_CHANGE
+        }
     }
 
     fn usable_branches(&self, required: Amount) -> u64 {
         self.utxos.iter().filter(|u| u.amount >= required).count() as u64
+    }
+
+    // Fee for the fan-out consolidation tx: many inputs, `n_out` change-style
+    // outputs, no data.
+    fn consolidation_fee(&self, n_in: usize, n_out: usize) -> Amount {
+        self.fee_from_vsize((11 + 68 * n_in + 31 * n_out) as u64)
     }
 
     // Build, sign and broadcast one transaction spending our own P2WPKH
@@ -389,7 +443,7 @@ impl RawSpammer {
             );
             return;
         }
-        let fee = self.fee_for(self.utxos.len(), target as usize);
+        let fee = self.consolidation_fee(self.utxos.len(), target as usize);
         let per_branch = match total.checked_sub(fee) {
             Some(split) => split / target,
             None => Amount::ZERO,
@@ -457,22 +511,68 @@ impl RawSpammer {
         None
     }
 
-    // Fee-bump (RBF) up to `count` of the just-sent spam txs, the raw
-    // counterpart of the wallet engine's bumpfee calls: rebuild the same
-    // spend with double the fee (change shrinks by the old fee, comfortably
+    // Build, sign and send one tx of the given shape from the next usable
+    // branch, updating that branch's tip to the tx's change output. Returns
+    // the SentSpam record (for RBF) or a classified error string.
+    fn send_shape(&mut self, shape: SpamShape, replaceable: bool) -> Result<SentSpam, String> {
+        let required = self.per_tx_required();
+        let Some(idx) = self.next_branch(required) else {
+            return Err("no usable branch".to_string());
+        };
+        let branch = self.utxos[idx];
+        let fee = self.shape_fee(&shape);
+        let nonchange = self.shape_nonchange_value(&shape);
+        let change = match branch.amount.checked_sub(nonchange + fee) {
+            Some(c) if c >= MIN_CHANGE => c,
+            _ => return Err("branch too small for this tx".to_string()),
+        };
+        let vout = self.shape_change_vout(&shape);
+        let outputs = self.build_outputs(&shape, change);
+        match self.send_tx(std::slice::from_ref(&branch), outputs, replaceable) {
+            Ok(txid) => {
+                self.utxos[idx] = Utxo {
+                    outpoint: OutPoint::new(txid, vout),
+                    amount: change,
+                };
+                Ok(SentSpam {
+                    txid,
+                    spent: branch,
+                    fee,
+                    change,
+                    shape,
+                })
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("missing") || msg.contains("conflict") || msg.contains("spent") {
+                    // Our view of this branch is stale (a reorg or restart
+                    // raced us): forget it, resync picks up the truth next
+                    // shortage.
+                    self.utxos.remove(idx);
+                    if !self.utxos.is_empty() {
+                        self.cursor %= self.utxos.len();
+                    }
+                }
+                Err(msg)
+            }
+        }
+    }
+
+    // Fee-bump (RBF) up to `count` of the just-sent spam txs: rebuild the same
+    // spend (same shape) with double the fee (change shrinks by the old fee,
     // clearing BIP125's +1 sat/vB minimum), re-sign, broadcast. Only branch
     // TIPS can be replaced -- if a later tx already chained off this one's
     // change, replacing it would orphan that child -- and the tip check is
     // simply "is this tx's change outpoint still in our UTXO set".
     fn bump_spam_txs(&mut self, sent: &[SentSpam], count: u64) {
-        let change_vout = self.change_vout();
         let mut bumped = 0;
         let mut first_error: Option<String> = None;
         for s in sent.iter().rev() {
             if bumped >= count {
                 break;
             }
-            let tip = OutPoint::new(s.txid, change_vout);
+            let vout = self.shape_change_vout(&s.shape);
+            let tip = OutPoint::new(s.txid, vout);
             let Some(idx) = self.utxos.iter().position(|u| u.outpoint == tip) else {
                 continue;
             };
@@ -482,11 +582,11 @@ impl RawSpammer {
             if new_change < MIN_CHANGE {
                 continue;
             }
-            let outputs = self.spam_outputs(new_change);
+            let outputs = self.build_outputs(&s.shape, new_change);
             match self.send_tx(std::slice::from_ref(&s.spent), outputs, true) {
                 Ok(txid) => {
                     self.utxos[idx] = Utxo {
-                        outpoint: OutPoint::new(txid, change_vout),
+                        outpoint: OutPoint::new(txid, vout),
                         amount: new_change,
                     };
                     bumped += 1;
@@ -507,28 +607,21 @@ impl RawSpammer {
         }
     }
 
-    // One node's full spam round, the raw counterpart of the wallet engine's
-    // spam_round: top up the branch pool if it ran low, send this node's
-    // share of the block's spam (each tx: one branch input -> burn outputs +
-    // change back to the branch), then fee-bump its own txs when RBF traffic
-    // is enabled. Two instances run in parallel, one thread per node.
-    pub fn spam_round(
+    // OUTPUT mode: send this node's fixed share of burn-output spam txs
+    // (sequential or batch, depending on the burn-script count), then fee-bump
+    // its own txs when RBF is enabled.
+    pub fn output_round(
         &mut self,
         share: u64,
-        fanout_need: u64,
-        fanout_target: u64,
+        fanout: u64,
         replaceable: bool,
         replaces: u64,
     ) -> Vec<Txid> {
-        self.ensure_funds(fanout_need, fanout_target);
-
+        if fanout > 0 {
+            self.ensure_funds(share.min(fanout), fanout);
+        }
         let n_burns = self.burn_scripts.len();
-        if self.data_bytes > 0 {
-            println!(
-                "{} => Raw-spamming {share} txs carrying a {}-byte OP_RETURN each",
-                self.label, self.data_bytes
-            );
-        } else if n_burns == 1 {
+        if n_burns == 1 {
             println!(
                 "{} => Raw-spamming {share} transactions to a burn address",
                 self.label
@@ -540,67 +633,28 @@ impl RawSpammer {
             );
         }
 
-        let required = self.per_tx_required();
-        let fee = self.spam_tx_fee();
-        let burn_total = self.spam_burn_total();
-        let change_vout = self.change_vout();
-
-        let mut txids: Vec<Txid> = Vec::new();
-        let mut sent: Vec<SentSpam> = Vec::new();
+        let mut txids = Vec::new();
+        let mut sent = Vec::new();
         let mut first_error: Option<String> = None;
-        // One failure per branch in a row means every branch is refusing
-        // (chain limits, drained pool): give up on this block instead of
-        // spinning; the confirmations in the next block clear the limits.
         let mut consecutive_failures = 0;
-
         while (txids.len() as u64) < share {
             if self.utxos.is_empty() || consecutive_failures >= self.utxos.len() {
                 break;
             }
-            let Some(idx) = self.next_branch(required) else {
-                break;
-            };
-            let branch = self.utxos[idx];
-            let change = branch.amount - burn_total - fee;
-            let outputs = self.spam_outputs(change);
-            match self.send_tx(std::slice::from_ref(&branch), outputs, replaceable) {
-                Ok(txid) => {
-                    // The branch's new tip is this tx's change output.
-                    self.utxos[idx] = Utxo {
-                        outpoint: OutPoint::new(txid, change_vout),
-                        amount: change,
-                    };
-                    sent.push(SentSpam {
-                        txid,
-                        spent: branch,
-                        fee,
-                        change,
-                    });
-                    txids.push(txid);
+            match self.send_shape(SpamShape::Burns, replaceable) {
+                Ok(s) => {
+                    txids.push(s.txid);
+                    sent.push(s);
                     consecutive_failures = 0;
                 }
                 Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("missing") || msg.contains("conflict") || msg.contains("spent")
-                    {
-                        // Our view of this branch is stale (a reorg or a
-                        // restart raced us): forget it, resync picks up the
-                        // truth next shortage.
-                        self.utxos.remove(idx);
-                        if !self.utxos.is_empty() {
-                            self.cursor %= self.utxos.len();
-                        }
-                    }
-                    // Other errors (too-long-mempool-chain, policy): the
-                    // branch stays; it becomes spendable again after a block.
                     if first_error.is_none() {
-                        first_error = Some(msg);
+                        first_error = Some(e);
                     }
                     consecutive_failures += 1;
                 }
             }
         }
-
         if (txids.len() as u64) < share {
             let detail = first_error
                 .map(|e| format!(", first error: {e}"))
@@ -614,5 +668,99 @@ impl RawSpammer {
             self.bump_spam_txs(&sent, replaces);
         }
         txids
+    }
+
+    // DATA/HYBRID mode: send `small_txs` guaranteed minimum-size gap-sealer
+    // txs (so the fee floor holds), then fill with varied-size OP_RETURN data
+    // txs until `deficit_vsize` of weight has been offered (or the branch pool
+    // is exhausted). `deficit_vsize` is how much the caller wants added to the
+    // mempool this block to reach the SPAM_FILL_BLOCK_RATIO target. Returns the
+    // txids and the total vsize actually offered.
+    pub fn hybrid_round(
+        &mut self,
+        deficit_vsize: u64,
+        small_txs: u64,
+        fanout: u64,
+        replaceable: bool,
+        replaces: u64,
+    ) -> (Vec<Txid>, u64) {
+        self.ensure_funds(fanout, fanout);
+
+        let mut txids: Vec<Txid> = Vec::new();
+        let mut sent: Vec<SentSpam> = Vec::new();
+        let mut added: u64 = 0;
+        let mut first_error: Option<String> = None;
+        let mut sealer_count = 0u64;
+        let mut data_count = 0u64;
+
+        // Guaranteed gap-sealers first: minimum-size floor-priced txs that take
+        // any leftover block space before a cheap user tx can.
+        let mut fails = 0;
+        while sealer_count < small_txs {
+            if self.utxos.is_empty() || fails >= self.utxos.len() {
+                break;
+            }
+            match self.send_shape(SpamShape::Sealer, replaceable) {
+                Ok(s) => {
+                    added += self.shape_vsize(&s.shape);
+                    txids.push(s.txid);
+                    sent.push(s);
+                    sealer_count += 1;
+                    fails = 0;
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    fails += 1;
+                }
+            }
+        }
+
+        // Bulk fill with varied-size data txs up to the requested weight.
+        fails = 0;
+        while added < deficit_vsize {
+            if self.utxos.is_empty() || fails >= self.utxos.len() {
+                break;
+            }
+            let size = self.draw_data_size();
+            match self.send_shape(SpamShape::Data(size), replaceable) {
+                Ok(s) => {
+                    added += self.shape_vsize(&s.shape);
+                    txids.push(s.txid);
+                    sent.push(s);
+                    data_count += 1;
+                    fails = 0;
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    fails += 1;
+                }
+            }
+        }
+
+        println!(
+            "{} => Hybrid: {sealer_count} gap-sealers + {data_count} data txs, ~{}k vB offered",
+            self.label,
+            added / 1000
+        );
+        if added < deficit_vsize {
+            let detail = first_error.map(|e| format!(", first error: {e}")).unwrap_or_else(|| {
+                ", branch pool exhausted (raise SPAM_FANOUT_UTXOS / SPAM_FILL_BLOCK_RATIO headroom)"
+                    .to_string()
+            });
+            println!(
+                "WARNING: {} only offered ~{}k/{}k vB this block{detail}",
+                self.label,
+                added / 1000,
+                deficit_vsize / 1000
+            );
+        }
+        if replaceable {
+            self.bump_spam_txs(&sent, replaces);
+        }
+        (txids, added)
     }
 }

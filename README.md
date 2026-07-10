@@ -37,10 +37,12 @@ The network consists of 3 well-connected nodes plus helper containers:
   the run (heights 205-304). After that it asks each miner to mine 1 block in a round-robin
   manner every `BLOCK_INTERVAL_SECS`. Stop this container after funding if you want to
   control mining manually.
-- **Spammer `btc-simnet-spammer`**, spams `SPAM_TXS_PER_BLOCK` transactions per block
-  (split across the miner wallets, outputs paid to burn addresses so no wallet fills
-  up with dust), so blocks are not empty. On startup it waits
-  for the wallet funds to mature and splits them into `SPAM_FANOUT_UTXOS` independent
+- **Spammer `btc-simnet-spammer`**, fills blocks so they are not empty. By default
+  (raw engine) it can run in DATA/HYBRID mode — OP_RETURN data txs of varied sizes that
+  fill blocks at near-zero node cost, kept `SPAM_FILL_BLOCK_RATIO` blocks deep — or in
+  OUTPUT mode, spamming `SPAM_FIXED_TXS_PER_BLOCK` burn-output txs per block. Outputs
+  are paid to burn addresses so no wallet fills with dust. See SETTINGS.md "Spammer".
+  On startup it waits for funds to mature and splits them into `SPAM_FANOUT_UTXOS` independent
   UTXOs, otherwise the 25-tx unconfirmed-chain mempool limit would cap spam at 25 txs
   per wallet per block. If you spam many
   transactions, some may stay in the mempool and join the next batch, tune the settings

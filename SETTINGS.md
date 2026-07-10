@@ -175,10 +175,14 @@ fee-market simulation).
 |---|---|---|
 | `ENABLE_SPAM` | `true` | Spam transactions after each block so blocks are not empty. |
 | `USE_RAW_TX_SPAM` | `true` | Selects the spam engine. `true`: **raw engine** — the spammer holds its own keys, tracks its own UTXO set in memory, signs every tx locally and submits with `sendrawtransaction`. The node wallets are bypassed, so the send rate stays flat forever (no wallet fatigue) and every tx pays exactly `FALLBACK_FEE`. `false`: **node-wallet engine** — spam is sent with `sendtoaddress`/`sendmany` on the miner wallets, so bitcoind does coin selection and signing (wallet-realistic traffic, the original behavior); throughput is bound by the wallet lock and degrades as wallet history grows (see [Full blocks](#full-blocks)). All other spam knobs apply to both engines. |
-| `SPAM_TXS_PER_BLOCK` | `100` | Total spam txs offered per block — the number a block explorer shows per block (plus coinbase) as long as blocks are not already full; excess waits in the mempool. The spammer splits it across the miner wallets (currently node2 and node3) — how many miners exist is its responsibility, not the user's. Replaces the deprecated `SPAM_PER_MINER_PER_BLOCK` (still honored standalone: its value × 2). |
-| `SPAM_SENDMANY_OUTPUTS` | `0` | `0`: sequential mode — one `sendtoaddress` RPC per tx, txs arrive at the mempool one by one like real p2p traffic. `N > 0`: batch mode — each spam tx is a single `sendmany` with N outputs (exchange-payout-shaped), so one RPC places N payments; needed to fill consensus-size blocks on short intervals (see [Full blocks](#full-blocks)). |
-| `SPAM_TX_DATA_BYTES` | `0` | Raw engine only. `0`: fatness comes from outputs (`SPAM_SENDMANY_OUTPUTS`). `N > 0`: **data mode** — each spam tx carries one OP_RETURN of N bytes instead of the burn outputs. An OP_RETURN is provably unspendable, so it never enters the UTXO set: the tx is pure block weight at near-zero node cost. ~11 max-size (90k-byte) txs fill a 4M WU block vs ~1130 in output mode, so the nodes do a fraction of the per-tx work and the UTXO set barely grows (measured: node CPU ~100% → ~2% at the same full-block rate). Capped just under the 100k-vB standard-tx limit; needs Core 30+. Trade-off: worst-case fee-floor granularity and a low tx count — for cheap block-filling / mempool-bloat, not floor testing. See [Full blocks](#full-blocks). |
-| `SPAM_FANOUT_UTXOS` | `50` | The spammer keeps each wallet split into this many independent UTXOs, replenishing when the pool runs low (startup, or after a reorg un-confirms the wallet's change). The mempool caps unconfirmed chains at 25 txs, so without the split a wallet can never place more than 25 txs per block. `0` disables. |
+| `SPAM_FIXED_TXS_PER_BLOCK` | `100` | Fixed tx count for the **OUTPUT** spam modes (sequential/batch) and the wallet engine — the number a block explorer shows per block (plus coinbase) until blocks are full; excess waits in the mempool. Split across the miner nodes for you. **Ignored in DATA/HYBRID mode**, where the fill is driven by `SPAM_FILL_BLOCK_RATIO`. Renamed from `SPAM_TXS_PER_BLOCK` (still honored); replaces the older `SPAM_PER_MINER_PER_BLOCK` (× 2). |
+| `SPAM_SENDMANY_OUTPUTS` | `0` | OUTPUT-mode fatness. `0`: sequential — one tx with a single burn output at a time, p2p-like arrival. `N > 0`: batch — each spam tx carries N burn outputs (exchange-payout-shaped). Ignored in DATA/HYBRID mode. |
+| `SPAM_TX_DATA_MAX_BYTES` | `0` | Raw engine only. `0`: OUTPUT mode (fatness from burn outputs). `N > 0`: **DATA/HYBRID mode** — the fill comes from OP_RETURN data txs (biggest payload = N). An OP_RETURN is provably unspendable, so it never enters the UTXO set: pure block weight at near-zero node cost (a handful of fat txs fill a 4M WU block vs ~1130 in output mode; measured node CPU ~100% → ~2%). Capped just under the 100k-vB standard-tx limit; needs Core 30+. Renamed from `SPAM_TX_DATA_BYTES` (still honored). See [Hybrid: varied sizes and mempool depth](#hybrid-varied-sizes-and-mempool-depth). |
+| `SPAM_TX_DATA_MIN_BYTES` | `0` | Smallest data payload. `0` (or ≥ MAX): every data tx is exactly MAX (uniform). Below MAX: each tx's size is drawn **log-uniformly** in `[MIN, MAX]` — a realistic spread, most small and a few large. |
+| `SPAM_SMALL_TXS_PER_BLOCK` | `0` | HYBRID: this many extra minimum-size (~140 vB) floor-priced txs per block, on top of the data fill. They tighten packing and add a stream of small realistic-looking txs. **The fee floor is not yet airtight** — see [The fee floor is soft](#the-fee-floor-is-soft). `0`: none. |
+| `SPAM_FILL_BLOCK_RATIO` | `1.0` | DATA/HYBRID fill target, in blocks of mempool weight, measured live each block and topped up. `0.5`: half-full blocks (floor off). `1`: full blocks + a shallow backlog. `5`: full blocks + ~4 pending blocks visible in the mempool. |
+| `SPAM_FANOUT_AUTO` | `true` | DATA/HYBRID: auto-size the branch pool from the fill ratio. `true`: use `max(12, ceil(ratio × 15))` branches (a deep pool is needed to hold that many blocks of unconfirmed spam). `false`: use `SPAM_FANOUT_UTXOS`, erroring at startup if it is below the `ratio × 10` minimum. |
+| `SPAM_FANOUT_UTXOS` | `50` | The spammer keeps its funds split into this many independent UTXOs ("branches"), replenishing when the pool runs low. The mempool caps unconfirmed chains at 25 txs / 101k vB, so without the split a single UTXO can place only ~25 txs per block. In DATA/HYBRID mode this is overridden by the auto value unless `SPAM_FANOUT_AUTO=false`. `0` disables (OUTPUT/wallet only). |
 | `ENABLE_SPAM_REPLACES` | `false` | `true` or `1`: every spam tx signals RBF (BIP125) and, right after each batch, the newest `SPAM_REPLACES_PER_MINER_PER_BLOCK` txs per miner are fee-bumped with `bumpfee`, so the mempool carries real replacements (old txid evicted, new txid appears) for downstream code to handle. `false`/`0`: exactly today's behavior. |
 | `SPAM_REPLACES_PER_MINER_PER_BLOCK` | `5` | How many of each miner's spam txs are fee-bumped per block when `ENABLE_SPAM_REPLACES` is on. The newest txs are bumped (a tx with unconfirmed descendants cannot be replaced). |
 
@@ -196,7 +200,7 @@ Fast full blocks, under 1 minute each (batch mode):
 
 ```bash
 BLOCK_INTERVAL_SECS=60
-SPAM_TXS_PER_BLOCK=360
+SPAM_FIXED_TXS_PER_BLOCK=360
 SPAM_SENDMANY_OUTPUTS=100     # 360 batches x ~12.7k WU ≈ 4.6M WU offered > 4M cap
 ```
 
@@ -207,7 +211,7 @@ out partial; use `BLOCK_INTERVAL_SECS=90` if every single block must be full.
 The spam outputs pay burn addresses (no known key), not wallet addresses, and that
 is what makes sustained full blocks possible: bitcoind's coin selection scans the
 whole wallet on every send, so when the spam used to pay the other miner's wallet,
-each full block grew that wallet by `SPAM_TXS_PER_BLOCK × SPAM_SENDMANY_OUTPUTS`
+each full block grew that wallet by `SPAM_FIXED_TXS_PER_BLOCK × SPAM_SENDMANY_OUTPUTS`
 dust UTXOs (~18k) until the send cycle no longer fit any interval (measured: 54s
 fresh → 15+ min after ~2h). Burned dust never enters a wallet; the miners only keep
 their own change, so the cycle time stays flat. The cost is a slow drain, ~0.16 BTC
@@ -228,7 +232,7 @@ Sequential p2p-like arrival (`SPAM_SENDMANY_OUTPUTS=0`), full blocks:
 
 ```bash
 BLOCK_INTERVAL_SECS=420       # ~330s minimum at 22 tx/s; 420s reserves for slower machines
-SPAM_TXS_PER_BLOCK=8000
+SPAM_FIXED_TXS_PER_BLOCK=8000
 SPAM_FANOUT_UTXOS=200         # 4000 txs per wallet need >= 160 independent 25-tx chains
 ```
 
@@ -236,41 +240,65 @@ With shorter sequential intervals blocks fill proportionally
 (`fill ≈ interval × send_rate / 7100`), so expect ~5.5–7 minutes per full block
 depending on machine speed.
 
-Data mode — full blocks with the nodes near-idle (raw engine, Core 30+):
+Data mode makes blocks heavy with *data* instead of *transactions* — the thing that
+loads a node (signature checks, mempool package math, and, in output/batch mode, a
+UTXO-set insert per output: measured ~31k new UTXOs per full block). An OP_RETURN
+output is provably unspendable, so it never enters the UTXO set. About 11 max-size
+(90k-byte) txs fill a 4M WU block versus ~1130 in batch mode, so the per-tx work
+collapses: on the same machine that sat pegged at ~100% node CPU under batch spam,
+data mode runs at **~2% node CPU**, blocks still ~99% full, the send cycle under a
+second. It is the way to run *fast* full blocks without the nodes — or your machine —
+becoming the limit. The recommended way to use it is **HYBRID mode** below (a spread of
+sizes + a few small txs), not a single fixed size.
+
+### Hybrid: varied sizes and mempool depth
+
+HYBRID mode fills blocks with data txs of *varied* sizes (a realistic mempool look)
+plus a few small txs, and keeps the mempool a chosen number of blocks deep:
 
 ```bash
-SPAM_TX_DATA_BYTES=90000      # one OP_RETURN of 90k bytes per tx (~90k vB)
-SPAM_TXS_PER_BLOCK=16         # ~11 fill a block; 16 over-offers so blocks stay full
-SPAM_FANOUT_UTXOS=20          # only ~8 txs/node/block, so a small branch pool suffices
+SPAM_TX_DATA_MAX_BYTES=90000   # biggest OP_RETURN payload (cheap bulk weight)
+SPAM_TX_DATA_MIN_BYTES=250     # spread each tx's size log-uniformly in [MIN, MAX]
+SPAM_SMALL_TXS_PER_BLOCK=40    # small floor-priced txs (soft floor — see below)
+SPAM_FILL_BLOCK_RATIO=2        # keep ~2 blocks of weight pending in the mempool
+FALLBACK_FEE=0.001             # 100 sat/vB price level for all spam
 ```
 
-The other fill recipes make blocks heavy with *transactions* — the exact thing that
-loads a node (signature checks, mempool package math, and, in output/batch mode, a
-UTXO-set insert per output: measured ~31k new UTXOs per full block). Data mode makes
-each tx heavy with *data* instead: an OP_RETURN output is provably unspendable, so it
-never enters the UTXO set. About 11 max-size (90k-byte) txs fill a 4M WU block, versus
-~1130 in batch mode, so the per-tx work collapses. Measured on the same machine that
-sat pegged at ~100% node CPU under batch spam: **~2% node CPU** in data mode, blocks
-still 99% full, the send cycle under a second. It is the way to run *fast* full blocks
-(short `BLOCK_INTERVAL_SECS`) without the nodes — or your machine — becoming the limit.
+`SPAM_FILL_BLOCK_RATIO` is measured live each block and topped up, so it controls both
+fullness *and* mempool depth from one dial: `0.5` → half-full blocks (an uncongested
+chain), `1` → full blocks with a shallow backlog, `5` → full blocks with ~4 pending
+blocks visible in mempool.space. The branch pool auto-sizes to the ratio
+(`SPAM_FANOUT_AUTO=true` → `max(12, ratio × 15)` branches); a deep pool is needed
+because the mempool caps each unconfirmed chain at ~101k vB, so holding `R` blocks of
+unconfirmed spam needs about `R × 10` branches. Sizes verified live spanning ~141 vB
+(smallest) to ~88k vB in a single mempool; node CPU stays low and the UTXO set barely
+grows (only the small txs add outputs).
 
-Two costs to know. Fee-floor granularity is at its worst: a block filled by ~11 giant
-txs leaves ~90k-vB gaps, so a cheap tiny transaction sails straight in — data mode is
-the opposite of a fee floor (see [The fee market](#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor)).
-And the explorer shows a *low tx count* (~12/block) even though the block is full by
-weight. So data mode is for cheaply filling blocks and bloating the mempool, not for
-realistic-looking traffic or floor testing — use batch or sequential mode for those.
+### The fee floor is soft
 
-Full blocks also unlock a real confirmation floor: raise `FALLBACK_FEE` and the spam
-outbids every cheaper transaction — see
-[The fee market](#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor).
+Raising `FALLBACK_FEE` with full blocks makes the estimator and mempool.space show a
+price floor (e.g. Low/Medium/High all at 100 sat/vB). **But the floor is not airtight
+against tiny transactions.** Blocks pack to ~98–99%, not 100%, and a cheap tiny tx
+(below the floor rate) can still slip into the leftover ~12–17k-vB packing gap and
+confirm next block — visible as the `No Priority` band sitting at ~1–2 sat/vB.
+
+Why: every spam tx chains off a branch, so only a branch-count of them are *standalone*
+(mineable into a small gap on their own); the rest are chain tips whose ancestor
+package is far too big to fit a gap. And any floor-priced tx the engine does make gets
+*mined* (it pays the floor), so none persist to guard the residual gap. The
+`SPAM_SMALL_TXS_PER_BLOCK` gap-sealers tighten packing and raise the bar — the floor
+holds for any tx *larger* than the gap — but they do not close it for the smallest txs.
+Closing it fully needs a pool of standalone confirmed UTXOs feeding the current block's
+fill (planned — see `nice-to-have.md`). For a genuinely airtight floor today, use the
+small-tx [Market pressure](#market-pressure-floor-to-100-satsvb) recipe below (higher
+node load), whose spam is itself small enough to leave no exploitable gap.
 
 ### Market pressure floor to 100 sats/vB
 full blocks with 100 sats/vb every tx
 ```bash
 BLOCK_INTERVAL_SECS=15
 ENABLE_SPAM=true
-SPAM_TXS_PER_BLOCK=250
+SPAM_FIXED_TXS_PER_BLOCK=250
 SPAM_SENDMANY_OUTPUTS=250
 FALLBACK_FEE=0.001
 
@@ -287,7 +315,7 @@ FALLBACK_FEE=0.001
 | `REORG_NODE` | `btc-simnet-node3` | Node used to fork the chain (a hidden miner is realistic). |
 | `REORG_NODE_RPC_PORT` | `18443` | RPC port of `REORG_NODE` inside the compose network. |
 | `REORG_MINE_ADDRESS` | `bcrt1qtmjq...tf3rr` | Address receiving the replacement block rewards. **The default is the same address as `USER_ADDRESS`'s default** (intentional), so after a reorg plus 100 blocks of maturity the user balance grows beyond the bootstrap 2x50 BTC. Set a separate throwaway address if your test asserts exact user balances. |
-| `REORG_ADDS_NEW_TXS` | `5` | Fresh wallet txs seeded into the reorg node's mempool before mining, modelling a node that received transactions its peers have not yet seen; they are mined into the winning chain alongside the returned txs. `0` disables. Ignored for `empty` reorgs. To match spammed block fullness, set it near `SPAM_TXS_PER_BLOCK`. |
+| `REORG_ADDS_NEW_TXS` | `5` | Fresh wallet txs seeded into the reorg node's mempool before mining, modelling a node that received transactions its peers have not yet seen; they are mined into the winning chain alongside the returned txs. `0` disables. Ignored for `empty` reorgs. To match spammed block fullness, set it near `SPAM_FIXED_TXS_PER_BLOCK` (OUTPUT mode). |
 | `REORG_WALLET_NAME` | `NODE3_WALLET_NAME` (`node3`) | Wallet used to send the `REORG_ADDS_NEW_TXS` transactions on the reorg node. Falls back to the first loaded wallet if it is not loaded. |
 | `REORG_WITNESS_NODE` | `btc-simnet-node1` | Node polled after mining the replacements to confirm the whole network adopted the new chain. If the mining controller extended the old chain during the reorg window (tie), extra blocks are mined (up to 10) until the witness follows the new tip. `none` disables the check. |
 
