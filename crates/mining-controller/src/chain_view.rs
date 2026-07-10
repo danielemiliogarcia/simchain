@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 
 // How many recent blocks to remember for reorg analysis. Reorgs deeper than
 // this window are still detected, but the fork point is then reported as the
-// bottom of the window (the same rule chainwatch.sh uses).
+// bottom of the window (the same rule scripts/chainwatch.sh uses).
 pub const REORG_WINDOW: u64 = 100;
 
 // The controller's view of the recent chain: the hash it last observed at

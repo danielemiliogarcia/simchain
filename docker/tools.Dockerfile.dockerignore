@@ -1,0 +1,10 @@
+# Build context for docker/tools.Dockerfile (repo root). BuildKit prefers this
+# per-Dockerfile ignore over the root .dockerignore (which is scoped to the
+# repo-root context and also covers the bitcoind node image). Allowlist only
+# what the workspace build needs so the upload stays small — no .git, no
+# target/ dirs (GBs after local builds).
+*
+!Cargo.toml
+!Cargo.lock
+!.cargo
+!crates

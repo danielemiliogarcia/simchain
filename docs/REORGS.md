@@ -4,13 +4,13 @@ The reorg simulator (a Rust container using only bitcoind RPC calls) invalidates
 
 ## One-Shot Reorg
 
-Pass `empty` to mine **empty** replacement blocks instead (a chaos reorg that leaves the orphaned txs unconfirmed): `./simulate-reorg.sh 3 empty`. It is a per-run argument, not a setting, so a real reorg and an empty one can be issued against the same running chain.
+Pass `empty` to mine **empty** replacement blocks instead (a chaos reorg that leaves the orphaned txs unconfirmed): `./scripts/simulate-reorg.sh 3 empty`. It is a per-run argument, not a setting, so a real reorg and an empty one can be issued against the same running chain.
 
 ```bash
-./simulate-reorg.sh 3
+./scripts/simulate-reorg.sh 3
 # equivalent to:
 docker compose run --rm btc-simnet-reorg 3     # depth defaults to REORG_DEPTH (3)
-./simulate-reorg.sh 3 empty                    # chaos: mine empty replacement blocks
+./scripts/simulate-reorg.sh 3 empty            # chaos: mine empty replacement blocks
 ```
 
 ## Continuous Reorgs

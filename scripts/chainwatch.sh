@@ -18,8 +18,10 @@
 
 set -u
 
-# Locate the repo .env relative to this script so it works from any cwd.
+# Locate the repo root and .env relative to this script so it works from any
+# cwd.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Defaults (overridable by .env and CLI flags)
 RPC_HOST="127.0.0.1"
@@ -27,7 +29,7 @@ RPC_PORT=""           # resolved from .env NODE1_RPC_PORT, else 18443
 RPC_USER=""           # resolved from .env BTC_RPC_USER, else foo
 RPC_PASSWORD=""       # resolved from .env BTC_RPC_PASS, else rpcpassword
 INTERVAL=2            # Poll interval in seconds
-ENV_FILE="$SCRIPT_DIR/.env"
+ENV_FILE="$REPO_ROOT/.env"
 MAX_REORG_DEPTH=100   # How far back to search for a reorg fork point
 
 # Recent height -> block hash, used to notice when a block gets replaced.
@@ -104,6 +106,17 @@ prune_seen() {
     done
 }
 
+# Seed the recent chain window without printing it, so the first reorg after
+# startup can still find an accurate fork point.
+seed_recent_chain() {
+    local tip="$1" floor h hash
+    floor=$((tip - MAX_REORG_DEPTH)); [ "$floor" -lt 0 ] && floor=0
+    for ((h = floor; h <= tip; h++)); do
+        hash="$(get_block_hash "$h")"
+        [ -n "$hash" ] && SEEN[$h]="$hash"
+    done
+}
+
 # Walk down from `start` to the highest height whose recorded hash still matches
 # the node's current hash: the fork point (last common block). Prints it.
 find_fork() {
@@ -133,7 +146,7 @@ Options:
   -u, --user USER        RPC username (default: .env BTC_RPC_USER or foo)
   -p, --password PASS    RPC password (default: .env BTC_RPC_PASS or rpcpassword)
   -i, --interval SECS    Poll interval in seconds (default: 2)
-  -e, --env FILE         Path to the env file (default: <script dir>/.env)
+  -e, --env FILE         Path to the env file (default: <repo root>/.env)
   -h, --help             Show this help
 
 Examples:
@@ -169,9 +182,11 @@ main() {
     echo
     wait_for_rpc
 
-    # Seed from the current tip so we only stream blocks from now on.
+    # Seed a recent hash window so reorg detection has a real fork search
+    # range, while still only printing blocks from now on.
     local tip
     tip="$(get_block_count)"
+    seed_recent_chain "$tip"
     print_info "Chain at height #$tip; watching for new blocks..."
     print_block "$tip"
     LAST="$tip"
