@@ -1,0 +1,29 @@
+[alias]
+# Builds in debug mode: (add --release for release mode)
+# * Library (lib.rs)
+# * Binary (main.rs)
+# * All tests (unit + integration + doc tests)
+# * All examples
+# * All benchmarks (release mode)
+buildall = "test --no-run --all-targets --benches"
+
+# Shorthand for buildall
+ba = "buildall"
+
+# Shorthand for buildall --release
+bar = "buildall --release"
+
+# Run tests with single thread
+tt = "test -- --test-threads=1"
+
+# Run tests in release mode with single thread
+ttr = "test --release -- --test-threads=1"
+
+# Run clippy with all targets and treat warnings as errors
+ca = "clippy --all-targets -- -D warnings"
+
+# Run cargo fmt on all targets
+fa = "fmt --all"
+
+# Run cargo fmt check on all targets
+fac = "fmt --all --check"

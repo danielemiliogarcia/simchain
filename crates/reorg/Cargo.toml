@@ -1,7 +1,9 @@
 [package]
-    name = "simchain-mining-controller"
+    name = "simchain-reorg"
     version = "0.1.0"
     edition = "2021"
 
     [dependencies]
     bitcoincore-rpc = "0.19.0"
+    serde_json = "1"
+    simchain-common = { path = "../simchain-common" }

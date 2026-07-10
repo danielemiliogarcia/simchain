@@ -338,6 +338,56 @@ print(topic, len(body), 'bytes')
 "
 ```
 
+## Repository structure
+
+The three Rust tools live in a single Cargo workspace at the repo root, sharing one
+`target/` dir, one dependency resolution, and one committed `Cargo.lock` so every build
+of a given commit ships identical dependency versions.
+
+| Path | Purpose |
+|---|---|
+| [crates/simchain-common](crates/simchain-common) | Shared helpers: RPC client construction (`create_client`) and env lookup (`env_or`), used by all three tools |
+| [crates/mining-controller](crates/mining-controller) | Bootstraps the chain and drives configurable mining (`btc-simnet-mining-controller`) |
+| [crates/spammer](crates/spammer) | Fills blocks with transactions (`btc-simnet-spammer`) |
+| [crates/reorg](crates/reorg) | Forces chain reorganizations on demand (`btc-simnet-reorg`) |
+
+`Cargo.lock` is committed on purpose: these are binaries for a reproducible test
+network, so the lockfile is tracked (unlike a library crate, which would leave it to
+the consumer).
+
+### Embedding under a parent workspace
+
+The workspace is deliberately embeddable. There is **no `[workspace.dependencies]`
+table** — each crate declares its own dependencies, so a parent workspace's version
+pins can never conflict with a shared table here. If you embed this repo inside an
+upper-level Cargo workspace, that workspace must exclude this directory to avoid
+nested-workspace errors:
+
+```toml
+[workspace]
+exclude = ["path/to/simchain"]
+```
+
+### Local development
+
+All `cargo` commands run from the repo root. Project aliases live in
+[.cargo/config.toml](.cargo/config.toml) (Cargo discovers it by walking up from any
+crate directory):
+
+| Alias | Expands to | Purpose |
+|---|---|---|
+| `cargo ba` | `cargo test --no-run --all-targets --benches` | Build all targets (prefer over `cargo build`) |
+| `cargo bar` | `cargo ba --release` | Same, release mode |
+| `cargo tt` | `cargo test -- --test-threads=1` | Run tests serially |
+| `cargo ca` | `cargo clippy --all-targets -- -D warnings` | Lint; warnings are errors |
+| `cargo fa` / `cargo fac` | `cargo fmt --all` / `--check` | Format / check formatting |
+
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs `cargo ba`, clippy
+(`-D warnings`), `cargo fmt --check`, and the test suite on every pull request, all
+with `--locked` so a stale `Cargo.lock` fails the build. The three tool Docker images
+build from one shared [tools.Dockerfile](tools.Dockerfile) (one builder stage, three
+targets), also with `--locked`.
+
 ## Documents
 
 - [SETTINGS.md](./docs/SETTINGS.md), every setting, its default and what it does.

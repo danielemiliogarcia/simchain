@@ -35,7 +35,7 @@ meaningful.
 This plan supersedes the original implementation sketch from `nice-to-have.md`: that sketch
 (pass `fee_rate` to `send_to_address`/`send_many`) predates the raw engine, which is now
 the default and computes fees itself (`fee_from_vsize` in
-`spammer/src/raw_transaction_spammer.rs`). Size/output-count variance from the sketch
+`crates/spammer/src/raw_transaction_spammer.rs`). Size/output-count variance from the sketch
 already exists (`SPAM_TX_DATA_MIN/MAX_BYTES` log-uniform draw, `SPAM_SENDMANY_OUTPUTS`),
 so the only genuinely new work is fee-rate variance.
 
@@ -95,7 +95,7 @@ contain big-cheap, big-expensive, small-cheap and small-expensive txs.
 | `SPAM_FEE_MIN` | `1` | Market mode: bottom of the ladder, sat/vB. Floor fills also pay this. Must be ≥ the relay floor (1 sat/vB at the default `MIN_RELAY_TX_FEE`). |
 | `SPAM_FEE_MAX` | `50` | Market mode: top of the ladder, sat/vB. |
 
-Parsing/validation in `spammer/src/main.rs`, same style as the existing settings:
+Parsing/validation in `crates/spammer/src/main.rs`, same style as the existing settings:
 
 - `SPAM_FEE_MODE` accepts `flat` / `market`, anything else panics with a clear message.
 - In market mode: panic if `SPAM_FEE_MIN <= 0`, `SPAM_FEE_MAX < SPAM_FEE_MIN`; warn
@@ -117,7 +117,7 @@ this feature is purely spammer behavior).
 
 ## 3. Code changes, file by file
 
-### 3.1 `spammer/src/raw_transaction_spammer.rs`
+### 3.1 `crates/spammer/src/raw_transaction_spammer.rs`
 
 1. Add `enum FeeMode { Flat, Market }` and fields `fee_mode: FeeMode`,
    `fee_min: f64`, `fee_max: f64` to `RawSpammer`; extend `RawSpammer::new` to take
@@ -156,7 +156,7 @@ this feature is purely spammer behavior).
    `Node 2 => Fees offered this cycle: 1.2..48.7 sat/vB, weighted mean 9.3 (market mode)`.
    Flat mode keeps today's log lines untouched.
 
-### 3.2 `spammer/src/main.rs`
+### 3.2 `crates/spammer/src/main.rs`
 
 1. Parse the three new settings with validation as in §2 (near the existing
    `FALLBACK_FEE` block, `main.rs:152`).
@@ -274,7 +274,8 @@ image silently runs old code. Use `/usr/bin/docker` for unmangled output.
    printed, spam runs flat.
 4. **Validation errors:** `SPAM_FEE_MAX < SPAM_FEE_MIN` panics with the message;
    `SPAM_FEE_MODE=bogus` panics.
-5. `cargo build` in `spammer/` must exit 0 (check the exit code, not the output).
+5. `cargo ba -p simchain-spammer` (from the repo root) must exit 0 (check the exit
+   code, not the output).
 
 Do not commit or stage anything — the user manual-tests first and commits himself.
 

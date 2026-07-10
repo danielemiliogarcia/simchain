@@ -7,15 +7,13 @@ use bitcoincore_rpc::{
         hashes::{hash160, Hash},
         Address, Amount, Network, ScriptBuf, WPubkeyHash,
     },
-    jsonrpc, Client, RpcApi,
+    Client, RpcApi,
 };
-use std::{env, thread, time::Duration};
+use std::{thread, time::Duration};
 
-// A node busy with a big mempool or mid-block-assembly can take longer than
-// the default 15s RPC timeout (a large sendmany alone can), and the client
-// then dies on a WouldBlock socket error. Generous timeout instead; healthy
-// calls are unaffected.
-const RPC_TIMEOUT_SECS: u64 = 300;
+// RPC client construction and env lookup are shared with the other tools; the
+// raw-transaction engine needs the raw jsonrpc::Client, so re-export both here.
+pub use simchain_common::{create_client, create_jsonrpc_client, env_or};
 
 /// Retry a replay-safe RPC call with exponential backoff. Panics after the
 /// bounded attempt count so compose `restart: on-failure` remains the
@@ -50,25 +48,6 @@ pub fn rpc_retry<T>(what: &str, mut call: impl FnMut() -> Result<T, bitcoincore_
 // "total txs per block" for the user.
 pub const MINER_COUNT: u64 = 2;
 
-pub fn env_or(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-pub fn create_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Client {
-    Client::from_jsonrpc(create_jsonrpc_client(rpc_url, rpc_user, rpc_pass))
-}
-
-pub fn create_jsonrpc_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> jsonrpc::Client {
-    let (user, pass) = (rpc_user.to_string(), Some(rpc_pass.to_string()));
-    let transport = jsonrpc::simple_http::SimpleHttpTransport::builder()
-        .url(rpc_url)
-        .expect("invalid RPC url")
-        .auth(user, pass)
-        .timeout(Duration::from_secs(RPC_TIMEOUT_SECS))
-        .build();
-    jsonrpc::Client::with_transport(transport)
-}
-
 // Spam destinations are burn addresses (P2WPKH over the hash of a fixed tag,
 // no known key), not wallet addresses. Dust paid to a wallet address lands in
 // that wallet, and bitcoind's coin selection scans every UTXO on each send:
@@ -95,7 +74,7 @@ pub fn wait_for_funds(wallet: &Client, name: &str) {
         match wallet.get_balances() {
             Ok(balances) if balances.mine.trusted >= minimum => return,
             Ok(balances) => {
-                if iterations > 0 && iterations % 60 == 0 {
+                if iterations > 0 && iterations.is_multiple_of(60) {
                     println!(
                         "Still waiting for wallet '{name}': trusted balance {:.8} BTC < 1 BTC (coinbase maturity)",
                         balances.mine.trusted.to_btc()
@@ -103,7 +82,7 @@ pub fn wait_for_funds(wallet: &Client, name: &str) {
                 }
             }
             Err(error) => {
-                if iterations > 0 && iterations % 60 == 0 {
+                if iterations > 0 && iterations.is_multiple_of(60) {
                     println!(
                         "Still waiting for wallet '{name}': not loaded yet (the mining controller creates it during bootstrap) — {error}"
                     );

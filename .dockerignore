@@ -1,7 +1,17 @@
-# Build context for build-bitcoin.sh (repo root). The bitcoin node image
-# only needs the Dockerfile and the entrypoint script; keep everything else
-# (.git, the Rust target/ dirs - GBs after local builds) out of the upload.
-# The Rust tool images use their own contexts and .dockerignore files.
+# Shared build-context ignore for BOTH images built from the repo root:
+#   - Dockerfile        -> the bitcoind node image (needs Dockerfile + entrypoint)
+#   - tools.Dockerfile  -> the three Rust tools (needs the Cargo workspace)
+#
+# Allowlist only what those builds COPY; everything else (.git, and the Rust
+# target/ dirs that reach GBs after local builds) stays out of the upload.
+#
+# Under BuildKit, tools.Dockerfile.dockerignore overrides this file for the
+# tools image. The classic builder ignores per-Dockerfile files, so this root
+# file must cover both images on its own — hence the Rust allowlist entries.
 *
 !Dockerfile
 !docker-entrypoint.sh
+!Cargo.toml
+!Cargo.lock
+!.cargo
+!crates

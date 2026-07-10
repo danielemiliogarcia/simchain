@@ -469,7 +469,6 @@ impl RawSpammer {
             };
             *cache.witness_mut(i).unwrap() = Witness::p2wpkh(&signature, pubkey);
         }
-        drop(cache);
         tx
     }
 

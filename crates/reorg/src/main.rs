@@ -1,8 +1,9 @@
 use bitcoincore_rpc::{
     bitcoin::{address::NetworkUnchecked, Address, Amount, Network, Txid},
-    jsonrpc, Client, RpcApi,
+    Client, RpcApi,
 };
 use serde_json::json;
+use simchain_common::{create_client, env_or};
 use std::{
     collections::HashSet,
     env, process, thread,
@@ -37,28 +38,11 @@ use std::{
 //   auto           - every AUTO_REORG_EVERY_BLOCKS new blocks, reorg
 //                    REORG_DEPTH blocks. Requires EVERY > DEPTH.
 
-fn env_or(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
-}
-
-fn create_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Client {
-    // Disconnecting blocks with hundreds of txs can exceed the default 15s
-    // RPC timeout, so build the transport with a generous one.
-    let (user, pass) = (rpc_user.to_string(), Some(rpc_pass.to_string()));
-    let transport = jsonrpc::simple_http::SimpleHttpTransport::builder()
-        .url(rpc_url)
-        .expect("invalid RPC url")
-        .auth(user, pass)
-        .timeout(Duration::from_secs(300))
-        .build();
-    Client::from_jsonrpc(jsonrpc::client::Client::with_transport(transport))
 }
 
 fn wait_for_node(node: &Client, name: &str) {
@@ -290,6 +274,10 @@ fn mine_exact(
     Ok(())
 }
 
+// The reorg driver legitimately needs the node handle, RPC credentials, depth,
+// mode, and optional witness together; splitting them into a struct would only
+// move the argument list without simplifying it.
+#[allow(clippy::too_many_arguments)]
 fn do_reorg(
     node: &Client,
     rpc_url: &str,
@@ -356,7 +344,7 @@ fn do_reorg(
         for i in 0..blocks_to_mine as usize {
             let blocks_left = blocks_to_mine as usize - i;
             let live = live_mempool_topo(node)?;
-            let take = ((live.len() + blocks_left - 1) / blocks_left).min(live.len());
+            let take = live.len().div_ceil(blocks_left).min(live.len());
             mine_exact(node, mine_address, &live[..take])?;
         }
     }

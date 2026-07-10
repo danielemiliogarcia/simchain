@@ -102,7 +102,7 @@ fn send_spam_tx(from: &Client, to_address: &Address, count: u64, replaceable: bo
     let replaceable = if replaceable { Some(true) } else { None };
     for _ in 0..count {
         match from.send_to_address(
-            &to_address,
+            to_address,
             amount,
             None,
             None,

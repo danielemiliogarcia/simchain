@@ -1,10 +1,11 @@
 use bitcoincore_rpc::{
     bitcoin::{address::NetworkUnchecked, Address, BlockHash, Network},
-    jsonrpc, Client, RpcApi,
+    Client, RpcApi,
 };
+use simchain_common::{create_client, env_or};
 use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{env, thread, time::Duration};
+use std::{thread, time::Duration};
 
 // How many recent blocks to remember for reorg analysis. Reorgs deeper than
 // this window are still detected, but the fork point is then reported as the
@@ -14,12 +15,6 @@ const REORG_WINDOW: u64 = 100;
 // Height at which the bootstrap sequence (funding + coinbase maturity) ends.
 const BOOTSTRAP_END: u64 = 204;
 
-// A node assembling a full 4M WU block under spam load can take longer than
-// the default 15s RPC timeout; the client then dies on a WouldBlock socket
-// error while the node quietly finishes the call. Generous timeout instead:
-// a healthy call is unaffected, and a node that needs this long is wedged
-// enough that crashing (and restarting) is the right outcome.
-const RPC_TIMEOUT_SECS: u64 = 300;
 // 8 attempts with the backoff below give ~61s of tolerance for fast-failing
 // errors (connection refused while a node reboots), so a normal bitcoind
 // restart is ridden out in-process instead of crashing into a container
@@ -237,21 +232,6 @@ fn entropy_seed() -> u64 {
         .expect("system clock must be after the Unix epoch")
         .as_nanos() as u64;
     nanos ^ (u64::from(std::process::id()).rotate_left(32))
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-fn create_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Client {
-    let (user, pass) = (rpc_user.to_string(), Some(rpc_pass.to_string()));
-    let transport = jsonrpc::simple_http::SimpleHttpTransport::builder()
-        .url(rpc_url)
-        .expect("invalid RPC url")
-        .auth(user, pass)
-        .timeout(Duration::from_secs(RPC_TIMEOUT_SECS))
-        .build();
-    Client::from_jsonrpc(jsonrpc::client::Client::with_transport(transport))
 }
 
 fn wait_for_rpc(client: &Client, name: &str) {

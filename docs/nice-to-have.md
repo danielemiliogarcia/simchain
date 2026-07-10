@@ -33,20 +33,11 @@ Accepted decisions (not defects, recorded so they are not re-reported):
   `docker inspect`/`ps`): acceptable for a throwaway regtest; documented with a warning
   in SETTINGS.md not to replicate in production.
 
-Findings, ordered by severity:
-
-1. **No `Cargo.lock` is committed for any of the three tools** (all three
-   `.gitignore`s exclude it; `git ls-files` confirms none tracked). Each fresh clone or
-   image rebuild resolves dependencies anew, so two builds of the same commit can ship
-   different dependency versions, the opposite of what a reproducible test network
-   wants. Lockfiles should be committed for binary crates: drop `Cargo.lock` from the
-   three `.gitignore`s and commit the locks.
-
-2. **No Cargo workspace; helpers duplicated three times.** `env_or`/`create_client`
-   are copy-pasted per tool, and compose builds three independent dependency graphs
-   serially (three `target/` dirs, three lock states). A workspace with one shared
-   util crate, or a single multi-binary crate with three Dockerfile targets, would cut
-   build time and future drift.
+No open findings from the last review remain: the two that were open (uncommitted
+`Cargo.lock` and no Cargo workspace / duplicated helpers) are now shipped — the three
+tools are a single Cargo workspace with a shared `simchain-common` crate, one committed
+`Cargo.lock`, one `tools.Dockerfile`, and a CI workflow. See the README "Repository
+structure" section.
 
 ---
 

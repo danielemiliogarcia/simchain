@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/simchain-common",
+    "crates/mining-controller",
+    "crates/reorg",
+    "crates/spammer",
+]
+resolver = "2"
+
+# Each member crate declares its own dependencies independently. There is
+# deliberately no [workspace.dependencies] table: when this repo is embedded
+# inside an upper-level Cargo workspace, a shared dependency table can conflict
+# with the parent's version pins, and keeping per-crate declarations is what
+# makes exclusion-based embedding work cleanly.
+#
+# Note for parent workspace consumers: if this repo is embedded inside an
+# upper-level Cargo workspace, add this directory to that workspace's
+# `exclude` list to prevent nested-workspace errors:
+#
+#   [workspace]
+#   exclude = ["path/to/simchain"]
