@@ -19,9 +19,8 @@
   node policy parameters (`-minrelaytxfee` for the mempool floor, `-blockmintxfee`
   for the miner's inclusion floor) so blocks fill up and transactions genuinely
   compete for block space
-- The six proposed features below: Poisson block timing, fee-market simulation,
-  scenario engine, network partitions, reorgs that drop transactions, and an
-  airtight fee floor (standalone-UTXO fill pool)
+- The five proposed features below: Poisson block timing, fee-market simulation,
+  scenario engine, network partitions, and reorgs that drop transactions
 
 ### Code review findings (2026-07-04)
 
@@ -88,7 +87,7 @@ Simchain's purpose is to simulate the Bitcoin chain on regtest while staying as 
 mainnet reality as regtest allows: multiple P2P-connected nodes, rotating miners, a
 non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus six bigger proposed features with their
+limitations and future enhancements, plus five bigger proposed features with their
 rationale and an implementation plan.
 
 ## 1. Realistic block timing and hashrate distribution
@@ -227,33 +226,6 @@ wanting *their* tx permanently dropped must broadcast the conflicting tx themsel
 2. Log which txids were conflicted so tests can assert on them.
 
 Effort: medium (raw-tx construction, only meaningful with spam enabled).
-
----
-
-## 6. Airtight fee floor: standalone-UTXO fill pool
-
-**What:** Make the current block's fill come from a pool of *standalone* confirmed
-UTXOs (each spam tx spends a confirmed UTXO, no unconfirmed ancestors), so the miner
-can pack the block to within one tiny tx of full — leaving no gap a cheap tx can use.
-
-**Why it's needed:** In the shipped hybrid engine every spam tx chains off a branch,
-so only ~branch-count of them are standalone (mineable into a small gap); the rest are
-chain tips with huge ancestor packages that cannot fill a gap. And any floor-priced tx
-the engine makes gets *mined* (it pays the floor), so none persist to guard the residual
-gap. Net: blocks pack to ~98–99% and a below-floor tx confirms through the leftover
-~12–17k vB. Simply adding more sealers, more branches, or smaller data did not close it
-(tested). The fix is architectural: standalone txs, not chained ones.
-
-**Implementation sketch:**
-1. Maintain a pool of many small *confirmed* UTXOs (separate from the data branches).
-2. Each block, spend them as standalone floor-priced txs of assorted small sizes to
-   pack the current block to ~100%; their change outputs confirm next block and
-   replenish the pool (steady state ≈ one block of standalone UTXOs regenerating).
-3. Keep chained data only for backlog *depth* beyond block 1 (it need not be standalone
-   — it is not being mined this block).
-
-Effort: medium (a second UTXO-management path in the raw engine, reorg/restart
-recovery for the pool).
 
 ---
 

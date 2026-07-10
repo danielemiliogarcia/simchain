@@ -216,11 +216,13 @@ services:
       - SPAM_TX_DATA_MAX_BYTES=${SPAM_TX_DATA_MAX_BYTES:-0}
       - SPAM_TX_DATA_MIN_BYTES=${SPAM_TX_DATA_MIN_BYTES:-0}
       # Extra minimum-size floor-priced txs per block, on top of the data fill:
-      # they tighten packing and add a stream of small realistic-looking txs.
-      # NOTE: the fee floor is NOT yet airtight -- blocks still leave a small
-      # packing gap a tiny cheap tx can slip into (known limitation, see
-      # SETTINGS.md "The fee floor is soft"). 0 = none.
+      # they add a stream of small realistic-looking txs. 0 = none.
       - SPAM_SMALL_TXS_PER_BLOCK=${SPAM_SMALL_TXS_PER_BLOCK:-0}
+      # Airtight fee floor (DATA/HYBRID mode): keep this many standalone
+      # minimum-size floor-priced fill txs STANDING in the mempool, so block
+      # assembly packs any residual gap with them and a below-floor tx cannot
+      # slip through. 0 = off (floor is then soft; see SETTINGS.md).
+      - SPAM_FLOOR_POOL_TXS=${SPAM_FLOOR_POOL_TXS:-500}
       # DATA/HYBRID fill target in blocks of mempool weight: 0.5 = half-full
       # blocks (floor off), 1 = full + shallow backlog, 5 = full + ~4 pending.
       - SPAM_FILL_BLOCK_RATIO=${SPAM_FILL_BLOCK_RATIO:-1.0}

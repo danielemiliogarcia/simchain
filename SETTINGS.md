@@ -179,7 +179,8 @@ fee-market simulation).
 | `SPAM_SENDMANY_OUTPUTS` | `0` | OUTPUT-mode fatness. `0`: sequential — one tx with a single burn output at a time, p2p-like arrival. `N > 0`: batch — each spam tx carries N burn outputs (exchange-payout-shaped). Ignored in DATA/HYBRID mode. |
 | `SPAM_TX_DATA_MAX_BYTES` | `0` | Raw engine only. `0`: OUTPUT mode (fatness from burn outputs). `N > 0`: **DATA/HYBRID mode** — the fill comes from OP_RETURN data txs (biggest payload = N). An OP_RETURN is provably unspendable, so it never enters the UTXO set: pure block weight at near-zero node cost (a handful of fat txs fill a 4M WU block vs ~1130 in output mode; measured node CPU ~100% → ~2%). Capped just under the 100k-vB standard-tx limit; needs Core 30+. Renamed from `SPAM_TX_DATA_BYTES` (still honored). See [Hybrid: varied sizes and mempool depth](#hybrid-varied-sizes-and-mempool-depth). |
 | `SPAM_TX_DATA_MIN_BYTES` | `0` | Smallest data payload. `0` (or ≥ MAX): every data tx is exactly MAX (uniform). Below MAX: each tx's size is drawn **log-uniformly** in `[MIN, MAX]` — a realistic spread, most small and a few large. |
-| `SPAM_SMALL_TXS_PER_BLOCK` | `0` | HYBRID: this many extra minimum-size (~140 vB) floor-priced txs per block, on top of the data fill. They tighten packing and add a stream of small realistic-looking txs. **The fee floor is not yet airtight** — see [The fee floor is soft](#the-fee-floor-is-soft). `0`: none. |
+| `SPAM_SMALL_TXS_PER_BLOCK` | `0` | HYBRID: this many extra minimum-size (~140 vB) floor-priced txs per block, on top of the data fill. Cosmetic — they add a stream of small realistic-looking payment-shaped txs. This is **not** the fee floor; the airtight floor is `SPAM_FLOOR_POOL_TXS`. `0`: none. |
+| `SPAM_FLOOR_POOL_TXS` | `500` | **Airtight fee floor** (DATA/HYBRID mode). Keep this many standalone minimum-size (~110 vB) floor-priced fill txs *standing* in the mempool at all times, split across the miners on their own nodes. Each fill spends a **confirmed** UTXO from a dedicated second key (never unconfirmed spam change), so its ancestor package is itself and block assembly can pack any residual gap with it — blocks reach ~99.99% full, so a below-floor tx has no gap to slip into and must **outbid** the floor to confirm. Mined fills recycle their change into fresh ammo (zero net UTXO-set growth). `0`: off — the floor is then **soft** (see [The fee floor](#the-fee-floor)). Ignored in OUTPUT/wallet modes. |
 | `SPAM_FILL_BLOCK_RATIO` | `1.0` | DATA/HYBRID fill target, in blocks of mempool weight, measured live each block and topped up. `0.5`: half-full blocks (floor off). `1`: full blocks + a shallow backlog. `5`: full blocks + ~4 pending blocks visible in the mempool. |
 | `SPAM_FANOUT_AUTO` | `true` | DATA/HYBRID: auto-size the branch pool from the fill ratio. `true`: use `max(12, ceil(ratio × 15))` branches (a deep pool is needed to hold that many blocks of unconfirmed spam). `false`: use `SPAM_FANOUT_UTXOS`, erroring at startup if it is below the `ratio × 10` minimum. |
 | `SPAM_FANOUT_UTXOS` | `50` | The spammer keeps its funds split into this many independent UTXOs ("branches"), replenishing when the pool runs low. The mempool caps unconfirmed chains at 25 txs / 101k vB, so without the split a single UTXO can place only ~25 txs per block. In DATA/HYBRID mode this is overridden by the auto value unless `SPAM_FANOUT_AUTO=false`. `0` disables (OUTPUT/wallet only). |
@@ -259,7 +260,8 @@ plus a few small txs, and keeps the mempool a chosen number of blocks deep:
 ```bash
 SPAM_TX_DATA_MAX_BYTES=90000   # biggest OP_RETURN payload (cheap bulk weight)
 SPAM_TX_DATA_MIN_BYTES=250     # spread each tx's size log-uniformly in [MIN, MAX]
-SPAM_SMALL_TXS_PER_BLOCK=40    # small floor-priced txs (soft floor — see below)
+SPAM_SMALL_TXS_PER_BLOCK=40    # small realistic payment-shaped txs (cosmetic)
+SPAM_FLOOR_POOL_TXS=500        # standing standalone fills → airtight floor (see below)
 SPAM_FILL_BLOCK_RATIO=2        # keep ~2 blocks of weight pending in the mempool
 FALLBACK_FEE=0.001             # 100 sat/vB price level for all spam
 ```
@@ -274,24 +276,34 @@ unconfirmed spam needs about `R × 10` branches. Sizes verified live spanning ~1
 (smallest) to ~88k vB in a single mempool; node CPU stays low and the UTXO set barely
 grows (only the small txs add outputs).
 
-### The fee floor is soft
+### The fee floor
 
 Raising `FALLBACK_FEE` with full blocks makes the estimator and mempool.space show a
-price floor (e.g. Low/Medium/High all at 100 sat/vB). **But the floor is not airtight
-against tiny transactions.** Blocks pack to ~98–99%, not 100%, and a cheap tiny tx
-(below the floor rate) can still slip into the leftover ~12–17k-vB packing gap and
-confirm next block — visible as the `No Priority` band sitting at ~1–2 sat/vB.
+price floor (e.g. Low/Medium/High all at 100 sat/vB). Whether that floor is **airtight**
+against tiny below-floor transactions depends on `SPAM_FLOOR_POOL_TXS`.
 
-Why: every spam tx chains off a branch, so only a branch-count of them are *standalone*
-(mineable into a small gap on their own); the rest are chain tips whose ancestor
-package is far too big to fit a gap. And any floor-priced tx the engine does make gets
-*mined* (it pays the floor), so none persist to guard the residual gap. The
-`SPAM_SMALL_TXS_PER_BLOCK` gap-sealers tighten packing and raise the bar — the floor
-holds for any tx *larger* than the gap — but they do not close it for the smallest txs.
-Closing it fully needs a pool of standalone confirmed UTXOs feeding the current block's
-fill (planned — see `nice-to-have.md`). For a genuinely airtight floor today, use the
-small-tx [Market pressure](#market-pressure-floor-to-100-satsvb) recipe below (higher
-node load), whose spam is itself small enough to leave no exploitable gap.
+**The problem (with `SPAM_FLOOR_POOL_TXS=0`, a soft floor).** Every data/sealer spam tx
+chains off a branch, so only a branch-count of them are *standalone* (mineable into a
+small gap on their own); the rest are chain tips whose ancestor package is far too big
+to fit a gap. And any floor-priced tx the engine makes gets *mined* (it pays the floor),
+so none persist to guard the residual gap. Blocks therefore pack to ~98–99%, not 100%,
+and a cheap tiny tx (below the floor rate) slips into the leftover ~12–17k-vB packing
+gap and confirms next block — visible as the `No Priority` band at ~1–2 sat/vB.
+`SPAM_SMALL_TXS_PER_BLOCK` gap-sealers tighten packing and raise the bar (the floor
+holds for any tx *larger* than the gap) but do not close it for the smallest txs.
+
+**The fix (`SPAM_FLOOR_POOL_TXS > 0`, default `500`, airtight).** The engine maintains a
+standing pool of standalone minimum-size (~110 vB) floor-priced fill txs *sitting in the
+mempool at all times*, from a dedicated second key. Each fill spends a **confirmed** pool
+UTXO — never unconfirmed change — so its ancestor package is itself and block assembly
+can drop it into any residual gap. With hundreds of them standing, blocks pack to within
+~110 vB of full (~99.99%), leaving no gap a real tx can fit: a below-floor tx must
+**outbid** the floor to confirm. Each block, mined fills recycle their change into fresh
+confirmed ammo, so the pool churns ~1:1 and holds at the target with **zero net
+UTXO-set growth** (self-transfers spend one output and create one) and near-idle nodes.
+The pool only applies in DATA/HYBRID mode and only while blocks are actually full
+(`SPAM_FILL_BLOCK_RATIO ≥ 1`); at `ratio < 1` blocks are partial by design and
+everything confirms regardless.
 
 ### Market pressure floor to 100 sats/vB
 full blocks with 100 sats/vb every tx

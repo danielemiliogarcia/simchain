@@ -22,13 +22,24 @@
 //!     SPAM_TX_DATA_MIN_BYTES and _MAX_BYTES, giving a realistic spread of tx
 //!     sizes at near-zero node cost (OP_RETURN never enters the UTXO set).
 //!     Each block also gets a guaranteed batch of minimum-size P2WPKH
-//!     gap-sealer txs (SPAM_SMALL_TXS_PER_BLOCK) so leftover block space is
-//!     always taken by a floor-priced tx -- a cheap user tx then has to
-//!     *outbid* the floor, not slip through an unused gap. The engine fills to
-//!     a target of SPAM_FILL_BLOCK_RATIO blocks of mempool weight, so the same
-//!     mode does partial blocks (ratio < 1), just-full blocks (ratio 1) and a
-//!     deep visible mempool backlog (ratio > 1). Needs Bitcoin Core 30+ (large
+//!     gap-sealer txs (SPAM_SMALL_TXS_PER_BLOCK), small realistic-looking
+//!     floor-priced traffic. The engine fills to a target of
+//!     SPAM_FILL_BLOCK_RATIO blocks of mempool weight, so the same mode does
+//!     partial blocks (ratio < 1), just-full blocks (ratio 1) and a deep
+//!     visible mempool backlog (ratio > 1). Needs Bitcoin Core 30+ (large
 //!     OP_RETURN standard by default).
+//!
+//! The airtight fee floor comes from a third piece, the FLOOR FILL POOL
+//! (SPAM_FLOOR_POOL_TXS, DATA/HYBRID mode): a standing pool of standalone
+//! minimum-size floor-priced self-transfers kept sitting in the mempool at
+//! all times. Spam txs chain off unconfirmed change, so their ancestor
+//! packages are far too big to fit the ~12-17k vB gap block packing leaves;
+//! a fill instead spends a CONFIRMED UTXO from a dedicated second key, so
+//! its ancestor package is itself (~110 vB) and the block assembler can drop
+//! it into any residual gap. Blocks pack to within ~110 vB of full and a
+//! below-floor tx has no gap left to slip into -- it must outbid the floor.
+//! Mined fills confirm their change, which becomes fresh pool ammo: the pool
+//! churns 1:1 with zero net UTXO-set growth.
 
 use crate::common;
 use bitcoincore_rpc::{
@@ -48,7 +59,7 @@ use bitcoincore_rpc::{
     Client, RpcApi,
 };
 use serde_json::json;
-use std::{thread, time::Duration};
+use std::{collections::HashSet, thread, time::Duration};
 
 // 546-sat burn/gap-sealer outputs: safely above the P2PKH dust floor for any
 // address type, same amount as the wallet engine so shapes match.
@@ -66,6 +77,18 @@ const FUND_PULL_MAX_BTC: f64 = 500.0;
 // A branch must afford at least this many spam txs to count as usable when
 // deciding whether the pool needs a refill/re-split.
 const BRANCH_MIN_TXS: u64 = 16;
+
+// vsize of one floor fill: a 1-in/1-out P2WPKH self-transfer (11 vB overhead
+// + 68 vB input + 31 vB change). The smallest SELF-SUSTAINING standard shape:
+// the change must be spendable as the next fill's input, and a taproot
+// self-transfer is bigger (~111 vB: 57.5 vB input but a 43 vB output).
+const FILL_VSIZE: u64 = 110;
+
+// One funding pull for the floor pool, much smaller than the data engine's
+// FUND_PULL_MAX_BTC: the pool only ever burns fees (~0.011 BTC per block at
+// 100 sat/vB with ~100 fills mined per block), so this lasts thousands of
+// blocks.
+const POOL_PULL_MAX_BTC: f64 = 50.0;
 
 #[derive(Clone, Copy)]
 struct Utxo {
@@ -121,6 +144,23 @@ pub struct RawSpammer {
     draw_counter: u64,
     utxos: Vec<Utxo>,
     cursor: usize,
+    // Floor fill pool: a SECOND deterministic key whose confirmed UTXOs feed
+    // the standalone floor fills. Separate from the data branches so the
+    // fills never chain off unconfirmed spam change and stay identifiable.
+    pool_secret: SecretKey,
+    pool_pubkey: PublicKey,
+    pool_address: Address,
+    pool_script: ScriptBuf,
+    // Confirmed pool UTXOs ready to be spent as fills ("ammo").
+    pool_utxos: Vec<Utxo>,
+    // Fills currently sitting unmined in the mempool (the standing pool).
+    // Each entry is the fill's own change output: outpoint (txid, 0) carries
+    // the fill txid for mined-detection, and the amount is ready to move to
+    // pool_utxos the moment a block mines it.
+    fills_inflight: Vec<Utxo>,
+    // Last block height whose txs were checked for mined fills, so a cycle
+    // that overruns a block interval never misses a mined fill.
+    pool_seen_height: u64,
 }
 
 // vsize of an OP_RETURN data tx: 1 P2WPKH input (~68 vB incl. witness), 1
@@ -184,7 +224,17 @@ impl RawSpammer {
                 .collect()
         };
         let sealer_script = common::burn_address(0).script_pubkey();
+        // The floor pool's own key, same recovery story as the engine key: a
+        // restarted spammer derives the same address and picks its confirmed
+        // pool UTXOs back up with scantxoutset.
+        let pool_tag = sha256::Hash::hash(format!("simchain-raw-floor-{wallet_name}").as_bytes());
+        let pool_secret =
+            SecretKey::from_slice(pool_tag.as_byte_array()).expect("sha256 of tag is a valid key");
+        let pool_pubkey = PublicKey::from_secret_key(&secp, &pool_secret);
+        let pool_address = Address::p2wpkh(&CompressedPublicKey(pool_pubkey), Network::Regtest);
+        let pool_script = pool_address.script_pubkey();
         println!("{label} => Raw spam engine address: {address}");
+        println!("{label} => Floor fill-pool address: {pool_address}");
         RawSpammer {
             node,
             wallet,
@@ -203,6 +253,13 @@ impl RawSpammer {
             draw_counter: 0,
             utxos: Vec::new(),
             cursor: 0,
+            pool_secret,
+            pool_pubkey,
+            pool_address,
+            pool_script,
+            pool_utxos: Vec::new(),
+            fills_inflight: Vec::new(),
+            pool_seen_height: 0,
         }
     }
 
@@ -313,14 +370,37 @@ impl RawSpammer {
         self.fee_from_vsize((11 + 68 * n_in + 31 * n_out) as u64)
     }
 
-    // Build, sign and broadcast one transaction spending our own P2WPKH
-    // UTXOs. maxfeerate=0 disables sendrawtransaction's 0.1 BTC/kvB safety
-    // cap, so a deliberately high FALLBACK_FEE price level still broadcasts.
+    // Build, sign and broadcast one transaction spending the engine key's
+    // P2WPKH UTXOs. maxfeerate=0 disables sendrawtransaction's 0.1 BTC/kvB
+    // safety cap, so a deliberately high FALLBACK_FEE price level still
+    // broadcasts.
     fn send_tx(
         &self,
         inputs: &[Utxo],
         outputs: Vec<TxOut>,
         replaceable: bool,
+    ) -> Result<Txid, bitcoincore_rpc::Error> {
+        self.send_signed(
+            inputs,
+            outputs,
+            replaceable,
+            &self.script_pubkey,
+            &self.secret,
+            &self.pubkey,
+        )
+    }
+
+    // send_tx generalized over the spending key, so the same builder serves
+    // both the engine key (data branches) and the floor-pool key (fills).
+    // All inputs must pay `spent_script` (P2WPKH of `pubkey`).
+    fn send_signed(
+        &self,
+        inputs: &[Utxo],
+        outputs: Vec<TxOut>,
+        replaceable: bool,
+        spent_script: &ScriptBuf,
+        secret: &SecretKey,
+        pubkey: &PublicKey,
     ) -> Result<Txid, bitcoincore_rpc::Error> {
         let sequence = if replaceable {
             Sequence::ENABLE_RBF_NO_LOCKTIME
@@ -344,15 +424,15 @@ impl RawSpammer {
         let mut cache = SighashCache::new(&mut tx);
         for (i, utxo) in inputs.iter().enumerate() {
             let sighash = cache
-                .p2wpkh_signature_hash(i, &self.script_pubkey, utxo.amount, EcdsaSighashType::All)
+                .p2wpkh_signature_hash(i, spent_script, utxo.amount, EcdsaSighashType::All)
                 .expect("valid p2wpkh sighash");
             let signature = ecdsa::Signature {
                 signature: self
                     .secp
-                    .sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &self.secret),
+                    .sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), secret),
                 sighash_type: EcdsaSighashType::All,
             };
-            *cache.witness_mut(i).unwrap() = Witness::p2wpkh(&signature, &self.pubkey);
+            *cache.witness_mut(i).unwrap() = Witness::p2wpkh(&signature, pubkey);
         }
         drop(cache);
         self.node
@@ -360,22 +440,19 @@ impl RawSpammer {
             .map(|s| s.parse().expect("bitcoind returned an invalid txid"))
     }
 
-    // Rebuild the UTXO set from the chain. scantxoutset only sees CONFIRMED
-    // outputs, so two corrections apply: outputs already spent by our own
-    // still-in-mempool txs are filtered out with gettxout(include_mempool),
-    // and branches whose current tip is unconfirmed stay invisible until a
-    // block confirms them (the next low-pool check picks them back up). Only
-    // a recovery path -- startup, reorgs, lost track -- never the hot path.
-    fn resync(&mut self) {
+    // Confirmed, still-unspent UTXOs paying `address`, from the chain.
+    // scantxoutset only sees CONFIRMED outputs, so two corrections apply:
+    // outputs already spent by our own still-in-mempool txs are filtered out
+    // with gettxout(include_mempool), and outputs whose tx is unconfirmed
+    // stay invisible until a block confirms them (the next low-pool check
+    // picks them back up). Only a recovery path -- startup, reorgs, lost
+    // track -- never the hot path.
+    fn scan_address_utxos(&self, address: &Address) -> Vec<Utxo> {
         let scan = self
             .node
-            .scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(format!(
-                "addr({})",
-                self.address
-            ))])
+            .scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(format!("addr({address})"))])
             .unwrap();
-        self.utxos = scan
-            .unspents
+        scan.unspents
             .into_iter()
             .filter(|u| {
                 self.node
@@ -387,8 +464,18 @@ impl RawSpammer {
                 outpoint: OutPoint::new(u.txid, u.vout),
                 amount: u.amount,
             })
-            .collect();
+            .collect()
+    }
+
+    // Rebuild the data-branch UTXO set from the chain.
+    fn resync(&mut self) {
+        self.utxos = self.scan_address_utxos(&self.address);
         self.cursor = 0;
+    }
+
+    // Rebuild the floor pool's confirmed ammo from the chain.
+    fn pool_resync(&mut self) {
+        self.pool_utxos = self.scan_address_utxos(&self.pool_address);
     }
 
     // Keep the engine holding `target` independent branches able to spam.
@@ -607,6 +694,240 @@ impl RawSpammer {
         }
     }
 
+    fn fill_fee(&self) -> Amount {
+        self.fee_from_vsize(FILL_VSIZE)
+    }
+
+    // Move fills that a block has mined from the in-flight list back into the
+    // pool's confirmed ammo (a mined fill's change is spendable again). Walks
+    // every block since the last look, so fills mined while a spam cycle
+    // overran a block interval are never missed and the standing count stays
+    // honest.
+    fn harvest_mined_fills(&mut self) {
+        let tip = self.node.get_block_count().unwrap();
+        if self.pool_seen_height == 0 || self.fills_inflight.is_empty() {
+            self.pool_seen_height = tip;
+            return;
+        }
+        let mut mined: HashSet<Txid> = HashSet::new();
+        for height in (self.pool_seen_height + 1)..=tip {
+            let hash = self.node.get_block_hash(height).unwrap();
+            mined.extend(self.node.get_block_info(&hash).unwrap().tx);
+        }
+        self.pool_seen_height = tip;
+        let mut still_standing = Vec::new();
+        for fill in self.fills_inflight.drain(..) {
+            // The duplicate guard covers the rare race where a resync already
+            // picked this change up as confirmed ammo before we saw the block.
+            if mined.contains(&fill.outpoint.txid) {
+                if !self.pool_utxos.iter().any(|u| u.outpoint == fill.outpoint) {
+                    self.pool_utxos.push(fill);
+                }
+            } else {
+                still_standing.push(fill);
+            }
+        }
+        self.fills_inflight = still_standing;
+    }
+
+    fn usable_fill_ammo(&self, required: Amount) -> u64 {
+        self.pool_utxos
+            .iter()
+            .filter(|u| u.amount >= required)
+            .count() as u64
+    }
+
+    // Keep the floor pool holding enough confirmed ammo to top the standing
+    // fill count back up to `target`. Mirrors ensure_funds: cheap in-memory
+    // check when healthy, then a scantxoutset resync, then a miner-wallet
+    // pull, then a consolidate + fan-out into target + 25% equal UTXOs (the
+    // buffer covers UTXOs locked under in-flight fills). Waits for the
+    // fan-out to confirm before returning: fills must spend CONFIRMED
+    // outputs only, or they stop being standalone and the floor reopens.
+    fn ensure_pool_funds(&mut self, need: u64, target: u64) {
+        let required = self.fill_fee() + MIN_CHANGE;
+        if self.usable_fill_ammo(required) >= need {
+            return;
+        }
+        self.pool_resync();
+        if self.usable_fill_ammo(required) >= need {
+            return;
+        }
+
+        let seed_count = target + target.div_ceil(4);
+        let total: Amount = self.pool_utxos.iter().map(|u| u.amount).sum();
+        let refill_floor = required * (seed_count * BRANCH_MIN_TXS);
+        if total < refill_floor {
+            common::wait_for_funds(&self.wallet, &self.wallet_name);
+            let trusted = self.wallet.get_balances().unwrap().mine.trusted.to_btc();
+            let pull_btc = ((trusted * 0.5).min(POOL_PULL_MAX_BTC) * 1e8).floor() / 1e8;
+            let pull = Amount::from_btc(pull_btc).unwrap();
+            println!(
+                "{} => Floor pool pulling {pull} from wallet '{}'",
+                self.label, self.wallet_name
+            );
+            let txid = self
+                .wallet
+                .send_to_address(&self.pool_address, pull, None, None, None, None, None, None)
+                .unwrap();
+            while self
+                .wallet
+                .get_transaction(&txid, None)
+                .map(|tx| tx.info.confirmations)
+                .unwrap_or(0)
+                < 1
+            {
+                thread::sleep(Duration::from_millis(500));
+            }
+            self.pool_resync();
+        }
+
+        let total: Amount = self.pool_utxos.iter().map(|u| u.amount).sum();
+        if self.pool_utxos.is_empty() {
+            println!(
+                "{} => Floor pool has no confirmed funds to fan out yet, deferring",
+                self.label
+            );
+            return;
+        }
+        let fee = self.consolidation_fee(self.pool_utxos.len(), seed_count as usize);
+        let per_utxo = match total.checked_sub(fee) {
+            Some(split) => split / seed_count,
+            None => Amount::ZERO,
+        };
+        if per_utxo < required {
+            println!(
+                "{} => Floor pool funds too low to split {total} into {seed_count} usable fill UTXOs, deferring",
+                self.label
+            );
+            return;
+        }
+
+        println!(
+            "{} => Floor pool splitting {total} into {seed_count} fill UTXOs of {per_utxo}",
+            self.label
+        );
+        let outputs: Vec<TxOut> = (0..seed_count)
+            .map(|_| TxOut {
+                value: per_utxo,
+                script_pubkey: self.pool_script.clone(),
+            })
+            .collect();
+        let inputs = std::mem::take(&mut self.pool_utxos);
+        match self.send_signed(
+            &inputs,
+            outputs,
+            false,
+            &self.pool_script,
+            &self.pool_secret,
+            &self.pool_pubkey,
+        ) {
+            Ok(txid) => {
+                println!(
+                    "{} => Pool fan-out tx {txid} sent, waiting for it to confirm...",
+                    self.label
+                );
+                while !matches!(self.node.get_tx_out(&txid, 0, Some(false)), Ok(Some(_))) {
+                    thread::sleep(Duration::from_millis(500));
+                }
+                self.pool_utxos = (0..seed_count)
+                    .map(|i| Utxo {
+                        outpoint: OutPoint::new(txid, i as u32),
+                        amount: per_utxo,
+                    })
+                    .collect();
+                println!("{} => Pool fan-out confirmed", self.label);
+            }
+            Err(e) => {
+                println!(
+                    "{} => Floor pool fan-out failed ({e}), retrying next block",
+                    self.label
+                );
+                self.pool_resync();
+            }
+        }
+    }
+
+    // Keep a standing pool of `target` standalone floor-priced fills sitting
+    // in this node's mempool: harvest what the last block(s) mined (their
+    // change is fresh confirmed ammo), then top the standing count back up.
+    // Each fill spends one CONFIRMED pool UTXO, so its ancestor package is
+    // itself (~110 vB) and the block assembler can drop it into any residual
+    // packing gap: blocks pack to within ~110 vB of full, leaving a
+    // below-floor tx no gap to slip into. Returns the number of fills sent.
+    pub fn floor_round(&mut self, target: u64) -> usize {
+        if target == 0 {
+            return 0;
+        }
+        self.harvest_mined_fills();
+        let standing = self.fills_inflight.len() as u64;
+        let need = target.saturating_sub(standing);
+        if need == 0 {
+            println!(
+                "{} => Floor pool: {standing}/{target} fills standing, none needed",
+                self.label
+            );
+            return 0;
+        }
+        self.ensure_pool_funds(need, target);
+
+        let fee = self.fill_fee();
+        let required = fee + MIN_CHANGE;
+        let mut sent = 0u64;
+        let mut fails = 0;
+        let mut first_error: Option<String> = None;
+        while sent < need && fails < 3 {
+            let Some(idx) = self.pool_utxos.iter().position(|u| u.amount >= required) else {
+                break;
+            };
+            let utxo = self.pool_utxos.swap_remove(idx);
+            let change = utxo.amount - fee;
+            let outputs = vec![TxOut {
+                value: change,
+                script_pubkey: self.pool_script.clone(),
+            }];
+            match self.send_signed(
+                &[utxo],
+                outputs,
+                false,
+                &self.pool_script,
+                &self.pool_secret,
+                &self.pool_pubkey,
+            ) {
+                Ok(txid) => {
+                    self.fills_inflight.push(Utxo {
+                        outpoint: OutPoint::new(txid, 0),
+                        amount: change,
+                    });
+                    sent += 1;
+                    fails = 0;
+                }
+                Err(e) => {
+                    // The UTXO stays dropped either way: if our view of it
+                    // was stale, the next pool resync recovers the truth.
+                    if first_error.is_none() {
+                        first_error = Some(e.to_string());
+                    }
+                    fails += 1;
+                }
+            }
+        }
+        println!(
+            "{} => Floor pool: {standing} standing + {sent} new fills (target {target})",
+            self.label
+        );
+        if sent < need {
+            let detail = first_error
+                .map(|e| format!(", first error: {e}"))
+                .unwrap_or_else(|| ", pool ammo exhausted".to_string());
+            println!(
+                "WARNING: {} floor pool only sent {sent}/{need} fills this block{detail}",
+                self.label
+            );
+        }
+        sent as usize
+    }
+
     // OUTPUT mode: send this node's fixed share of burn-output spam txs
     // (sequential or batch, depending on the burn-script count), then fee-bump
     // its own txs when RBF is enabled.
@@ -670,10 +991,11 @@ impl RawSpammer {
         txids
     }
 
-    // DATA/HYBRID mode: send `small_txs` guaranteed minimum-size gap-sealer
-    // txs (so the fee floor holds), then fill with varied-size OP_RETURN data
-    // txs until `deficit_vsize` of weight has been offered (or the branch pool
-    // is exhausted). `deficit_vsize` is how much the caller wants added to the
+    // DATA/HYBRID mode: send `small_txs` minimum-size P2WPKH txs (cosmetic
+    // small-payment-shaped traffic; the airtight floor is the separate
+    // floor_round pool), then fill with varied-size OP_RETURN data txs until
+    // `deficit_vsize` of weight has been offered (or the branch pool is
+    // exhausted). `deficit_vsize` is how much the caller wants added to the
     // mempool this block to reach the SPAM_FILL_BLOCK_RATIO target. Returns the
     // txids and the total vsize actually offered.
     pub fn hybrid_round(
@@ -693,8 +1015,8 @@ impl RawSpammer {
         let mut sealer_count = 0u64;
         let mut data_count = 0u64;
 
-        // Guaranteed gap-sealers first: minimum-size floor-priced txs that take
-        // any leftover block space before a cheap user tx can.
+        // Small payment-shaped txs first: cosmetic minimum-size traffic in the
+        // mempool. (The airtight packing guarantee is the floor_round pool.)
         let mut fails = 0;
         while sealer_count < small_txs {
             if self.utxos.is_empty() || fails >= self.utxos.len() {

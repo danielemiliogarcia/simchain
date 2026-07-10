@@ -103,10 +103,10 @@ fn main() {
         .parse::<u64>()
         .expect("SPAM_TX_DATA_MIN_BYTES must be a non-negative integer")
         .min(data_max_bytes);
-    // HYBRID gap-sealers: this many guaranteed minimum-size (~140 vB) P2WPKH
-    // floor-priced txs per block, so any leftover block space is taken by a
-    // floor tx and a cheap user tx must OUTBID the floor, not slip through a
-    // gap. A few is plenty (they are tiny); 0 disables (floor can then leak).
+    // HYBRID small txs: this many minimum-size (~140 vB) P2WPKH floor-priced
+    // txs per block, cosmetic small-payment-shaped traffic on top of the data
+    // fill. NOT the fee floor -- the airtight floor is SPAM_FLOOR_POOL_TXS
+    // below. 0 disables.
     let small_txs_per_block: u64 = env_or("SPAM_SMALL_TXS_PER_BLOCK", "0")
         .parse()
         .expect("SPAM_SMALL_TXS_PER_BLOCK must be a non-negative integer");
@@ -116,6 +116,16 @@ fn main() {
     let fill_block_ratio: f64 = env_or("SPAM_FILL_BLOCK_RATIO", "1.0")
         .parse()
         .expect("SPAM_FILL_BLOCK_RATIO must be a number");
+    // Airtight fee floor (raw DATA/HYBRID only): keep this many standalone
+    // minimum-size (~110 vB) floor-priced fill txs STANDING in the mempool at
+    // all times, split across the miners. Each fill spends a confirmed UTXO
+    // from a dedicated pool (never unconfirmed change), so the block
+    // assembler can pack any residual gap with them and a below-floor tx has
+    // nowhere left to slip in. 0 disables (the floor is then soft: a small
+    // cheap tx can confirm through the ~12-17k vB packing gap).
+    let floor_pool_txs: u64 = env_or("SPAM_FLOOR_POOL_TXS", "500")
+        .parse()
+        .expect("SPAM_FLOOR_POOL_TXS must be a non-negative integer");
     // Whether to auto-derive the branch pool from the fill ratio. true
     // (default): use max(12, ceil(ratio x 15)) branches for headroom, ignoring
     // SPAM_FANOUT_UTXOS. false: use SPAM_FANOUT_UTXOS, hard-erroring if it is
@@ -212,18 +222,23 @@ fn main() {
             };
             if fill_block_ratio < 1.0 && (fallback_fee - 0.0001).abs() > 1e-9 {
                 println!(
-                    "WARNING: SPAM_FILL_BLOCK_RATIO={fill_block_ratio} < 1 leaves blocks only ~{:.0}% full, so the raised FALLBACK_FEE floor will NOT hold -- cheaper txs still confirm in the unused block space (expected if you are deliberately simulating an uncongested chain).",
+                    "WARNING: SPAM_FILL_BLOCK_RATIO={fill_block_ratio} < 1 leaves blocks only ~{:.0}% full, so the raised FALLBACK_FEE floor will NOT hold -- cheaper txs still confirm in the unused block space, and the floor fill pool cannot seal deliberately partial blocks (expected if you are simulating an uncongested chain).",
                     fill_block_ratio * 100.0
                 );
             }
             let small2 = small_txs_per_block.div_ceil(MINER_COUNT);
             let small3 = small_txs_per_block / MINER_COUNT;
+            // Each engine keeps its share of the standing floor fills on its
+            // OWN node, so both miners always have the fills locally when
+            // they assemble a block template.
+            let pool2 = floor_pool_txs.div_ceil(MINER_COUNT);
+            let pool3 = floor_pool_txs / MINER_COUNT;
             // A full block is 4M WU = 1M vB; getmempoolinfo's `bytes` is the
             // mempool's total vsize, in the same units.
             const BLOCK_VSIZE: u64 = 1_000_000;
             let meter = create_client(&node1_url, &rpc_user, &rpc_pass);
             println!(
-                "Spam engine: raw DATA/HYBRID mode, {data_min_bytes}..{data_max_bytes} byte OP_RETURN, {small_txs_per_block} gap-sealers/block, fill {fill_block_ratio} block(s), {fee_rate_sat_vb} sat/vB"
+                "Spam engine: raw DATA/HYBRID mode, {data_min_bytes}..{data_max_bytes} byte OP_RETURN, {small_txs_per_block} gap-sealers/block, {floor_pool_txs} standing floor fills, fill {fill_block_ratio} block(s), {fee_rate_sat_vb} sat/vB"
             );
             run_block_loop(&node1, move || {
                 // Measure the live mempool right after the new block drained it,
@@ -244,36 +259,47 @@ fn main() {
                 let d2 = deficit / MINER_COUNT;
                 let d3 = deficit - d2;
                 let (r2, r3) = thread::scope(|s| {
+                    // Floor fills first: the standing pool is the airtight
+                    // guarantee, the data fill is the bulk behind it.
                     let t2 = s.spawn(|| {
-                        engine2.hybrid_round(
+                        let fills = engine2.floor_round(pool2);
+                        let (txids, _) = engine2.hybrid_round(
                             d2,
                             small2,
                             effective_fanout,
                             enable_replaces,
                             replaces_per_miner,
-                        )
+                        );
+                        fills + txids.len()
                     });
                     let t3 = s.spawn(|| {
-                        engine3.hybrid_round(
+                        let fills = engine3.floor_round(pool3);
+                        let (txids, _) = engine3.hybrid_round(
                             d3,
                             small3,
                             effective_fanout,
                             enable_replaces,
                             replaces_per_miner,
-                        )
+                        );
+                        fills + txids.len()
                     });
                     (
                         t2.join().expect("node2 spam thread panicked"),
                         t3.join().expect("node3 spam thread panicked"),
                     )
                 });
-                r2.0.len() + r3.0.len()
+                r2 + r3
             });
         } else {
             // OUTPUT mode: a fixed count of burn-output txs per block.
             println!(
                 "Spam engine: raw transactions (USE_RAW_TX_SPAM=true), OUTPUT mode, {fee_rate_sat_vb} sat/vB"
             );
+            if floor_pool_txs > 0 {
+                println!(
+                    "NOTE: SPAM_FLOOR_POOL_TXS only applies to DATA/HYBRID mode (SPAM_TX_DATA_MAX_BYTES > 0); no floor fill pool in OUTPUT mode"
+                );
+            }
             // The raw engine always needs a branch pool (a single UTXO caps the
             // whole engine at one 25-tx unconfirmed chain), so 0 means 1 branch.
             let fanout_target = fanout_utxos.max(1);
