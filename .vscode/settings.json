@@ -1,0 +1,5 @@
+{
+  "dockerfile-validator.rulefile.path": "/home/emi/SoftDev/simchain/.vscode/dockerfile-validator-rules.yaml",
+  "docker.lsp.experimental.scout.criticalHighVulnerabilities": false,
+  "docker.lsp.experimental.scout.vulnerabilities": false
+}

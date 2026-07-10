@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Set default UID and GID
 ARG UID=101
@@ -20,6 +20,8 @@ RUN apt-get update -y \
 ARG BITCOIN_VERSION
 ENV BITCOIN_DATA=/home/bitcoin/.bitcoin
 ENV PATH=/opt/bitcoin-${BITCOIN_VERSION}/bin:$PATH
+LABEL Name="simchain_bitcoin_node"
+LABEL Version="${BITCOIN_VERSION}"
 
 # The bitcoin.org mirror currently only provides versions through 27.0. To
 # use that fallback, replace the DOWNLOAD_BASE assignment below with:
