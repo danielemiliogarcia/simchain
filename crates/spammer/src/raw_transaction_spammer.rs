@@ -117,6 +117,24 @@ enum SpamShape {
     Burns,
 }
 
+// Failures a single spam/fill send can hit. Kept as a typed error instead of a
+// bare `String` so callers can match on cause; `Rpc` still carries the node's
+// message text because `send_shape` inspects it to decide whether a branch is
+// stale (missing/conflict/spent) and must be dropped.
+#[derive(Debug, thiserror::Error)]
+enum SpamError {
+    #[error("no usable branch")]
+    NoUsableBranch,
+    #[error("branch too small for this tx")]
+    BranchTooSmall,
+    #[error("missing batch response")]
+    MissingBatchResponse,
+    #[error("bitcoind returned an invalid txid")]
+    InvalidTxid,
+    #[error("{0}")]
+    Rpc(String),
+}
+
 // Everything needed to RBF-bump a spam tx after the fact: the input it spent
 // (sighash needs the spent amount), what it paid, and its shape (to rebuild).
 struct SentSpam {
@@ -248,10 +266,10 @@ impl RawSpammer {
         let pool_pubkey = PublicKey::from_secret_key(&secp, &pool_secret);
         let pool_address = Address::p2wpkh(&CompressedPublicKey(pool_pubkey), Network::Regtest);
         let pool_script = pool_address.script_pubkey();
-        println!("{label} => Raw spam engine address: {address}");
-        println!("{label} => Floor fill-pool address: {pool_address}");
+        tracing::info!("{label} => Raw spam engine address: {address}");
+        tracing::info!("{label} => Floor fill-pool address: {pool_address}");
         if !relay_nodes.is_empty() {
-            println!(
+            tracing::info!(
                 "{label} => Direct floor-fill RPC relay peers: {}",
                 relay_nodes.len()
             );
@@ -494,7 +512,7 @@ impl RawSpammer {
             .map(|s| s.parse().expect("bitcoind returned an invalid txid"))
     }
 
-    fn send_raw_batch(client: &JsonClient, raw_txs: &[String]) -> Vec<Result<Txid, String>> {
+    fn send_raw_batch(client: &JsonClient, raw_txs: &[String]) -> Vec<Result<Txid, SpamError>> {
         if raw_txs.is_empty() {
             return Vec::new();
         }
@@ -511,13 +529,20 @@ impl RawSpammer {
             Ok(responses) => responses
                 .into_iter()
                 .map(|response| {
-                    let response = response.ok_or_else(|| "missing batch response".to_string())?;
-                    let txid = response.result::<String>().map_err(|e| e.to_string())?;
-                    txid.parse()
-                        .map_err(|_| "bitcoind returned an invalid txid".to_string())
+                    let response = response.ok_or(SpamError::MissingBatchResponse)?;
+                    let txid = response
+                        .result::<String>()
+                        .map_err(|e| SpamError::Rpc(e.to_string()))?;
+                    txid.parse().map_err(|_| SpamError::InvalidTxid)
                 })
                 .collect(),
-            Err(e) => raw_txs.iter().map(|_| Err(e.to_string())).collect(),
+            Err(e) => {
+                let msg = e.to_string();
+                raw_txs
+                    .iter()
+                    .map(|_| Err(SpamError::Rpc(msg.clone())))
+                    .collect()
+            }
         }
     }
 
@@ -594,9 +619,10 @@ impl RawSpammer {
             .to_btc();
             let pull_btc = ((trusted * 0.5).min(FUND_PULL_MAX_BTC) * 1e8).floor() / 1e8;
             let pull = Amount::from_btc(pull_btc).unwrap();
-            println!(
+            tracing::info!(
                 "{} => Raw engine pulling {pull} from wallet '{}'",
-                self.label, self.wallet_name
+                self.label,
+                self.wallet_name
             );
             let txid = match self.wallet.send_to_address(
                 &self.address,
@@ -610,7 +636,7 @@ impl RawSpammer {
             ) {
                 Ok(txid) => txid,
                 Err(error) => {
-                    println!(
+                    tracing::warn!(
                         "{} => Raw engine funding pull failed ({error}), deferring until the next block",
                         self.label
                     );
@@ -631,7 +657,7 @@ impl RawSpammer {
 
         let total: Amount = self.utxos.iter().map(|u| u.amount).sum();
         if self.utxos.is_empty() {
-            println!(
+            tracing::warn!(
                 "{} => Raw engine has no confirmed funds to fan out yet, deferring",
                 self.label
             );
@@ -643,14 +669,14 @@ impl RawSpammer {
             None => Amount::ZERO,
         };
         if per_branch < required {
-            println!(
+            tracing::warn!(
                 "{} => Raw engine funds too low to split {total} into {target} usable branches, deferring",
                 self.label
             );
             return;
         }
 
-        println!(
+        tracing::info!(
             "{} => Raw engine splitting {total} into {target} branches of {per_branch}",
             self.label
         );
@@ -663,7 +689,7 @@ impl RawSpammer {
         let inputs = std::mem::take(&mut self.utxos);
         match self.send_tx(&inputs, outputs, false) {
             Ok(txid) => {
-                println!(
+                tracing::info!(
                     "{} => Fan-out tx {txid} sent, waiting for it to confirm...",
                     self.label
                 );
@@ -677,10 +703,10 @@ impl RawSpammer {
                     })
                     .collect();
                 self.cursor = 0;
-                println!("{} => Fan-out confirmed", self.label);
+                tracing::info!("{} => Fan-out confirmed", self.label);
             }
             Err(e) => {
-                println!(
+                tracing::warn!(
                     "{} => Raw engine fan-out failed ({e}), retrying next block",
                     self.label
                 );
@@ -707,18 +733,18 @@ impl RawSpammer {
 
     // Build, sign and send one tx of the given shape from the next usable
     // branch, updating that branch's tip to the tx's change output. Returns
-    // the SentSpam record (for RBF) or a classified error string.
-    fn send_shape(&mut self, shape: SpamShape, replaceable: bool) -> Result<SentSpam, String> {
+    // the SentSpam record (for RBF) or a classified error.
+    fn send_shape(&mut self, shape: SpamShape, replaceable: bool) -> Result<SentSpam, SpamError> {
         let required = self.per_tx_required();
         let Some(idx) = self.next_branch(required) else {
-            return Err("no usable branch".to_string());
+            return Err(SpamError::NoUsableBranch);
         };
         let branch = self.utxos[idx];
         let fee = self.shape_fee(&shape);
         let nonchange = self.shape_nonchange_value(&shape);
         let change = match branch.amount.checked_sub(nonchange + fee) {
             Some(c) if c >= MIN_CHANGE => c,
-            _ => return Err("branch too small for this tx".to_string()),
+            _ => return Err(SpamError::BranchTooSmall),
         };
         let vout = self.shape_change_vout(&shape);
         let outputs = self.build_outputs(&shape, change);
@@ -747,7 +773,7 @@ impl RawSpammer {
                         self.cursor %= self.utxos.len();
                     }
                 }
-                Err(msg)
+                Err(SpamError::Rpc(msg))
             }
         }
     }
@@ -793,11 +819,11 @@ impl RawSpammer {
             }
         }
         match first_error {
-            Some(error) if bumped < count => println!(
+            Some(error) if bumped < count => tracing::info!(
                 "{} => Fee-bumped (RBF) {bumped}/{count} raw spam txs, first error: {error}",
                 self.label
             ),
-            _ => println!("{} => Fee-bumped (RBF) {bumped} raw spam txs", self.label),
+            _ => tracing::info!("{} => Fee-bumped (RBF) {bumped} raw spam txs", self.label),
         }
     }
 
@@ -821,7 +847,7 @@ impl RawSpammer {
             let hash = match self.node.get_block_hash(height) {
                 Ok(hash) => hash,
                 Err(error) => {
-                    println!(
+                    tracing::warn!(
                         "{} => Floor-pool harvest skipped at height {height}: block hash RPC failed ({error})",
                         self.label
                     );
@@ -831,7 +857,7 @@ impl RawSpammer {
             let block = match self.node.get_block_info(&hash) {
                 Ok(block) => block,
                 Err(error) => {
-                    println!(
+                    tracing::warn!(
                         "{} => Floor-pool harvest skipped for block {hash}: block info RPC failed ({error})",
                         self.label
                     );
@@ -893,9 +919,10 @@ impl RawSpammer {
             .to_btc();
             let pull_btc = ((trusted * 0.5).min(POOL_PULL_MAX_BTC) * 1e8).floor() / 1e8;
             let pull = Amount::from_btc(pull_btc).unwrap();
-            println!(
+            tracing::info!(
                 "{} => Floor pool pulling {pull} from wallet '{}'",
-                self.label, self.wallet_name
+                self.label,
+                self.wallet_name
             );
             let txid = match self.wallet.send_to_address(
                 &self.pool_address,
@@ -909,7 +936,7 @@ impl RawSpammer {
             ) {
                 Ok(txid) => txid,
                 Err(error) => {
-                    println!(
+                    tracing::warn!(
                         "{} => Floor-pool funding pull failed ({error}), deferring until the next block",
                         self.label
                     );
@@ -930,7 +957,7 @@ impl RawSpammer {
 
         let total: Amount = self.pool_utxos.iter().map(|u| u.amount).sum();
         if self.pool_utxos.is_empty() {
-            println!(
+            tracing::warn!(
                 "{} => Floor pool has no confirmed funds to fan out yet, deferring",
                 self.label
             );
@@ -942,14 +969,14 @@ impl RawSpammer {
             None => Amount::ZERO,
         };
         if per_utxo < required {
-            println!(
+            tracing::warn!(
                 "{} => Floor pool funds too low to split {total} into {seed_count} usable fill UTXOs, deferring",
                 self.label
             );
             return;
         }
 
-        println!(
+        tracing::info!(
             "{} => Floor pool splitting {total} into {seed_count} fill UTXOs of {per_utxo}",
             self.label
         );
@@ -972,7 +999,7 @@ impl RawSpammer {
                     break;
                 }
                 let Some(input) = available.pop() else {
-                    println!(
+                    tracing::warn!(
                         "{} => Floor pool ran out of inputs mid fan-out, retrying next block",
                         self.label
                     );
@@ -1012,7 +1039,7 @@ impl RawSpammer {
                 &self.pool_pubkey,
             ) {
                 Ok(txid) => {
-                    println!(
+                    tracing::info!(
                         "{} => Pool fan-out tx {txid} sent ({n_fill} fill outputs), waiting for it to confirm...",
                         self.label
                     );
@@ -1032,7 +1059,7 @@ impl RawSpammer {
                     outputs_left -= n_fill;
                 }
                 Err(e) => {
-                    println!(
+                    tracing::warn!(
                         "{} => Floor pool fan-out failed ({e}), retrying next block",
                         self.label
                     );
@@ -1043,7 +1070,7 @@ impl RawSpammer {
         }
         self.pool_utxos = available;
         self.pool_utxos.extend(fresh);
-        println!("{} => Pool fan-out confirmed", self.label);
+        tracing::info!("{} => Pool fan-out confirmed", self.label);
     }
 
     // Keep a standing pool of `target` standalone floor-priced fills sitting
@@ -1060,7 +1087,7 @@ impl RawSpammer {
         let standing = self.fills_inflight.len() as u64;
         let need = target.saturating_sub(standing);
         if need == 0 {
-            println!(
+            tracing::info!(
                 "{} => Floor pool: {standing}/{target} fills standing, none needed",
                 self.label
             );
@@ -1113,14 +1140,14 @@ impl RawSpammer {
                     // The UTXO stays dropped either way: if our view of it
                     // was stale, the next pool resync recovers the truth.
                     if first_error.is_none() {
-                        first_error = Some(e);
+                        first_error = Some(e.to_string());
                     }
                 }
             }
         }
         self.relay_raw_batch(&relays);
 
-        println!(
+        tracing::info!(
             "{} => Floor pool: {standing} standing + {sent} new fills (~{}k vB; target {target})",
             self.label,
             sent_vsize / 1000
@@ -1129,8 +1156,8 @@ impl RawSpammer {
             let detail = first_error
                 .map(|e| format!(", first error: {e}"))
                 .unwrap_or_else(|| ", pool ammo exhausted".to_string());
-            println!(
-                "WARNING: {} floor pool only sent {sent}/{need} fills this block{detail}",
+            tracing::warn!(
+                "{} floor pool only sent {sent}/{need} fills this block{detail}",
                 self.label
             );
         }
@@ -1152,12 +1179,12 @@ impl RawSpammer {
         }
         let n_burns = self.burn_scripts.len();
         if n_burns == 1 {
-            println!(
+            tracing::info!(
                 "{} => Raw-spamming {share} transactions to a burn address",
                 self.label
             );
         } else {
-            println!(
+            tracing::info!(
                 "{} => Raw-spamming {share} txs of {n_burns} outputs to burn addresses",
                 self.label
             );
@@ -1179,7 +1206,7 @@ impl RawSpammer {
                 }
                 Err(e) => {
                     if first_error.is_none() {
-                        first_error = Some(e);
+                        first_error = Some(e.to_string());
                     }
                     consecutive_failures += 1;
                 }
@@ -1189,10 +1216,7 @@ impl RawSpammer {
             let detail = first_error
                 .map(|e| format!(", first error: {e}"))
                 .unwrap_or_else(|| ", branch pool exhausted".to_string());
-            println!(
-                "WARNING: only {}/{share} raw spam txs accepted{detail}",
-                txids.len()
-            );
+            tracing::warn!("only {}/{share} raw spam txs accepted{detail}", txids.len());
         }
         if replaceable {
             self.bump_spam_txs(&sent, replaces);
@@ -1241,7 +1265,7 @@ impl RawSpammer {
                 }
                 Err(e) => {
                     if first_error.is_none() {
-                        first_error = Some(e);
+                        first_error = Some(e.to_string());
                     }
                     fails += 1;
                 }
@@ -1265,14 +1289,14 @@ impl RawSpammer {
                 }
                 Err(e) => {
                     if first_error.is_none() {
-                        first_error = Some(e);
+                        first_error = Some(e.to_string());
                     }
                     fails += 1;
                 }
             }
         }
 
-        println!(
+        tracing::info!(
             "{} => Hybrid: {sealer_count} gap-sealers + {data_count} data txs, ~{}k vB offered",
             self.label,
             added / 1000
@@ -1282,8 +1306,8 @@ impl RawSpammer {
                 ", branch pool exhausted (raise SPAM_FANOUT_UTXOS / SPAM_FILL_BLOCK_RATIO headroom)"
                     .to_string()
             });
-            println!(
-                "WARNING: {} only offered ~{}k/{}k vB this block{detail}",
+            tracing::warn!(
+                "{} only offered ~{}k/{}k vB this block{detail}",
                 self.label,
                 added / 1000,
                 deficit_vsize / 1000

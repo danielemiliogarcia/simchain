@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context};
 use bitcoincore_rpc::{
     bitcoin::{address::NetworkUnchecked, Address, BlockHash, Network},
     Client, RpcApi,
@@ -32,10 +33,11 @@ pub fn rpc_retry<T>(what: &str, mut call: impl FnMut() -> Result<T, bitcoincore_
         match call() {
             Ok(value) => return value,
             Err(error) if attempt == RPC_RETRY_ATTEMPTS => {
+                tracing::error!("RPC {what} failed after {RPC_RETRY_ATTEMPTS} attempts: {error}");
                 panic!("RPC {what} failed after {RPC_RETRY_ATTEMPTS} attempts: {error}")
             }
             Err(error) => {
-                println!(
+                tracing::warn!(
                     "RPC {what} failed ({error}), retry {attempt}/{RPC_RETRY_ATTEMPTS} in {delay:?}"
                 );
                 thread::sleep(delay);
@@ -239,7 +241,7 @@ fn wait_for_rpc(client: &Client, name: &str) {
         match client.get_block_count() {
             Ok(_) => return,
             Err(_) => {
-                println!("Waiting for {name} RPC...");
+                tracing::info!("Waiting for {name} RPC...");
                 thread::sleep(Duration::from_millis(200));
             }
         }
@@ -268,15 +270,17 @@ fn setup_wallet(
     rpc_pass: &str,
     node: &Client,
     wallet_name: &str,
-) -> (Client, Address) {
+) -> anyhow::Result<(Client, Address)> {
     if let Err(create_err) = node.create_wallet(wallet_name, None, None, None, None) {
         match node.load_wallet(wallet_name) {
-            Ok(_) => println!("Wallet '{wallet_name}' already exists, loaded it"),
+            Ok(_) => tracing::info!("Wallet '{wallet_name}' already exists, loaded it"),
             Err(load_err) if load_err.to_string().contains("already loaded") => {
-                println!("Wallet '{wallet_name}' already loaded, reusing it");
+                tracing::info!("Wallet '{wallet_name}' already loaded, reusing it");
             }
             Err(load_err) => {
-                panic!("wallet '{wallet_name}': create failed ({create_err}), load failed ({load_err})")
+                return Err(anyhow!(
+                    "wallet '{wallet_name}': create failed ({create_err}), load failed ({load_err})"
+                ));
             }
         }
     }
@@ -284,12 +288,15 @@ fn setup_wallet(
         &format!("{rpc_url}/wallet/{wallet_name}"),
         rpc_user,
         rpc_pass,
-    );
+    )
+    .context("build wallet-scoped mining client")?;
     let address = rpc_retry("get new mining wallet address", || {
         wallet.get_new_address(None, None)
     });
-    let address = address.require_network(Network::Regtest).unwrap();
-    (wallet, address)
+    let address = address
+        .require_network(Network::Regtest)
+        .context("mining wallet address must be a regtest address")?;
+    Ok((wallet, address))
 }
 
 // The controller's view of the recent chain: the hash it last observed at
@@ -362,7 +369,7 @@ fn sync_view(view: &mut ChainView, node: &Client, last: u64) -> u64 {
 
     let from = if reorged {
         let fork = view.find_fork(node, base);
-        println!(
+        tracing::info!(
             "REORG detected: blocks [{}..{}] replaced; forked at [{}], new tip [{}], mining continues on the new chain",
             fork + 1, last, fork, tip
         );
@@ -386,14 +393,21 @@ fn sync_view(view: &mut ChainView, node: &Client, last: u64) -> u64 {
         };
         let mined_by_us = view.own.contains(&hash);
         if !mined_by_us {
-            println!("EXTERNAL block [{h}] {hash} (not mined by this controller)");
+            tracing::info!("EXTERNAL block [{h}] {hash} (not mined by this controller)");
         }
         view.record(h, hash, mined_by_us);
     }
     tip
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "simchain_mining_controller=info,info".parse().unwrap()),
+        )
+        .init();
+
     // Every setting has a default matching docker-compose.yml, so the tool
     // also runs standalone with no environment at all.
     let user_address = env_or(
@@ -424,14 +438,16 @@ fn main() {
 
     let node2_url = env_or("NODE2_RPC_URL", "http://btc-simnet-node2:18443");
     let node3_url = env_or("NODE3_RPC_URL", "http://btc-simnet-node3:18443");
-    let node2 = create_client(&node2_url, &rpc_user, &rpc_pass);
-    let node3 = create_client(&node3_url, &rpc_user, &rpc_pass);
+    let node2 = create_client(&node2_url, &rpc_user, &rpc_pass).context("build node2 client")?;
+    let node3 = create_client(&node3_url, &rpc_user, &rpc_pass).context("build node3 client")?;
 
     let user_address: Address<NetworkUnchecked> =
-        user_address.parse().expect("Invalid Bitcoin address");
-    let user_address = user_address.require_network(Network::Regtest).unwrap();
+        user_address.parse().context("Invalid Bitcoin address")?;
+    let user_address = user_address
+        .require_network(Network::Regtest)
+        .context("USER_ADDRESS must be a regtest address")?;
 
-    println!("Waiting for nodes to be ready");
+    tracing::info!("Waiting for nodes to be ready");
     wait_for_rpc(&node2, "node2");
     wait_for_rpc(&node3, "node3");
 
@@ -445,8 +461,8 @@ fn main() {
     // single mature reward. The maturity batches also go to the miner
     // wallets, so their coinbases keep maturing during the run (heights
     // 205-304), sustaining long sessions.
-    let (_wallet2, addr2) = setup_wallet(&node2_url, &rpc_user, &rpc_pass, &node2, &wallet2_name);
-    let (_wallet3, addr3) = setup_wallet(&node3_url, &rpc_user, &rpc_pass, &node3, &wallet3_name);
+    let (_wallet2, addr2) = setup_wallet(&node2_url, &rpc_user, &rpc_pass, &node2, &wallet2_name)?;
+    let (_wallet3, addr3) = setup_wallet(&node3_url, &rpc_user, &rpc_pass, &node3, &wallet3_name)?;
 
     // Each stage ends at a fixed height, so the sequence is resumable: on
     // restart a completed stage is skipped (height already >= its target)
@@ -473,9 +489,11 @@ fn main() {
 
     let mut height = rpc_retry("get pre-bootstrap block count", || node2.get_block_count());
     if height >= BOOTSTRAP_END {
-        println!("Chain already bootstrapped (height {height}), skipping the funding sequence");
+        tracing::info!(
+            "Chain already bootstrapped (height {height}), skipping the funding sequence"
+        );
     } else if height > 0 {
-        println!("Resuming interrupted bootstrap at height {height}");
+        tracing::info!("Resuming interrupted bootstrap at height {height}");
     }
     for (target, miner, witness, addr, label) in stages {
         if height >= target {
@@ -491,7 +509,7 @@ fn main() {
             if height >= target {
                 break;
             }
-            println!(
+            tracing::info!(
                 "Bootstrap => Mining {} block(s) to address {addr} ({label}, up to height {target})",
                 target - height
             );
@@ -500,7 +518,7 @@ fn main() {
                 Err(error) => {
                     last_error = Some(error.to_string());
                     if attempt < RPC_RETRY_ATTEMPTS {
-                        println!(
+                        tracing::warn!(
                             "Bootstrap generate failed ({error}), retry {attempt}/{RPC_RETRY_ATTEMPTS} in {delay:?} after re-reading height"
                         );
                         thread::sleep(delay);
@@ -515,26 +533,26 @@ fn main() {
             miner.get_block_count()
         });
         if height < target {
-            panic!(
+            return Err(anyhow!(
                 "Bootstrap stage '{label}' did not reach height {target} after {RPC_RETRY_ATTEMPTS} generate attempts; last error: {}",
                 last_error.as_deref().unwrap_or("generate returned success without reaching the target")
-            );
+            ));
         }
         // Wait for the other node to sync before the next stage mines on
         // top, so blocks do not compete and stack on each other.
         wait_for_height(witness, height);
-        println!("New block height: {height}");
+        tracing::info!("New block height: {height}");
     }
 
-    println!(
+    tracing::info!(
         "\nActual block height: {}",
         rpc_retry("get post-bootstrap block count", || node2.get_block_count())
     );
 
-    println!("\n//////////////////////////////////////////////////////////////////\n");
-    println!("Funds in address {user_address} are mature and ready to spend.");
-    println!("To list UTXOs, use scantxoutset or list_unspent from bdk crate");
-    println!("\n//////////////////////////////////////////////////////////////////\n");
+    tracing::info!("\n//////////////////////////////////////////////////////////////////\n");
+    tracing::info!("Funds in address {user_address} are mature and ready to spend.");
+    tracing::info!("To list UTXOs, use scantxoutset or list_unspent from bdk crate");
+    tracing::info!("\n//////////////////////////////////////////////////////////////////\n");
 
     // Continuous mining loop. The controller remembers the recent chain --
     // heights, hashes, and which blocks it mined itself -- so a reorg (the
@@ -569,11 +587,13 @@ fn main() {
         None => "alternate".to_string(),
     };
     if stochastic {
-        println!(
+        tracing::info!(
             "Mining config: interval={interval_description}, weights={weights_description}, rng_seed={seed}"
         );
     } else {
-        println!("Mining config: interval={interval_description}, weights={weights_description}");
+        tracing::info!(
+            "Mining config: interval={interval_description}, weights={weights_description}"
+        );
     }
 
     let mut toggle = true;
@@ -583,7 +603,7 @@ fn main() {
         let target = if poisson {
             let sampled = rng.next_exp(mean_secs as f64);
             let target_secs = interval_bounds.apply(sampled);
-            println!(
+            tracing::info!(
                 "TIMING sampled interval {sampled:.2}s, target {target_secs:.2}s (poisson, mean {mean_secs}s, bounds={})",
                 bounds_description
             );
@@ -609,7 +629,7 @@ fn main() {
         let mined = match miner.generate_to_address(1, addr) {
             Ok(mined) => mined,
             Err(error) => {
-                println!("{name} => Block generation failed ({error}), retrying next round");
+                tracing::warn!("{name} => Block generation failed ({error}), retrying next round");
                 // Do not re-issue a timed-out generate: it may have mined a
                 // block. The next sync_view re-derives live chain state. Such
                 // a block is reported as EXTERNAL because its returned hash
@@ -625,7 +645,7 @@ fn main() {
             miner.get_block_header_info(&hash)
         })
         .height as u64;
-        println!("{name} => Mined 1 block [{mined_height}] {hash} to address {addr}");
+        tracing::info!("{name} => Mined 1 block [{mined_height}] {hash} to address {addr}");
         view.record(mined_height, hash, true);
         last = last.max(mined_height);
         wait_for_height(other, mined_height);

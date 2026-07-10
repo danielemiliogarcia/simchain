@@ -62,20 +62,20 @@ fn ensure_fanout(wallet: &Client, name: &str, need: u64, target: u64) {
     let per_output = (per_output * 1e8).floor() / 1e8;
     if per_output <= 0.0 {
         // Funds are tied up in unconfirmed spam; a block will free them.
-        println!("Wallet '{name}' has no confirmed funds to fan out yet, deferring");
+        tracing::warn!("Wallet '{name}' has no confirmed funds to fan out yet, deferring");
         return;
     }
 
-    println!("Wallet '{name}' low on spammable UTXOs, splitting funds into {target} UTXOs of {per_output} BTC each");
+    tracing::info!("Wallet '{name}' low on spammable UTXOs, splitting funds into {target} UTXOs of {per_output} BTC each");
     let mut outputs = serde_json::Map::new();
     while outputs.len() < target as usize {
         let address = get_new_wallet_address(wallet);
         outputs.insert(address.to_string(), json!(per_output));
     }
     match wallet.call::<String>("sendmany", &[json!(""), json!(outputs)]) {
-        Ok(txid) => println!("Fan-out tx {txid} sent, waiting for it to confirm..."),
+        Ok(txid) => tracing::info!("Fan-out tx {txid} sent, waiting for it to confirm..."),
         Err(e) => {
-            println!("Wallet '{name}' fan-out failed ({e}), retrying next block");
+            tracing::warn!("Wallet '{name}' fan-out failed ({e}), retrying next block");
             return;
         }
     }
@@ -86,7 +86,7 @@ fn ensure_fanout(wallet: &Client, name: &str, need: u64, target: u64) {
         }
         thread::sleep(Duration::from_millis(500));
     }
-    println!("Wallet '{name}' fan-out confirmed");
+    tracing::info!("Wallet '{name}' fan-out confirmed");
 }
 
 // Send `count` txs and report how many actually made it, so empty blocks
@@ -120,8 +120,8 @@ fn send_spam_tx(from: &Client, to_address: &Address, count: u64, replaceable: bo
         }
     }
     if let Some(error) = first_error {
-        println!(
-            "WARNING: only {}/{count} spam txs accepted, first error: {error}",
+        tracing::warn!(
+            "only {}/{count} spam txs accepted, first error: {error}",
             txids.len()
         );
     }
@@ -167,8 +167,8 @@ fn send_spam_batch(
         }
     }
     if let Some(error) = first_error {
-        println!(
-            "WARNING: only {}/{count} sendmany batches accepted, first error: {error}",
+        tracing::warn!(
+            "only {}/{count} sendmany batches accepted, first error: {error}",
             txids.len()
         );
     }
@@ -197,9 +197,11 @@ fn bump_spam_txs(wallet: &Client, label: &str, txids: &[Txid], count: u64) {
     }
     match first_error {
         Some(error) if bumped < count => {
-            println!("{label} => Fee-bumped (RBF) {bumped}/{count} spam txs, first error: {error}")
+            tracing::info!(
+                "{label} => Fee-bumped (RBF) {bumped}/{count} spam txs, first error: {error}"
+            )
         }
-        _ => println!("{label} => Fee-bumped (RBF) {bumped} spam txs"),
+        _ => tracing::info!("{label} => Fee-bumped (RBF) {bumped} spam txs"),
     }
 }
 
@@ -226,13 +228,13 @@ pub fn spam_round(
         ensure_fanout(wallet, wallet_name, fanout_need, fanout_utxos);
     }
     let txids = if !batch_addrs.is_empty() {
-        println!(
+        tracing::info!(
             "{label} => Spamming {share} sendmany batches of {} outputs to burn addresses",
             batch_addrs.len()
         );
         send_spam_batch(wallet, batch_addrs, share, replaceable)
     } else {
-        println!("{label} => Spamming {share} transactions to address {seq_addr}");
+        tracing::info!("{label} => Spamming {share} transactions to address {seq_addr}");
         send_spam_tx(wallet, seq_addr, share, replaceable)
     };
     if replaceable {

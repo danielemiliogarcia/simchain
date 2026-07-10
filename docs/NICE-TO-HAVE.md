@@ -33,19 +33,17 @@ Accepted decisions (not defects, recorded so they are not re-reported):
   `docker inspect`/`ps`): acceptable for a throwaway regtest; documented with a warning
   in SETTINGS.md not to replicate in production.
 
-No open findings from the last review remain: the two that were open (uncommitted
-`Cargo.lock` and no Cargo workspace / duplicated helpers) are now shipped — the three
-tools are a single Cargo workspace with a shared `simchain-common` crate, one committed
-`Cargo.lock`, one `tools.Dockerfile`, and a CI workflow. See the README "Repository
-structure" section.
+No open findings from the last review remain.
 
 ---
 
 # Simchain Nice-to-have Features
 
 Simchain's purpose is to simulate the Bitcoin chain on regtest while staying as close to
-mainnet reality as regtest allows: multiple P2P-connected nodes, rotating miners, a
-non-mining full node as the user endpoint, non-empty blocks, and user-controlled
+mainnet reality as regtest allows, but also providing a "controlled by the user environment"
+that allows to defining mining pace, block filling and fee rates.
+It consists on: multiple P2P-connected nodes, rotating miners,
+a non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
 limitations and future enhancements, plus four bigger proposed features with their
 rationale and an implementation plan, and a section for parked features.
@@ -202,8 +200,6 @@ reproduce with the "tx per block" knob. Pairs well with the shipped Poisson bloc
 
 ## Tech debt
 
-- use a rust logging tool instead of print
-- use a rust error managing tool
 - use config module to read env, and serve configs
 
 ---
