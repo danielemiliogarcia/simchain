@@ -5,12 +5,12 @@
 //! produces, but throughput is bound by the wallet lock and degrades as the
 //! wallet's tx history grows (see SETTINGS.md "Full blocks").
 
-use crate::common::rpc_retry;
 use bitcoincore_rpc::{
-    bitcoin::{Address, Amount, Network, Txid},
+    bitcoin::{Address, Amount, Txid},
     Client, RpcApi,
 };
 use serde_json::json;
+use simchain_common::{require_regtest_address, rpc_retry};
 use std::{thread, time::Duration};
 
 // A fan-out UTXO is ~0.1 BTC. Count only confirmed UTXOs in this band as
@@ -25,7 +25,7 @@ fn get_new_wallet_address(wallet: &Client) -> Address {
     let address = rpc_retry("get new wallet address", || {
         wallet.get_new_address(None, None)
     });
-    address.require_network(Network::Regtest).unwrap()
+    require_regtest_address(address).unwrap()
 }
 
 fn spammable_utxos(wallet: &Client) -> u64 {

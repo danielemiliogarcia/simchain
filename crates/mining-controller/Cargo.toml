@@ -7,5 +7,4 @@
     bitcoincore-rpc = "0.19.0"
     simchain-common = { path = "../simchain-common" }
     anyhow = "1"
-    tracing = "0.1"
-    tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1"

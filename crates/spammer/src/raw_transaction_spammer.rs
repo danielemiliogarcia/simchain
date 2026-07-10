@@ -41,7 +41,7 @@
 //! Mined fills confirm their change, which becomes fresh pool ammo: the pool
 //! churns 1:1 with zero net UTXO-set growth.
 
-use crate::common;
+use crate::{burn, error::SpamError, wallet};
 use bitcoincore_rpc::{
     bitcoin::{
         absolute::LockTime,
@@ -60,6 +60,7 @@ use bitcoincore_rpc::{
     Client, RpcApi,
 };
 use serde_json::json;
+use simchain_common::rpc_retry;
 use std::{collections::HashSet, thread, time::Duration};
 
 // 546-sat burn/gap-sealer outputs: safely above the P2PKH dust floor for any
@@ -115,24 +116,6 @@ enum SpamShape {
     Sealer,
     // The OUTPUT-mode burn outputs (1 in sequential, N in batch mode).
     Burns,
-}
-
-// Failures a single spam/fill send can hit. Kept as a typed error instead of a
-// bare `String` so callers can match on cause; `Rpc` still carries the node's
-// message text because `send_shape` inspects it to decide whether a branch is
-// stale (missing/conflict/spent) and must be dropped.
-#[derive(Debug, thiserror::Error)]
-enum SpamError {
-    #[error("no usable branch")]
-    NoUsableBranch,
-    #[error("branch too small for this tx")]
-    BranchTooSmall,
-    #[error("missing batch response")]
-    MissingBatchResponse,
-    #[error("bitcoind returned an invalid txid")]
-    InvalidTxid,
-    #[error("{0}")]
-    Rpc(String),
 }
 
 // Everything needed to RBF-bump a spam tx after the fact: the input it spent
@@ -250,13 +233,13 @@ impl RawSpammer {
         let address = Address::p2wpkh(&CompressedPublicKey(pubkey), Network::Regtest);
         let script_pubkey = address.script_pubkey();
         let burn_scripts: Vec<ScriptBuf> = if sendmany_outputs == 0 {
-            vec![common::burn_address(0).script_pubkey()]
+            vec![burn::burn_address(0).script_pubkey()]
         } else {
             (1..=sendmany_outputs)
-                .map(|i| common::burn_address(i).script_pubkey())
+                .map(|i| burn::burn_address(i).script_pubkey())
                 .collect()
         };
-        let sealer_script = common::burn_address(0).script_pubkey();
+        let sealer_script = burn::burn_address(0).script_pubkey();
         // The floor pool's own key, same recovery story as the engine key: a
         // restarted spammer derives the same address and picks its confirmed
         // pool UTXOs back up with scantxoutset.
@@ -560,14 +543,14 @@ impl RawSpammer {
     // picks them back up). Only a recovery path -- startup, reorgs, lost
     // track -- never the hot path.
     fn scan_address_utxos(&self, address: &Address) -> Vec<Utxo> {
-        let scan = common::rpc_retry("scan address UTXOs", || {
+        let scan = rpc_retry("scan address UTXOs", || {
             self.node
                 .scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(format!("addr({address})"))])
         });
         scan.unspents
             .into_iter()
             .filter(|u| {
-                common::rpc_retry("check scanned UTXO", || {
+                rpc_retry("check scanned UTXO", || {
                     self.node.get_tx_out(&u.txid, u.vout, Some(true))
                 })
                 .is_some()
@@ -610,8 +593,8 @@ impl RawSpammer {
         let total: Amount = self.utxos.iter().map(|u| u.amount).sum();
         let refill_floor = required * (target * BRANCH_MIN_TXS);
         if total < refill_floor {
-            common::wait_for_funds(&self.wallet, &self.wallet_name);
-            let trusted = common::rpc_retry("get raw-engine wallet balance", || {
+            wallet::wait_for_funds(&self.wallet, &self.wallet_name);
+            let trusted = rpc_retry("get raw-engine wallet balance", || {
                 self.wallet.get_balances()
             })
             .mine
@@ -837,7 +820,7 @@ impl RawSpammer {
     // overran a block interval are never missed and the standing count stays
     // honest.
     fn harvest_mined_fills(&mut self) {
-        let tip = common::rpc_retry("get floor-pool block count", || self.node.get_block_count());
+        let tip = rpc_retry("get floor-pool block count", || self.node.get_block_count());
         if self.pool_seen_height == 0 || self.fills_inflight.is_empty() {
             self.pool_seen_height = tip;
             return;
@@ -910,8 +893,8 @@ impl RawSpammer {
         let total: Amount = self.pool_utxos.iter().map(|u| u.amount).sum();
         let refill_floor = required * seed_count;
         if total < refill_floor {
-            common::wait_for_funds(&self.wallet, &self.wallet_name);
-            let trusted = common::rpc_retry("get floor-pool wallet balance", || {
+            wallet::wait_for_funds(&self.wallet, &self.wallet_name);
+            let trusted = rpc_retry("get floor-pool wallet balance", || {
                 self.wallet.get_balances()
             })
             .mine
