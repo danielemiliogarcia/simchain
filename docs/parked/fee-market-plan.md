@@ -25,13 +25,14 @@ Decision after design review: the cost/benefit does not justify building this no
 tests. The expensive thinking is done and recorded below: the CPFP-rescue analysis
 (§1), the per-branch ladder design, and the funding-pull deadlock fix (§3.3).
 
-Implements nice-to-have feature 2, **as a selectable mode**: the current flat-floor
+Implements the nice-to-have "Fee-market simulation in the spammer" (now in the Parked
+features section), **as a selectable mode**: the current flat-floor
 behavior stays the default and remains byte-for-byte unchanged; a new market mode
 spreads spam fee rates across a configurable range so `estimatesmartfee`, the mempool
 explorer's fee histogram, and RBF/fee-bumping logic in projects under test become
 meaningful.
 
-This plan supersedes the implementation sketch in `nice-to-have.md` item 2: that sketch
+This plan supersedes the original implementation sketch from `nice-to-have.md`: that sketch
 (pass `fee_rate` to `send_to_address`/`send_many`) predates the raw engine, which is now
 the default and computes fees itself (`fee_from_vsize` in
 `spammer/src/raw_transaction_spammer.rs`). Size/output-count variance from the sketch
@@ -149,7 +150,7 @@ this feature is purely spammer behavior).
 7. RBF bumps (`bump_spam_txs`): no change needed — it doubles the recorded fee of the
    specific tx (`SentSpam.fee`), which is already per-tx data. In market mode bumps
    naturally jump histogram buckets, which is realistic RBF traffic.
-8. Per-cycle fee summary log (nice-to-have step 3). Cheapest honest version: in
+8. Per-cycle fee summary log (step 3 of the original sketch). Cheapest honest version: in
    `hybrid_round`/`output_round`, track min/max rate and vsize-weighted mean of the
    rates actually used this cycle, and print one line, e.g.
    `Node 2 => Fees offered this cycle: 1.2..48.7 sat/vB, weighted mean 9.3 (market mode)`.
@@ -239,11 +240,11 @@ neighbors):
 
 ### 3.6 `nice-to-have.md`
 
-Per repo convention: **delete** feature 2 entirely (never mark done), renumber
-features 3–5 to 2–4, and fix every reference to the count/numbers ("five proposed
-features" → "four", the list in the Simulations section, "Pairs well with feature 1"
-cross-references). Also update the "Fee-market pressure" bullet under Simulations to
-point at the new `SPAM_FEE_MODE` setting instead of describing it as future work.
+Per repo convention: **delete** the fee-market entry from the Parked features section
+entirely (never mark done), drop this plan from `docs/parked/`, and fix every reference
+to it (the list in the Simulations section, the Parked features intro). Also update the
+"Fee-market pressure" bullet under Simulations to point at the new `SPAM_FEE_MODE`
+setting instead of describing it as future work.
 
 ## 4. Verification
 
@@ -284,6 +285,6 @@ Do not commit or stage anything — the user manual-tests first and commits hims
   without touching the settings above.
 - Fee-market support in the node-wallet engine.
 - Time-varying fee levels (rush hours / bursts): belongs to the scenario engine
-  (nice-to-have feature 3).
+  (nice-to-have feature 1).
 - `SPAM_OUTPUTS_MAX` from the original sketch: size/output variance already exists
   (`SPAM_TX_DATA_MIN/MAX_BYTES`, `SPAM_SENDMANY_OUTPUTS`).

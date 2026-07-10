@@ -19,8 +19,9 @@
   node policy parameters (`-minrelaytxfee` for the mempool floor, `-blockmintxfee`
   for the miner's inclusion floor) so blocks fill up and transactions genuinely
   compete for block space
-- The four proposed features below: fee-market simulation, scenario engine, network
-  partitions, and reorgs that drop transactions
+- The three proposed features below: scenario engine, network partitions, and reorgs
+  that drop transactions; fee-market simulation is designed but parked (see the Parked
+  features section)
 
 ### Code review findings (2026-07-04)
 
@@ -88,38 +89,10 @@ Simchain's purpose is to simulate the Bitcoin chain on regtest while staying as 
 mainnet reality as regtest allows: multiple P2P-connected nodes, rotating miners, a
 non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus four bigger proposed features with their
-rationale and an implementation plan.
+limitations and future enhancements, plus three bigger proposed features with their
+rationale and an implementation plan, and a section for parked features.
 
-## 1. Fee-market simulation in the spammer
-
-**What:** Make the spammer emit transactions with varied fee rates (sampled from a
-configurable distribution, e.g. log-normal between `SPAM_FEE_MIN`/`SPAM_FEE_MAX` sat/vB)
-and varied sizes/output counts, instead of identical 540-sat dust sends at fallback fee.
-
-**Why it's a nice-to-have:** With uniform transactions, `estimatesmartfee`, mempool fee
-histograms (visible in the mempool explorer) and any RBF/fee-bumping logic in the project
-under test are meaningless, everything sits in one fee bucket. A spread of fee rates
-creates real block-space competition: when spam volume exceeds block capacity, low-fee
-transactions genuinely wait, which is exactly the mainnet behavior users want to
-reproduce with the "tx per block" knob.
-
-**Implementation plan:**
-1. In `spammer`, switch from `send_to_address` defaults to passing an explicit
-   `fee_rate` (bitcoincore-rpc `send` / `sendtoaddress` fee_rate arg), sampled per tx.
-2. Add `.env` settings with defaults: `SPAM_FEE_MIN=1`, `SPAM_FEE_MAX=50`,
-   `SPAM_OUTPUTS_MAX=4` (multi-output txs via `send_many` for size variance).
-3. Log a per-batch fee summary; verify the histogram in the mempool explorer.
-
-Effort: medium. Pairs well with feature 1 (bursty blocks + fee spread = realistic mempool).
-
-**Status (2026-07-10): parked** — full design in [fee-market-plan.md](fee-market-plan.md)
-(CPFP-safe per-branch fee ladder, funding-pull fix); complexity/benefit says wait for a
-concrete fee-estimation or fee-bumping test need.
-
----
-
-## 2. Declarative scenario engine
+## 1. Declarative scenario engine
 
 **What:** A `scenario.yml` interpreted by a small controller container: an ordered list of
 steps like *"at height 150 reorg 2 blocks"*, *"pause mining 120s"*, *"burst 500 txs"*,
@@ -148,7 +121,7 @@ Effort: the largest item here, but mostly glue around already-existing capabilit
 
 ---
 
-## 3. Network partition / latency simulation
+## 2. Network partition / latency simulation
 
 **What:** Tooling to split the P2P network (e.g. isolate node3, let it mine alone, then
 reconnect) and to inject latency/packet loss between nodes, via `docker network
@@ -168,14 +141,14 @@ nodes during the window), which no instantaneous regtest network shows.
 2. Phase 2: optional latency profile, run nodes with `cap_add: NET_ADMIN` and a sidecar
    applying `tc qdisc add dev eth0 root netem delay 500ms loss 1%`, parameterized via
    `.env` (`P2P_DELAY_MS`, `P2P_LOSS_PCT`).
-3. Expose as compose profile `partition` and/or a scenario-engine action (feature 3),
+3. Expose as compose profile `partition` and/or a scenario-engine action (feature 1),
    with settings `PARTITION_NODE`, `PARTITION_BLOCKS`.
 
 Effort: phase 1 small; phase 2 medium (needs NET_ADMIN and per-node sidecars).
 
 ---
 
-## 4. Reorgs that drop transactions permanently (double-spend)
+## 3. Reorgs that drop transactions permanently (double-spend)
 
 **What:** For a configurable fraction of the orphaned *wallet-owned* (spam) transactions
 in a reorg, include a conflicting transaction (same inputs, different output) in the
@@ -206,6 +179,32 @@ wanting *their* tx permanently dropped must broadcast the conflicting tx themsel
 2. Log which txids were conflicted so tests can assert on them.
 
 Effort: medium (raw-tx construction, only meaningful with spam enabled).
+
+---
+
+## Parked features
+
+Designed but deliberately not built. Each entry records why it is parked and what would
+revive it; the expensive design thinking is preserved in `parked/`.
+
+### Fee-market simulation in the spammer — PARKED
+
+**Status (2026-07-10): parked** — complexity/benefit says wait for a concrete
+fee-estimation or fee-bumping test need. Full design (CPFP-safe per-branch fee ladder,
+funding-pull deadlock fix) in [parked/fee-market-plan.md](parked/fee-market-plan.md),
+which supersedes the implementation sketch that used to live here.
+
+**What:** Make the spammer emit transactions with varied fee rates (sampled from a
+configurable distribution, e.g. log-normal between `SPAM_FEE_MIN`/`SPAM_FEE_MAX` sat/vB)
+and varied sizes/output counts, instead of identical 540-sat dust sends at fallback fee.
+
+**Why it's a nice-to-have:** With uniform transactions, `estimatesmartfee`, mempool fee
+histograms (visible in the mempool explorer) and any RBF/fee-bumping logic in the project
+under test are meaningless, everything sits in one fee bucket. A spread of fee rates
+creates real block-space competition: when spam volume exceeds block capacity, low-fee
+transactions genuinely wait, which is exactly the mainnet behavior users want to
+reproduce with the "tx per block" knob. Pairs well with the shipped Poisson block timing
+(bursty blocks + fee spread = realistic mempool).
 
 ---
 
