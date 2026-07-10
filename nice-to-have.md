@@ -32,6 +32,7 @@ Accepted decisions (not defects, recorded so they are not re-reported):
 
 - **RPC bound on all host interfaces** (`-rpcallowip=0.0.0.0/0` + unrestricted port
   binding): intentional, reaching the simnet from another machine is a wanted use case.
+
 - **Plaintext RPC credentials on the bitcoind command line** (visible in
   `docker inspect`/`ps`): acceptable for a throwaway regtest; documented with a warning
   in SETTINGS.md not to replicate in production.
