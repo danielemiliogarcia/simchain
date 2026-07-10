@@ -37,10 +37,16 @@ The network consists of 3 well-connected nodes plus helper containers:
   the run (heights 205-304). After that it asks each miner to mine 1 block in a round-robin
   manner every `BLOCK_INTERVAL_SECS`. Stop this container after funding if you want to
   control mining manually.
-- **Spammer `btc-simnet-spammer`**, spams `SPAM_TXS_PER_BLOCK` transactions per block
-  (split across the miner wallets, outputs paid to burn addresses so no wallet fills
-  up with dust), so blocks are not empty. On startup it waits
-  for the wallet funds to mature and splits them into `SPAM_FANOUT_UTXOS` independent
+- **Spammer `btc-simnet-spammer`**, fills blocks so they are not empty. By default
+  (raw engine) it can run in DATA/HYBRID mode — OP_RETURN data txs of varied sizes that
+  fill blocks at near-zero node cost, kept `SPAM_FILL_BLOCK_RATIO` blocks deep — or in
+  OUTPUT mode, spamming `SPAM_FIXED_TXS_PER_BLOCK` burn-output txs per block. Outputs
+  are paid to burn addresses so no wallet fills with dust. In DATA/HYBRID mode it also
+  maintains a standing pool of `SPAM_FLOOR_POOL_TXS` standalone ~110-vB floor-priced
+  fills, so blocks pack ~100% full and the `FALLBACK_FEE` price floor is **airtight**:
+  a below-floor tx waits in the mempool until it outbids the floor, like mainnet under
+  congestion. See SETTINGS.md "Spammer".
+  On startup it waits for funds to mature and splits them into `SPAM_FANOUT_UTXOS` independent
   UTXOs, otherwise the 25-tx unconfirmed-chain mempool limit would cap spam at 25 txs
   per wallet per block. If you spam many
   transactions, some may stay in the mempool and join the next batch, tune the settings
@@ -104,8 +110,8 @@ flowchart TB
     mc -->|"RPC: mine block"| n2
     mc -->|"RPC: mine block"| n3
     sp -->|"RPC: watch height"| n1
-    sp -->|"RPC: wallet spam"| n2
-    sp -->|"RPC: wallet spam"| n3
+    sp -->|"RPC: raw spam + floor fills"| n2
+    sp -->|"RPC: raw spam + floor fills"| n3
     rg -->|"RPC: invalidate + re-mine"| n3
     rg -.->|"witness poll"| n1
 
@@ -156,7 +162,7 @@ documented with its default in **[SETTINGS.md](./SETTINGS.md)**.
 By default the stack pulls the official registry image, no build step needed:
 
 ```bash
-BTC_IMAGE=bitcoin/bitcoin:29.0   # default if unset
+BTC_IMAGE=bitcoin/bitcoin:31.1   # default if unset
 ```
 
 To use the locally built image instead (arch auto-detected; binaries are
@@ -166,10 +172,10 @@ Bitcoin Core builder keys from
 
 ```bash
 ./build-bitcoin.sh                        # builds simchainbitcoinnode:<BITCOIN_VERSION>
-echo "BTC_IMAGE=simchainbitcoinnode:29.0" >> .env
+echo "BTC_IMAGE=simchainbitcoinnode:31.1" >> .env
 ```
 
-`build-bitcoin.sh` reads `BITCOIN_VERSION` from `.env` (default 29.0). It only builds
+`build-bitcoin.sh` reads `BITCOIN_VERSION` from `.env` (default 31.1). It only builds
 the bitcoin node image; the Rust tool images are built by compose itself.
 
 ## How to run

@@ -24,9 +24,9 @@ networks:
 
 services:
   btc-simnet-node1:
-    # Default: official registry image. Set BTC_IMAGE=simchainbitcoinnode:29.0
+    # Default: official registry image. Set BTC_IMAGE=simchainbitcoinnode:31.1
     # in .env to use the locally built one (./build-bitcoin.sh).
-    image: ${BTC_IMAGE:-bitcoin/bitcoin:29.0}
+    image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node1
     restart: unless-stopped
     ports:
@@ -58,6 +58,7 @@ services:
       - -fallbackfee=${FALLBACK_FEE:-0.0001}
       - -minrelaytxfee=${MIN_RELAY_TX_FEE:-0.00001}
       - -maxtxfee=${MAX_TX_FEE:-10000000}
+      - -blockreservedweight=${BLOCK_RESERVED_WEIGHT:-2000}
       # Wallet disabled by default: node1 mimics a 3rd-party production
       # endpoint, the user manages keys externally and submits signed raw txs
       - -disablewallet=${NODE1_DISABLE_WALLET:-1}
@@ -80,7 +81,7 @@ services:
       # - -debug=validation
 
   btc-simnet-node2:
-    image: ${BTC_IMAGE:-bitcoin/bitcoin:29.0}
+    image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node2
     restart: unless-stopped
     ports:
@@ -111,6 +112,7 @@ services:
       - -fallbackfee=${FALLBACK_FEE:-0.0001}
       - -minrelaytxfee=${MIN_RELAY_TX_FEE:-0.00001}
       - -maxtxfee=${MAX_TX_FEE:-10000000}
+      - -blockreservedweight=${BLOCK_RESERVED_WEIGHT:-2000}
       - -port=18444
       - -rpcport=18443
       - -txindex
@@ -125,7 +127,7 @@ services:
       - -addnode=btc-simnet-node3:18444
 
   btc-simnet-node3:
-    image: ${BTC_IMAGE:-bitcoin/bitcoin:29.0}
+    image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node3
     restart: unless-stopped
     networks:
@@ -148,6 +150,7 @@ services:
       - -fallbackfee=${FALLBACK_FEE:-0.0001}
       - -minrelaytxfee=${MIN_RELAY_TX_FEE:-0.00001}
       - -maxtxfee=${MAX_TX_FEE:-10000000}
+      - -blockreservedweight=${BLOCK_RESERVED_WEIGHT:-2000}
       - -port=18444
       - -rpcport=18443
       - -txindex
@@ -199,8 +202,39 @@ services:
       - btc-simnet-network
     environment:
       - ENABLE_SPAM=${ENABLE_SPAM:-true}
-      - SPAM_TXS_PER_BLOCK=${SPAM_TXS_PER_BLOCK:-100}
+      # true = raw engine (spammer signs its own txs, immune to wallet
+      # fatigue); false = original node-wallet engine (sendtoaddress/sendmany)
+      - USE_RAW_TX_SPAM=${USE_RAW_TX_SPAM:-true}
+      # Floor price level. Floor fills pay exactly this; DATA/HYBRID bulk
+      # spam pays a small premium so floor fills remain residual-gap sealers.
+      - FALLBACK_FEE=${FALLBACK_FEE:-0.0001}
+      # Fixed tx count for OUTPUT modes (sequential/batch) and the wallet
+      # engine. Ignored in DATA/HYBRID mode (fill is driven by the ratio below).
+      - SPAM_FIXED_TXS_PER_BLOCK=${SPAM_FIXED_TXS_PER_BLOCK:-100}
+      # OUTPUT-mode fatness: 0 = sequential, N = batch of N burn outputs per tx.
       - SPAM_SENDMANY_OUTPUTS=${SPAM_SENDMANY_OUTPUTS:-0}
+      # DATA/HYBRID mode (raw engine, Core 30+), the default: fills blocks with
+      # OP_RETURN data txs (no UTXO-set growth, nodes stay near-idle). MAX is
+      # the biggest payload; MIN < MAX spreads tx sizes log-uniformly. Set
+      # MAX=0 for the legacy OUTPUT mode (burn-output txs, UTXO-heavy).
+      - SPAM_TX_DATA_MAX_BYTES=${SPAM_TX_DATA_MAX_BYTES:-90000}
+      - SPAM_TX_DATA_MIN_BYTES=${SPAM_TX_DATA_MIN_BYTES:-250}
+      # Extra minimum-size floor-priced txs per block, on top of the data fill:
+      # they add a stream of small realistic-looking txs. 0 = none.
+      - SPAM_SMALL_TXS_PER_BLOCK=${SPAM_SMALL_TXS_PER_BLOCK:-0}
+      # Airtight fee floor (DATA/HYBRID mode): keep this many standalone
+      # floor-priced ~110-vB self-transfers STANDING in the mempool.
+      # 0 = off (soft floor).
+      - SPAM_FLOOR_POOL_TXS=${SPAM_FLOOR_POOL_TXS:-4000}
+      # DATA/HYBRID fill target in blocks of mempool weight: 0.5 = half-full
+      # blocks (floor off), 1 = full + shallow backlog, 5 = full + ~4 pending.
+      # Default 2: the mempool swings ~1 block between top-ups, so 2 keeps a
+      # full block of floor-priced supply at every template (airtight floor);
+      # 1 rides the trough and can leave occasional partial blocks.
+      - SPAM_FILL_BLOCK_RATIO=${SPAM_FILL_BLOCK_RATIO:-2.0}
+      # Auto-size the branch pool from the fill ratio (max(12, ratio x15)).
+      # false = use SPAM_FANOUT_UTXOS, erroring if below the ratio x10 minimum.
+      - SPAM_FANOUT_AUTO=${SPAM_FANOUT_AUTO:-true}
       - SPAM_FANOUT_UTXOS=${SPAM_FANOUT_UTXOS:-50}
       - ENABLE_SPAM_REPLACES=${ENABLE_SPAM_REPLACES:-false}
       - SPAM_REPLACES_PER_MINER_PER_BLOCK=${SPAM_REPLACES_PER_MINER_PER_BLOCK:-5}
