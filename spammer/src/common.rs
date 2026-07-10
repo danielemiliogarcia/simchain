@@ -17,6 +17,34 @@ use std::{env, thread, time::Duration};
 // calls are unaffected.
 const RPC_TIMEOUT_SECS: u64 = 300;
 
+/// Retry a replay-safe RPC call with exponential backoff. Panics after the
+/// bounded attempt count so compose `restart: on-failure` remains the
+/// backstop for a wedged node. Most uses must be read-only; `getnewaddress` is
+/// also safe because replay only advances the wallet's address index. Do not
+/// use this for non-idempotent actions such as sending funds.
+pub fn rpc_retry<T>(what: &str, mut call: impl FnMut() -> Result<T, bitcoincore_rpc::Error>) -> T {
+    // 8 attempts with the backoff below give ~61s of tolerance for
+    // fast-failing errors (connection refused while a node reboots), so a
+    // normal bitcoind restart is ridden out in-process instead of crashing
+    // into a container restart.
+    const ATTEMPTS: u32 = 8;
+    let mut delay = Duration::from_millis(500);
+    for attempt in 1..=ATTEMPTS {
+        match call() {
+            Ok(value) => return value,
+            Err(error) if attempt == ATTEMPTS => {
+                panic!("RPC {what} failed after {ATTEMPTS} attempts: {error}")
+            }
+            Err(error) => {
+                println!("RPC {what} failed ({error}), retry {attempt}/{ATTEMPTS} in {delay:?}");
+                thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+    unreachable!()
+}
+
 // Wallets the spam is split across (node2 and node3). If a miner is ever
 // added or removed, updating this constant keeps SPAM_TXS_PER_BLOCK meaning
 // "total txs per block" for the user.
@@ -61,10 +89,28 @@ pub fn burn_address(index: u64) -> Address {
 // spammer starts before the mining controller finishes funding.
 pub fn wait_for_funds(wallet: &Client, name: &str) {
     println!("Waiting for wallet '{name}' funds to mature...");
+    let minimum = Amount::from_btc(1.0).unwrap();
+    let mut iterations = 0u64;
     loop {
         match wallet.get_balances() {
-            Ok(balances) if balances.mine.trusted >= Amount::from_btc(1.0).unwrap() => return,
-            _ => thread::sleep(Duration::from_millis(500)),
+            Ok(balances) if balances.mine.trusted >= minimum => return,
+            Ok(balances) => {
+                if iterations > 0 && iterations % 60 == 0 {
+                    println!(
+                        "Still waiting for wallet '{name}': trusted balance {:.8} BTC < 1 BTC (coinbase maturity)",
+                        balances.mine.trusted.to_btc()
+                    );
+                }
+            }
+            Err(error) => {
+                if iterations > 0 && iterations % 60 == 0 {
+                    println!(
+                        "Still waiting for wallet '{name}': not loaded yet (the mining controller creates it during bootstrap) — {error}"
+                    );
+                }
+            }
         }
+        iterations += 1;
+        thread::sleep(Duration::from_millis(500));
     }
 }

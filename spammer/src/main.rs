@@ -4,7 +4,8 @@ mod raw_transaction_spammer;
 
 use bitcoincore_rpc::{bitcoin::Address, Client, RpcApi};
 use common::{
-    burn_address, create_client, create_jsonrpc_client, env_or, wait_for_funds, MINER_COUNT,
+    burn_address, create_client, create_jsonrpc_client, env_or, rpc_retry, wait_for_funds,
+    MINER_COUNT,
 };
 use raw_transaction_spammer::RawSpammer;
 use std::{env, thread, time::Duration};
@@ -15,7 +16,7 @@ use std::{env, thread, time::Duration};
 fn run_block_loop(node1: &Client, mut cycle: impl FnMut() -> usize) {
     let mut spammed_at_block_height = 0;
     loop {
-        let current_block_height = node1.get_block_count().unwrap();
+        let current_block_height = rpc_retry("get node1 block count", || node1.get_block_count());
         if current_block_height > spammed_at_block_height {
             spammed_at_block_height = current_block_height;
             let cycle_start = std::time::Instant::now();

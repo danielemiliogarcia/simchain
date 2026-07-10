@@ -536,17 +536,17 @@ impl RawSpammer {
     // picks them back up). Only a recovery path -- startup, reorgs, lost
     // track -- never the hot path.
     fn scan_address_utxos(&self, address: &Address) -> Vec<Utxo> {
-        let scan = self
-            .node
-            .scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(format!("addr({address})"))])
-            .unwrap();
+        let scan = common::rpc_retry("scan address UTXOs", || {
+            self.node
+                .scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(format!("addr({address})"))])
+        });
         scan.unspents
             .into_iter()
             .filter(|u| {
-                self.node
-                    .get_tx_out(&u.txid, u.vout, Some(true))
-                    .unwrap()
-                    .is_some()
+                common::rpc_retry("check scanned UTXO", || {
+                    self.node.get_tx_out(&u.txid, u.vout, Some(true))
+                })
+                .is_some()
             })
             .map(|u| Utxo {
                 outpoint: OutPoint::new(u.txid, u.vout),
@@ -587,17 +587,37 @@ impl RawSpammer {
         let refill_floor = required * (target * BRANCH_MIN_TXS);
         if total < refill_floor {
             common::wait_for_funds(&self.wallet, &self.wallet_name);
-            let trusted = self.wallet.get_balances().unwrap().mine.trusted.to_btc();
+            let trusted = common::rpc_retry("get raw-engine wallet balance", || {
+                self.wallet.get_balances()
+            })
+            .mine
+            .trusted
+            .to_btc();
             let pull_btc = ((trusted * 0.5).min(FUND_PULL_MAX_BTC) * 1e8).floor() / 1e8;
             let pull = Amount::from_btc(pull_btc).unwrap();
             println!(
                 "{} => Raw engine pulling {pull} from wallet '{}'",
                 self.label, self.wallet_name
             );
-            let txid = self
-                .wallet
-                .send_to_address(&self.address, pull, None, None, None, None, None, None)
-                .unwrap();
+            let txid = match self.wallet.send_to_address(
+                &self.address,
+                pull,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) {
+                Ok(txid) => txid,
+                Err(error) => {
+                    println!(
+                        "{} => Raw engine funding pull failed ({error}), deferring until the next block",
+                        self.label
+                    );
+                    return;
+                }
+            };
             while self
                 .wallet
                 .get_transaction(&txid, None)
@@ -792,15 +812,34 @@ impl RawSpammer {
     // overran a block interval are never missed and the standing count stays
     // honest.
     fn harvest_mined_fills(&mut self) {
-        let tip = self.node.get_block_count().unwrap();
+        let tip = common::rpc_retry("get floor-pool block count", || self.node.get_block_count());
         if self.pool_seen_height == 0 || self.fills_inflight.is_empty() {
             self.pool_seen_height = tip;
             return;
         }
         let mut mined: HashSet<Txid> = HashSet::new();
         for height in (self.pool_seen_height + 1)..=tip {
-            let hash = self.node.get_block_hash(height).unwrap();
-            mined.extend(self.node.get_block_info(&hash).unwrap().tx);
+            let hash = match self.node.get_block_hash(height) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    println!(
+                        "{} => Floor-pool harvest skipped at height {height}: block hash RPC failed ({error})",
+                        self.label
+                    );
+                    return;
+                }
+            };
+            let block = match self.node.get_block_info(&hash) {
+                Ok(block) => block,
+                Err(error) => {
+                    println!(
+                        "{} => Floor-pool harvest skipped for block {hash}: block info RPC failed ({error})",
+                        self.label
+                    );
+                    return;
+                }
+            };
+            mined.extend(block.tx);
         }
         self.pool_seen_height = tip;
         let mut still_standing = Vec::new();
@@ -847,17 +886,37 @@ impl RawSpammer {
         let refill_floor = required * seed_count;
         if total < refill_floor {
             common::wait_for_funds(&self.wallet, &self.wallet_name);
-            let trusted = self.wallet.get_balances().unwrap().mine.trusted.to_btc();
+            let trusted = common::rpc_retry("get floor-pool wallet balance", || {
+                self.wallet.get_balances()
+            })
+            .mine
+            .trusted
+            .to_btc();
             let pull_btc = ((trusted * 0.5).min(POOL_PULL_MAX_BTC) * 1e8).floor() / 1e8;
             let pull = Amount::from_btc(pull_btc).unwrap();
             println!(
                 "{} => Floor pool pulling {pull} from wallet '{}'",
                 self.label, self.wallet_name
             );
-            let txid = self
-                .wallet
-                .send_to_address(&self.pool_address, pull, None, None, None, None, None, None)
-                .unwrap();
+            let txid = match self.wallet.send_to_address(
+                &self.pool_address,
+                pull,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) {
+                Ok(txid) => txid,
+                Err(error) => {
+                    println!(
+                        "{} => Floor-pool funding pull failed ({error}), deferring until the next block",
+                        self.label
+                    );
+                    return;
+                }
+            };
             while self
                 .wallet
                 .get_transaction(&txid, None)

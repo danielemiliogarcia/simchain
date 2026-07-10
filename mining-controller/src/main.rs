@@ -20,6 +20,36 @@ const BOOTSTRAP_END: u64 = 204;
 // a healthy call is unaffected, and a node that needs this long is wedged
 // enough that crashing (and restarting) is the right outcome.
 const RPC_TIMEOUT_SECS: u64 = 300;
+// 8 attempts with the backoff below give ~61s of tolerance for fast-failing
+// errors (connection refused while a node reboots), so a normal bitcoind
+// restart is ridden out in-process instead of crashing into a container
+// restart. Timeouts are far slower per attempt and stay bounded regardless.
+const RPC_RETRY_ATTEMPTS: u32 = 8;
+
+/// Retry a replay-safe RPC call with exponential backoff. Panics after the
+/// bounded attempt count so compose `restart: on-failure` remains the
+/// backstop for a wedged node. Most uses must be read-only; `getnewaddress` is
+/// also safe because replay only advances the wallet's address index. Do not
+/// use this for non-idempotent actions such as mining or sending funds.
+pub fn rpc_retry<T>(what: &str, mut call: impl FnMut() -> Result<T, bitcoincore_rpc::Error>) -> T {
+    let mut delay = Duration::from_millis(500);
+    for attempt in 1..=RPC_RETRY_ATTEMPTS {
+        match call() {
+            Ok(value) => return value,
+            Err(error) if attempt == RPC_RETRY_ATTEMPTS => {
+                panic!("RPC {what} failed after {RPC_RETRY_ATTEMPTS} attempts: {error}")
+            }
+            Err(error) => {
+                println!(
+                    "RPC {what} failed ({error}), retry {attempt}/{RPC_RETRY_ATTEMPTS} in {delay:?}"
+                );
+                thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+    unreachable!()
+}
 
 // SplitMix64 is small, seedable, and has a stable stream across builds. Using it
 // directly keeps MINING_RNG_SEED reproducible without adding an RNG dependency
@@ -275,7 +305,9 @@ fn setup_wallet(
         rpc_user,
         rpc_pass,
     );
-    let address = wallet.get_new_address(None, None).unwrap();
+    let address = rpc_retry("get new mining wallet address", || {
+        wallet.get_new_address(None, None)
+    });
     let address = address.require_network(Network::Regtest).unwrap();
     (wallet, address)
 }
@@ -459,7 +491,7 @@ fn main() {
         "stage table must end at BOOTSTRAP_END"
     );
 
-    let mut height = node2.get_block_count().unwrap();
+    let mut height = rpc_retry("get pre-bootstrap block count", || node2.get_block_count());
     if height >= BOOTSTRAP_END {
         println!("Chain already bootstrapped (height {height}), skipping the funding sequence");
     } else if height > 0 {
@@ -469,12 +501,45 @@ fn main() {
         if height >= target {
             continue;
         }
-        println!(
-            "Bootstrap => Mining {} block(s) to address {addr} ({label}, up to height {target})",
-            target - height
-        );
-        miner.generate_to_address(target - height, addr).unwrap();
-        height = miner.get_block_count().unwrap();
+        let mut delay = Duration::from_millis(500);
+        let mut last_error = None;
+        for attempt in 1..=RPC_RETRY_ATTEMPTS {
+            // Re-read the live height before every generate attempt. A
+            // timed-out generate may still have mined some or all blocks, so
+            // only the missing remainder is safe to issue again.
+            height = rpc_retry("get bootstrap stage height", || miner.get_block_count());
+            if height >= target {
+                break;
+            }
+            println!(
+                "Bootstrap => Mining {} block(s) to address {addr} ({label}, up to height {target})",
+                target - height
+            );
+            match miner.generate_to_address(target - height, addr) {
+                Ok(_) => {}
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    if attempt < RPC_RETRY_ATTEMPTS {
+                        println!(
+                            "Bootstrap generate failed ({error}), retry {attempt}/{RPC_RETRY_ATTEMPTS} in {delay:?} after re-reading height"
+                        );
+                        thread::sleep(delay);
+                        delay = (delay * 2).min(Duration::from_secs(30));
+                    }
+                }
+            }
+        }
+        // One final state read catches a fifth timed-out call that completed
+        // on the node before deciding the stage is truly wedged.
+        height = rpc_retry("get completed bootstrap stage height", || {
+            miner.get_block_count()
+        });
+        if height < target {
+            panic!(
+                "Bootstrap stage '{label}' did not reach height {target} after {RPC_RETRY_ATTEMPTS} generate attempts; last error: {}",
+                last_error.as_deref().unwrap_or("generate returned success without reaching the target")
+            );
+        }
         // Wait for the other node to sync before the next stage mines on
         // top, so blocks do not compete and stack on each other.
         wait_for_height(witness, height);
@@ -483,7 +548,7 @@ fn main() {
 
     println!(
         "\nActual block height: {}",
-        node2.get_block_count().unwrap()
+        rpc_retry("get post-bootstrap block count", || node2.get_block_count())
     );
 
     println!("\n//////////////////////////////////////////////////////////////////\n");
@@ -500,7 +565,9 @@ fn main() {
     // generate_to_address already does that -- so detection only makes the
     // events visible here; nothing needs to be controlled.
     let mut view = ChainView::new();
-    let mut last = node2.get_block_count().unwrap();
+    let mut last = rpc_retry("get initial mining-loop block count", || {
+        node2.get_block_count()
+    });
     // Seed the view with the recent chain so even the first reorg gets an
     // accurate fork point. Bootstrap blocks are seeded as not-ours, which is
     // harmless: seeded heights are never re-walked unless a reorg replaces
@@ -559,11 +626,25 @@ fn main() {
         // externally mined blocks that appeared since the last round.
         last = sync_view(&mut view, miner, last);
 
-        let mined = miner.generate_to_address(1, addr).unwrap();
+        let mined = match miner.generate_to_address(1, addr) {
+            Ok(mined) => mined,
+            Err(error) => {
+                println!("{name} => Block generation failed ({error}), retrying next round");
+                // Do not re-issue a timed-out generate: it may have mined a
+                // block. The next sync_view re-derives live chain state. Such
+                // a block is reported as EXTERNAL because its returned hash
+                // was never available for attribution to this controller.
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
         // Identify the new block by the hash generate returned instead of
         // the tip counter, which races with blocks arriving from elsewhere.
         let hash = mined[0];
-        let mined_height = miner.get_block_header_info(&hash).unwrap().height as u64;
+        let mined_height = rpc_retry("get newly mined block header", || {
+            miner.get_block_header_info(&hash)
+        })
+        .height as u64;
         println!("{name} => Mined 1 block [{mined_height}] {hash} to address {addr}");
         view.record(mined_height, hash, true);
         last = last.max(mined_height);

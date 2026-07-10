@@ -1,16 +1,11 @@
 ## Limitations and future enhancements
 
 ### BitcoinCore containers
-- Build from sources instead of downloading binaries
-- Clean up the Dockerfile: drop the debug `RUN echo UID/GID` layers and merge related
-  `RUN` steps to reduce image layers
 
-### Rust containers
-- Use multistage builds in the Dockerfiles: build with `rust:latest`, copy only the
-  binary into a slim runtime image (each tool image is currently ~2.6GB)
-- Retries for RPC calls (finding 1 below)
+- Build from sources instead of downloading binaries
 
 ### Simulations
+
 - Per-node policies: give each node different bitcoind parameters (mempool size,
   relay fees, RBF policy) or even different bitcoind versions/images, like a real
   heterogeneous network (the compose file already declares each node in full to
@@ -40,42 +35,14 @@ Accepted decisions (not defects, recorded so they are not re-reported):
 
 Findings, ordered by severity:
 
-1. **No RPC retries; transient errors are panics** (controller and spammer). Every call
-   is `.unwrap()`: a node hiccup mid-run kills the process. The reorg tool is the
-   exception (Results, retry loop) and can serve as the template.
-   Mitigations in place: both services use the reorg tool's 300s RPC timeout (the
-   default 15s died with `WouldBlock` whenever a loaded node answered slowly), both
-   have compose `restart: on-failure`, and the controller bootstrap resumes exactly
-   from any height (stage table with fixed target heights; wallets are loaded if
-   they exist). Remaining work is retrying transient errors in-process instead of
-   crashing into a restart.
-
-2. **Rust tool images are single-stage `rust:latest`** (~2.6 GB each; the Dockerfiles'
-   own TODO). Multistage build, copy the binary into a slim runtime. Also listed under
-   "Rust containers" above.
-
-3. **Dockerfile cleanup**: `RUN echo "UID/GID"` debug layers still present, several
-   mergeable `RUN` steps, duplicate `bitcoind -version` layers. Also listed under
-   "BitcoinCore containers" above.
-
-4. **Spammer↔controller implicit wallet contract (minor).** The spammer depends on
-   wallets the controller creates, but `wait_for_funds` polls `get_balances` and
-   tolerates a missing wallet indefinitely, so the contract no longer crashes anything;
-   it just waits forever (one log line) if funding logic changes. Acceptable; a
-   periodic "still waiting" log would make a misconfiguration visible.
-
-5. **No `Cargo.lock` is committed for any of the three tools** (all three
+1. **No `Cargo.lock` is committed for any of the three tools** (all three
    `.gitignore`s exclude it; `git ls-files` confirms none tracked). Each fresh clone or
    image rebuild resolves dependencies anew, so two builds of the same commit can ship
    different dependency versions, the opposite of what a reproducible test network
    wants. Lockfiles should be committed for binary crates: drop `Cargo.lock` from the
    three `.gitignore`s and commit the locks.
 
-6. **Bitcoin node base image is `debian:bullseye-slim`** (oldstable; security support
-   ends mid-2026). The official `bitcoin/bitcoin` images are bookworm-based. Bump to
-   `bookworm-slim` next time the image is touched.
-
-7. **No Cargo workspace; helpers duplicated three times.** `env_or`/`create_client`
+2. **No Cargo workspace; helpers duplicated three times.** `env_or`/`create_client`
    are copy-pasted per tool, and compose builds three independent dependency graphs
    serially (three `target/` dirs, three lock states). A workspace with one shared
    util crate, or a single multi-binary crate with three Dockerfile targets, would cut

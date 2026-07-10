@@ -5,6 +5,7 @@
 //! produces, but throughput is bound by the wallet lock and degrades as the
 //! wallet's tx history grows (see SETTINGS.md "Full blocks").
 
+use crate::common::rpc_retry;
 use bitcoincore_rpc::{
     bitcoin::{Address, Amount, Network, Txid},
     Client, RpcApi,
@@ -21,19 +22,21 @@ const SPAMMABLE_MIN_BTC: f64 = 0.001;
 const SPAMMABLE_MAX_BTC: f64 = 0.5;
 
 fn get_new_wallet_address(wallet: &Client) -> Address {
-    let address = wallet.get_new_address(None, None).unwrap();
+    let address = rpc_retry("get new wallet address", || {
+        wallet.get_new_address(None, None)
+    });
     address.require_network(Network::Regtest).unwrap()
 }
 
 fn spammable_utxos(wallet: &Client) -> u64 {
     let min = Amount::from_btc(SPAMMABLE_MIN_BTC).unwrap();
     let max = Amount::from_btc(SPAMMABLE_MAX_BTC).unwrap();
-    wallet
-        .list_unspent(Some(1), None, None, None, None)
-        .unwrap()
-        .iter()
-        .filter(|u| u.amount >= min && u.amount <= max)
-        .count() as u64
+    rpc_retry("list spammable wallet UTXOs", || {
+        wallet.list_unspent(Some(1), None, None, None, None)
+    })
+    .iter()
+    .filter(|u| u.amount >= min && u.amount <= max)
+    .count() as u64
 }
 
 // Keep the wallet supplied with independent fan-out UTXOs. The mempool limits a
@@ -49,7 +52,10 @@ fn ensure_fanout(wallet: &Client, name: &str, need: u64, target: u64) {
         return;
     }
 
-    let trusted = wallet.get_balances().unwrap().mine.trusted.to_btc();
+    let trusted = rpc_retry("get wallet balance for fan-out", || wallet.get_balances())
+        .mine
+        .trusted
+        .to_btc();
     // 0.1 BTC per branch funds years of dust spam; scale down if the wallet is
     // smaller than target * 0.1 (keep 20% margin for fees).
     let per_output = (trusted * 0.8 / target as f64).min(0.1);
