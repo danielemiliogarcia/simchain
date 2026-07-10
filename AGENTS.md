@@ -10,13 +10,23 @@ The three Rust tools are members of a single Cargo workspace rooted at the repo 
 Cargo.toml                  # workspace root (members + resolver = "2")
 Cargo.lock                  # committed — binaries want reproducible builds
 .cargo/config.toml          # project-wide cargo aliases
-tools.Dockerfile            # one builder stage, three final targets
+docker/                     # docker build files and helper scripts
+  bitcoin-node.Dockerfile   # local bitcoind image build
+  tools.Dockerfile          # one builder stage, three final targets
+  build-bitcoin-image.sh    # local bitcoind image build helper
+  entrypoint.sh             # bitcoind container entrypoint
+scripts/                    # host-side helper scripts
+  chainwatch.sh             # host RPC watcher
+  simulate-reorg.sh         # convenience reorg wrapper
 crates/
-  simchain-common/          # shared helpers (create_client, env_or)
+  simchain-common/          # shared helpers (RPC clients, config parsing)
   mining-controller/        # bootstrap + configurable mining
   reorg/                    # on-demand chain reorganizations
   spammer/                  # block-filling transaction spam
 ```
+
+`.dockerignore` intentionally remains at the repo root because Docker applies it
+to the build context root (`.`), not to the directory containing the Dockerfile.
 
 `.cargo/config.toml` lives at the repo root; Cargo discovers it by walking up the
 directory tree, so the aliases work from any crate directory.
@@ -37,8 +47,8 @@ network). Do not add it to any `.gitignore`.
 ## Project intent
 
 - `crates/simchain-common` — the one home for helpers shared across tools (RPC client
-  construction, env lookup). Put a helper here the moment a second tool needs it,
-  rather than copy-pasting.
+  construction, config parsing/validation, logging). Put a helper here the moment a
+  second tool needs it, rather than copy-pasting.
 - `crates/mining-controller`, `crates/reorg`, `crates/spammer` — the three binaries,
   each a thin RPC driver over bitcoind. They must imitate mainnet **behavior**; do not
   add relay/mempool/capacity policy flags that diverge from mainnet.

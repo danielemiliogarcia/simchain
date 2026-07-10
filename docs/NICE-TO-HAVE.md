@@ -115,7 +115,7 @@ re-confirm. Setting sketch: `REORG_DOUBLE_SPEND_PCT=0..100` (default 0).
 orphaned transactions into the replacement blocks (same txids), so a reorg only changes
 block hashes/heights — a user's transaction never *loses* confirmations. The
 temporary-drop case (confirmed → 0-conf → re-confirmed) is already available through the
-`empty` reorg mode (`./simulate-reorg.sh <depth> empty`, which mines empty replacement
+`empty` reorg mode (`./scripts/simulate-reorg.sh <depth> empty`, which mines empty replacement
 blocks and leaves the orphaned txs in the mempool). But the scariest real reorg is
 *permanent*: *"my deposit had N confirmations, a reorg happened, and now my transaction
 is gone forever."* Exchanges, custody watchers, indexers and payment processors must

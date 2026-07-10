@@ -126,12 +126,13 @@ Bitcoin Core builder keys from
 [bitcoin-core/guix.sigs](https://github.com/bitcoin-core/guix.sigs)):
 
 ```bash
-./build-bitcoin.sh                        # builds simchainbitcoinnode:<BITCOIN_VERSION>
+./docker/build-bitcoin-image.sh           # builds simchainbitcoinnode:<BITCOIN_VERSION>
 echo "BTC_IMAGE=simchainbitcoinnode:31.1" >> .env
 ```
 
-`build-bitcoin.sh` reads `BITCOIN_VERSION` from `.env` (default 31.1). It only builds
-the bitcoin node image; the Rust tool images are built by compose itself.
+`docker/build-bitcoin-image.sh` uses `BITCOIN_VERSION` from the environment or `.env`
+(default 31.1). It only builds the bitcoin node image; the Rust tool images are built
+by compose itself.
 
 ## How to run
 
@@ -249,7 +250,7 @@ exclude = ["path/to/simchain"]
 - [SETTINGS.md](./docs/SETTINGS.md), every setting, its default and what it does.
 - [NICE-TO-HAVE.md](./docs/NICE-TO-HAVE.md), all limitations, future enhancements and
   proposed features with rationale and implementation plans.
-- [RUNBOOK.md](./RUNBOOK.md), handy `bitcoin-cli` one-liners against the simnet.
+- [RUNBOOK.md](./docs/RUNBOOK.md), handy `bitcoin-cli` one-liners against the simnet.
 
 ## Limitations and future enhancements
 
@@ -265,8 +266,8 @@ crate directory):
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs `cargo ba`, clippy
 (`-D warnings`), `cargo fmt --check`, and the test suite on every pull request, all
 with `--locked` so a stale `Cargo.lock` fails the build. The three tool Docker images
-build from one shared [tools.Dockerfile](tools.Dockerfile) (one builder stage, three
-targets), also with `--locked`.
+build from one shared [docker/tools.Dockerfile](docker/tools.Dockerfile) (one builder
+stage, three targets), also with `--locked`.
 
 # Trouble shotting
 

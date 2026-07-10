@@ -25,7 +25,7 @@ networks:
 services:
   btc-simnet-node1:
     # Default: official registry image. Set BTC_IMAGE=simchainbitcoinnode:31.1
-    # in .env to use the locally built one (./build-bitcoin.sh).
+    # in .env to use the locally built one (./docker/build-bitcoin-image.sh).
     image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node1
     restart: unless-stopped
@@ -160,7 +160,7 @@ services:
   btc-simnet-mining-controller:
     build:
       context: .
-      dockerfile: tools.Dockerfile
+      dockerfile: docker/tools.Dockerfile
       target: mining-controller
     container_name: btc-simnet-mining-controller
     # A crash (e.g. an RPC hiccup) must not stop the chain: the bootstrap is
@@ -193,7 +193,7 @@ services:
   btc-simnet-spammer:
     build:
       context: .
-      dockerfile: tools.Dockerfile
+      dockerfile: docker/tools.Dockerfile
       target: spammer
     container_name: btc-simnet-spammer
     # Stateless between cycles: safe to restart after a crash, spam resumes.
@@ -268,7 +268,7 @@ services:
     profiles: ["reorg"]
     build:
       context: .
-      dockerfile: tools.Dockerfile
+      dockerfile: docker/tools.Dockerfile
       target: reorg
     container_name: btc-simnet-reorg
     restart: "no"

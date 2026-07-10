@@ -18,8 +18,8 @@ edit `.env`, then `docker compose up -d --force-recreate` only those services. S
 
 | Variable | Default | Description |
 |---|---|---|
-| `BTC_IMAGE` | `bitcoin/bitcoin:31.1` | Docker image used by the 3 nodes. Default is pulled from the registry (no build needed). Set `simchainbitcoinnode:31.1` to use the locally built image (`./build-bitcoin.sh`). |
-| `BITCOIN_VERSION` | `31.1` | Bitcoin Core version downloaded by `./build-bitcoin.sh` when building the local image. Not used by compose. |
+| `BTC_IMAGE` | `bitcoin/bitcoin:31.1` | Docker image used by the 3 nodes. Default is pulled from the registry (no build needed). Set `simchainbitcoinnode:31.1` to use the locally built image (`./docker/build-bitcoin-image.sh`). |
+| `BITCOIN_VERSION` | `31.1` | Bitcoin Core version used by `./docker/build-bitcoin-image.sh` when building the local image. Not used by compose. |
 
 ## RPC credentials
 
@@ -368,8 +368,8 @@ pool in OUTPUT mode — see [When the floor leaks](#the-fee-market-what-spam-pay
 
 | Variable | Default | Description |
 |---|---|---|
-| `REORG_DEPTH` | `3` | How many blocks to orphan per reorg. CLI argument overrides it: `./simulate-reorg.sh 5`. |
-| _(CLI only)_ `empty` | off | Per-run argument, not an env var: `./simulate-reorg.sh 3 empty` mines empty replacement blocks (chaos reorg) and leaves the orphaned txs unconfirmed, instead of re-mining them. Chosen per run so real and empty reorgs can be interleaved on the same chain. |
+| `REORG_DEPTH` | `3` | How many blocks to orphan per reorg. CLI argument overrides it: `./scripts/simulate-reorg.sh 5`. |
+| _(CLI only)_ `empty` | off | Per-run argument, not an env var: `./scripts/simulate-reorg.sh 3 empty` mines empty replacement blocks (chaos reorg) and leaves the orphaned txs unconfirmed, instead of re-mining them. Chosen per run so real and empty reorgs can be interleaved on the same chain. |
 | `REORG_MODE` | `once` | `once` = single reorg then exit. `auto` = reorg every `AUTO_REORG_EVERY_BLOCKS`. |
 | `AUTO_REORG_EVERY_BLOCKS` | `20` | Auto mode cadence (x); must be greater than `REORG_DEPTH` (y). |
 | `REORG_NODE` | `btc-simnet-node3` | Node used to fork the chain (a hidden miner is realistic). |

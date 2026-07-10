@@ -58,7 +58,7 @@ RUN set -eux; \
   rm -rf /tmp/guix.sigs-main /root/.gnupg /opt/bitcoin-${BITCOIN_VERSION}/bin/bitcoin-qt
 
 # Copy the entrypoint script
-COPY docker-entrypoint.sh /entrypoint.sh
+COPY docker/entrypoint.sh /entrypoint.sh
 
 # REGTEST VERSION, WE DONT WANT A VOLUME
 # Define a volume for the Bitcoin data directory

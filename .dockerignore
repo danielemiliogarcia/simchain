@@ -1,16 +1,20 @@
-# Shared build-context ignore for BOTH images built from the repo root:
-#   - Dockerfile        -> the bitcoind node image (needs Dockerfile + entrypoint)
-#   - tools.Dockerfile  -> the three Rust tools (needs the Cargo workspace)
+# Shared build-context ignore for BOTH images built with repo-root context (`.`):
+#   - docker/bitcoin-node.Dockerfile -> the bitcoind node image
+#   - docker/tools.Dockerfile        -> the three Rust tools
+#
+# This file stays at the repo root because `.dockerignore` is scoped to the
+# build-context root, not to the Dockerfile location.
 #
 # Allowlist only what those builds COPY; everything else (.git, and the Rust
 # target/ dirs that reach GBs after local builds) stays out of the upload.
 #
-# Under BuildKit, tools.Dockerfile.dockerignore overrides this file for the
-# tools image. The classic builder ignores per-Dockerfile files, so this root
-# file must cover both images on its own — hence the Rust allowlist entries.
+# Under BuildKit, docker/tools.Dockerfile.dockerignore overrides this file for
+# the tools image. The classic builder ignores per-Dockerfile files, so this
+# root file must still cover both images on its own — hence the Rust allowlist
+# entries.
 *
-!Dockerfile
-!docker-entrypoint.sh
+!docker/bitcoin-node.Dockerfile
+!docker/entrypoint.sh
 !Cargo.toml
 !Cargo.lock
 !.cargo
