@@ -1,5 +1,7 @@
 # BTC Simchain
 
+[![CI](https://github.com/danielemiliogarcia/simchain/actions/workflows/ci.yml/badge.svg)](https://github.com/danielemiliogarcia/simchain/actions/workflows/ci.yml) [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](./LICENSE)
+
 A regtest Bitcoin simulation network that tries to stay as close to mainnet reality as
 regtest allows: several P2P-connected nodes, rotating miners, a non-mining full node as
 the user endpoint, non-empty blocks, and simulated reorgs, all controlled from a `.env`
@@ -368,37 +370,29 @@ nested-workspace errors:
 exclude = ["path/to/simchain"]
 ```
 
+## Documents
+
+- [SETTINGS.md](./docs/SETTINGS.md), every setting, its default and what it does.
+- [NICE-TO-HAVE.md](./docs/NICE-TO-HAVE.md), all limitations, future enhancements and
+  proposed features with rationale and implementation plans.
+- [RUNBOOK.md](./RUNBOOK.md), handy `bitcoin-cli` one-liners against the simnet.
+
+## Limitations and future enhancements
+
+All known limitations, future enhancements and proposed features live in
+[NICE-TO-HAVE.md](./docs/NICE-TO-HAVE.md).
+
 ### Local development
 
 All `cargo` commands run from the repo root. Project aliases live in
 [.cargo/config.toml](.cargo/config.toml) (Cargo discovers it by walking up from any
 crate directory):
 
-| Alias | Expands to | Purpose |
-|---|---|---|
-| `cargo ba` | `cargo test --no-run --all-targets --benches` | Build all targets (prefer over `cargo build`) |
-| `cargo bar` | `cargo ba --release` | Same, release mode |
-| `cargo tt` | `cargo test -- --test-threads=1` | Run tests serially |
-| `cargo ca` | `cargo clippy --all-targets -- -D warnings` | Lint; warnings are errors |
-| `cargo fa` / `cargo fac` | `cargo fmt --all` / `--check` | Format / check formatting |
-
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs `cargo ba`, clippy
 (`-D warnings`), `cargo fmt --check`, and the test suite on every pull request, all
 with `--locked` so a stale `Cargo.lock` fails the build. The three tool Docker images
 build from one shared [tools.Dockerfile](tools.Dockerfile) (one builder stage, three
 targets), also with `--locked`.
-
-## Documents
-
-- [SETTINGS.md](./docs/SETTINGS.md), every setting, its default and what it does.
-- [nice-to-have.md](./docs/nice-to-have.md), all limitations, future enhancements and
-  proposed features with rationale and implementation plans.
-- [runbook.txt](./runbook.txt), handy `bitcoin-cli` one-liners against the simnet.
-
-## Limitations and future enhancements
-
-All known limitations, future enhancements and proposed features live in
-[nice-to-have.md](./docs/nice-to-have.md).
 
 # Trouble shotting
 

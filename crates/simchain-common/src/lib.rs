@@ -8,6 +8,18 @@
 use bitcoincore_rpc::{jsonrpc, Client};
 use std::env;
 use std::time::Duration;
+use thiserror::Error;
+
+/// Errors produced while constructing an RPC client from configuration.
+#[derive(Debug, Error)]
+pub enum CommonError {
+    #[error("invalid RPC url '{url}': {source}")]
+    InvalidRpcUrl {
+        url: String,
+        #[source]
+        source: jsonrpc::simple_http::Error,
+    },
+}
 
 /// A node busy with a big mempool or mid-block-assembly can take longer than
 /// the default 15s RPC timeout (a large `sendmany` alone can, and so can
@@ -22,23 +34,34 @@ pub fn env_or(key: &str, default: &str) -> String {
 }
 
 /// Build a Bitcoin Core RPC [`Client`] with the shared [`RPC_TIMEOUT_SECS`]
-/// timeout.
-pub fn create_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Client {
-    Client::from_jsonrpc(create_jsonrpc_client(rpc_url, rpc_user, rpc_pass))
+/// timeout. Fails with [`CommonError::InvalidRpcUrl`] if `rpc_url` does not
+/// parse.
+pub fn create_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Result<Client, CommonError> {
+    Ok(Client::from_jsonrpc(create_jsonrpc_client(
+        rpc_url, rpc_user, rpc_pass,
+    )?))
 }
 
 /// Build the underlying [`jsonrpc::Client`]. Exposed for callers that need the
 /// raw JSON-RPC client (the spammer's raw-transaction engine) rather than the
-/// wrapped [`Client`].
-pub fn create_jsonrpc_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> jsonrpc::Client {
+/// wrapped [`Client`]. Fails with [`CommonError::InvalidRpcUrl`] if `rpc_url`
+/// does not parse.
+pub fn create_jsonrpc_client(
+    rpc_url: &str,
+    rpc_user: &str,
+    rpc_pass: &str,
+) -> Result<jsonrpc::Client, CommonError> {
     let (user, pass) = (rpc_user.to_string(), Some(rpc_pass.to_string()));
     let transport = jsonrpc::simple_http::SimpleHttpTransport::builder()
         .url(rpc_url)
-        .expect("invalid RPC url")
+        .map_err(|source| CommonError::InvalidRpcUrl {
+            url: rpc_url.to_string(),
+            source,
+        })?
         .auth(user, pass)
         .timeout(Duration::from_secs(RPC_TIMEOUT_SECS))
         .build();
-    jsonrpc::Client::with_transport(transport)
+    Ok(jsonrpc::Client::with_transport(transport))
 }
 
 #[cfg(test)]

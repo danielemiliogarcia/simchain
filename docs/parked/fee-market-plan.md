@@ -32,7 +32,7 @@ spreads spam fee rates across a configurable range so `estimatesmartfee`, the me
 explorer's fee histogram, and RBF/fee-bumping logic in projects under test become
 meaningful.
 
-This plan supersedes the original implementation sketch from `nice-to-have.md`: that sketch
+This plan supersedes the original implementation sketch from `NICE-TO-HAVE.md`: that sketch
 (pass `fee_rate` to `send_to_address`/`send_many`) predates the raw engine, which is now
 the default and computes fees itself (`fee_from_vsize` in
 `crates/spammer/src/raw_transaction_spammer.rs`). Size/output-count variance from the sketch
@@ -238,7 +238,7 @@ neighbors):
   - Update "The fee market: what spam pays..." section (line ~105) to mention the new
     mode exists and link the new subsection.
 
-### 3.6 `nice-to-have.md`
+### 3.6 `NICE-TO-HAVE.md`
 
 Per repo convention: **delete** the fee-market entry from the Parked features section
 entirely (never mark done), drop this plan from `docs/parked/`, and fix every reference

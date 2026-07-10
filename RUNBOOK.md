@@ -1,35 +1,79 @@
-# Handy one-liners against the simnet.
-# Credentials below are the defaults; replace with your BTC_RPC_USER / BTC_RPC_PASS from .env
+# Runbook
 
+Handy `bitcoin-cli` one-liners against the simnet. This how all this started... trying a bunch of docker commands
+
+> The credentials in the commands below (`-rpcuser=foo -rpcpassword=rpcpassword`)
+> are the defaults; replace them with your `BTC_RPC_USER` / `BTC_RPC_PASS` from
+> `.env`.
+
+## Peer management
+
+Add a peer:
+
+```bash
 docker exec btc-simnet-node1 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword addnode btc-simnet-node2:18444 add
+```
 
+Inspect connected peers:
+
+```bash
 docker exec btc-simnet-node1 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword getpeerinfo
+```
 
-# mine manually (e.g. after stopping the mining controller)
+## Manual mining
+
+Mine manually (e.g. after stopping the mining controller):
+
+```bash
 while true; do
   docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword generatetoaddress 1 bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr
   sleep 5
 done
+```
 
-# spam manually
+## Manual spam
+
+Spam manually:
+
+```bash
 while true; do
     for i in $(seq 0 10); do
       docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.0000050$i "spam$i"
     done
   sleep 5
 done
+```
 
-# get utxos
+## UTXOs & balance
+
+Get UTXOs:
+
+```bash
 docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword scantxoutset start '["addr(bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr)"]'
+```
 
-# get total balance
+Get total balance:
+
+```bash
 docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword scantxoutset start '["addr(bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr)"]' | jq '[.unspents[].amount] | add'
+```
 
-# one-shot reorg of the last 3 blocks
+## Reorgs
+
+One-shot reorg of the last 3 blocks:
+
+```bash
 ./simulate-reorg.sh 3
+```
 
-# chaos reorg: replace them with empty blocks (orphaned txs stay unconfirmed)
+Chaos reorg: replace them with empty blocks (orphaned txs stay unconfirmed):
+
+```bash
 ./simulate-reorg.sh 3 empty
+```
 
-# continuous reorgs: every AUTO_REORG_EVERY_BLOCKS blocks, reorg REORG_DEPTH blocks
+Continuous reorgs: every `AUTO_REORG_EVERY_BLOCKS` blocks, reorg `REORG_DEPTH` blocks:
+
+```bash
 REORG_MODE=auto docker compose --profile reorg up btc-simnet-reorg
+```

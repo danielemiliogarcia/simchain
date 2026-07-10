@@ -31,10 +31,13 @@ pub fn rpc_retry<T>(what: &str, mut call: impl FnMut() -> Result<T, bitcoincore_
         match call() {
             Ok(value) => return value,
             Err(error) if attempt == ATTEMPTS => {
+                tracing::error!("RPC {what} failed after {ATTEMPTS} attempts: {error}");
                 panic!("RPC {what} failed after {ATTEMPTS} attempts: {error}")
             }
             Err(error) => {
-                println!("RPC {what} failed ({error}), retry {attempt}/{ATTEMPTS} in {delay:?}");
+                tracing::warn!(
+                    "RPC {what} failed ({error}), retry {attempt}/{ATTEMPTS} in {delay:?}"
+                );
                 thread::sleep(delay);
                 delay = (delay * 2).min(Duration::from_secs(30));
             }
@@ -67,7 +70,7 @@ pub fn burn_address(index: u64) -> Address {
 // 50 BTC coinbase, so this returns quickly; it only really waits when the
 // spammer starts before the mining controller finishes funding.
 pub fn wait_for_funds(wallet: &Client, name: &str) {
-    println!("Waiting for wallet '{name}' funds to mature...");
+    tracing::info!("Waiting for wallet '{name}' funds to mature...");
     let minimum = Amount::from_btc(1.0).unwrap();
     let mut iterations = 0u64;
     loop {
@@ -75,7 +78,7 @@ pub fn wait_for_funds(wallet: &Client, name: &str) {
             Ok(balances) if balances.mine.trusted >= minimum => return,
             Ok(balances) => {
                 if iterations > 0 && iterations.is_multiple_of(60) {
-                    println!(
+                    tracing::info!(
                         "Still waiting for wallet '{name}': trusted balance {:.8} BTC < 1 BTC (coinbase maturity)",
                         balances.mine.trusted.to_btc()
                     );
@@ -83,7 +86,7 @@ pub fn wait_for_funds(wallet: &Client, name: &str) {
             }
             Err(error) => {
                 if iterations > 0 && iterations.is_multiple_of(60) {
-                    println!(
+                    tracing::info!(
                         "Still waiting for wallet '{name}': not loaded yet (the mining controller creates it during bootstrap) — {error}"
                     );
                 }

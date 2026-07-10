@@ -21,7 +21,7 @@ fn run_block_loop(node1: &Client, mut cycle: impl FnMut() -> usize) {
             spammed_at_block_height = current_block_height;
             let cycle_start = std::time::Instant::now();
             let accepted = cycle();
-            println!(
+            tracing::info!(
                 "Spam cycle done in {:.1}s ({accepted} txs accepted)",
                 cycle_start.elapsed().as_secs_f32()
             );
@@ -30,13 +30,20 @@ fn run_block_loop(node1: &Client, mut cycle: impl FnMut() -> usize) {
     }
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "simchain_spammer=info,info".parse().unwrap()),
+        )
+        .init();
+
     // Every setting has a default matching docker-compose.yml, so the tool
     // also runs standalone with no environment at all.
     let enable_spam = env_or("ENABLE_SPAM", "true") == "true";
     if !enable_spam {
-        println!("ENABLE_SPAM is not 'true', nothing to do, exiting");
-        return;
+        tracing::info!("ENABLE_SPAM is not 'true', nothing to do, exiting");
+        return Ok(());
     }
 
     // Which engine builds the spam: true (default) = raw engine, the spammer
@@ -61,7 +68,7 @@ fn main() {
                 let per_miner: u64 = v
                     .parse()
                     .expect("SPAM_PER_MINER_PER_BLOCK must be a positive integer");
-                println!("WARNING: SPAM_PER_MINER_PER_BLOCK is deprecated, set SPAM_FIXED_TXS_PER_BLOCK (total per block) instead; using {}", per_miner * MINER_COUNT);
+                tracing::warn!("SPAM_PER_MINER_PER_BLOCK is deprecated, set SPAM_FIXED_TXS_PER_BLOCK (total per block) instead; using {}", per_miner * MINER_COUNT);
                 per_miner * MINER_COUNT
             }
             Err(_) => 100,
@@ -94,7 +101,7 @@ fn main() {
             .parse()
             .expect("SPAM_TX_DATA_MAX_BYTES must be a non-negative integer");
         if requested > MAX_DATA_BYTES {
-            println!("WARNING: SPAM_TX_DATA_MAX_BYTES={requested} exceeds the {MAX_DATA_BYTES}-byte standard-tx limit, clamping to {MAX_DATA_BYTES}");
+            tracing::warn!("SPAM_TX_DATA_MAX_BYTES={requested} exceeds the {MAX_DATA_BYTES}-byte standard-tx limit, clamping to {MAX_DATA_BYTES}");
             MAX_DATA_BYTES
         } else {
             requested
@@ -163,19 +170,19 @@ fn main() {
     let node2_url = env_or("NODE2_RPC_URL", "http://btc-simnet-node2:18443");
     let node3_url = env_or("NODE3_RPC_URL", "http://btc-simnet-node3:18443");
 
-    let node1 = create_client(&node1_url, &rpc_user, &rpc_pass);
+    let node1 = create_client(&node1_url, &rpc_user, &rpc_pass)?;
     // Wallet-scoped clients: they keep working even if the user loads extra
     // wallets on the nodes (the generic RPC path breaks with more than one)
     let wallet2 = create_client(
         &format!("{node2_url}/wallet/{wallet2_name}"),
         &rpc_user,
         &rpc_pass,
-    );
+    )?;
     let wallet3 = create_client(
         &format!("{node3_url}/wallet/{wallet3_name}"),
         &rpc_user,
         &rpc_pass,
-    );
+    )?;
 
     wait_for_funds(&wallet2, &wallet2_name);
     wait_for_funds(&wallet3, &wallet3_name);
@@ -187,9 +194,9 @@ fn main() {
         // template from a fresh local floor pool without waiting on P2P
         // propagation. Bulk DATA txs stay on the owner-node path.
         let mut engine2 = RawSpammer::new(
-            create_client(&node2_url, &rpc_user, &rpc_pass),
-            create_jsonrpc_client(&node2_url, &rpc_user, &rpc_pass),
-            vec![create_jsonrpc_client(&node3_url, &rpc_user, &rpc_pass)],
+            create_client(&node2_url, &rpc_user, &rpc_pass)?,
+            create_jsonrpc_client(&node2_url, &rpc_user, &rpc_pass)?,
+            vec![create_jsonrpc_client(&node3_url, &rpc_user, &rpc_pass)?],
             wallet2,
             &wallet2_name,
             "Node 2",
@@ -199,9 +206,9 @@ fn main() {
             data_max_bytes,
         );
         let mut engine3 = RawSpammer::new(
-            create_client(&node3_url, &rpc_user, &rpc_pass),
-            create_jsonrpc_client(&node3_url, &rpc_user, &rpc_pass),
-            vec![create_jsonrpc_client(&node2_url, &rpc_user, &rpc_pass)],
+            create_client(&node3_url, &rpc_user, &rpc_pass)?,
+            create_jsonrpc_client(&node3_url, &rpc_user, &rpc_pass)?,
+            vec![create_jsonrpc_client(&node2_url, &rpc_user, &rpc_pass)?],
             wallet3,
             &wallet3_name,
             "Node 3",
@@ -221,19 +228,19 @@ fn main() {
             let required_min = std::cmp::max(12, (fill_block_ratio * 10.0).ceil() as u64);
             let effective_fanout = if fanout_auto {
                 let f = std::cmp::max(12, (fill_block_ratio * 15.0).ceil() as u64);
-                println!("Raw DATA/HYBRID mode: fanout auto-derived to {f} branches (SPAM_FILL_BLOCK_RATIO={fill_block_ratio} x15, min 12)");
+                tracing::info!("Raw DATA/HYBRID mode: fanout auto-derived to {f} branches (SPAM_FILL_BLOCK_RATIO={fill_block_ratio} x15, min 12)");
                 f
             } else {
                 assert!(
                     fanout_utxos >= required_min,
                     "SPAM_FANOUT_UTXOS={fanout_utxos} is too low for SPAM_FILL_BLOCK_RATIO={fill_block_ratio}: need >= {required_min} branches (ratio x10) to hold that many blocks of unconfirmed spam, or the mempool cannot reach the target and blocks come out partial. Raise SPAM_FANOUT_UTXOS to >= {required_min}, or set SPAM_FANOUT_AUTO=true."
                 );
-                println!("Raw DATA/HYBRID mode: fanout manual {fanout_utxos} branches (SPAM_FANOUT_AUTO=false)");
+                tracing::info!("Raw DATA/HYBRID mode: fanout manual {fanout_utxos} branches (SPAM_FANOUT_AUTO=false)");
                 fanout_utxos
             };
             if fill_block_ratio < 1.0 && (fallback_fee - 0.0001).abs() > 1e-9 {
-                println!(
-                    "WARNING: SPAM_FILL_BLOCK_RATIO={fill_block_ratio} < 1 leaves blocks only ~{:.0}% full, so the raised FALLBACK_FEE floor will NOT hold -- cheaper txs still confirm in the unused block space, and the floor fill pool cannot seal deliberately partial blocks (expected if you are simulating an uncongested chain).",
+                tracing::warn!(
+                    "SPAM_FILL_BLOCK_RATIO={fill_block_ratio} < 1 leaves blocks only ~{:.0}% full, so the raised FALLBACK_FEE floor will NOT hold -- cheaper txs still confirm in the unused block space, and the floor fill pool cannot seal deliberately partial blocks (expected if you are simulating an uncongested chain).",
                     fill_block_ratio * 100.0
                 );
             }
@@ -247,8 +254,8 @@ fn main() {
             // A full block is 4M WU = 1M vB; getmempoolinfo's `bytes` is the
             // mempool's total vsize, in the same units.
             const BLOCK_VSIZE: u64 = 1_000_000;
-            let meter = create_client(&node1_url, &rpc_user, &rpc_pass);
-            println!(
+            let meter = create_client(&node1_url, &rpc_user, &rpc_pass)?;
+            tracing::info!(
                 "Spam engine: raw DATA/HYBRID mode, {data_min_bytes}..{data_max_bytes} byte OP_RETURN, {small_txs_per_block} gap-sealers/block, {floor_pool_txs} standing 110-vB floor fills, fill {fill_block_ratio} block(s), floor {fee_rate_sat_vb} sat/vB"
             );
             run_block_loop(&node1, move || {
@@ -303,11 +310,11 @@ fn main() {
             });
         } else {
             // OUTPUT mode: a fixed count of burn-output txs per block.
-            println!(
+            tracing::info!(
                 "Spam engine: raw transactions (USE_RAW_TX_SPAM=true), OUTPUT mode, {fee_rate_sat_vb} sat/vB"
             );
             if floor_pool_txs > 0 {
-                println!(
+                tracing::info!(
                     "NOTE: SPAM_FLOOR_POOL_TXS only applies to DATA/HYBRID mode (SPAM_TX_DATA_MAX_BYTES > 0); no floor fill pool in OUTPUT mode"
                 );
             }
@@ -341,7 +348,7 @@ fn main() {
             });
         }
     } else {
-        println!("Spam engine: node wallets (USE_RAW_TX_SPAM=false)");
+        tracing::info!("Spam engine: node wallets (USE_RAW_TX_SPAM=false)");
         // Sequential mode target: one shared burn address -- reusing a single
         // address is exactly what real dust spam looks like.
         let seq_addr = burn_address(0);
@@ -395,4 +402,6 @@ fn main() {
             txids2.len() + txids3.len()
         });
     }
+
+    Ok(())
 }

@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context};
 use bitcoincore_rpc::{
     bitcoin::{address::NetworkUnchecked, Address, Amount, Network, Txid},
     Client, RpcApi,
@@ -6,7 +7,7 @@ use serde_json::json;
 use simchain_common::{create_client, env_or};
 use std::{
     collections::HashSet,
-    env, process, thread,
+    env, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -50,7 +51,7 @@ fn wait_for_node(node: &Client, name: &str) {
         match node.get_block_count() {
             Ok(_) => return,
             Err(_) => {
-                println!("Waiting for {name} RPC...");
+                tracing::info!("Waiting for {name} RPC...");
                 thread::sleep(Duration::from_secs(1));
             }
         }
@@ -80,7 +81,7 @@ fn last_blocks(
 /// the newest block is always on the last line, like ordered shell output.
 fn print_blocks(blocks: &[(u64, String, usize)]) {
     for (height, hash, txs) in blocks.iter().rev() {
-        println!("{height} : {txs:>3} txs -> {hash}");
+        tracing::info!("{height} : {txs:>3} txs -> {hash}");
     }
 }
 
@@ -95,32 +96,38 @@ fn inject_transactions(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Cli
     let wallet_name = match node.list_wallets() {
         Ok(wallets) if wallets.contains(&preferred) => preferred,
         Ok(wallets) if !wallets.is_empty() => {
-            println!(
+            tracing::warn!(
                 "Wallet '{preferred}' not loaded on the reorg node, using '{}' instead",
                 wallets[0]
             );
             wallets[0].clone()
         }
         _ => {
-            println!("No wallet loaded on the reorg node, cannot add new transactions");
+            tracing::warn!("No wallet loaded on the reorg node, cannot add new transactions");
             return;
         }
     };
-    let wallet = create_client(
+    let wallet = match create_client(
         &format!("{rpc_url}/wallet/{wallet_name}"),
         rpc_user,
         rpc_pass,
-    );
+    ) {
+        Ok(wallet) => wallet,
+        Err(e) => {
+            tracing::error!("Wallet client build failed ({e}), skipping tx injection");
+            return;
+        }
+    };
     let address = match wallet.get_new_address(None, None) {
         Ok(a) => match a.require_network(Network::Regtest) {
             Ok(a) => a,
             Err(e) => {
-                println!("Wallet address not usable ({e}), skipping tx injection");
+                tracing::warn!("Wallet address not usable ({e}), skipping tx injection");
                 return;
             }
         },
         Err(e) => {
-            println!(
+            tracing::warn!(
                 "Could not get an address from wallet '{wallet_name}' ({e}), skipping tx injection"
             );
             return;
@@ -140,15 +147,17 @@ fn inject_transactions(rpc_url: &str, rpc_user: &str, rpc_pass: &str, node: &Cli
         ) {
             Ok(_) => sent += 1,
             Err(e) => {
-                println!("Tx injection stopped after {sent} txs: {e}");
+                tracing::warn!("Tx injection stopped after {sent} txs: {e}");
                 break;
             }
         }
     }
     if sent > 0 {
-        println!("Added {sent} new transactions from wallet '{wallet_name}' (txs this node saw first) to mine into the winning chain");
+        tracing::info!("Added {sent} new transactions from wallet '{wallet_name}' (txs this node saw first) to mine into the winning chain");
     } else {
-        println!("Could not add new transactions (wallet '{wallet_name}' has no spendable funds)");
+        tracing::warn!(
+            "Could not add new transactions (wallet '{wallet_name}' has no spendable funds)"
+        );
     }
 }
 
@@ -174,13 +183,15 @@ fn ensure_network_adopts(
             match witness.get_best_block_hash() {
                 Ok(hash) if hash == tip => {
                     if extra > 0 {
-                        println!("Network adopted the new chain after {extra} extra block(s)");
+                        tracing::info!(
+                            "Network adopted the new chain after {extra} extra block(s)"
+                        );
                     }
                     return Ok(());
                 }
                 Ok(_) => thread::sleep(Duration::from_millis(250)),
                 Err(e) => {
-                    println!("Witness node '{witness_name}' unreachable ({e}), cannot verify the network reorged");
+                    tracing::warn!("Witness node '{witness_name}' unreachable ({e}), cannot verify the network reorged");
                     return Ok(());
                 }
             }
@@ -188,14 +199,14 @@ fn ensure_network_adopts(
         if extra == max_extra {
             break;
         }
-        println!("'{witness_name}' is still on the old chain (miners kept extending it), mining 1 extra block...");
+        tracing::info!("'{witness_name}' is still on the old chain (miners kept extending it), mining 1 extra block...");
         if empty_mode {
             mine_exact(node, mine_address, &[])?;
         } else {
             node.generate_to_address(1, mine_address)?;
         }
     }
-    println!("WARNING: the network did not adopt the new chain after {max_extra} extra blocks");
+    tracing::warn!("the network did not adopt the new chain after {max_extra} extra blocks");
     Ok(())
 }
 
@@ -234,7 +245,7 @@ fn mine_exact(
         &[json!(mine_address.to_string()), json!(list)],
     ) {
         Ok(_) => return Ok(()),
-        Err(e) => println!(
+        Err(e) => tracing::warn!(
             "generateblock rejected {} tx(s) ({e}), re-filtering to the live mempool...",
             list.len()
         ),
@@ -253,7 +264,7 @@ fn mine_exact(
     // untouched txs stay in the mempool for the next block's sweep.
     let dropped = list.len() - filtered.len();
     if !filtered.is_empty() && dropped > 0 {
-        println!(
+        tracing::info!(
             "  dropped {dropped} stale tx(s), mining the remaining {}",
             filtered.len()
         );
@@ -262,7 +273,7 @@ fn mine_exact(
             &[json!(mine_address.to_string()), json!(filtered)],
         )?;
     } else {
-        println!(
+        tracing::info!(
             "  mining an empty block, {} tx(s) left for the next block",
             filtered.len()
         );
@@ -291,12 +302,12 @@ fn do_reorg(
 ) -> Result<(), bitcoincore_rpc::Error> {
     let tip = node.get_block_count()?;
     if tip < depth + 1 {
-        println!("Chain too short (height {tip}) to reorg {depth} blocks, skipping");
+        tracing::warn!("Chain too short (height {tip}) to reorg {depth} blocks, skipping");
         return Ok(());
     }
 
-    println!("\n=== Simulating a reorg of the last {depth} blocks ===\n");
-    println!("--- Last {} blocks BEFORE reorg ---", depth + 2);
+    tracing::info!("\n=== Simulating a reorg of the last {depth} blocks ===\n");
+    tracing::info!("--- Last {} blocks BEFORE reorg ---", depth + 2);
     let before = last_blocks(node, depth + 2)?;
     print_blocks(&before);
 
@@ -304,14 +315,14 @@ fn do_reorg(
     let target_hash = node.get_block_hash(target_height)?;
     let target_time = node.get_block_info(&target_hash)?.time as u64;
 
-    println!("\nInvalidating block {target_height} ({target_hash})...");
+    tracing::info!("\nInvalidating block {target_height} ({target_hash})...");
     node.invalidate_block(&target_hash)?;
 
     // Count the txs the orphaned blocks returned to the mempool (for the
     // summary). The mining below reads the mempool live for each block, so RBF
     // replacements that arrive mid-reorg are handled without special-casing.
     let returned = node.get_raw_mempool()?.len();
-    println!("{returned} transactions returned to the mempool from the orphaned blocks");
+    tracing::info!("{returned} transactions returned to the mempool from the orphaned blocks");
 
     // A replacement block with the same timestamp and coinbase as the
     // invalidated one hashes identically and is rejected as known-invalid,
@@ -325,7 +336,7 @@ fn do_reorg(
         // Chaos reorg: mine empty replacement blocks and leave the orphaned txs
         // unconfirmed in the mempool, like a miner that reorgs with empty
         // blocks. adds_new_txs is ignored -- empty means empty.
-        println!("Mining {blocks_to_mine} EMPTY replacement blocks (chaos reorg, one extra so the new chain wins network-wide)...");
+        tracing::info!("Mining {blocks_to_mine} EMPTY replacement blocks (chaos reorg, one extra so the new chain wins network-wide)...");
         for _ in 0..blocks_to_mine {
             mine_exact(node, mine_address, &[])?;
         }
@@ -340,7 +351,7 @@ fn do_reorg(
         // like the competing chain of a real reorg. Reading it fresh each round
         // reflects any RBF replacements; the last block's ceil takes whatever is
         // left, so no tx is stranded.
-        println!("Mining {blocks_to_mine} replacement blocks from the live mempool (one extra so the new chain wins network-wide)...");
+        tracing::info!("Mining {blocks_to_mine} replacement blocks from the live mempool (one extra so the new chain wins network-wide)...");
         for i in 0..blocks_to_mine as usize {
             let blocks_left = blocks_to_mine as usize - i;
             let live = live_mempool_topo(node)?;
@@ -357,27 +368,36 @@ fn do_reorg(
     }
     thread::sleep(Duration::from_secs(2));
 
-    println!("\n--- Last {} blocks AFTER reorg ---", depth + 3);
+    tracing::info!("\n--- Last {} blocks AFTER reorg ---", depth + 3);
     let after = last_blocks(node, depth + 3)?;
     print_blocks(&after);
 
-    println!("\n--- Replaced blocks ---");
+    tracing::info!("\n--- Replaced blocks ---");
     for (height, old_hash, old_txs) in before.iter().rev() {
         if let Some((_, new_hash, new_txs)) = after.iter().find(|(h, _, _)| h == height) {
             if new_hash != old_hash {
-                println!("{height} : {old_hash} ({old_txs} txs) => {new_hash} ({new_txs} txs)");
+                tracing::info!(
+                    "{height} : {old_hash} ({old_txs} txs) => {new_hash} ({new_txs} txs)"
+                );
             }
         }
     }
 
-    println!(
+    tracing::info!(
         "\n=== Reorg done: blocks from height {target_height} replaced, new tip {} ===",
         node.get_block_count()?
     );
     Ok(())
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "simchain_reorg=info,info".parse().unwrap()),
+        )
+        .init();
+
     let rpc_user = env_or("BTC_RPC_USER", "foo");
     let rpc_pass = env_or("BTC_RPC_PASS", "rpcpassword");
     let node_name = env_or("REORG_NODE", "btc-simnet-node3");
@@ -410,8 +430,7 @@ fn main() {
                 .expect("REORG_DEPTH must be a positive integer")
         });
     if depth < 1 {
-        eprintln!("Reorg depth must be at least 1");
-        process::exit(1);
+        return Err(anyhow!("Reorg depth must be at least 1"));
     }
 
     let mine_address: Address<NetworkUnchecked> = env_or(
@@ -419,13 +438,13 @@ fn main() {
         "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr",
     )
     .parse()
-    .expect("Invalid REORG_MINE_ADDRESS");
+    .context("Invalid REORG_MINE_ADDRESS")?;
     let mine_address = mine_address
         .require_network(Network::Regtest)
-        .expect("REORG_MINE_ADDRESS must be a regtest address");
+        .context("REORG_MINE_ADDRESS must be a regtest address")?;
 
     let rpc_url = format!("http://{node_name}:{rpc_port}");
-    let node = create_client(&rpc_url, &rpc_user, &rpc_pass);
+    let node = create_client(&rpc_url, &rpc_user, &rpc_pass).context("build reorg node client")?;
     wait_for_node(&node, &node_name);
 
     // Witness node: another node polled after the reorg to confirm the whole
@@ -440,13 +459,14 @@ fn main() {
             &format!("http://{witness_name}:{rpc_port}"),
             &rpc_user,
             &rpc_pass,
-        );
+        )
+        .context("build witness node client")?;
         Some((&witness_client, witness_name.as_str()))
     };
 
     match mode.as_str() {
         "once" => {
-            if let Err(e) = do_reorg(
+            do_reorg(
                 &node,
                 &rpc_url,
                 &rpc_user,
@@ -456,20 +476,17 @@ fn main() {
                 adds_new_txs,
                 empty_mode,
                 witness,
-            ) {
-                eprintln!("Reorg failed: {e}");
-                process::exit(1);
-            }
+            )
+            .context("reorg failed")?;
         }
         "auto" => {
             if every <= depth {
-                eprintln!(
+                return Err(anyhow!(
                     "AUTO_REORG_EVERY_BLOCKS ({every}) must be greater than REORG_DEPTH ({depth})"
-                );
-                process::exit(1);
+                ));
             }
-            let mut last = node.get_block_count().expect("get_block_count failed");
-            println!("Auto-reorg mode: every {every} blocks, reorg the last {depth} (current height {last})");
+            let mut last = node.get_block_count().context("get_block_count failed")?;
+            tracing::info!("Auto-reorg mode: every {every} blocks, reorg the last {depth} (current height {last})");
             loop {
                 match node.get_block_count() {
                     Ok(tip) if tip >= last + every => {
@@ -484,19 +501,22 @@ fn main() {
                             empty_mode,
                             witness,
                         ) {
-                            eprintln!("Reorg failed: {e}");
+                            tracing::error!("Reorg failed: {e}");
                         }
                         last = node.get_block_count().unwrap_or(tip);
                     }
                     Ok(_) => {}
-                    Err(e) => println!("RPC error while polling height: {e}"),
+                    Err(e) => tracing::warn!("RPC error while polling height: {e}"),
                 }
                 thread::sleep(Duration::from_secs(2));
             }
         }
         other => {
-            eprintln!("Unknown REORG_MODE '{other}' (expected: once | auto)");
-            process::exit(1);
+            return Err(anyhow!(
+                "Unknown REORG_MODE '{other}' (expected: once | auto)"
+            ));
         }
     }
+
+    Ok(())
 }
