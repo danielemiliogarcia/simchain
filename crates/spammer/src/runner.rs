@@ -2,7 +2,7 @@
 
 use crate::{
     burn::{burn_address, MINER_COUNT},
-    config::Config,
+    config::SpamConfig,
     node_wallet_spammer,
     raw_transaction_spammer::RawSpammer,
     wallet::wait_for_funds,
@@ -33,57 +33,40 @@ fn run_block_loop(node1: &Client, mut cycle: impl FnMut() -> usize) {
 
 /// Connect the node and wallet clients, wait for mature funds, then start the
 /// configured spam engine.
-pub fn run(config: Option<&Config>) -> anyhow::Result<()> {
-    let Some(config) = config else {
+pub fn run() -> anyhow::Result<()> {
+    if !SpamConfig::is_enabled() {
         tracing::info!("ENABLE_SPAM is not 'true', nothing to do, exiting");
         return Ok(());
-    };
+    }
 
-    let node1 = create_client(&config.node1_url, &config.rpc_user, &config.rpc_pass)?;
+    let config = SpamConfig::global();
+    let node1 = create_client(&config.node1_url)?;
     // Wallet-scoped clients keep working even if a user loads extra wallets on
     // a node (the generic RPC path breaks with more than one wallet).
-    let wallet2 = create_wallet_client(
-        &config.node2_url,
-        &config.wallet2_name,
-        &config.rpc_user,
-        &config.rpc_pass,
-    )?;
-    let wallet3 = create_wallet_client(
-        &config.node3_url,
-        &config.wallet3_name,
-        &config.rpc_user,
-        &config.rpc_pass,
-    )?;
+    let wallet2 = create_wallet_client(&config.node2_url, &config.wallet2_name)?;
+    let wallet3 = create_wallet_client(&config.node3_url, &config.wallet3_name)?;
 
     wait_for_funds(&wallet2, &config.wallet2_name);
     wait_for_funds(&wallet3, &config.wallet3_name);
 
     if config.use_raw {
-        run_raw(config, &node1, wallet2, wallet3)
+        run_raw(&node1, wallet2, wallet3)
     } else {
-        run_node_wallets(config, &node1, wallet2, wallet3);
+        run_node_wallets(&node1, wallet2, wallet3);
         Ok(())
     }
 }
 
-fn run_raw(
-    config: &Config,
-    node1: &Client,
-    wallet2: Client,
-    wallet3: Client,
-) -> anyhow::Result<()> {
+fn run_raw(node1: &Client, wallet2: Client, wallet3: Client) -> anyhow::Result<()> {
+    let config = SpamConfig::global();
     // Raw engine: one instance per miner node, each with its own key and UTXO
     // pool. Floor fills are relayed to the other miner by RPC so both rotating
     // miners can template from a fresh local floor pool without waiting for P2P
     // propagation. Bulk DATA txs stay on their owner-node path.
     let mut engine2 = RawSpammer::new(
-        create_client(&config.node2_url, &config.rpc_user, &config.rpc_pass)?,
-        create_jsonrpc_client(&config.node2_url, &config.rpc_user, &config.rpc_pass)?,
-        vec![create_jsonrpc_client(
-            &config.node3_url,
-            &config.rpc_user,
-            &config.rpc_pass,
-        )?],
+        create_client(&config.node2_url)?,
+        create_jsonrpc_client(&config.node2_url)?,
+        vec![create_jsonrpc_client(&config.node3_url)?],
         wallet2,
         &config.wallet2_name,
         "Node 2",
@@ -93,13 +76,9 @@ fn run_raw(
         config.data_max_bytes,
     );
     let mut engine3 = RawSpammer::new(
-        create_client(&config.node3_url, &config.rpc_user, &config.rpc_pass)?,
-        create_jsonrpc_client(&config.node3_url, &config.rpc_user, &config.rpc_pass)?,
-        vec![create_jsonrpc_client(
-            &config.node2_url,
-            &config.rpc_user,
-            &config.rpc_pass,
-        )?],
+        create_client(&config.node3_url)?,
+        create_jsonrpc_client(&config.node3_url)?,
+        vec![create_jsonrpc_client(&config.node2_url)?],
         wallet3,
         &config.wallet3_name,
         "Node 3",
@@ -110,33 +89,26 @@ fn run_raw(
     );
 
     if config.data_max_bytes > 0 {
-        run_raw_data_mode(config, node1, &mut engine2, &mut engine3)?;
+        run_raw_data_mode(node1, &mut engine2, &mut engine3)?;
     } else {
-        run_raw_output_mode(config, node1, &mut engine2, &mut engine3);
+        run_raw_output_mode(node1, &mut engine2, &mut engine3);
     }
     Ok(())
 }
 
 fn run_raw_data_mode(
-    config: &Config,
     node1: &Client,
     engine2: &mut RawSpammer,
     engine3: &mut RawSpammer,
 ) -> anyhow::Result<()> {
+    let config = SpamConfig::global();
     // The branch pool must hold R blocks of unconfirmed spam, and each branch
     // chain caps at ~101k vB, so it needs at least R x 10 branches.
-    let required_min = std::cmp::max(12, (config.fill_block_ratio * 10.0).ceil() as u64);
     let effective_fanout = if config.fanout_auto {
         let fanout = std::cmp::max(12, (config.fill_block_ratio * 15.0).ceil() as u64);
         tracing::info!("Raw DATA/HYBRID mode: fanout auto-derived to {fanout} branches (SPAM_FILL_BLOCK_RATIO={} x15, min 12)", config.fill_block_ratio);
         fanout
     } else {
-        assert!(
-            config.fanout_utxos >= required_min,
-            "SPAM_FANOUT_UTXOS={} is too low for SPAM_FILL_BLOCK_RATIO={}: need >= {required_min} branches (ratio x10) to hold that many blocks of unconfirmed spam, or the mempool cannot reach the target and blocks come out partial. Raise SPAM_FANOUT_UTXOS to >= {required_min}, or set SPAM_FANOUT_AUTO=true.",
-            config.fanout_utxos,
-            config.fill_block_ratio,
-        );
         tracing::info!(
             "Raw DATA/HYBRID mode: fanout manual {} branches (SPAM_FANOUT_AUTO=false)",
             config.fanout_utxos
@@ -158,7 +130,7 @@ fn run_raw_data_mode(
     let pool3 = config.floor_pool_txs / MINER_COUNT;
     // A full block is 4M WU = 1M vB; getmempoolinfo's `bytes` has the same unit.
     const BLOCK_VSIZE: u64 = 1_000_000;
-    let meter = create_client(&config.node1_url, &config.rpc_user, &config.rpc_pass)?;
+    let meter = create_client(&config.node1_url)?;
     tracing::info!(
         "Spam engine: raw DATA/HYBRID mode, {}..{} byte OP_RETURN, {} gap-sealers/block, {} standing 110-vB floor fills, fill {} block(s), floor {} sat/vB",
         config.data_min_bytes,
@@ -219,12 +191,8 @@ fn run_raw_data_mode(
     Ok(())
 }
 
-fn run_raw_output_mode(
-    config: &Config,
-    node1: &Client,
-    engine2: &mut RawSpammer,
-    engine3: &mut RawSpammer,
-) {
+fn run_raw_output_mode(node1: &Client, engine2: &mut RawSpammer, engine3: &mut RawSpammer) {
+    let config = SpamConfig::global();
     tracing::info!(
         "Spam engine: raw transactions (USE_RAW_TX_SPAM=true), OUTPUT mode, {} sat/vB",
         config.fee_rate_sat_vb
@@ -265,7 +233,8 @@ fn run_raw_output_mode(
     });
 }
 
-fn run_node_wallets(config: &Config, node1: &Client, wallet2: Client, wallet3: Client) {
+fn run_node_wallets(node1: &Client, wallet2: Client, wallet3: Client) {
+    let config = SpamConfig::global();
     tracing::info!("Spam engine: node wallets (USE_RAW_TX_SPAM=false)");
     // Sequential mode target: one shared burn address -- reusing a single
     // address is exactly what real dust spam looks like.

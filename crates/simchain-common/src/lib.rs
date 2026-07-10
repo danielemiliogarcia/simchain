@@ -7,13 +7,13 @@
 //! of drifting apart.
 
 mod address;
-mod env;
+pub mod config;
 mod error;
 mod logging;
 mod rpc;
 
 pub use address::require_regtest_address;
-pub use env::env_or;
+pub use config::{CommonConfig, ConfigError, RpcUrl};
 pub use error::CommonError;
 pub use logging::init_tracing;
 pub use rpc::{

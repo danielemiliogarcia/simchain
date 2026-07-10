@@ -1,5 +1,6 @@
 //! Bitcoin Core RPC client construction and the shared retry policy.
 
+use crate::config::CommonConfig;
 use crate::error::CommonError;
 use bitcoincore_rpc::{jsonrpc, Client, RpcApi};
 use std::thread;
@@ -73,39 +74,31 @@ pub fn wait_for_height(client: &Client, height: u64, poll_interval: Duration) {
 }
 
 /// Build a Bitcoin Core RPC [`Client`] with the shared [`RPC_TIMEOUT_SECS`]
-/// timeout. Fails with [`CommonError::InvalidRpcUrl`] if `rpc_url` does not
-/// parse.
-pub fn create_client(rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Result<Client, CommonError> {
-    Ok(Client::from_jsonrpc(create_jsonrpc_client(
-        rpc_url, rpc_user, rpc_pass,
-    )?))
+/// timeout and the process-global RPC credentials from [`CommonConfig`].
+/// `CommonConfig::init()` must run first in `main`. Fails with
+/// [`CommonError::InvalidRpcUrl`] if `rpc_url` does not parse.
+pub fn create_client(rpc_url: impl AsRef<str>) -> Result<Client, CommonError> {
+    Ok(Client::from_jsonrpc(create_jsonrpc_client(rpc_url)?))
 }
 
 /// Build a wallet-scoped RPC client. Wallet paths stay stable even when a node
 /// has multiple wallets loaded, unlike the generic node RPC endpoint.
 pub fn create_wallet_client(
-    node_rpc_url: &str,
+    node_rpc_url: impl AsRef<str>,
     wallet_name: &str,
-    rpc_user: &str,
-    rpc_pass: &str,
 ) -> Result<Client, CommonError> {
-    create_client(
-        &format!("{node_rpc_url}/wallet/{wallet_name}"),
-        rpc_user,
-        rpc_pass,
-    )
+    create_client(format!("{}/wallet/{wallet_name}", node_rpc_url.as_ref()))
 }
 
 /// Build the underlying [`jsonrpc::Client`]. Exposed for callers that need the
 /// raw JSON-RPC client (the spammer's raw-transaction engine) rather than the
-/// wrapped [`Client`]. Fails with [`CommonError::InvalidRpcUrl`] if `rpc_url`
-/// does not parse.
-pub fn create_jsonrpc_client(
-    rpc_url: &str,
-    rpc_user: &str,
-    rpc_pass: &str,
-) -> Result<jsonrpc::Client, CommonError> {
-    let (user, pass) = (rpc_user.to_string(), Some(rpc_pass.to_string()));
+/// wrapped [`Client`]. Uses the process-global RPC credentials from
+/// [`CommonConfig`], so `CommonConfig::init()` must run first in `main`. Fails
+/// with [`CommonError::InvalidRpcUrl`] if `rpc_url` does not parse.
+pub fn create_jsonrpc_client(rpc_url: impl AsRef<str>) -> Result<jsonrpc::Client, CommonError> {
+    let common = CommonConfig::global();
+    let rpc_url = rpc_url.as_ref();
+    let (user, pass) = (common.rpc_user.clone(), Some(common.rpc_pass.clone()));
     let transport = jsonrpc::simple_http::SimpleHttpTransport::builder()
         .url(rpc_url)
         .map_err(|source| CommonError::InvalidRpcUrl {
@@ -113,7 +106,7 @@ pub fn create_jsonrpc_client(
             source,
         })?
         .auth(user, pass)
-        .timeout(Duration::from_secs(RPC_TIMEOUT_SECS))
+        .timeout(common.rpc_timeout)
         .build();
     Ok(jsonrpc::Client::with_transport(transport))
 }

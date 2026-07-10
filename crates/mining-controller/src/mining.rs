@@ -2,7 +2,7 @@
 //! poisson block intervals, with reorg and external-block reporting.
 
 use crate::chain_view::{sync_view, ChainView, REORG_WINDOW};
-use crate::config::Config;
+use crate::config::MiningConfig;
 use crate::rng::Rng;
 use bitcoincore_rpc::{bitcoin::Address, Client, RpcApi};
 use simchain_common::{rpc_retry, wait_for_height};
@@ -17,7 +17,6 @@ use std::{thread, time::Duration};
 // generate_to_address already does that -- so detection only makes the
 // events visible here; nothing needs to be controlled.
 pub fn run(
-    config: &Config,
     seed: u64,
     mut rng: Rng,
     node2: &Client,
@@ -25,8 +24,9 @@ pub fn run(
     addr2: &Address,
     addr3: &Address,
 ) -> ! {
+    let config = MiningConfig::global();
     let mean_secs = config.mean_secs;
-    let poisson = config.poisson;
+    let poisson = config.interval_mode.is_poisson();
     let interval_bounds = config.interval_bounds;
     let miner_weights = config.miner_weights;
     let stochastic = poisson || miner_weights.is_some();

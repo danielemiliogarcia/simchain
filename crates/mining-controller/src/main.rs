@@ -9,11 +9,13 @@ mod rng;
 mod runner;
 mod wallet;
 
-use config::Config;
+use config::MiningConfig;
 use simchain_common::init_tracing;
 
 fn main() -> anyhow::Result<()> {
+    let _ = dotenvy::dotenv();
     init_tracing("simchain_mining_controller=info,info");
+    MiningConfig::init()?;
 
-    runner::run(&Config::from_env()?)
+    runner::run()
 }

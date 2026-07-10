@@ -1,10 +1,28 @@
-//! Environment-driven configuration: parsing and validation of every
-//! setting the controller reads, collected into one [`Config`].
+//! Environment-driven configuration: parsing and validation of every setting
+//! the controller reads, collected into one global [`MiningConfig`].
 
-use anyhow::Context;
 use bitcoincore_rpc::bitcoin::{address::NetworkUnchecked, Address};
-use simchain_common::{env_or, require_regtest_address};
-use std::time::Duration;
+use simchain_common::config::{
+    finish, parse_optional, parse_or, parse_rpc_url_or, string_or, take, CommonConfig, ConfigError,
+    RpcUrl, DEFAULT_NODE2_RPC_URL, DEFAULT_NODE2_WALLET_NAME, DEFAULT_NODE3_RPC_URL,
+    DEFAULT_NODE3_WALLET_NAME,
+};
+use simchain_common::require_regtest_address;
+use std::{sync::OnceLock, time::Duration};
+
+static MINING_CONFIG: OnceLock<MiningConfig> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockIntervalMode {
+    Fixed,
+    Poisson,
+}
+
+impl BlockIntervalMode {
+    pub fn is_poisson(self) -> bool {
+        matches!(self, BlockIntervalMode::Poisson)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MinerWeights {
@@ -35,297 +53,283 @@ impl IntervalBounds {
     }
 }
 
-/// Everything the controller reads from the environment. Every setting has a
-/// default matching docker-compose.yml, so the tool also runs standalone with
-/// no environment at all.
-pub struct Config {
+#[derive(Clone, Debug)]
+pub struct MiningConfig {
     pub user_address: Address,
     pub mean_secs: u64,
-    pub poisson: bool,
+    pub interval_mode: BlockIntervalMode,
     pub interval_bounds: IntervalBounds,
     pub miner_weights: Option<MinerWeights>,
     pub configured_seed: Option<u64>,
-    pub rpc_user: String,
-    pub rpc_pass: String,
+    pub node2_url: RpcUrl,
+    pub node3_url: RpcUrl,
     pub wallet2_name: String,
     pub wallet3_name: String,
-    pub node2_url: String,
-    pub node3_url: String,
 }
 
-impl Config {
-    pub fn from_env() -> anyhow::Result<Config> {
-        let user_address = env_or(
-            "USER_ADDRESS",
-            "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr",
-        );
-        let user_address: Address<NetworkUnchecked> =
-            user_address.parse().context("Invalid Bitcoin address")?;
-        let user_address = require_regtest_address(user_address)
-            .context("USER_ADDRESS must be a regtest address")?;
-
-        let mean_secs = parse_mean_secs(&env_or("BLOCK_INTERVAL_MEAN_SECS", "15"));
-        let poisson = parse_interval_mode(&env_or("BLOCK_INTERVAL_MODE", "poisson"));
-        let interval_bounds = parse_interval_bounds(
-            &env_or("BLOCK_INTERVAL_MIN_SECS", "10"),
-            &env_or("BLOCK_INTERVAL_MAX_SECS", "20"),
-        );
-        if poisson {
-            validate_poisson_mean(mean_secs, interval_bounds);
+impl MiningConfig {
+    pub fn init() -> Result<&'static Self, ConfigError> {
+        if let Some(config) = MINING_CONFIG.get() {
+            return Ok(config);
         }
-        let miner_weights = parse_miner_weights(&env_or("MINER_WEIGHTS", ""));
-        // Parse a supplied seed even when stochastic modes are disabled, so a
-        // typo cannot lie dormant until a mode is enabled later.
-        let configured_seed = parse_rng_seed(&env_or("MINING_RNG_SEED", ""));
 
-        Ok(Config {
+        let mining = CommonConfig::init_with(Self::from_env())?;
+        let _ = MINING_CONFIG.set(mining);
+        Ok(Self::global())
+    }
+
+    pub fn global() -> &'static Self {
+        MINING_CONFIG
+            .get()
+            .unwrap_or_else(|| panic!("MiningConfig::init() not called in main"))
+    }
+
+    fn from_env() -> Result<Self, ConfigError> {
+        let mut errors = Vec::new();
+        let user_address = take(&mut errors, parse_user_address());
+        let mean_secs = take(
+            &mut errors,
+            parse_positive_u64("BLOCK_INTERVAL_MEAN_SECS", "15"),
+        );
+        let interval_mode = take(&mut errors, parse_interval_mode());
+        let interval_bounds = take(&mut errors, parse_interval_bounds());
+        let miner_weights = take(&mut errors, parse_miner_weights());
+        let configured_seed = take(&mut errors, parse_optional::<u64>("MINING_RNG_SEED"));
+        let node2_url = take(
+            &mut errors,
+            parse_rpc_url_or("NODE2_RPC_URL", DEFAULT_NODE2_RPC_URL),
+        );
+        let node3_url = take(
+            &mut errors,
+            parse_rpc_url_or("NODE3_RPC_URL", DEFAULT_NODE3_RPC_URL),
+        );
+        let wallet2_name = take(
+            &mut errors,
+            simchain_common::config::non_empty_or("NODE2_WALLET_NAME", DEFAULT_NODE2_WALLET_NAME),
+        );
+        let wallet3_name = take(
+            &mut errors,
+            simchain_common::config::non_empty_or("NODE3_WALLET_NAME", DEFAULT_NODE3_WALLET_NAME),
+        );
+
+        if let (Some(mean_secs), Some(interval_mode), Some(interval_bounds)) =
+            (mean_secs, interval_mode, interval_bounds)
+        {
+            if interval_mode.is_poisson() {
+                validate_poisson_mean(&mut errors, mean_secs, interval_bounds);
+            }
+        }
+
+        finish(errors)?;
+
+        let (
+            Some(user_address),
+            Some(mean_secs),
+            Some(interval_mode),
+            Some(interval_bounds),
+            Some(miner_weights),
+            Some(configured_seed),
+            Some(node2_url),
+            Some(node3_url),
+            Some(wallet2_name),
+            Some(wallet3_name),
+        ) = (
             user_address,
             mean_secs,
-            poisson,
+            interval_mode,
             interval_bounds,
             miner_weights,
             configured_seed,
-            rpc_user: env_or("BTC_RPC_USER", "foo"),
-            rpc_pass: env_or("BTC_RPC_PASS", "rpcpassword"),
-            wallet2_name: env_or("NODE2_WALLET_NAME", "node2"),
-            wallet3_name: env_or("NODE3_WALLET_NAME", "node3"),
-            node2_url: env_or("NODE2_RPC_URL", "http://btc-simnet-node2:18443"),
-            node3_url: env_or("NODE3_RPC_URL", "http://btc-simnet-node3:18443"),
+            node2_url,
+            node3_url,
+            wallet2_name,
+            wallet3_name,
+        )
+        else {
+            unreachable!("MiningConfig fields must be present after validation");
+        };
+
+        Ok(Self {
+            user_address,
+            mean_secs,
+            interval_mode,
+            interval_bounds,
+            miner_weights,
+            configured_seed,
+            node2_url,
+            node3_url,
+            wallet2_name,
+            wallet3_name,
         })
     }
 }
 
-fn parse_mean_secs(value: &str) -> u64 {
-    let seconds: u64 = value
-        .parse()
-        .expect("BLOCK_INTERVAL_MEAN_SECS must be a positive integer");
-    assert!(
-        seconds > 0,
-        "BLOCK_INTERVAL_MEAN_SECS must be a positive integer"
+fn parse_user_address() -> Result<Address, ConfigError> {
+    let value = string_or(
+        "USER_ADDRESS",
+        "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr",
     );
-    seconds
+    let parsed = value
+        .parse::<Address<NetworkUnchecked>>()
+        .map_err(|error| ConfigError::invalid("USER_ADDRESS", value.clone(), error.to_string()))?;
+    require_regtest_address(parsed)
+        .map_err(|error| ConfigError::invalid("USER_ADDRESS", value, error.to_string()))
 }
 
-fn parse_interval_mode(value: &str) -> bool {
-    match value {
-        "fixed" => false,
-        "poisson" => true,
-        _ => panic!("BLOCK_INTERVAL_MODE must be 'fixed' or 'poisson', got '{value}'"),
+fn parse_positive_u64(key: &'static str, default: &'static str) -> Result<u64, ConfigError> {
+    let value = parse_or::<u64>(key, default)?;
+    if value == 0 {
+        return Err(ConfigError::out_of_range(
+            key,
+            value.to_string(),
+            "must be a positive integer",
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_interval_mode() -> Result<BlockIntervalMode, ConfigError> {
+    let value = string_or("BLOCK_INTERVAL_MODE", "poisson");
+    match value.trim() {
+        "fixed" => Ok(BlockIntervalMode::Fixed),
+        "poisson" => Ok(BlockIntervalMode::Poisson),
+        _ => Err(ConfigError::invalid(
+            "BLOCK_INTERVAL_MODE",
+            value,
+            "expected one of: fixed, poisson",
+        )),
     }
 }
 
-fn parse_interval_bound(key: &str, value: &str) -> Option<f64> {
-    if value.trim().is_empty() {
-        return None;
+fn parse_interval_bound(key: &'static str) -> Result<Option<f64>, ConfigError> {
+    let seconds = parse_optional::<f64>(key)?;
+    let Some(seconds) = seconds else {
+        return Ok(None);
+    };
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(ConfigError::out_of_range(
+            key,
+            seconds.to_string(),
+            "must be a non-negative finite number",
+        ));
     }
-
-    let seconds: f64 = value
-        .trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("{key} must be a non-negative finite number"));
-    assert!(
-        seconds.is_finite() && seconds >= 0.0,
-        "{key} must be a non-negative finite number"
-    );
-    assert!(
-        Duration::try_from_secs_f64(seconds).is_ok(),
-        "{key} is too large to represent as a duration"
-    );
-    Some(seconds)
+    if Duration::try_from_secs_f64(seconds).is_err() {
+        return Err(ConfigError::out_of_range(
+            key,
+            seconds.to_string(),
+            "is too large to represent as a duration",
+        ));
+    }
+    Ok(Some(seconds))
 }
 
-fn parse_interval_bounds(min: &str, max: &str) -> IntervalBounds {
-    let min = parse_interval_bound("BLOCK_INTERVAL_MIN_SECS", min);
-    let max = parse_interval_bound("BLOCK_INTERVAL_MAX_SECS", max);
-    if let Some(max) = max {
-        assert!(
-            max > 0.0,
-            "BLOCK_INTERVAL_MAX_SECS must be greater than zero"
-        );
+fn parse_interval_bounds() -> Result<IntervalBounds, ConfigError> {
+    let mut errors = Vec::new();
+    let min = take(&mut errors, parse_interval_bound("BLOCK_INTERVAL_MIN_SECS"));
+    let max = take(&mut errors, parse_interval_bound("BLOCK_INTERVAL_MAX_SECS"));
+
+    if let Some(Some(max)) = max {
+        if max <= 0.0 {
+            errors.push(ConfigError::out_of_range(
+                "BLOCK_INTERVAL_MAX_SECS",
+                max.to_string(),
+                "must be greater than zero",
+            ));
+        }
     }
-    if let (Some(min), Some(max)) = (min, max) {
-        assert!(
-            min <= max,
-            "BLOCK_INTERVAL_MIN_SECS must not exceed BLOCK_INTERVAL_MAX_SECS"
-        );
+    if let (Some(Some(min)), Some(Some(max))) = (min, max) {
+        if min > max {
+            errors.push(ConfigError::out_of_range(
+                "BLOCK_INTERVAL_MIN_SECS",
+                min.to_string(),
+                "must not exceed BLOCK_INTERVAL_MAX_SECS",
+            ));
+        }
     }
-    IntervalBounds { min, max }
+
+    finish(errors)?;
+
+    let (Some(min), Some(max)) = (min, max) else {
+        unreachable!("Interval bounds must be present after validation");
+    };
+
+    Ok(IntervalBounds { min, max })
 }
 
-// A mean outside the clamp range pins nearly every interval to a boundary --
-// almost certainly a leftover bound after the mean was changed, not intent.
-// Poisson mode only: fixed mode ignores the bounds, and the full-block recipes
-// legitimately combine a long fixed interval with the default bounds.
-fn validate_poisson_mean(mean_secs: u64, bounds: IntervalBounds) {
+fn validate_poisson_mean(errors: &mut Vec<ConfigError>, mean_secs: u64, bounds: IntervalBounds) {
     let mean = mean_secs as f64;
     if let Some(min) = bounds.min {
-        assert!(
-            mean >= min,
-            "BLOCK_INTERVAL_MEAN_SECS ({mean_secs}) is below BLOCK_INTERVAL_MIN_SECS ({min}): nearly every interval would clamp to the minimum. Raise the mean, lower the bound, or use fixed mode"
-        );
+        if mean < min {
+            errors.push(ConfigError::out_of_range(
+                "BLOCK_INTERVAL_MEAN_SECS",
+                mean_secs.to_string(),
+                format!(
+                    "is below BLOCK_INTERVAL_MIN_SECS ({min}): nearly every interval would clamp to the minimum"
+                ),
+            ));
+        }
     }
     if let Some(max) = bounds.max {
-        assert!(
-            mean <= max,
-            "BLOCK_INTERVAL_MEAN_SECS ({mean_secs}) exceeds BLOCK_INTERVAL_MAX_SECS ({max}): nearly every interval would clamp to the maximum. Lower the mean, raise the bound, or use fixed mode"
-        );
+        if mean > max {
+            errors.push(ConfigError::out_of_range(
+                "BLOCK_INTERVAL_MEAN_SECS",
+                mean_secs.to_string(),
+                format!(
+                    "exceeds BLOCK_INTERVAL_MAX_SECS ({max}): nearly every interval would clamp to the maximum"
+                ),
+            ));
+        }
     }
 }
 
-fn parse_miner_weights(value: &str) -> Option<MinerWeights> {
+fn parse_miner_weights() -> Result<Option<MinerWeights>, ConfigError> {
+    let value = string_or("MINER_WEIGHTS", "");
     if value.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    let parts: Vec<&str> = value.split(',').collect();
-    assert!(
-        parts.len() == 2,
-        "MINER_WEIGHTS must have exactly 2 entries (node2,node3), got {}",
-        parts.len()
-    );
-    let parse = |part: &str| {
-        part.trim()
-            .parse::<u64>()
-            .expect("MINER_WEIGHTS must be two non-negative integers, e.g. 70,30")
-    };
-    let node2 = parse(parts[0]);
-    let node3 = parse(parts[1]);
-    let total = node2
-        .checked_add(node3)
-        .expect("MINER_WEIGHTS entries must not overflow u64 when added");
-    assert!(total > 0, "MINER_WEIGHTS must not be 0,0");
+    let parts: Vec<_> = value.split(',').map(str::trim).collect();
+    if parts.len() != 2 {
+        return Err(ConfigError::invalid(
+            "MINER_WEIGHTS",
+            value.clone(),
+            format!(
+                "expected exactly 2 entries (node2,node3), got {}",
+                parts.len()
+            ),
+        ));
+    }
 
-    Some(MinerWeights {
+    let node2 = parse_or_weight("MINER_WEIGHTS", parts[0], &value)?;
+    let node3 = parse_or_weight("MINER_WEIGHTS", parts[1], &value)?;
+    let Some(total) = node2.checked_add(node3) else {
+        return Err(ConfigError::out_of_range(
+            "MINER_WEIGHTS",
+            value,
+            "entries must not overflow u64 when added",
+        ));
+    };
+    if total == 0 {
+        return Err(ConfigError::out_of_range(
+            "MINER_WEIGHTS",
+            value,
+            "must not be 0,0",
+        ));
+    }
+
+    Ok(Some(MinerWeights {
         node2,
         node3,
         total,
+    }))
+}
+
+fn parse_or_weight(key: &'static str, part: &str, full_value: &str) -> Result<u64, ConfigError> {
+    part.parse::<u64>().map_err(|error| {
+        ConfigError::invalid(
+            key,
+            full_value.to_string(),
+            format!("expected two non-negative integers, e.g. 70,30 ({error})"),
+        )
     })
-}
-
-fn parse_rng_seed(value: &str) -> Option<u64> {
-    if value.trim().is_empty() {
-        None
-    } else {
-        Some(value.trim().parse().expect("MINING_RNG_SEED must be a u64"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_supported_configuration() {
-        assert_eq!(parse_mean_secs("15"), 15);
-        assert!(!parse_interval_mode("fixed"));
-        assert!(parse_interval_mode("poisson"));
-        assert_eq!(
-            parse_interval_bounds("", ""),
-            IntervalBounds {
-                min: None,
-                max: None,
-            }
-        );
-        assert_eq!(
-            parse_interval_bounds("0.25", "30"),
-            IntervalBounds {
-                min: Some(0.25),
-                max: Some(30.0),
-            }
-        );
-        assert_eq!(parse_miner_weights(""), None);
-        assert_eq!(parse_miner_weights("   "), None);
-        assert_eq!(
-            parse_miner_weights("70, 30"),
-            Some(MinerWeights {
-                node2: 70,
-                node3: 30,
-                total: 100,
-            })
-        );
-        assert_eq!(parse_rng_seed("42"), Some(42));
-        assert_eq!(parse_rng_seed(""), None);
-    }
-
-    #[test]
-    #[should_panic(expected = "BLOCK_INTERVAL_MEAN_SECS must be a positive integer")]
-    fn rejects_zero_interval() {
-        parse_mean_secs("0");
-    }
-
-    #[test]
-    fn clamps_poisson_samples_to_configured_bounds() {
-        let bounds = parse_interval_bounds("2.5", "10");
-        assert_eq!(bounds.apply(0.1), 2.5);
-        assert_eq!(bounds.apply(7.0), 7.0);
-        assert_eq!(bounds.apply(20.0), 10.0);
-    }
-
-    #[test]
-    fn accepts_poisson_mean_within_bounds() {
-        validate_poisson_mean(15, parse_interval_bounds("10", "20"));
-        validate_poisson_mean(15, parse_interval_bounds("", ""));
-        validate_poisson_mean(10, parse_interval_bounds("10", "20"));
-        validate_poisson_mean(20, parse_interval_bounds("10", "20"));
-    }
-
-    #[test]
-    #[should_panic(expected = "exceeds BLOCK_INTERVAL_MAX_SECS")]
-    fn rejects_poisson_mean_above_max() {
-        validate_poisson_mean(60, parse_interval_bounds("10", "20"));
-    }
-
-    #[test]
-    #[should_panic(expected = "is below BLOCK_INTERVAL_MIN_SECS")]
-    fn rejects_poisson_mean_below_min() {
-        validate_poisson_mean(5, parse_interval_bounds("10", "20"));
-    }
-
-    #[test]
-    #[should_panic(expected = "BLOCK_INTERVAL_MIN_SECS must not exceed")]
-    fn rejects_reversed_interval_bounds() {
-        parse_interval_bounds("10", "2");
-    }
-
-    #[test]
-    #[should_panic(expected = "BLOCK_INTERVAL_MAX_SECS must be greater than zero")]
-    fn rejects_zero_max_interval() {
-        parse_interval_bounds("", "0");
-    }
-
-    #[test]
-    #[should_panic(expected = "BLOCK_INTERVAL_MIN_SECS must be a non-negative finite number")]
-    fn rejects_negative_min_interval() {
-        parse_interval_bounds("-1", "");
-    }
-
-    #[test]
-    #[should_panic(expected = "BLOCK_INTERVAL_MODE must be 'fixed' or 'poisson'")]
-    fn rejects_unknown_interval_mode() {
-        parse_interval_mode("gaussian");
-    }
-
-    #[test]
-    #[should_panic(expected = "MINER_WEIGHTS must have exactly 2 entries")]
-    fn rejects_extra_miner_weight() {
-        parse_miner_weights("1,2,3");
-    }
-
-    #[test]
-    #[should_panic(expected = "MINER_WEIGHTS must not be 0,0")]
-    fn rejects_zero_miner_weights() {
-        parse_miner_weights("0,0");
-    }
-
-    #[test]
-    #[should_panic(expected = "MINER_WEIGHTS entries must not overflow u64")]
-    fn rejects_miner_weight_overflow() {
-        parse_miner_weights("18446744073709551615,1");
-    }
-
-    #[test]
-    #[should_panic(expected = "MINING_RNG_SEED must be a u64")]
-    fn rejects_invalid_seed() {
-        parse_rng_seed("not-a-number");
-    }
 }

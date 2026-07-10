@@ -1,7 +1,7 @@
 //! Wallet actions used by a reorg: inject transactions that only the winning
 //! node saw before it mines its replacement chain.
 
-use crate::config::Config;
+use crate::config::ReorgConfig;
 use bitcoincore_rpc::{bitcoin::Amount, Client, RpcApi};
 use simchain_common::{create_wallet_client, require_regtest_address};
 
@@ -10,7 +10,8 @@ use simchain_common::{create_wallet_client, require_regtest_address};
 /// yet seen (clients broadcasting only to it). Prefers `REORG_WALLET_NAME`
 /// (the wallet the controller created on the reorg node); falls back to the
 /// first loaded wallet if that one is not loaded.
-pub fn inject_transactions(config: &Config, node: &Client, count: u64) {
+pub fn inject_transactions(node: &Client, count: u64) {
+    let config = ReorgConfig::global();
     let wallet_name = match node.list_wallets() {
         Ok(wallets) if wallets.contains(&config.wallet_name) => config.wallet_name.clone(),
         Ok(wallets) if !wallets.is_empty() => {
@@ -26,12 +27,7 @@ pub fn inject_transactions(config: &Config, node: &Client, count: u64) {
             return;
         }
     };
-    let wallet = match create_wallet_client(
-        &config.rpc_url,
-        &wallet_name,
-        &config.rpc_user,
-        &config.rpc_pass,
-    ) {
+    let wallet = match create_wallet_client(&config.rpc_url, &wallet_name) {
         Ok(wallet) => wallet,
         Err(error) => {
             tracing::error!("Wallet client build failed ({error}), skipping tx injection");
