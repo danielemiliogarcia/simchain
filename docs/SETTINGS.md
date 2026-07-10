@@ -9,6 +9,11 @@ cp .env.example .env        # everyday version
 cp .env.full.example .env   # everything tweakable
 ```
 
+Settings consumed by the mining controller or the spammer (block cadence, fee floor,
+block fill, spam mode) can be applied to a **running** chain without resetting it:
+edit `.env`, then `docker compose up -d --force-recreate` only those services. See
+"Retuning a live chain" in the README.
+
 ## Bitcoin node image
 
 | Variable | Default | Description |

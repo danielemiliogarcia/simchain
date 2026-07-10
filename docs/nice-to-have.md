@@ -19,11 +19,11 @@
   node policy parameters (`-minrelaytxfee` for the mempool floor, `-blockmintxfee`
   for the miner's inclusion floor) so blocks fill up and transactions genuinely
   compete for block space
-- The three proposed features below: scenario engine, network partitions, and reorgs
+- Three of the proposed features below: scenario engine, network partitions, and reorgs
   that drop transactions; fee-market simulation is designed but parked (see the Parked
   features section)
 
-### Code review findings (2026-07-04)
+### Code review findings
 
 Open findings from the last full code review, kept here so this is the single tracking
 document. Everything the review found fixed has been dropped; the items below were
@@ -89,7 +89,7 @@ Simchain's purpose is to simulate the Bitcoin chain on regtest while staying as 
 mainnet reality as regtest allows: multiple P2P-connected nodes, rotating miners, a
 non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus three bigger proposed features with their
+limitations and future enhancements, plus four bigger proposed features with their
 rationale and an implementation plan, and a section for parked features.
 
 ## 1. Declarative scenario engine
@@ -179,6 +179,40 @@ wanting *their* tx permanently dropped must broadcast the conflicting tx themsel
 2. Log which txids were conflicted so tests can assert on them.
 
 Effort: medium (raw-tx construction, only meaningful with spam enabled).
+
+---
+
+## 4. Dashboard / control panel
+
+**What:** A small web UI (one container, compose profile `panel`, localhost-only) that
+shows live chain state (height, block cadence, mempool depth/fees, current settings)
+and lets the user change the tool settings — block cadence, miner weights, fee floor,
+fill ratio, spam mode — and apply them with one click. Applying means rewriting the
+values in `.env` and force-recreating only the affected service(s), i.e. automating
+the manual flow documented in README "Retuning a live chain".
+
+**Why it's a nice-to-have:** Retuning a live chain today means editing `.env` by hand
+and knowing which compose service consumes which variable. That works, but a panel
+makes the knobs discoverable, removes the docker knowledge requirement for teammates
+using the simnet, and turns "try 3 different fee floors" from minutes of shell
+round-trips into seconds. It also gives one place to watch the effect (mempool
+histogram, block fullness) right next to the control that caused it.
+
+**Implementation plan:**
+1. Container with the project's `.env` bind-mounted and access to the Docker API
+   (mounted `docker.sock` + docker CLI with the compose plugin) to run
+   `docker compose up -d --force-recreate <service>`.
+2. Backend (Rust axum to match the stack) that reads current values from `.env` plus
+   defaults, validates edits, writes `.env`, and recreates only the services that
+   consume the changed variables (the variable→service mapping is static, taken from
+   docker-compose.yml).
+3. Status pane fed by node1 RPC: height, last blocks with tx counts, mempool size and
+   fee histogram, observed block interval.
+4. Security: `docker.sock` is root-equivalent on the host, so bind the panel to
+   localhost only and keep it out of the default profile.
+
+Effort: medium (UI plus a thin compose/RPC glue layer; no changes to the existing
+tools).
 
 ---
 
