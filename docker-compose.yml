@@ -8,6 +8,7 @@
 #                        (mempool-web/mempool-api/mempool-db)
 #   all-tools         -> basic + every tool above
 #   reorg             -> reorg simulator (run on demand, see README)
+#   partition         -> one-shot P2P latency/loss helpers
 #
 # Examples:
 #   docker compose up
@@ -19,8 +20,13 @@
 # per-node policies, like in a real network.
 
 networks:
-  btc-simnet-network:
-    name: btc-simnet-network
+  btc-simnet-control:
+    name: btc-simnet-control
+  btc-simnet-p2p:
+    name: btc-simnet-p2p
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
 
 # Node datadirs persist on named volumes: the chain survives `docker compose
 # down` (the controller detects the height and skips the bootstrap) and can be
@@ -59,7 +65,10 @@ services:
       - "${NODE1_ZMQ_HASHTX_PORT:-28335}:28335"
       - "${NODE1_ZMQ_SEQUENCE_PORT:-28336}:28336"
     networks:
-      - btc-simnet-network
+      btc-simnet-control:
+      btc-simnet-p2p:
+        aliases:
+          - node1-p2p
     environment:
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
@@ -93,8 +102,8 @@ services:
       - -zmqpubhashblock=tcp://0.0.0.0:28334
       - -zmqpubhashtx=tcp://0.0.0.0:28335
       - -zmqpubsequence=tcp://0.0.0.0:28336
-      - -addnode=btc-simnet-node2:18444
-      - -addnode=btc-simnet-node3:18444
+      - -addnode=node2-p2p:18444
+      - -addnode=node3-p2p:18444
       # - -debug=1
       # - -debug=rpc
       # - -debug=net
@@ -117,7 +126,10 @@ services:
       - "${NODE2_ZMQ_HASHTX_PORT:-38335}:28335"
       - "${NODE2_ZMQ_SEQUENCE_PORT:-38336}:28336"
     networks:
-      - btc-simnet-network
+      btc-simnet-control:
+      btc-simnet-p2p:
+        aliases:
+          - node2-p2p
     environment:
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
@@ -147,8 +159,8 @@ services:
       - -zmqpubhashblock=tcp://0.0.0.0:28334
       - -zmqpubhashtx=tcp://0.0.0.0:28335
       - -zmqpubsequence=tcp://0.0.0.0:28336
-      - -addnode=btc-simnet-node1:18444
-      - -addnode=btc-simnet-node3:18444
+      - -addnode=node1-p2p:18444
+      - -addnode=node3-p2p:18444
 
   btc-simnet-node3:
     image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
@@ -158,7 +170,10 @@ services:
     volumes:
       - node3-data:/home/bitcoin/.bitcoin
     networks:
-      - btc-simnet-network
+      btc-simnet-control:
+      btc-simnet-p2p:
+        aliases:
+          - node3-p2p
     environment:
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
@@ -181,8 +196,8 @@ services:
       - -port=18444
       - -rpcport=18443
       - -txindex
-      - -addnode=btc-simnet-node1:18444
-      - -addnode=btc-simnet-node2:18444
+      - -addnode=node1-p2p:18444
+      - -addnode=node2-p2p:18444
 
   btc-simnet-mining-controller:
     build:
@@ -201,7 +216,7 @@ services:
       btc-simnet-node3:
         condition: service_healthy
     networks:
-      - btc-simnet-network
+      - btc-simnet-control
     environment:
       - USER_ADDRESS=${USER_ADDRESS:-bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr}
       - BLOCK_INTERVAL_MEAN_SECS=${BLOCK_INTERVAL_MEAN_SECS:-15}
@@ -235,7 +250,7 @@ services:
       btc-simnet-mining-controller:
         condition: service_started
     networks:
-      - btc-simnet-network
+      - btc-simnet-control
     environment:
       - ENABLE_SPAM=${ENABLE_SPAM:-true}
       # true = raw engine (spammer signs its own txs, immune to wallet
@@ -306,7 +321,7 @@ services:
       btc-simnet-node3:
         condition: service_healthy
     networks:
-      - btc-simnet-network
+      - btc-simnet-control
     environment:
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
@@ -358,7 +373,7 @@ services:
       - --jsonrpc-import
       - --db-dir=/tmp/electrs-db
     networks:
-      - btc-simnet-network
+      - btc-simnet-control
 
   # ---------------------------------------------------------------------------
   # Tools: mempool.space explorer (profiles: mempool, all-tools)
@@ -380,7 +395,7 @@ services:
     ports:
       - "${MEMPOOL_WEB_PORT:-1080}:8080"
     networks:
-      - btc-simnet-network
+      - btc-simnet-control
 
   mempool-api:
     profiles: ["mempool", "all-tools"]
@@ -411,7 +426,7 @@ services:
     stop_grace_period: 5s
     command: "./wait-for-it.sh mempool-db:3306 --timeout=720 --strict -- ./start.sh"
     networks:
-      - btc-simnet-network
+      - btc-simnet-control
 
   mempool-db:
     profiles: ["mempool", "all-tools"]
@@ -430,4 +445,48 @@ services:
     restart: always
     stop_grace_period: 10s
     networks:
-      - btc-simnet-network
+      - btc-simnet-control
+
+  # ---------------------------------------------------------------------------
+  # P2P latency/loss helpers (profile: partition), run on demand by netem.sh.
+  # Each helper shares a node's network namespace, but only the short-lived
+  # helper receives NET_ADMIN. No helper joins a network independently.
+  # ---------------------------------------------------------------------------
+  btc-simnet-netem-node1:
+    profiles: ["partition"]
+    build:
+      context: .
+      dockerfile: docker/netem.Dockerfile
+    network_mode: "service:btc-simnet-node1"
+    cap_add: ["NET_ADMIN"]
+    environment:
+      - P2P_PEER_ALIAS=node2-p2p
+    depends_on:
+      btc-simnet-node1:
+        condition: service_started
+
+  btc-simnet-netem-node2:
+    profiles: ["partition"]
+    build:
+      context: .
+      dockerfile: docker/netem.Dockerfile
+    network_mode: "service:btc-simnet-node2"
+    cap_add: ["NET_ADMIN"]
+    environment:
+      - P2P_PEER_ALIAS=node1-p2p
+    depends_on:
+      btc-simnet-node2:
+        condition: service_started
+
+  btc-simnet-netem-node3:
+    profiles: ["partition"]
+    build:
+      context: .
+      dockerfile: docker/netem.Dockerfile
+    network_mode: "service:btc-simnet-node3"
+    cap_add: ["NET_ADMIN"]
+    environment:
+      - P2P_PEER_ALIAS=node1-p2p
+    depends_on:
+      btc-simnet-node3:
+        condition: service_started

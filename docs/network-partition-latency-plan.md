@@ -1,6 +1,6 @@
 # Implementation plan: network partition / latency simulation
 
-## Status: READY TO IMPLEMENT (written 2026-07-10)
+## Status: IMPLEMENTED (2026-07-11)
 
 Implements nice-to-have **"2. Network partition / latency simulation"** from
 [NICE-TO-HAVE.md](NICE-TO-HAVE.md). That entry explains the user-facing motivation; this
@@ -457,3 +457,25 @@ user-facing control is "just a script". Phase 2 is medium on top.
 
 That order keeps the highest-risk change first: the network split that makes every later
 step possible.
+
+
+----------------
+codex
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• Implemented the network partition and P2P latency plan.
+
+  - Split Compose into btc-simnet-control and btc-simnet-p2p.
+  - Added deterministic partition orchestration in scripts/partition.sh.
+  - Added P2P-only netem support in scripts/netem.sh with a dedicated helper image.
+  - Updated README, runbook, settings, architecture, and nice-to-have documentation.
+
+  Verification passed:
+
+  - cargo ba && cargo ca && cargo fac && cargo tt
+  - Compose configuration, Bash syntax, ShellCheck, and diff checks
+  - Live 1-vs-2-block partition, organic convergence, and service restoration
+  - Live netem apply/status/clear on the P2P interface
+  - Manual disconnect/heal and idempotency checks
+
+  The running stack was migrated to the new networks with volumes preserved and is healthy.

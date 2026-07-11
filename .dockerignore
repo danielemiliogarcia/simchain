@@ -1,6 +1,7 @@
-# Shared build-context ignore for BOTH images built with repo-root context (`.`):
+# Shared build-context ignore for all images built with repo-root context (`.`):
 #   - docker/bitcoin-node.Dockerfile -> the bitcoind node image
 #   - docker/tools.Dockerfile        -> the three Rust tools
+#   - docker/netem.Dockerfile        -> the P2P netem helper
 #
 # This file stays at the repo root because `.dockerignore` is scoped to the
 # build-context root, not to the Dockerfile location.
@@ -15,6 +16,8 @@
 *
 !docker/bitcoin-node.Dockerfile
 !docker/entrypoint.sh
+!docker/netem.Dockerfile
+!docker/netem-entrypoint.sh
 !Cargo.toml
 !Cargo.lock
 !.cargo

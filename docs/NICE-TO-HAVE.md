@@ -36,7 +36,7 @@ that allows to defining mining pace, block filling and fee rates.
 It consists on: multiple P2P-connected nodes, rotating miners,
 a non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus three bigger proposed features with their
+limitations and future enhancements, plus two bigger proposed features with their
 rationale and an implementation plan, and a section for parked features.
 
 ## 1. Declarative scenario engine
@@ -68,34 +68,7 @@ Effort: the largest item here, but mostly glue around already-existing capabilit
 
 ---
 
-## 2. Network partition / latency simulation
-
-**What:** Tooling to split the P2P network (e.g. isolate node3, let it mine alone, then
-reconnect) and to inject latency/packet loss between nodes, via `docker network
-disconnect/connect` or `tc netem` in a helper container.
-
-**Why it's a nice-to-have:** Real reorgs are *caused* by propagation delays and network
-partitions; today's reorg simulator forces one administratively (`invalidateblock`).
-A partition that heals produces organic competing chains, natural orphan races, and
-double-spend windows, the scenarios exchanges and payment processors actually fear.
-Latency injection also makes block/tx propagation observable (compare heights across
-nodes during the window), which no instantaneous regtest network shows.
-
-**Implementation plan:**
-1. Phase 1 (no new images): `partition.sh` helper using `docker network disconnect
-   btc-simnet-network btc-simnet-node3` + reconnect after N seconds/blocks; while split,
-   direct mining on both sides via RPC so competing chains grow.
-2. Phase 2: optional latency profile, run nodes with `cap_add: NET_ADMIN` and a sidecar
-   applying `tc qdisc add dev eth0 root netem delay 500ms loss 1%`, parameterized via
-   `.env` (`P2P_DELAY_MS`, `P2P_LOSS_PCT`).
-3. Expose as compose profile `partition` and/or a scenario-engine action (feature 1),
-   with settings `PARTITION_NODE`, `PARTITION_BLOCKS`.
-
-Effort: phase 1 small; phase 2 medium (needs NET_ADMIN and per-node sidecars).
-
----
-
-## 3. Dashboard / control panel
+## 2. Dashboard / control panel
 
 **What:** A small web UI (one container, compose profile `panel`, localhost-only) that
 shows live chain state (height, block cadence, mempool depth/fees, current settings)

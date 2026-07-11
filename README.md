@@ -16,11 +16,12 @@ For detailed component descriptions, see [INTRO.md](./docs/INTRO.md).
 
 ## Network topology
 
-All containers join a single Docker network (`btc-simnet-network`). The three bitcoind
-nodes form a full P2P mesh (`-addnode`, port 18444). The user lives on the host and
-talks to **node1**, the non-mining full node, over RPC on `localhost:18443`, exactly like
-talking to a 3rd-party production endpoint (node2's RPC on `localhost:28443` is also
-exposed, for the "owned node" scenarios).
+Traffic is split across two Docker networks. Only the three bitcoind nodes join
+`btc-simnet-p2p`, where `node1-p2p`, `node2-p2p`, and `node3-p2p` form the full P2P
+mesh on port 18444. Nodes and helper containers also join `btc-simnet-control` for RPC,
+health checks, and explorer traffic. This separation lets P2P links be partitioned or
+impaired without losing control access. The user talks to **node1** over RPC on
+`localhost:18443`; node2's RPC is also exposed on `localhost:28443`.
 
 ```mermaid
 flowchart TB
@@ -29,12 +30,13 @@ flowchart TB
         zmqc["ZMQ consumers<br/>LND / CLN / indexers / watchers"]
     end
 
-    subgraph net["Docker network: btc-simnet-network"]
-        subgraph mesh["bitcoind nodes — full P2P mesh (port 18444)"]
-            n1["node1 — full node, never mines<br/>txindex, wallet disabled<br/>production-like endpoint"]
-            n2["node2 — miner<br/>wallet enabled, owned node"]
-            n3["node3 — miner<br/>not exposed to host"]
-        end
+    subgraph mesh["btc-simnet-p2p — bitcoind full mesh (port 18444)"]
+        n1["node1 — full node, never mines<br/>txindex, wallet disabled<br/>production-like endpoint"]
+        n2["node2 — miner<br/>wallet enabled, owned node"]
+        n3["node3 — miner<br/>not exposed to host"]
+    end
+
+    subgraph control["btc-simnet-control — RPC and helper traffic"]
         mc["mining-controller<br/>bootstrap + configurable mining"]
         sp["spammer<br/>fills blocks with txs"]
         rg["reorg simulator<br/>profile: reorg, on demand"]
@@ -81,7 +83,7 @@ flowchart LR
     browser["Browser<br/>localhost:1080"]
     electrum["Electrum clients<br/>localhost:60001"]
 
-    subgraph net["btc-simnet-network (tool profiles)"]
+    subgraph net["btc-simnet-control (tool profiles)"]
         mweb["mempool-web"]
         mapi["mempool-api"]
         mdb["mempool-db<br/>MariaDB"]
@@ -225,6 +227,33 @@ One compose file serves every combination via
 
 With `mempool` or `all-tools`, browse the explorer at
 [http://localhost:1080/](http://localhost:1080/) (port: `MEMPOOL_WEB_PORT`).
+
+## Partitions and P2P latency
+
+After bootstrap reaches height 204, create a deterministic organic fork by isolating one
+miner, mining both branches, healing the P2P network, and waiting for the longer branch
+to win everywhere:
+
+```bash
+./scripts/partition.sh run btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
+./scripts/partition.sh disconnect btc-simnet-node3
+./scripts/partition.sh heal btc-simnet-node3
+./scripts/partition.sh status
+```
+
+The `run` command pauses and restores the mining controller and, unless
+`--keep-spammer` is passed, the spammer. Manual `disconnect` and `heal` do not manage
+either service. Add latency or loss to only a node's P2P interface with the one-shot
+netem helper:
+
+```bash
+./scripts/netem.sh apply btc-simnet-node3 --delay-ms 500 --loss-pct 1
+./scripts/netem.sh status btc-simnet-node3
+./scripts/netem.sh clear btc-simnet-node3
+```
+
+Netem state is ephemeral and clears when the target node is recreated or restarted.
+Operational recipes and guardrails are in [RUNBOOK.md](./docs/RUNBOOK.md).
 
 
 ## Simulating reorgs

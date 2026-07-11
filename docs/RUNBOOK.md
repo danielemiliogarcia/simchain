@@ -11,7 +11,7 @@ Handy `bitcoin-cli` one-liners against the simnet. This how all this started... 
 Add a peer:
 
 ```bash
-docker exec btc-simnet-node1 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword addnode btc-simnet-node2:18444 add
+docker exec btc-simnet-node1 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword addnode node2-p2p:18444 add
 ```
 
 Inspect connected peers:
@@ -19,6 +19,48 @@ Inspect connected peers:
 ```bash
 docker exec btc-simnet-node1 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword getpeerinfo
 ```
+
+## Network partitions
+
+Partition runs are post-bootstrap only (node1 must be at height 204 or higher). This
+command pauses the mining controller and spammer, disconnects node3 from P2P only, mines
+three blocks on the connected side and four on node3, heals, waits for convergence, and
+restores the services it stopped:
+
+```bash
+./scripts/partition.sh run btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
+```
+
+Use `--keep-spammer` to leave the spammer running. The block counts must differ, otherwise
+the winning branch would be nondeterministic. Manual controls do not stop or restart any
+services:
+
+```bash
+docker compose stop btc-simnet-mining-controller btc-simnet-spammer
+./scripts/partition.sh disconnect btc-simnet-node3
+./scripts/partition.sh status
+# Mine or submit transactions on each side as needed.
+./scripts/partition.sh heal btc-simnet-node3
+docker compose start btc-simnet-mining-controller btc-simnet-spammer
+```
+
+The allowed isolated miners are `btc-simnet-node2` and `btc-simnet-node3`. A failed
+`run` attempts to heal the P2P attachment and restores any services it stopped.
+
+## P2P latency and packet loss
+
+Apply delay and optional loss to a node's P2P interface without affecting its RPC or
+helper traffic:
+
+```bash
+./scripts/netem.sh apply btc-simnet-node3 --delay-ms 500 --loss-pct 1
+./scripts/netem.sh status btc-simnet-node3
+./scripts/netem.sh clear btc-simnet-node3
+```
+
+The first command builds the small `docker/netem.Dockerfile` helper if needed. The helper
+is one-shot; only it receives `NET_ADMIN`. The qdisc lives in the target node's network
+namespace and therefore disappears when that node is restarted or recreated.
 
 ## Manual mining
 
