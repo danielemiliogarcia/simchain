@@ -1,4 +1,5 @@
-//! Helpers shared by the simchain tools (mining-controller, reorg, spammer):
+//! Helpers shared by the simchain tools (mining-controller, reorg, spammer,
+//! scenario engine):
 //! environment lookup, Bitcoin Core RPC client construction and the shared
 //! retry policy.
 //!
@@ -7,12 +8,14 @@
 //! of drifting apart.
 
 mod address;
+mod burn;
 pub mod config;
 mod error;
 mod logging;
 mod rpc;
 
 pub use address::require_regtest_address;
+pub use burn::burn_address;
 pub use config::{CommonConfig, ConfigError, RpcUrl};
 pub use error::CommonError;
 pub use logging::init_tracing;

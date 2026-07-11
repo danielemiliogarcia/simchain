@@ -1,0 +1,13 @@
+version: 1
+steps:
+  - type: wait_height
+    height: 205
+
+  - type: pause_mining
+
+  - type: spam_burst
+    node: btc-simnet-node2
+    txs: 100
+    outputs_per_tx: 25
+
+  - type: resume_mining

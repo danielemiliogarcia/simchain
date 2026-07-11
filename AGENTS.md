@@ -4,7 +4,7 @@ Guidance for agents and contributors working in this repository.
 
 ## Repository structure
 
-The three Rust tools are members of a single Cargo workspace rooted at the repo top:
+The four Rust tools are members of a single Cargo workspace rooted at the repo top:
 
 ```
 Cargo.toml                  # workspace root (members + resolver = "2")
@@ -12,7 +12,7 @@ Cargo.lock                  # committed — binaries want reproducible builds
 .cargo/config.toml          # project-wide cargo aliases
 docker/                     # docker build files and helper scripts
   bitcoin-node.Dockerfile   # local bitcoind image build
-  tools.Dockerfile          # one builder stage, three final targets
+  tools.Dockerfile          # one builder stage, four final targets
   build-bitcoin-image.sh    # local bitcoind image build helper
   entrypoint.sh             # bitcoind container entrypoint
 scripts/                    # host-side helper scripts
@@ -23,6 +23,7 @@ crates/
   mining-controller/        # bootstrap + configurable mining
   reorg/                    # on-demand chain reorganizations
   spammer/                  # block-filling transaction spam
+  scenario-engine/          # ordered declarative scenario orchestration
 ```
 
 `.dockerignore` intentionally remains at the repo root because Docker applies it
@@ -49,9 +50,10 @@ network). Do not add it to any `.gitignore`.
 - `crates/simchain-common` — the one home for helpers shared across tools (RPC client
   construction, config parsing/validation, logging). Put a helper here the moment a
   second tool needs it, rather than copy-pasting.
-- `crates/mining-controller`, `crates/reorg`, `crates/spammer` — the three binaries,
-  each a thin RPC driver over bitcoind. They must imitate mainnet **behavior**; do not
-  add relay/mempool/capacity policy flags that diverge from mainnet.
+- `crates/mining-controller`, `crates/reorg`, `crates/spammer`,
+  `crates/scenario-engine` — the four binaries, each a thin RPC driver or orchestrator
+  over bitcoind. They must imitate mainnet **behavior**; do not add
+  relay/mempool/capacity policy flags that diverge from mainnet.
 
 ## Commands
 

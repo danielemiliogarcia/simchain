@@ -4,6 +4,7 @@ members = [
     "crates/mining-controller",
     "crates/reorg",
     "crates/spammer",
+    "crates/scenario-engine",
 ]
 resolver = "2"
 

@@ -36,39 +36,10 @@ that allows to defining mining pace, block filling and fee rates.
 It consists on: multiple P2P-connected nodes, rotating miners,
 a non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus two bigger proposed features with their
+limitations and future enhancements, plus one bigger proposed feature with its
 rationale and an implementation plan, and a section for parked features.
 
-## 1. Declarative scenario engine
-
-**What:** A `scenario.yml` interpreted by a small controller container: an ordered list of
-steps like *"at height 150 reorg 2 blocks"*, *"pause mining 120s"*, *"burst 500 txs"*,
-*"partition node3 for 3 blocks, then heal"*. A `scenario` compose profile runs it.
-
-**Why it's a nice-to-have:** Today reproducing a test case means hand-running
-`bitcoin-cli`/reorg commands in the right order at the right time. A scenario file makes
-chain histories **reproducible and shareable**, a bug report can include the exact
-scenario that triggers it, and downstream projects can pin scenarios in CI ("our indexer
-must survive `reorg-during-sync.yml`"). This turns simchain from an environment into a
-test harness.
-
-**Implementation plan:**
-1. Define a minimal step schema: `at: {height|time}`, `action:
-   {mine, pause_mining, reorg, spam_burst, disconnect, connect}`, `params: {...}`.
-2. Implement an interpreter (Rust to match the repo, or Python for speed of iteration)
-   that polls node1 height and drives the existing pieces over RPC; reuse the
-   `reorg` crate's logic for the reorg action.
-3. Coordinate with the mining controller via a simple flag: either the scenario engine
-   *replaces* it (`MINING_MODE=scenario`), or exposes pause/resume through a tiny control
-   file/HTTP endpoint the controller checks each loop.
-4. Ship 2–3 example scenarios in `scenarios/`; add compose service with
-   `profiles: ["scenario"]` mounting the chosen file.
-
-Effort: the largest item here, but mostly glue around already-existing capabilities.
-
----
-
-## 2. Dashboard / control panel
+## 1. Dashboard / control panel
 
 **What:** A small web UI (one container, compose profile `panel`, localhost-only) that
 shows live chain state (height, block cadence, mempool depth/fees, current settings)

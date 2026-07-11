@@ -224,9 +224,54 @@ One compose file serves every combination via
 | `docker compose --profile electrs up` | basic + electrs (Electrum RPC on 60001, HTTP on 3000) |
 | `docker compose --profile mempool up` | basic + electrs + mempool.space explorer |
 | `docker compose --profile all-tools up` | basic + all the tools above |
+| `SCENARIO_FILE=scenarios/reorg-during-sync.yml docker compose --profile scenario run --rm btc-simnet-scenario` | run one declarative scenario against the simnet, then exit |
 
 With `mempool` or `all-tools`, browse the explorer at
 [http://localhost:1080/](http://localhost:1080/) (port: `MEMPOOL_WEB_PORT`).
+
+## Scenarios
+
+Reproduce an ordered chain history from YAML after the simnet has bootstrapped:
+
+```bash
+docker compose up -d
+SCENARIO_FILE=scenarios/reorg-during-sync.yml \
+  docker compose --profile scenario run --rm --build btc-simnet-scenario
+```
+
+The one-shot engine waits for height 204, runs each step in order, stops at the first
+failure, and exits with the scenario result. It supports height waits, sleeps, mining
+pause/resume, manual mining, reorgs, one-shot wallet bursts, and deterministic network
+partitions. The container mounts `docker.sock`, so the profile is intentionally opt-in
+and excluded from `all-tools`. Schema, cleanup behavior, and all shipped examples are in
+[SCENARIOS.md](./docs/SCENARIOS.md).
+
+## Partitions and P2P latency
+
+After bootstrap reaches height 204, create a deterministic organic fork by isolating one
+miner, mining both branches, healing the P2P network, and waiting for the longer branch
+to win everywhere:
+
+```bash
+./scripts/partition.sh run btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
+./scripts/partition.sh disconnect btc-simnet-node3
+./scripts/partition.sh heal btc-simnet-node3
+./scripts/partition.sh status
+```
+
+The `run` command pauses and restores the mining controller and, unless
+`--keep-spammer` is passed, the spammer. Manual `disconnect` and `heal` do not manage
+either service. Add latency or loss to only a node's P2P interface with the one-shot
+netem helper:
+
+```bash
+./scripts/netem.sh apply btc-simnet-node3 --delay-ms 500 --loss-pct 1
+./scripts/netem.sh status btc-simnet-node3
+./scripts/netem.sh clear btc-simnet-node3
+```
+
+Netem state is ephemeral and clears when the target node is recreated or restarted.
+Operational recipes and guardrails are in [RUNBOOK.md](./docs/RUNBOOK.md).
 
 
 ## Simulating reorgs
@@ -271,16 +316,17 @@ print(topic, len(body), 'bytes')
 
 ## Repository structure
 
-The three Rust tools live in a single Cargo workspace at the repo root, sharing one
+The four Rust tools live in a single Cargo workspace at the repo root, sharing one
 `target/` dir, one dependency resolution, and one committed `Cargo.lock` so every build
 of a given commit ships identical dependency versions.
 
 | Path | Purpose |
 |---|---|
-| [crates/simchain-common](crates/simchain-common) | Shared helpers: RPC client construction (`create_client`) and env lookup (`env_or`), used by all three tools |
+| [crates/simchain-common](crates/simchain-common) | Shared helpers: RPC clients, config parsing, logging, and burn addresses, used across the four tools |
 | [crates/mining-controller](crates/mining-controller) | Bootstraps the chain and drives configurable mining (`btc-simnet-mining-controller`) |
 | [crates/spammer](crates/spammer) | Fills blocks with transactions (`btc-simnet-spammer`) |
 | [crates/reorg](crates/reorg) | Forces chain reorganizations on demand (`btc-simnet-reorg`) |
+| [crates/scenario-engine](crates/scenario-engine) | Executes ordered YAML scenarios (`btc-simnet-scenario`) |
 
 `Cargo.lock` is committed on purpose: these are binaries for a reproducible test
 network, so the lockfile is tracked (unlike a library crate, which would leave it to
@@ -306,6 +352,7 @@ exclude = ["path/to/simchain"]
 - [REORGS.md](./docs/REORGS.md), simulating chain reorganizations, commands, and modes.
 - [PARTITIONS.md](./docs/PARTITIONS.md), network partitions and P2P latency: organic
   reorgs, double-spend windows, propagation lag.
+- [SCENARIOS.md](./docs/SCENARIOS.md), declarative scenario schema, execution, and examples.
 - [SETTINGS.md](./docs/SETTINGS.md), every setting, its default and what it does.
 - [SNAPSHOTS.md](./docs/SNAPSHOTS.md), chain snapshot/restore cookbook: concrete
   commands for the common situations.
