@@ -158,7 +158,9 @@ docker compose logs -ft btc-simnet-node1
 # Everything at once
 docker compose logs -ft
 
-# Tear down; the chain persists on named volumes and resumes on the next up
+# Tear down; the chain persists on named volumes and resumes on the next up.
+# Let it finish on its own -- see "Chain snapshots" for why force-killing it
+# can cost you the chain.
 docker compose --profile all-tools down
 
 # Tear down AND wipe the chain (fresh bootstrap on the next up)
@@ -189,6 +191,15 @@ seconds instead of re-mining and re-funding:
 ./scripts/snapshot.sh restore mysnap                    # boot the simnet back at that state
 ./scripts/snapshot.sh list                              # what is saved
 ```
+
+> **⚠️ Let `docker compose down`/`stop` finish on their own.** On shutdown bitcoind
+> flushes the chainstate and dumps the mempool to `mempool.dat`; the compose file
+> gives each node up to 5 minutes (`stop_grace_period: 300s`) to do that, and after a
+> heavy spam run it can genuinely take a while. Force-killing the stack instead — a
+> second `Ctrl+C`, `docker compose kill`, `docker rm -f` — skips the flush: the
+> mempool is lost and the chainstate can be left unusable, and the only way back is a
+> snapshot restore or a fresh chain (`./scripts/fresh-chain.sh`, wipes the volumes).
+> If you want to resume or snapshot the chain later, always wait for the graceful stop.
 
 A snapshot also records which services were running (tool profiles included), and
 restore brings back exactly that shape — no `--profile` flags needed (passing compose

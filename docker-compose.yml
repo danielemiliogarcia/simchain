@@ -42,9 +42,12 @@ services:
     image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node1
     restart: unless-stopped
-    # Long grace so a slow chainstate/mempool flush on stop (large mempool)
-    # is never killed mid-write; a clean stop is what makes snapshots safe.
-    stop_grace_period: 60s
+    # Grace must outlive the slowest shutdown flush (chainstate + mempool.dat
+    # after a heavy spam run). bitcoind has no internal shutdown timeout -- it
+    # takes as long as the disk needs -- so docker's grace timer is the only
+    # thing that can kill it mid-write. 300s matches common bitcoind systemd
+    # practice; a clean stop is what makes resume and snapshots safe.
+    stop_grace_period: 300s
     volumes:
       - node1-data:/home/bitcoin/.bitcoin
     ports:
@@ -102,7 +105,7 @@ services:
     image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node2
     restart: unless-stopped
-    stop_grace_period: 60s
+    stop_grace_period: 300s
     volumes:
       - node2-data:/home/bitcoin/.bitcoin
     ports:
@@ -151,7 +154,7 @@ services:
     image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node3
     restart: unless-stopped
-    stop_grace_period: 60s
+    stop_grace_period: 300s
     volumes:
       - node3-data:/home/bitcoin/.bitcoin
     networks:
