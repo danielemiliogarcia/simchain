@@ -3,8 +3,8 @@
 
 use crate::{
     chain::{
-        branch_to_orphan, last_blocks, live_mempool_weighted, mine_exact, pack_by_weight,
-        print_blocks, weight_prefix_len, BlockTx, BLOCK_WEIGHT_BUDGET,
+        balanced_weight_budget, branch_to_orphan, last_blocks, live_mempool_weighted, mine_exact,
+        pack_by_weight, print_blocks, weight_prefix_len, BlockTx, BLOCK_WEIGHT_BUDGET,
     },
     config::ReorgConfig,
     double_spend::{build_plan, DoubleSpendPlan},
@@ -191,19 +191,39 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
                 pending.len()
             );
         }
-        for _ in 0..blocks_to_mine {
-            // Take the heaviest conflict prefix that fits one block (conflicts
-            // first, so they are never starved by mempool txs); any remainder
-            // rolls into the next block. Then fill the leftover budget from the
-            // fresh mempool.
+        for index in 0..blocks_to_mine {
+            let blocks_left = blocks_to_mine - index;
+            let mempool = live_mempool_weighted(node, &plan.excluded_mempool_txids)?;
+
+            // Balance all currently available work across the replacement
+            // blocks that remain. Oversized backlogs still fill each block to
+            // the safe cap; smaller backlogs are spread out instead of being
+            // exhausted by the first replacement and leaving coinbase-only
+            // blocks behind. Raw conflicts stay first in mining order.
             let conflict_weights: Vec<u64> = pending.iter().map(|(_, w)| *w).collect();
-            let take = weight_prefix_len(&conflict_weights, BLOCK_WEIGHT_BUDGET);
+            let all_weights: Vec<u64> = conflict_weights
+                .iter()
+                .copied()
+                .chain(mempool.iter().map(|tx| tx.weight))
+                .collect();
+            let target = balanced_weight_budget(&all_weights, blocks_left, BLOCK_WEIGHT_BUDGET);
+
+            let take = weight_prefix_len(&conflict_weights, target);
             let conflicts: Vec<(String, u64)> = pending.drain(..take).collect();
             let conflict_weight: u64 = conflicts.iter().map(|(_, w)| *w).sum();
-            let budget = BLOCK_WEIGHT_BUDGET.saturating_sub(conflict_weight);
+            let mempool_budget = target.saturating_sub(conflict_weight);
 
-            let mempool = live_mempool_weighted(node, &plan.excluded_mempool_txids)?;
-            let packed = pack_by_weight(&mempool, budget);
+            let packed = pack_by_weight(&mempool, mempool_budget);
+            let mempool_weight: u64 = mempool[..packed.len()].iter().map(|tx| tx.weight).sum();
+            tracing::info!(
+                "Replacement block {}/{}: {} conflict(s) + {} mempool tx(s), {} WU selected (target {target} WU, {} block(s) left)",
+                index + 1,
+                blocks_to_mine,
+                conflicts.len(),
+                packed.len(),
+                conflict_weight + mempool_weight,
+                blocks_left
+            );
 
             let mut items: Vec<BlockTx> = Vec::with_capacity(conflicts.len() + packed.len());
             items.extend(conflicts.into_iter().map(|(hex, _)| BlockTx::RawHex(hex)));

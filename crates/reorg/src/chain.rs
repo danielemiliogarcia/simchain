@@ -156,6 +156,28 @@ pub fn weight_prefix_len(weights: &[u64], budget: u64) -> usize {
     n
 }
 
+/// Weight target for the next block when `weights` must be spread over
+/// `blocks_left` replacement blocks. A backlog larger than the remaining
+/// capacity fills the next block to `max_budget`; a smaller backlog is divided
+/// evenly so the first block does not consume everything and leave later
+/// replacements empty. When transactions remain, the target is always large
+/// enough for the first one, guaranteeing forward progress for a topological
+/// prefix even if that transaction is larger than the even share.
+///
+/// `weights` must be in mining order (raw conflicts first, then the
+/// parents-first mempool). Pure and deterministic.
+pub fn balanced_weight_budget(weights: &[u64], blocks_left: u64, max_budget: u64) -> u64 {
+    if weights.is_empty() || blocks_left == 0 || max_budget == 0 {
+        return 0;
+    }
+
+    let total = weights
+        .iter()
+        .fold(0u64, |sum, weight| sum.saturating_add(*weight));
+    let even_share = total.div_ceil(blocks_left);
+    even_share.max(weights[0]).min(max_budget)
+}
+
 /// Greedily take a parents-first prefix of `mempool` whose combined weight fits
 /// in `budget`. Stops at the first tx that would overflow rather than skipping
 /// it, so the result stays a valid topological prefix and no parent is split
@@ -348,5 +370,30 @@ mod tests {
         assert_eq!(first, 2);
         let rest = weight_prefix_len(&weights[first..], 700);
         assert_eq!(rest, 2);
+    }
+
+    #[test]
+    fn balanced_budget_spreads_a_small_backlog_across_blocks() {
+        let weights = [400u64, 400, 400, 400, 400, 400];
+        assert_eq!(balanced_weight_budget(&weights, 3, 4_000), 800);
+    }
+
+    #[test]
+    fn balanced_budget_caps_an_oversized_backlog() {
+        let weights = [1_000u64, 1_000, 1_000, 1_000, 1_000];
+        assert_eq!(balanced_weight_budget(&weights, 2, 2_000), 2_000);
+    }
+
+    #[test]
+    fn balanced_budget_always_allows_the_first_transaction() {
+        let weights = [1_500u64, 100, 100];
+        assert_eq!(balanced_weight_budget(&weights, 3, 2_000), 1_500);
+    }
+
+    #[test]
+    fn balanced_budget_is_zero_without_work_or_blocks() {
+        assert_eq!(balanced_weight_budget(&[], 3, 2_000), 0);
+        assert_eq!(balanced_weight_budget(&[100], 0, 2_000), 0);
+        assert_eq!(balanced_weight_budget(&[100], 1, 0), 0);
     }
 }
