@@ -5,12 +5,13 @@ use crate::config::ReorgConfig;
 use bitcoincore_rpc::{bitcoin::Amount, Client, RpcApi};
 use simchain_common::{create_wallet_client, require_regtest_address};
 
-/// Send `count` fresh transactions from a wallet on the reorg node into its
-/// own mempool, modelling a node that received transactions its peers have not
-/// yet seen (clients broadcasting only to it). Prefers `REORG_WALLET_NAME`
-/// (the wallet the controller created on the reorg node); falls back to the
-/// first loaded wallet if that one is not loaded.
-pub fn inject_transactions(node: &Client, count: u64) {
+/// Resolve the reorg node's wallet, returning `(name, wallet-scoped client)`.
+/// Prefers `REORG_WALLET_NAME` (the wallet the controller created on the reorg
+/// node); falls back to the first loaded wallet if that one is not loaded, and
+/// logs once when it does. Returns `None` if no wallet is loaded or the client
+/// cannot be built. Shared so tx injection and the double-spend planner always
+/// agree on which wallet the reorg node is acting as.
+pub fn resolve_wallet(node: &Client) -> Option<(String, Client)> {
     let config = ReorgConfig::global();
     let wallet_name = match node.list_wallets() {
         Ok(wallets) if wallets.contains(&config.wallet_name) => config.wallet_name.clone(),
@@ -23,16 +24,26 @@ pub fn inject_transactions(node: &Client, count: u64) {
             wallets[0].clone()
         }
         _ => {
-            tracing::warn!("No wallet loaded on the reorg node, cannot add new transactions");
-            return;
+            tracing::warn!("No wallet loaded on the reorg node");
+            return None;
         }
     };
-    let wallet = match create_wallet_client(&config.rpc_url, &wallet_name) {
-        Ok(wallet) => wallet,
+    match create_wallet_client(&config.rpc_url, &wallet_name) {
+        Ok(wallet) => Some((wallet_name, wallet)),
         Err(error) => {
-            tracing::error!("Wallet client build failed ({error}), skipping tx injection");
-            return;
+            tracing::error!("Wallet client build failed ({error})");
+            None
         }
+    }
+}
+
+/// Send `count` fresh transactions from a wallet on the reorg node into its
+/// own mempool, modelling a node that received transactions its peers have not
+/// yet seen (clients broadcasting only to it).
+pub fn inject_transactions(node: &Client, count: u64) {
+    let Some((wallet_name, wallet)) = resolve_wallet(node) else {
+        tracing::warn!("Cannot add new transactions (no usable wallet on the reorg node)");
+        return;
     };
     let address = match wallet.get_new_address(None, None) {
         Ok(address) => match require_regtest_address(address) {
@@ -50,6 +61,7 @@ pub fn inject_transactions(node: &Client, count: u64) {
         }
     };
     let mut sent = 0;
+    let mut sample_txid = None;
     for _ in 0..count {
         match wallet.send_to_address(
             &address,
@@ -61,7 +73,10 @@ pub fn inject_transactions(node: &Client, count: u64) {
             None,
             None,
         ) {
-            Ok(_) => sent += 1,
+            Ok(txid) => {
+                sample_txid.get_or_insert(txid);
+                sent += 1;
+            }
             Err(error) => {
                 tracing::warn!("Tx injection stopped after {sent} txs: {error}");
                 break;
@@ -69,8 +84,9 @@ pub fn inject_transactions(node: &Client, count: u64) {
         }
     }
     if sent > 0 {
+        let sample_txid = sample_txid.expect("a successful send records its txid");
         tracing::info!(
-            "Added {sent} new transactions from wallet '{wallet_name}' (txs this node saw first) to mine into the winning chain"
+            "Added {sent} new transactions from wallet '{wallet_name}' (txs this node saw first) to mine into the winning chain; sample injected txid: {sample_txid}"
         );
     } else {
         tracing::warn!(

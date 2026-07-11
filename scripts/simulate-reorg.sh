@@ -8,4 +8,4 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 exec docker compose \
   -f "$REPO_ROOT/docker-compose.yml" \
   --project-directory "$REPO_ROOT" \
-  run --no-deps --rm btc-simnet-reorg "$@"
+  run --build --no-deps --rm btc-simnet-reorg "$@"

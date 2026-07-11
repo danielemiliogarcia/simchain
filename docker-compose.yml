@@ -320,6 +320,15 @@ services:
       # that saw transactions its peers have not yet (0 disables; ignored for
       # `empty` reorgs).
       - REORG_ADDS_NEW_TXS=${REORG_ADDS_NEW_TXS:-5}
+      # Percentage (0-100) of eligible orphaned wallet txs to permanently drop
+      # by mining a same-input, different-output conflict into the replacement
+      # chain (0 disables; ignored for `empty` reorgs). Only reorg-node
+      # wallet-engine spam is eligible; with USE_RAW_TX_SPAM=true there may be
+      # nothing to conflict.
+      - REORG_DOUBLE_SPEND_PCT=${REORG_DOUBLE_SPEND_PCT:-0}
+      # Passed through so the reorg tool can warn when permanent-drop mode is
+      # requested against raw-engine spam, whose keys its wallet cannot sign.
+      - USE_RAW_TX_SPAM=${USE_RAW_TX_SPAM:-true}
       # Wallet used for REORG_ADDS_NEW_TXS (follows the controller-created
       # wallet on the default reorg node)
       - REORG_WALLET_NAME=${REORG_WALLET_NAME:-${NODE3_WALLET_NAME:-node3}}

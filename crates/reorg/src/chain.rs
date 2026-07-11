@@ -2,11 +2,73 @@
 //! inspection, topological mempool reads and exact-content block mining.
 
 use bitcoincore_rpc::{
-    bitcoin::{Address, Txid},
+    bitcoin::{Address, BlockHash, Txid},
     Client, RpcApi,
 };
 use serde_json::json;
 use std::collections::HashSet;
+
+/// Consensus cap on block weight. A block whose transactions push past this is
+/// rejected with `bad-blk-length`, so replacement blocks are packed below it.
+const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+
+/// Weight budget for one replacement block's explicit transaction list. Kept
+/// below [`MAX_BLOCK_WEIGHT`] with headroom for the coinbase `generateblock`
+/// appends and for the vsize*4 upper-bound estimate a pre-0.19 node would use,
+/// so a packed list never trips the consensus size check.
+pub const BLOCK_WEIGHT_BUDGET: u64 = MAX_BLOCK_WEIGHT - 100_000;
+
+/// One block on the branch a reorg is about to orphan, with its full ordered
+/// txid list (coinbase first). Captured before invalidation so the double-spend
+/// planner can walk the exact txs being rolled back.
+#[derive(Clone, Debug)]
+pub struct BranchBlock {
+    pub height: u64,
+    pub hash: BlockHash,
+    pub txids: Vec<Txid>,
+}
+
+/// The exact slice of the chain a `depth`-block reorg will orphan: heights
+/// `tip-depth+1 ..= tip`, returned oldest-first so downstream selection is
+/// deterministic. Callers must have already checked the chain is long enough
+/// (`tip >= depth`).
+pub fn branch_to_orphan(
+    node: &Client,
+    depth: u64,
+) -> Result<Vec<BranchBlock>, bitcoincore_rpc::Error> {
+    let tip = node.get_block_count()?;
+    let first = tip.saturating_sub(depth) + 1;
+    let mut blocks = Vec::new();
+    for height in first..=tip {
+        let hash = node.get_block_hash(height)?;
+        let info = node.get_block_info(&hash)?;
+        blocks.push(BranchBlock {
+            height,
+            hash,
+            txids: info.tx,
+        });
+    }
+    Ok(blocks)
+}
+
+/// An item to mine into a `generateblock` call: either a txid already in the
+/// mempool, or a raw transaction (hex) that is not -- Bitcoin Core accepts a
+/// mixed ordered list of both. The double-spend conflicts are `RawHex` because
+/// they must land in the block regardless of mempool policy.
+#[derive(Clone, Debug)]
+pub enum BlockTx {
+    Mempool(Txid),
+    RawHex(String),
+}
+
+impl BlockTx {
+    fn to_arg(&self) -> String {
+        match self {
+            BlockTx::Mempool(txid) => txid.to_string(),
+            BlockTx::RawHex(hex) => hex.clone(),
+        }
+    }
+}
 
 /// (height, hash, tx count) for the last `count` blocks, tip first.
 pub fn last_blocks(
@@ -35,77 +97,303 @@ pub fn print_blocks(blocks: &[(u64, String, usize)]) {
     }
 }
 
-/// Txids currently in the mempool, ordered parents-first (ascending ancestor
-/// count). A leading slice of this list is always a valid set to mine into one
-/// block: a child never precedes its parent, and every parent still in the
-/// mempool sorts ahead of it.
-pub fn live_mempool_topo(node: &Client) -> Result<Vec<Txid>, bitcoincore_rpc::Error> {
-    let mut entries: Vec<(u64, Txid)> = Vec::new();
-    for txid in node.get_raw_mempool()? {
-        let ancestors = node
-            .get_mempool_entry(&txid)
-            .map(|e| e.ancestor_count)
-            .unwrap_or(0);
-        entries.push((ancestors, txid));
-    }
-    entries.sort_by_key(|(ancestors, _)| *ancestors);
-    Ok(entries.into_iter().map(|(_, txid)| txid).collect())
+/// One mempool transaction with the block weight it contributes. Ordered
+/// parents-first by the list it lives in.
+#[derive(Clone, Copy, Debug)]
+pub struct MempoolTx {
+    pub txid: Txid,
+    pub weight: u64,
 }
 
-/// Mine exactly `txids` (plus the coinbase) into one block with `generateblock`,
+/// Mempool transactions with their weights, ordered parents-first (ascending
+/// ancestor count, txid as a deterministic tiebreak) and with `excluded` txids
+/// removed. A leading slice is always a valid set to mine into one block: a
+/// child never precedes its parent, and every parent still in the mempool sorts
+/// ahead of it. The filter preserves that -- a kept child's parent could only
+/// be excluded if the child were itself an excluded descendant.
+///
+/// Reads the whole mempool in one verbose RPC (weights included) rather than a
+/// `getmempoolentry` per tx, so a multi-thousand-tx backlog costs one round-trip.
+pub fn live_mempool_weighted(
+    node: &Client,
+    excluded: &HashSet<Txid>,
+) -> Result<Vec<MempoolTx>, bitcoincore_rpc::Error> {
+    let mut entries: Vec<(u64, Txid, u64)> = node
+        .get_raw_mempool_verbose()?
+        .into_iter()
+        .filter(|(txid, _)| !excluded.contains(txid))
+        .map(|(txid, entry)| {
+            // `weight` is present on Core >= 0.19; fall back to vsize*4 (an
+            // upper bound, safe for budgeting) if an older node omits it.
+            let weight = entry.weight.unwrap_or(entry.vsize * 4);
+            (entry.ancestor_count, txid, weight)
+        })
+        .collect();
+    // Parents-first; txid tiebreak makes ties deterministic (the verbose
+    // mempool arrives as an unordered map).
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(entries
+        .into_iter()
+        .map(|(_, txid, weight)| MempoolTx { txid, weight })
+        .collect())
+}
+
+/// How many leading items of `weights` fit within `budget`, stopping at the
+/// first that would overflow rather than skipping it. Shared by mempool and
+/// raw-conflict packing so neither ever hands `generateblock` a list heavier
+/// than one block -- the size-limit rejection this whole path exists to avoid.
+/// Pure and deterministic.
+pub fn weight_prefix_len(weights: &[u64], budget: u64) -> usize {
+    let mut used: u64 = 0;
+    let mut n = 0;
+    for &w in weights {
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        n += 1;
+    }
+    n
+}
+
+/// Weight target for the next block when `weights` must be spread over
+/// `blocks_left` replacement blocks. A backlog larger than the remaining
+/// capacity fills the next block to `max_budget`; a smaller backlog is divided
+/// evenly so the first block does not consume everything and leave later
+/// replacements empty. When transactions remain, the target is always large
+/// enough for the first one, guaranteeing forward progress for a topological
+/// prefix even if that transaction is larger than the even share.
+///
+/// `weights` must be in mining order (raw conflicts first, then the
+/// parents-first mempool). Pure and deterministic.
+pub fn balanced_weight_budget(weights: &[u64], blocks_left: u64, max_budget: u64) -> u64 {
+    if weights.is_empty() || blocks_left == 0 || max_budget == 0 {
+        return 0;
+    }
+
+    let total = weights
+        .iter()
+        .fold(0u64, |sum, weight| sum.saturating_add(*weight));
+    let even_share = total.div_ceil(blocks_left);
+    even_share.max(weights[0]).min(max_budget)
+}
+
+/// Greedily take a parents-first prefix of `mempool` whose combined weight fits
+/// in `budget`. Stops at the first tx that would overflow rather than skipping
+/// it, so the result stays a valid topological prefix and no parent is split
+/// from a child. A standard mempool tx is far smaller than a block budget, so
+/// this never strands a tx that could otherwise be mined. Pure and deterministic.
+pub fn pack_by_weight(mempool: &[MempoolTx], budget: u64) -> Vec<Txid> {
+    let weights: Vec<u64> = mempool.iter().map(|tx| tx.weight).collect();
+    let n = weight_prefix_len(&weights, budget);
+    mempool[..n].iter().map(|tx| tx.txid).collect()
+}
+
+/// Issue one `generateblock` with an explicit item list. Returns `Ok(())` on
+/// success; the caller decides how to react to an error.
+fn generate_block(
+    node: &Client,
+    mine_address: &Address,
+    list: &[String],
+) -> Result<(), bitcoincore_rpc::Error> {
+    node.call::<serde_json::Value>(
+        "generateblock",
+        &[json!(mine_address.to_string()), json!(list)],
+    )
+    .map(|_| ())
+}
+
+/// Mine exactly `items` (plus the coinbase) into one block with `generateblock`,
 /// which -- unlike `generate_to_address` -- never pulls the rest of the mempool
 /// in, so mining one block can never strand a later block's transactions.
-/// If a tx went invalid since it was selected (e.g. RBF-replaced mid-reorg),
-/// re-filter to what is still in the mempool and retry once; if nothing valid
-/// remains (or the rejection was not about a missing tx), mine a real empty
-/// block. Never drains the mempool.
+///
+/// [`BlockTx::RawHex`] items are the deliberate double-spend conflicts and must
+/// land; [`BlockTx::Mempool`] items may go stale mid-reorg (e.g. RBF-replaced).
+/// On rejection the recovery ladder is: (1) re-filter mempool txids to what is
+/// still present while keeping every raw conflict, and retry; (2) if that still
+/// fails, mine just the raw conflicts, since they are the point of the reorg;
+/// (3) fall back to a real empty block. Never drains the mempool.
 pub fn mine_exact(
     node: &Client,
     mine_address: &Address,
-    txids: &[Txid],
+    items: &[BlockTx],
 ) -> Result<(), bitcoincore_rpc::Error> {
-    let list: Vec<String> = txids.iter().map(|t| t.to_string()).collect();
-    match node.call::<serde_json::Value>(
-        "generateblock",
-        &[json!(mine_address.to_string()), json!(list)],
-    ) {
-        Ok(_) => return Ok(()),
+    let full: Vec<String> = items.iter().map(BlockTx::to_arg).collect();
+    match generate_block(node, mine_address, &full) {
+        Ok(()) => return Ok(()),
         Err(e) => tracing::warn!(
-            "generateblock rejected {} tx(s) ({e}), re-filtering to the live mempool...",
-            list.len()
+            "generateblock rejected {} item(s) ({e}), re-filtering to the live mempool...",
+            full.len()
         ),
     }
 
     let live: HashSet<Txid> = node.get_raw_mempool()?.into_iter().collect();
-    let filtered: Vec<String> = txids
+    let raw: Vec<String> = items
         .iter()
-        .filter(|t| live.contains(*t))
-        .map(|t| t.to_string())
+        .filter_map(|item| match item {
+            BlockTx::RawHex(hex) => Some(hex.clone()),
+            BlockTx::Mempool(_) => None,
+        })
+        .collect();
+    let filtered: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            BlockTx::RawHex(hex) => Some(hex.clone()),
+            BlockTx::Mempool(txid) => live.contains(txid).then(|| txid.to_string()),
+        })
         .collect();
 
-    // Something salvageable is still in the mempool: retry with just those.
-    // Otherwise (all evicted, or the rejection was not about a missing tx and
-    // retrying the same list would only fail again) mine an empty block; the
-    // untouched txs stay in the mempool for the next block's sweep.
-    let dropped = list.len() - filtered.len();
-    if !filtered.is_empty() && dropped > 0 {
+    // Some mempool txids went stale but salvageable content remains: retry with
+    // the raw conflicts plus whatever mempool txids are still present.
+    let dropped = full.len() - filtered.len();
+    if dropped > 0 && !filtered.is_empty() {
         tracing::info!(
             "  dropped {dropped} stale tx(s), mining the remaining {}",
             filtered.len()
         );
-        node.call::<serde_json::Value>(
-            "generateblock",
-            &[json!(mine_address.to_string()), json!(filtered)],
-        )?;
-    } else {
-        tracing::info!(
-            "  mining an empty block, {} tx(s) left for the next block",
-            filtered.len()
-        );
-        node.call::<serde_json::Value>(
-            "generateblock",
-            &[json!(mine_address.to_string()), json!(Vec::<String>::new())],
-        )?;
+        match generate_block(node, mine_address, &filtered) {
+            Ok(()) => return Ok(()),
+            Err(e) => tracing::warn!("  filtered retry still rejected ({e})"),
+        }
     }
-    Ok(())
+
+    // The raw conflicts are the whole point of the reorg, so try them alone
+    // before giving up (the first attempt may have failed on a stale mempool
+    // txid rather than the conflicts).
+    if !raw.is_empty() && raw.len() < filtered.len() {
+        tracing::info!("  mining the {} raw replacement(s) only", raw.len());
+        match generate_block(node, mine_address, &raw) {
+            Ok(()) => return Ok(()),
+            Err(e) => tracing::warn!("  raw-only block rejected ({e})"),
+        }
+    }
+
+    // The conflicts could not be mined even in isolation, so they are unminable
+    // (e.g. an input got spent by an earlier replacement block). Rather than
+    // waste the whole block, salvage the surviving mempool txs -- the conflicts
+    // are dropped and log_dropped reports the miss, but the block stays full
+    // instead of empty and a single bad conflict no longer strands a block of
+    // otherwise-valid mempool txs.
+    let mempool_only: Vec<String> = filtered
+        .iter()
+        .filter(|s| !raw.contains(s))
+        .cloned()
+        .collect();
+    if !raw.is_empty() && !mempool_only.is_empty() {
+        tracing::warn!(
+            "  {} conflict(s) unminable; salvaging {} mempool tx(s) into this block instead",
+            raw.len(),
+            mempool_only.len()
+        );
+        match generate_block(node, mine_address, &mempool_only) {
+            Ok(()) => return Ok(()),
+            Err(e) => tracing::warn!("  mempool-only salvage rejected ({e})"),
+        }
+    }
+
+    // All evicted, or the rejection was not about a missing tx: mine an empty
+    // block; the untouched txs stay in the mempool for the next block's sweep.
+    // If this block carried raw conflicts, they just failed to land -- warn
+    // loudly rather than logging "0 tx(s) left" as if there were nothing to do;
+    // the corresponding permanent-drop did not happen this block (log_dropped
+    // confirms on-chain and reports any miss).
+    let mempool_left = filtered.len() - raw.len();
+    if raw.is_empty() {
+        tracing::info!("  mining an empty block, {mempool_left} tx(s) left for the next block");
+    } else {
+        tracing::warn!(
+            "  mining an empty block: {} raw replacement(s) FAILED to mine, \
+             {mempool_left} mempool tx(s) left for the next block",
+            raw.len()
+        );
+    }
+    generate_block(node, mine_address, &Vec::<String>::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoincore_rpc::bitcoin::hashes::Hash;
+
+    fn mtx(n: u8, weight: u64) -> MempoolTx {
+        MempoolTx {
+            txid: Txid::from_byte_array([n; 32]),
+            weight,
+        }
+    }
+
+    #[test]
+    fn pack_by_weight_takes_prefix_that_fits() {
+        let mempool = vec![mtx(1, 400), mtx(2, 400), mtx(3, 400)];
+        // Budget fits the first two but not the third.
+        let chosen = pack_by_weight(&mempool, 900);
+        assert_eq!(chosen, vec![mempool[0].txid, mempool[1].txid]);
+    }
+
+    #[test]
+    fn pack_by_weight_stops_at_first_overflow_keeping_topo_prefix() {
+        // A big tx in the middle stops packing there rather than skipping it to
+        // grab the smaller tx behind it, which would strand a parent.
+        let mempool = vec![mtx(1, 100), mtx(2, 5000), mtx(3, 100)];
+        let chosen = pack_by_weight(&mempool, 1000);
+        assert_eq!(chosen, vec![mempool[0].txid]);
+    }
+
+    #[test]
+    fn pack_by_weight_empty_when_first_tx_exceeds_budget() {
+        assert!(pack_by_weight(&[mtx(1, 5000)], 1000).is_empty());
+    }
+
+    #[test]
+    fn pack_by_weight_takes_all_when_budget_is_ample() {
+        let mempool = vec![mtx(1, 400), mtx(2, 400)];
+        let chosen = pack_by_weight(&mempool, BLOCK_WEIGHT_BUDGET);
+        assert_eq!(chosen.len(), 2);
+    }
+
+    #[test]
+    fn weight_prefix_len_counts_the_prefix_that_fits() {
+        // Same greedy rule the raw-conflict batching relies on: stop at the
+        // first item that would overflow, so a batch never exceeds one block.
+        assert_eq!(weight_prefix_len(&[400, 400, 400], 900), 2);
+        assert_eq!(weight_prefix_len(&[400, 400, 400], 1200), 3);
+        assert_eq!(weight_prefix_len(&[5000, 100], 1000), 0);
+        assert_eq!(weight_prefix_len(&[], 1000), 0);
+    }
+
+    #[test]
+    fn weight_prefix_len_rolls_remainder_to_the_next_block() {
+        // A conflict batch heavier than one block splits: the first call takes
+        // what fits, a second call over the remainder takes the rest.
+        let weights = [300u64, 300, 300, 300];
+        let first = weight_prefix_len(&weights, 700);
+        assert_eq!(first, 2);
+        let rest = weight_prefix_len(&weights[first..], 700);
+        assert_eq!(rest, 2);
+    }
+
+    #[test]
+    fn balanced_budget_spreads_a_small_backlog_across_blocks() {
+        let weights = [400u64, 400, 400, 400, 400, 400];
+        assert_eq!(balanced_weight_budget(&weights, 3, 4_000), 800);
+    }
+
+    #[test]
+    fn balanced_budget_caps_an_oversized_backlog() {
+        let weights = [1_000u64, 1_000, 1_000, 1_000, 1_000];
+        assert_eq!(balanced_weight_budget(&weights, 2, 2_000), 2_000);
+    }
+
+    #[test]
+    fn balanced_budget_always_allows_the_first_transaction() {
+        let weights = [1_500u64, 100, 100];
+        assert_eq!(balanced_weight_budget(&weights, 3, 2_000), 1_500);
+    }
+
+    #[test]
+    fn balanced_budget_is_zero_without_work_or_blocks() {
+        assert_eq!(balanced_weight_budget(&[], 3, 2_000), 0);
+        assert_eq!(balanced_weight_budget(&[100], 0, 2_000), 0);
+        assert_eq!(balanced_weight_budget(&[100], 1, 0), 0);
+    }
 }

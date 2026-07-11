@@ -2,6 +2,7 @@
 
 mod chain;
 mod config;
+mod double_spend;
 mod reorg;
 mod runner;
 mod wallet;

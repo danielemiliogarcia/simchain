@@ -2,8 +2,12 @@
 //! replacement branch, then make sure the network adopts it.
 
 use crate::{
-    chain::{last_blocks, live_mempool_topo, mine_exact, print_blocks},
+    chain::{
+        balanced_weight_budget, branch_to_orphan, last_blocks, live_mempool_weighted, mine_exact,
+        pack_by_weight, print_blocks, weight_prefix_len, BlockTx, BLOCK_WEIGHT_BUDGET,
+    },
     config::ReorgConfig,
+    double_spend::{build_plan, DoubleSpendPlan},
     wallet::inject_transactions,
 };
 use bitcoincore_rpc::{bitcoin::Address, Client, RpcApi};
@@ -90,9 +94,23 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
     let before = last_blocks(node, config.depth + 2)?;
     print_blocks(&before);
 
+    // Capture the exact branch about to be orphaned (full txid lists) before
+    // invalidation, so the double-spend planner can walk the rolled-back txs.
+    // Only needed for a non-empty reorg with the feature enabled.
+    let plan_branch = if !config.empty_mode && config.double_spend_pct > 0 {
+        Some(branch_to_orphan(node, config.depth)?)
+    } else {
+        None
+    };
+
     let target_height = tip - config.depth + 1;
     let target_hash = node.get_block_hash(target_height)?;
     let target_time = node.get_block_info(&target_hash)?.time as u64;
+
+    // Snapshot the mempool size just before invalidation so the "returned"
+    // count below reflects only the orphaned blocks' txs, not the pre-existing
+    // spam backlog already sitting in the mempool.
+    let mempool_before = node.get_raw_mempool()?.len();
 
     tracing::info!("\nInvalidating block {target_height} ({target_hash})...");
     node.invalidate_block(&target_hash)?;
@@ -100,8 +118,11 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
     // Count the txs the orphaned blocks returned to the mempool (for the
     // summary). The mining below reads the mempool live for each block, so RBF
     // replacements that arrive mid-reorg are handled without special-casing.
-    let returned = node.get_raw_mempool()?.len();
-    tracing::info!("{returned} transactions returned to the mempool from the orphaned blocks");
+    let mempool_after = node.get_raw_mempool()?.len();
+    let returned = mempool_after.saturating_sub(mempool_before);
+    tracing::info!(
+        "{returned} transactions returned to the mempool from the orphaned blocks (mempool now holds {mempool_after})"
+    );
 
     // A replacement block with the same timestamp and coinbase as the
     // invalidated one hashes identically and is rejected as known-invalid,
@@ -111,32 +132,112 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
     }
 
     let blocks_to_mine = config.depth + 1;
-    if config.empty_mode {
+    let plan: Option<DoubleSpendPlan> = if config.empty_mode {
         // Chaos reorg: mine empty replacement blocks and leave the orphaned
         // txs unconfirmed in the mempool. adds_new_txs is ignored -- empty
-        // means empty.
+        // means empty. Double-spend is ignored too: empty means empty.
+        if config.double_spend_pct > 0 {
+            tracing::info!(
+                "Double-spend mode ignored in empty (chaos) reorg (REORG_DOUBLE_SPEND_PCT={})",
+                config.double_spend_pct
+            );
+        }
         tracing::info!("Mining {blocks_to_mine} EMPTY replacement blocks (chaos reorg, one extra so the new chain wins network-wide)...");
         for _ in 0..blocks_to_mine {
             mine_exact(node, &config.mine_address, &[])?;
         }
+        None
     } else {
+        // Build the permanent-drop plan from the rolled-back state (roots are
+        // on-chain UTXOs again, orphaned txs are back in the mempool). A pct of
+        // 0 or an empty branch yields an empty plan and today's behavior.
+        let plan = build_plan(
+            node,
+            plan_branch.as_deref().unwrap_or(&[]),
+            config.double_spend_pct,
+        );
+        if config.double_spend_pct > 0 {
+            plan.log_selection(config.use_raw_tx_spam);
+        }
+
         // Seed the mempool with brand-new txs this node "saw first" so the
         // winning chain carries them alongside the returned txs.
         if config.adds_new_txs > 0 {
             inject_transactions(node, config.adds_new_txs);
         }
 
-        // Re-mine the live mempool, spread evenly across the replacement
-        // blocks. Reading it fresh each round reflects RBF replacements; the
-        // last block's ceiling takes whatever remains, so no tx is stranded.
-        tracing::info!("Mining {blocks_to_mine} replacement blocks from the live mempool (one extra so the new chain wins network-wide)...");
-        for index in 0..blocks_to_mine as usize {
-            let blocks_left = blocks_to_mine as usize - index;
-            let live = live_mempool_topo(node)?;
-            let take = live.len().div_ceil(blocks_left).min(live.len());
-            mine_exact(node, &config.mine_address, &live[..take])?;
+        // Re-mine the returned mempool plus the double-spend conflicts across
+        // the replacement blocks. The conflicts are raw hex that must land, so
+        // they take budget priority; the rest of each block's weight budget is
+        // packed from the mempool, read fresh each round -- so txs mined into
+        // earlier blocks drop out, RBF replacements are reflected, and the
+        // dropped originals + descendants stay filtered.
+        //
+        // Everything is packed by *weight*, not tx count: spam txs are fat, so
+        // only ~one block's worth fits per block. Splitting the whole backlog by
+        // block count instead would hand a single generateblock more weight than
+        // the 4M consensus limit, which Core rejects (`bad-blk-length`) and the
+        // recovery ladder then turns into an empty block -- the reorg would
+        // silently degrade to empty mode. The conflicts are weight-batched the
+        // same way, so a large batch can never overflow a block on its own.
+        // Whatever exceeds the replacement blocks' total capacity stays in the
+        // mempool for later real blocks.
+        let mut pending = plan.raw_conflicts();
+        if pending.is_empty() {
+            tracing::info!("Mining {blocks_to_mine} replacement blocks from the live mempool (one extra so the new chain wins network-wide)...");
+        } else {
+            tracing::info!(
+                "Mining {blocks_to_mine} replacement blocks from the live mempool plus {} double-spend conflict(s) (one extra so the new chain wins network-wide)...",
+                pending.len()
+            );
         }
-    }
+        for index in 0..blocks_to_mine {
+            let blocks_left = blocks_to_mine - index;
+            let mempool = live_mempool_weighted(node, &plan.excluded_mempool_txids)?;
+
+            // Balance all currently available work across the replacement
+            // blocks that remain. Oversized backlogs still fill each block to
+            // the safe cap; smaller backlogs are spread out instead of being
+            // exhausted by the first replacement and leaving coinbase-only
+            // blocks behind. Raw conflicts stay first in mining order.
+            let conflict_weights: Vec<u64> = pending.iter().map(|(_, w)| *w).collect();
+            let all_weights: Vec<u64> = conflict_weights
+                .iter()
+                .copied()
+                .chain(mempool.iter().map(|tx| tx.weight))
+                .collect();
+            let target = balanced_weight_budget(&all_weights, blocks_left, BLOCK_WEIGHT_BUDGET);
+
+            let take = weight_prefix_len(&conflict_weights, target);
+            let conflicts: Vec<(String, u64)> = pending.drain(..take).collect();
+            let conflict_weight: u64 = conflicts.iter().map(|(_, w)| *w).sum();
+            let mempool_budget = target.saturating_sub(conflict_weight);
+
+            let packed = pack_by_weight(&mempool, mempool_budget);
+            let mempool_weight: u64 = mempool[..packed.len()].iter().map(|tx| tx.weight).sum();
+            tracing::info!(
+                "Replacement block {}/{}: {} conflict(s) + {} mempool tx(s), {} WU selected (target {target} WU, {} block(s) left)",
+                index + 1,
+                blocks_to_mine,
+                conflicts.len(),
+                packed.len(),
+                conflict_weight + mempool_weight,
+                blocks_left
+            );
+
+            let mut items: Vec<BlockTx> = Vec::with_capacity(conflicts.len() + packed.len());
+            items.extend(conflicts.into_iter().map(|(hex, _)| BlockTx::RawHex(hex)));
+            items.extend(packed.into_iter().map(BlockTx::Mempool));
+            mine_exact(node, &config.mine_address, &items)?;
+        }
+        if !pending.is_empty() {
+            tracing::warn!(
+                "{} double-spend conflict(s) did not fit the replacement blocks and were not mined; their originals were not dropped",
+                pending.len()
+            );
+        }
+        Some(plan)
+    };
 
     // Make sure the rest of the network actually switched to the new chain
     // before declaring success, then let it propagate before reporting.
@@ -165,6 +266,10 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
                 );
             }
         }
+    }
+
+    if let Some(plan) = &plan {
+        plan.log_dropped(node);
     }
 
     tracing::info!(
