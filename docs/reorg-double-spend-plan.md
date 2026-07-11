@@ -542,3 +542,30 @@ Medium. No new crate, no new image, no change to the mining or spammer binaries.
 
 That order keeps the hard parts isolated: eligibility planning first, mixed block
 assembly second, orchestration last.
+
+
+---------------------------------
+
+What shipped
+
+Config/env/docs (REORG_DOUBLE_SPEND_PCT, default 0, range 0–100):
+- config.rs — new double_spend_pct: u8 field + parse_double_spend_pct (rejects >100).
+- docker-compose.yml, .env.full.example, docs/SETTINGS.md, docs/REORGS.md (new "Permanent Drop" section).
+- docs/NICE-TO-HAVE.md — removed shipped item #3, renumbered #4→#3, fixed "four"→"three".
+
+Code:
+- wallet.rs — extracted resolve_wallet(node) -> Option<(String, Client)>; inject_transactions reuses it.
+- chain.rs — BranchBlock + branch_to_orphan (full txid capture pre-invalidation); BlockTx{Mempool,RawHex} enum; mine_exact now takes &[BlockTx] with a recovery ladder (re-filter stale mempool keeping raw conflicts → raw-only → empty); live_mempool_topo_filtered.
+- double_spend.rs (new) — build_plan: resolve wallet, walk branch oldest-first, keep only wallet-owned root txs (gettxout(...,include_mempool=false) on every input), build same-input/single-output conflict at the original fee, sign with wallet, exclude selected originals + mempool descendants. Pure helpers selected_count / flatten_branch / exclusion_set unit-tested.
+- reorg.rs — capture branch before invalidate, build plan after, spread raw conflicts + filtered mempool evenly across replacement blocks, empty-mode ignore log, post-reorg "Permanently dropped transactions" section.
+
+Verify: cargo build/clippy/fmt clean; cargo test 16 pass (6 new in double_spend).
+
+Not done (yours)
+
+Not committed — you commit + manual-test yourself.
+
+Two gotchas for manual runs (plan §15):
+- Rebuild the reorg image before testing — the binary is baked into tools.Dockerfile. USE_RAW_TX_SPAM=true default → zero eligible txs (raw engine keys not held by reorg node); set USE_RAW_TX_SPAM=false to exercise it.
+- Sequence: baseline pct=0 unchanged → pct=100 empty logs ignore → wallet-engine pct=100 drop → descendant pruning → pct=50 partial → wrong-engine "0 eligible" → auto mode.
+-----------------------

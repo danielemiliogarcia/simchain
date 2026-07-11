@@ -2,8 +2,12 @@
 //! replacement branch, then make sure the network adopts it.
 
 use crate::{
-    chain::{last_blocks, live_mempool_topo, mine_exact, print_blocks},
+    chain::{
+        branch_to_orphan, last_blocks, live_mempool_topo_filtered, mine_exact, print_blocks,
+        BlockTx,
+    },
     config::ReorgConfig,
+    double_spend::{build_plan, DoubleSpendPlan},
     wallet::inject_transactions,
 };
 use bitcoincore_rpc::{bitcoin::Address, Client, RpcApi};
@@ -90,6 +94,15 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
     let before = last_blocks(node, config.depth + 2)?;
     print_blocks(&before);
 
+    // Capture the exact branch about to be orphaned (full txid lists) before
+    // invalidation, so the double-spend planner can walk the rolled-back txs.
+    // Only needed for a non-empty reorg with the feature enabled.
+    let plan_branch = if !config.empty_mode && config.double_spend_pct > 0 {
+        Some(branch_to_orphan(node, config.depth)?)
+    } else {
+        None
+    };
+
     let target_height = tip - config.depth + 1;
     let target_hash = node.get_block_hash(target_height)?;
     let target_time = node.get_block_info(&target_hash)?.time as u64;
@@ -111,32 +124,67 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
     }
 
     let blocks_to_mine = config.depth + 1;
-    if config.empty_mode {
+    let plan: Option<DoubleSpendPlan> = if config.empty_mode {
         // Chaos reorg: mine empty replacement blocks and leave the orphaned
         // txs unconfirmed in the mempool. adds_new_txs is ignored -- empty
-        // means empty.
+        // means empty. Double-spend is ignored too: empty means empty.
+        if config.double_spend_pct > 0 {
+            tracing::info!(
+                "Double-spend mode ignored in empty (chaos) reorg (REORG_DOUBLE_SPEND_PCT={})",
+                config.double_spend_pct
+            );
+        }
         tracing::info!("Mining {blocks_to_mine} EMPTY replacement blocks (chaos reorg, one extra so the new chain wins network-wide)...");
         for _ in 0..blocks_to_mine {
             mine_exact(node, &config.mine_address, &[])?;
         }
+        None
     } else {
+        // Build the permanent-drop plan from the rolled-back state (roots are
+        // on-chain UTXOs again, orphaned txs are back in the mempool). A pct of
+        // 0 or an empty branch yields an empty plan and today's behavior.
+        let plan = build_plan(
+            node,
+            plan_branch.as_deref().unwrap_or(&[]),
+            config.double_spend_pct,
+        );
+        if config.double_spend_pct > 0 {
+            plan.log_selection();
+        }
+
         // Seed the mempool with brand-new txs this node "saw first" so the
         // winning chain carries them alongside the returned txs.
         if config.adds_new_txs > 0 {
             inject_transactions(node, config.adds_new_txs);
         }
 
-        // Re-mine the live mempool, spread evenly across the replacement
-        // blocks. Reading it fresh each round reflects RBF replacements; the
-        // last block's ceiling takes whatever remains, so no tx is stranded.
-        tracing::info!("Mining {blocks_to_mine} replacement blocks from the live mempool (one extra so the new chain wins network-wide)...");
+        // Re-mine the live mempool plus the double-spend conflicts, spread
+        // evenly across the replacement blocks. The conflicts are raw hex that
+        // must land; the mempool is read fresh each round (reflecting RBF
+        // replacements) with the dropped originals and their descendants
+        // filtered out. Each block's ceiling takes whatever remains, so no tx
+        // is stranded.
+        let mut raw = plan.raw_conflicts();
+        if raw.is_empty() {
+            tracing::info!("Mining {blocks_to_mine} replacement blocks from the live mempool (one extra so the new chain wins network-wide)...");
+        } else {
+            tracing::info!(
+                "Mining {blocks_to_mine} replacement blocks from the live mempool plus {} double-spend conflict(s) (one extra so the new chain wins network-wide)...",
+                raw.len()
+            );
+        }
         for index in 0..blocks_to_mine as usize {
             let blocks_left = blocks_to_mine as usize - index;
-            let live = live_mempool_topo(node)?;
-            let take = live.len().div_ceil(blocks_left).min(live.len());
-            mine_exact(node, &config.mine_address, &live[..take])?;
+            let raw_take = raw.len().div_ceil(blocks_left).min(raw.len());
+            let live = live_mempool_topo_filtered(node, &plan.excluded_mempool_txids)?;
+            let mem_take = live.len().div_ceil(blocks_left).min(live.len());
+            let mut items: Vec<BlockTx> = Vec::with_capacity(raw_take + mem_take);
+            items.extend(raw.drain(..raw_take).map(BlockTx::RawHex));
+            items.extend(live[..mem_take].iter().copied().map(BlockTx::Mempool));
+            mine_exact(node, &config.mine_address, &items)?;
         }
-    }
+        Some(plan)
+    };
 
     // Make sure the rest of the network actually switched to the new chain
     // before declaring success, then let it propagate before reporting.
@@ -165,6 +213,10 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
                 );
             }
         }
+    }
+
+    if let Some(plan) = &plan {
+        plan.log_dropped();
     }
 
     tracing::info!(

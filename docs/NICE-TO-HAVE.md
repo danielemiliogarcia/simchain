@@ -36,7 +36,7 @@ that allows to defining mining pace, block filling and fee rates.
 It consists on: multiple P2P-connected nodes, rotating miners,
 a non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus four bigger proposed features with their
+limitations and future enhancements, plus three bigger proposed features with their
 rationale and an implementation plan, and a section for parked features.
 
 ## 1. Declarative scenario engine
@@ -95,41 +95,7 @@ Effort: phase 1 small; phase 2 medium (needs NET_ADMIN and per-node sidecars).
 
 ---
 
-## 3. Reorgs that drop transactions permanently (double-spend)
-
-**What:** For a configurable fraction of the orphaned *wallet-owned* (spam) transactions
-in a reorg, include a conflicting transaction (same inputs, different output) in the
-replacement blocks, so the originals become permanently invalid and can never
-re-confirm. Setting sketch: `REORG_DOUBLE_SPEND_PCT=0..100` (default 0).
-
-**Why it's a nice-to-have (the use case):** By default the reorg simulator re-mines the
-orphaned transactions into the replacement blocks (same txids), so a reorg only changes
-block hashes/heights — a user's transaction never *loses* confirmations. The
-temporary-drop case (confirmed → 0-conf → re-confirmed) is already available through the
-`empty` reorg mode (`./scripts/simulate-reorg.sh <depth> empty`, which mines empty replacement
-blocks and leaves the orphaned txs in the mempool). But the scariest real reorg is
-*permanent*: *"my deposit had N confirmations, a reorg happened, and now my transaction
-is gone forever."* Exchanges, custody watchers, indexers and payment processors must
-notice the tx conflicting entirely and un-credit / re-queue / alert — and simchain
-cannot produce that outcome today.
-
-This can only be automated for wallet-owned spam transactions: the user's own
-transactions are signed with external keys the reorg node does not hold, so a user
-wanting *their* tx permanently dropped must broadcast the conflicting tx themselves
-(an RBF replacement after an `empty` reorg).
-
-**Implementation plan:**
-1. Pick orphaned txs that spend the reorg node's wallet UTXOs, build conflicting raw txs
-   (`createrawtransaction` on the same inputs to a fresh wallet address,
-   `signrawtransactionwithwallet`), and pass them to `generateblock` in the replacement
-   blocks.
-2. Log which txids were conflicted so tests can assert on them.
-
-Effort: medium (raw-tx construction, only meaningful with spam enabled).
-
----
-
-## 4. Dashboard / control panel
+## 3. Dashboard / control panel
 
 **What:** A small web UI (one container, compose profile `panel`, localhost-only) that
 shows live chain state (height, block cadence, mempool depth/fees, current settings)

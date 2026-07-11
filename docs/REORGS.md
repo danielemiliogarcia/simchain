@@ -13,6 +13,22 @@ docker compose run --rm btc-simnet-reorg 3     # depth defaults to REORG_DEPTH (
 ./scripts/simulate-reorg.sh 3 empty            # chaos: mine empty replacement blocks
 ```
 
+## Permanent Drop (double-spend)
+
+By default a reorg re-mines the orphaned transactions with the **same txids**, so a user's transaction only changes block hash/height, it never loses a confirmation. The `empty` mode above models the *temporary* drop (confirmed → 0-conf, re-confirmable). `REORG_DOUBLE_SPEND_PCT=1..100` models the *permanent* drop: for that percentage of the **eligible orphaned wallet txs on the reorg node**, the tool mines a same-input, different-output conflict into the replacement chain, so the originals become permanently invalid and can never re-confirm. This is the outcome exchanges, custody watchers and payment processors must detect: *"my confirmed deposit is gone forever."*
+
+```bash
+REORG_DOUBLE_SPEND_PCT=100 ./scripts/simulate-reorg.sh 3        # drop all eligible
+REORG_DOUBLE_SPEND_PCT=50  ./scripts/simulate-reorg.sh 3        # drop half, re-mine the rest
+```
+
+It logs the configured percentage, the eligible/selected counts, and every `old_txid -> new_txid` pair (with how many descendants each replacement pruned), so the drop is auditable. Details of the semantics:
+
+- **Only the reorg node's own wallet spam is eligible.** The conflict is signed with the reorg node's wallet (`REORG_WALLET_NAME`), so only txs it can re-sign qualify. The default spam engine is the *raw* engine (`USE_RAW_TX_SPAM=true`), whose txs are signed by keys the reorg node does not hold, so **with stock settings there are usually zero eligible txs** and the reorg runs normally with a "0 eligible" log line. Set `USE_RAW_TX_SPAM=false` (wallet engine) to produce eligible txs. User-owned external-key txs are also never eligible; to drop one of those, broadcast the conflict yourself after an `empty` reorg.
+- **Root txs only.** A tx that spends the output of another orphaned tx is a descendant, not a root; the tool double-spends the ancestor and lets the descendant die with it (descendants are excluded from the replacement blocks, never mined).
+- **Ignored in `empty` mode** (empty means empty), with an explicit log line.
+- **Deterministic:** eligible txs are selected oldest-orphaned-block first, and `1`–`100` always selects at least one.
+
 ## Continuous Reorgs
 
 Reorg every `AUTO_REORG_EVERY_BLOCKS` (x) blocks, reorg `REORG_DEPTH` (y) blocks, with x > y enforced:
@@ -21,7 +37,7 @@ Reorg every `AUTO_REORG_EVERY_BLOCKS` (x) blocks, reorg `REORG_DEPTH` (y) blocks
 REORG_MODE=auto docker compose --profile reorg up btc-simnet-reorg
 ```
 
-Tune `REORG_DEPTH`, `AUTO_REORG_EVERY_BLOCKS`, `REORG_NODE`, `REORG_MINE_ADDRESS`, `REORG_ADDS_NEW_TXS`, `REORG_WALLET_NAME` and `REORG_WITNESS_NODE` in `.env` (see [SETTINGS.md](./SETTINGS.md)).
+Tune `REORG_DEPTH`, `AUTO_REORG_EVERY_BLOCKS`, `REORG_NODE`, `REORG_MINE_ADDRESS`, `REORG_ADDS_NEW_TXS`, `REORG_DOUBLE_SPEND_PCT`, `REORG_WALLET_NAME` and `REORG_WITNESS_NODE` in `.env` (see [SETTINGS.md](./SETTINGS.md)).
 
 ## Safety & Mining Controller Integration
 
