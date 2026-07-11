@@ -192,3 +192,8 @@ reproduce with the "tx per block" knob. Pairs well with the shipped Poisson bloc
 # Tech debt
 
 - Build from sources instead of downloading binaries
+
+Multi-platform
+- convert all bash scripts to rust compilable binaries, so its muti platform, or run the scripts indise an sphimeral container connected with networks and volumes?
+- save snapshots in a muti-platform format instead of .tar
+

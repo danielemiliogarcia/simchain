@@ -57,6 +57,10 @@ the short version lives in the README "Chain snapshots" section.
 # Changed USER_ADDRESS in .env? Restore proceeds but warns loudly:
 # the chain's user funds still belong to the address saved in the snapshot.
 
+# Changed NODE1_DISABLE_WALLET? Also a warning only: a node1 wallet saved
+# in the snapshot is invisible while the wallet is disabled (nothing is
+# lost; set NODE1_DISABLE_WALLET=0 to load it again).
+
 
 # --- Fresh chain ----------------------------------------------------------
 

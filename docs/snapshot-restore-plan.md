@@ -185,6 +185,7 @@ For each `snapshots/*.json`: name, creation date, height, image. Plain columns.
   "node2_wallet": "node2",
   "node3_wallet": "node3",
   "user_address": "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr",
+  "node1_disable_wallet": "1",
   "services": "btc-simnet-mining-controller btc-simnet-node1 ... mempool-web electrs"
 }
 ```
@@ -203,6 +204,10 @@ Checks on restore, in decreasing severity:
   (bootstrap blocks 3–4 and anything sent since) pays the *old* address. This is the
   core use case — the whole point of restoring is that the user's address set did not
   change — so the script must make an accidental mismatch impossible to miss.
+- **`node1_disable_wallet` differs** → warning (not abort): a node1 wallet stored in
+  the snapshot stays invisible while the wallet is disabled. Nothing is lost —
+  restoring with `NODE1_DISABLE_WALLET=0` loads it again. Absent in old snapshots;
+  the check is skipped then.
 
 ## 6. What needs no changes (verify, don't build)
 

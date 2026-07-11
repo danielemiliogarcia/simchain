@@ -69,6 +69,7 @@ BTC_RPC_PASS="$(resolve BTC_RPC_PASS rpcpassword)"
 NODE2_WALLET_NAME="$(resolve NODE2_WALLET_NAME node2)"
 NODE3_WALLET_NAME="$(resolve NODE3_WALLET_NAME node3)"
 USER_ADDRESS="$(resolve USER_ADDRESS bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr)"
+NODE1_DISABLE_WALLET="$(resolve NODE1_DISABLE_WALLET 1)"
 
 bcli() {
     docker exec btc-simnet-node1 bitcoin-cli -regtest \
@@ -145,6 +146,7 @@ cmd_save() {
   "node2_wallet": "$NODE2_WALLET_NAME",
   "node3_wallet": "$NODE3_WALLET_NAME",
   "user_address": "$USER_ADDRESS",
+  "node1_disable_wallet": "$NODE1_DISABLE_WALLET",
   "services": "$services_flat"
 }
 EOF
@@ -167,13 +169,14 @@ cmd_restore() {
     [ -f "$tar_file" ] || die "no such snapshot: $tar_file (see: snapshot.sh list)"
     [ -f "$meta_file" ] || die "snapshot metadata missing: $meta_file"
 
-    local m_height m_hash m_image m_w2 m_w3 m_addr m_services
+    local m_height m_hash m_image m_w2 m_w3 m_addr m_n1w m_services
     m_height="$(meta_get "$meta_file" height)"
     m_hash="$(meta_get "$meta_file" best_block_hash)"
     m_image="$(meta_get "$meta_file" btc_image)"
     m_w2="$(meta_get "$meta_file" node2_wallet)"
     m_w3="$(meta_get "$meta_file" node3_wallet)"
     m_addr="$(meta_get "$meta_file" user_address)"
+    m_n1w="$(meta_get "$meta_file" node1_disable_wallet)"
     m_services="$(meta_get "$meta_file" services)"
 
     # Guard rails: a snapshot only makes sense under the environment it was
@@ -198,6 +201,14 @@ cmd_restore() {
         warn "  snapshot funded: $m_addr"
         warn "  current .env:    $USER_ADDRESS"
         warn "the restored chain's user funds belong to the SNAPSHOT address; only keys for it can spend them"
+    fi
+    # Warn only: flipping the flag hides/reveals a node1 wallet but corrupts
+    # nothing. Old snapshots predate the field; skip the check when absent.
+    if [ -n "$m_n1w" ] && [ "$m_n1w" != "$NODE1_DISABLE_WALLET" ]; then
+        warn "NODE1_DISABLE_WALLET differs: snapshot '$m_n1w' vs current '$NODE1_DISABLE_WALLET'"
+        if [ "$NODE1_DISABLE_WALLET" != "0" ]; then
+            warn "any node1 wallet stored in the snapshot stays invisible until NODE1_DISABLE_WALLET=0 (nothing is lost)"
+        fi
     fi
 
     info "restoring '$name' (height $m_height, $m_image)"
