@@ -33,6 +33,11 @@ REORG_DOUBLE_SPEND_PCT=50  ./scripts/simulate-reorg.sh 3        # drop half, re-
 It logs the configured percentage, the eligible/selected counts, and every `old_txid -> new_txid` pair (with how many descendants each replacement pruned), so the drop is auditable. Details of the semantics:
 
 - **Only the reorg node's own wallet spam is eligible.** The conflict is signed with the reorg node's wallet (`REORG_WALLET_NAME`), so only txs it can re-sign qualify. The default spam engine is the *raw* engine (`USE_RAW_TX_SPAM=true`), whose txs are signed by keys the reorg node does not hold, so **with stock settings there are usually zero eligible txs** and the reorg runs normally with a "0 eligible" log line. Set `USE_RAW_TX_SPAM=false` (wallet engine) to produce eligible txs. User-owned external-key txs are also never eligible; to drop one of those, broadcast the conflict yourself after an `empty` reorg.
+- **Configuration mismatch warning.** If `REORG_DOUBLE_SPEND_PCT` is above zero,
+  `USE_RAW_TX_SPAM=true`, and the orphaned window has zero eligible wallet
+  transactions, the tool emits a highlighted `WARN` explaining that raw-engine
+  keys are unavailable to the reorg wallet and points to
+  `USE_RAW_TX_SPAM=false`.
 - **Root txs only.** A tx that spends the output of another orphaned tx is a descendant, not a root; the tool double-spends the ancestor and lets the descendant die with it (descendants are excluded from the replacement blocks, never mined).
 - **Ignored in `empty` mode** (empty means empty), with an explicit log line.
 - **Deterministic:** eligible txs are selected oldest-orphaned-block first, and `1`–`100` always selects at least one.

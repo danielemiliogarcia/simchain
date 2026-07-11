@@ -2,8 +2,8 @@
 
 use bitcoincore_rpc::bitcoin::{address::NetworkUnchecked, Address};
 use simchain_common::config::{
-    finish, non_empty_or, parse_or, parse_rpc_url, string_or, take, CommonConfig, ConfigError,
-    RpcUrl, DEFAULT_NODE3_WALLET_NAME,
+    finish, non_empty_or, parse_bool_or, parse_or, parse_rpc_url, string_or, take, CommonConfig,
+    ConfigError, RpcUrl, DEFAULT_NODE3_WALLET_NAME,
 };
 use simchain_common::require_regtest_address;
 use std::{env, sync::OnceLock};
@@ -35,6 +35,7 @@ pub struct ReorgConfig {
     pub witness: Option<WitnessConfig>,
     pub wallet_name: String,
     pub double_spend_pct: u8,
+    pub use_raw_tx_spam: bool,
 }
 
 impl ReorgConfig {
@@ -80,6 +81,7 @@ impl ReorgConfig {
             non_empty_or("REORG_WALLET_NAME", DEFAULT_NODE3_WALLET_NAME),
         );
         let double_spend_pct = take(&mut errors, parse_double_spend_pct());
+        let use_raw_tx_spam = take(&mut errors, parse_bool_or("USE_RAW_TX_SPAM", "true"));
 
         let rpc_url = match (&node_name, rpc_port) {
             (Some(node_name), Some(rpc_port)) => take(
@@ -131,6 +133,7 @@ impl ReorgConfig {
             Some(witness),
             Some(wallet_name),
             Some(double_spend_pct),
+            Some(use_raw_tx_spam),
         ) = (
             node_name,
             rpc_url,
@@ -142,6 +145,7 @@ impl ReorgConfig {
             witness,
             wallet_name,
             double_spend_pct,
+            use_raw_tx_spam,
         )
         else {
             unreachable!("ReorgConfig fields must be present after validation");
@@ -159,6 +163,7 @@ impl ReorgConfig {
             witness,
             wallet_name,
             double_spend_pct,
+            use_raw_tx_spam,
         })
     }
 }

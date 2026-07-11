@@ -326,6 +326,9 @@ services:
       # wallet-engine spam is eligible; with USE_RAW_TX_SPAM=true there may be
       # nothing to conflict.
       - REORG_DOUBLE_SPEND_PCT=${REORG_DOUBLE_SPEND_PCT:-0}
+      # Passed through so the reorg tool can warn when permanent-drop mode is
+      # requested against raw-engine spam, whose keys its wallet cannot sign.
+      - USE_RAW_TX_SPAM=${USE_RAW_TX_SPAM:-true}
       # Wallet used for REORG_ADDS_NEW_TXS (follows the controller-created
       # wallet on the default reorg node)
       - REORG_WALLET_NAME=${REORG_WALLET_NAME:-${NODE3_WALLET_NAME:-node3}}

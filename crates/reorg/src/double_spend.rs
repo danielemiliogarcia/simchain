@@ -81,14 +81,25 @@ impl DoubleSpendPlan {
 
     /// Log the up-front summary: configured pct, eligible/selected counts, and
     /// (when nothing was selected) the most likely reason.
-    pub fn log_selection(&self) {
+    pub fn log_selection(&self, use_raw_tx_spam: bool) {
         if self.replacements.is_empty() {
-            tracing::info!(
-                "Double-spend mode: 0 of {} eligible wallet txs selected (REORG_DOUBLE_SPEND_PCT={}); {}",
-                self.eligible_count,
-                self.configured_pct,
-                self.zero_reason()
-            );
+            if use_raw_tx_spam && self.eligible_count == 0 {
+                tracing::warn!(
+                    "DOUBLE-SPEND CONFIGURATION MISMATCH: REORG_DOUBLE_SPEND_PCT={} but \
+                     USE_RAW_TX_SPAM=true; raw-engine spam is signed with keys outside the \
+                     reorg wallet, so 0 txs are eligible for permanent replacement. Set \
+                     USE_RAW_TX_SPAM=false to exercise double-spend drops. The reorg will \
+                     continue without permanent drops.",
+                    self.configured_pct
+                );
+            } else {
+                tracing::info!(
+                    "Double-spend mode: 0 of {} eligible wallet txs selected (REORG_DOUBLE_SPEND_PCT={}); {}",
+                    self.eligible_count,
+                    self.configured_pct,
+                    self.zero_reason()
+                );
+            }
             return;
         }
         tracing::info!(

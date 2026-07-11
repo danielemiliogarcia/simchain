@@ -157,7 +157,7 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
             config.double_spend_pct,
         );
         if config.double_spend_pct > 0 {
-            plan.log_selection();
+            plan.log_selection(config.use_raw_tx_spam);
         }
 
         // Seed the mempool with brand-new txs this node "saw first" so the
