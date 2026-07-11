@@ -216,7 +216,7 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
     }
 
     if let Some(plan) = &plan {
-        plan.log_dropped();
+        plan.log_dropped(node);
     }
 
     tracing::info!(

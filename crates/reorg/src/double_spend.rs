@@ -104,18 +104,32 @@ impl DoubleSpendPlan {
     }
 
     /// Log the dedicated post-reorg section proving each original was dropped.
-    pub fn log_dropped(&self) {
+    /// Each conflict is verified on-chain first (its output is in the confirmed
+    /// UTXO set): `mine_exact`'s recovery ladder can fall back to an empty block
+    /// and never land a raw conflict, in which case the original stays in the
+    /// mempool and can re-confirm -- so a claimed drop that never mined is
+    /// reported as a FAILED drop rather than asserted as permanent.
+    pub fn log_dropped(&self, node: &Client) {
         if self.replacements.is_empty() {
             return;
         }
         tracing::info!("\n--- Permanently dropped transactions ---");
         for r in &self.replacements {
-            tracing::info!(
-                "{} -> {} (descendants pruned: {})",
-                r.original_txid,
-                r.replacement_txid,
-                r.pruned_descendants.len()
-            );
+            if replacement_confirmed(node, r.replacement_txid) {
+                tracing::info!(
+                    "{} -> {} (descendants pruned: {})",
+                    r.original_txid,
+                    r.replacement_txid,
+                    r.pruned_descendants.len()
+                );
+            } else {
+                tracing::warn!(
+                    "{} NOT dropped: replacement {} never confirmed on the winning chain; \
+                     the original stays in the mempool and can re-confirm",
+                    r.original_txid,
+                    r.replacement_txid
+                );
+            }
         }
     }
 
@@ -188,16 +202,19 @@ pub fn build_plan(node: &Client, branch: &[BranchBlock], pct: u8) -> DoubleSpend
         );
     }
 
+    // Assess eligibility cheaply first (no keypool address, no signing), so the
+    // count driving selection is known without burning an address and a sign
+    // round-trip on every candidate -- only the selected roots get signed below.
     let mut wallet_txs_seen = 0usize;
-    let mut eligible: Vec<Candidate> = Vec::new();
+    let mut roots: Vec<EligibleRoot> = Vec::new();
     for txid in flatten_branch(branch) {
         // Only the reorg node's own wallet txs can be re-signed into a conflict.
         if wallet.get_transaction(&txid, None).is_err() {
             continue;
         }
         wallet_txs_seen += 1;
-        match build_candidate(node, &wallet, &wallet_name, txid) {
-            Ok(Some(candidate)) => eligible.push(candidate),
+        match assess_root(node, txid) {
+            Ok(Some(root)) => roots.push(root),
             Ok(None) => {}
             Err(error) => {
                 tracing::debug!("double-spend: skipping {txid} ({error})");
@@ -205,21 +222,38 @@ pub fn build_plan(node: &Client, branch: &[BranchBlock], pct: u8) -> DoubleSpend
         }
     }
 
-    let eligible_count = eligible.len();
+    let eligible_count = roots.len();
     let take = selected_count(eligible_count, pct);
     if take == 0 {
         return DoubleSpendPlan::empty(pct, true, eligible_count, wallet_txs_seen);
     }
 
+    // Sign only the selected roots, in deterministic order. Signing can still
+    // fail (a key the wallet no longer holds), so keep walking the eligible list
+    // until `take` conflicts succeed rather than signing all of them up front.
     let mut replacements = Vec::with_capacity(take);
-    for candidate in eligible.into_iter().take(take) {
-        let pruned_descendants = mempool_descendants(node, candidate.original_txid);
-        replacements.push(ReplacementTx {
-            original_txid: candidate.original_txid,
-            replacement_txid: candidate.replacement_txid,
-            raw_hex: candidate.raw_hex,
-            pruned_descendants,
-        });
+    for root in &roots {
+        if replacements.len() == take {
+            break;
+        }
+        match sign_conflict(node, &wallet, &wallet_name, root) {
+            Ok(Some(candidate)) => {
+                let pruned_descendants = mempool_descendants(node, candidate.original_txid);
+                replacements.push(ReplacementTx {
+                    original_txid: candidate.original_txid,
+                    replacement_txid: candidate.replacement_txid,
+                    raw_hex: candidate.raw_hex,
+                    pruned_descendants,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(
+                    "double-spend: could not sign {} ({error})",
+                    root.original_txid
+                );
+            }
+        }
     }
 
     let excluded_mempool_txids = exclusion_set(&replacements);
@@ -233,21 +267,28 @@ pub fn build_plan(node: &Client, branch: &[BranchBlock], pct: u8) -> DoubleSpend
     }
 }
 
+/// A root orphaned wallet tx that passed the cheap structural checks (all
+/// inputs are on-chain UTXOs, single-output value non-dust) and is ready to be
+/// signed into a conflict. Holds the resolved inputs + payout value so signing
+/// needs no further RPC to reconstruct them.
+struct EligibleRoot {
+    original_txid: Txid,
+    inputs: Vec<CreateRawTransactionInput>,
+    output_total: u64,
+}
+
 struct Candidate {
     original_txid: Txid,
     replacement_txid: Txid,
     raw_hex: String,
 }
 
-/// Try to construct a signed same-input conflict for one orphaned wallet tx.
-/// Returns `Ok(None)` when the tx is ineligible (not a root, dust, or the
-/// wallet cannot fully sign the conflict) and `Err` only on an RPC failure.
-fn build_candidate(
-    node: &Client,
-    wallet: &Client,
-    wallet_name: &str,
-    txid: Txid,
-) -> Result<Option<Candidate>, bitcoincore_rpc::Error> {
+/// Cheap structural eligibility check for one orphaned wallet tx: is it a
+/// re-spendable root with a non-dust payout? Returns the resolved inputs +
+/// payout value for later signing, `Ok(None)` when ineligible, and `Err` only
+/// on an RPC failure. Touches neither the keypool nor the signer, so it is safe
+/// to run on every orphaned tx before selection.
+fn assess_root(node: &Client, txid: Txid) -> Result<Option<EligibleRoot>, bitcoincore_rpc::Error> {
     let original = node.get_raw_transaction(&txid, None)?;
 
     // Every input must spend a UTXO that exists on the rolled-back chain
@@ -271,11 +312,31 @@ fn build_candidate(
 
     // Keep the original absolute fee: pay (input_total - fee) = sum of the
     // original outputs to a single fresh address. Skip if that would be dust.
+    // The `output_total > input_total` guard is belt-and-suspenders: any
+    // consensus-valid original has fee >= 0, so it only trips on malformed data,
+    // never on a real orphaned tx.
     let output_total: u64 = original.output.iter().map(|o| o.value.to_sat()).sum();
     if output_total < DUST_SAT || output_total > input_total {
         return Ok(None);
     }
 
+    Ok(Some(EligibleRoot {
+        original_txid: txid,
+        inputs,
+        output_total,
+    }))
+}
+
+/// Sign one assessed root into a same-input, single-output conflict paid to a
+/// fresh wallet address. Consumes a keypool address and a sign RPC, so it runs
+/// only for selected roots. `Ok(None)` when the wallet cannot fully sign it
+/// (e.g. a key it no longer holds) and `Err` only on an RPC failure.
+fn sign_conflict(
+    node: &Client,
+    wallet: &Client,
+    wallet_name: &str,
+    root: &EligibleRoot,
+) -> Result<Option<Candidate>, bitcoincore_rpc::Error> {
     let address = wallet.get_new_address(None, None)?;
     let address = match simchain_common::require_regtest_address(address) {
         Ok(address) => address,
@@ -286,9 +347,9 @@ fn build_candidate(
     };
 
     let mut outs: HashMap<String, Amount> = HashMap::new();
-    outs.insert(address.to_string(), Amount::from_sat(output_total));
+    outs.insert(address.to_string(), Amount::from_sat(root.output_total));
 
-    let raw_hex = node.create_raw_transaction_hex(&inputs, &outs, None, None)?;
+    let raw_hex = node.create_raw_transaction_hex(&root.inputs, &outs, None, None)?;
     let signed = wallet.sign_raw_transaction_with_wallet(raw_hex.as_str(), None, None)?;
     if !signed.complete {
         return Ok(None);
@@ -297,15 +358,29 @@ fn build_candidate(
     let replacement = match signed.transaction() {
         Ok(tx) => tx,
         Err(error) => {
-            tracing::debug!("double-spend: could not decode signed conflict for {txid} ({error})");
+            tracing::debug!(
+                "double-spend: could not decode signed conflict for {} ({error})",
+                root.original_txid
+            );
             return Ok(None);
         }
     };
     Ok(Some(Candidate {
-        original_txid: txid,
+        original_txid: root.original_txid,
         replacement_txid: replacement.compute_txid(),
         raw_hex: bitcoincore_rpc::bitcoin::consensus::encode::serialize_hex(&replacement),
     }))
+}
+
+/// True when a mined conflict actually landed on the winning chain: its single
+/// output is present in the confirmed UTXO set (`include_mempool=false`). A
+/// fresh replacement output is never spent within the reorg window, so `None`
+/// (or an RPC error) means the conflict was not mined, not mined-and-spent.
+fn replacement_confirmed(node: &Client, replacement_txid: Txid) -> bool {
+    matches!(
+        node.get_tx_out(&replacement_txid, 0, Some(false)),
+        Ok(Some(_))
+    )
 }
 
 /// Value (sats) of an input's prevout on the rolled-back chain, or `None` if it
@@ -323,10 +398,22 @@ fn original_prevout(
 }
 
 /// Mempool descendants of a selected original (excluding itself). Best-effort:
-/// an RPC error yields an empty list rather than aborting the reorg.
+/// an RPC error yields an empty list rather than aborting the reorg, but is
+/// logged loudly -- an un-excluded descendant of a replaced original would be
+/// carried into a replacement block and rejected as invalid (then dropped by
+/// `mine_exact`'s filtered retry), so a silent empty list on the feature's most
+/// important correctness condition must not pass unnoticed.
 fn mempool_descendants(node: &Client, txid: Txid) -> Vec<Txid> {
-    node.call::<Vec<Txid>>("getmempooldescendants", &[json!(txid.to_string())])
-        .unwrap_or_default()
+    match node.call::<Vec<Txid>>("getmempooldescendants", &[json!(txid.to_string())]) {
+        Ok(descendants) => descendants,
+        Err(error) => {
+            tracing::warn!(
+                "double-spend: getmempooldescendants({txid}) failed ({error}); \
+                 its descendants will not be excluded and may be dropped from a replacement block"
+            );
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]

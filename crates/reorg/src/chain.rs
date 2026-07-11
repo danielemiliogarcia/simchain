@@ -201,7 +201,19 @@ pub fn mine_exact(
 
     // All evicted, or the rejection was not about a missing tx: mine an empty
     // block; the untouched txs stay in the mempool for the next block's sweep.
+    // If this block carried raw conflicts, they just failed to land -- warn
+    // loudly rather than logging "0 tx(s) left" as if there were nothing to do;
+    // the corresponding permanent-drop did not happen this block (log_dropped
+    // confirms on-chain and reports any miss).
     let mempool_left = filtered.len() - raw.len();
-    tracing::info!("  mining an empty block, {mempool_left} tx(s) left for the next block");
+    if raw.is_empty() {
+        tracing::info!("  mining an empty block, {mempool_left} tx(s) left for the next block");
+    } else {
+        tracing::warn!(
+            "  mining an empty block: {} raw replacement(s) FAILED to mine, \
+             {mempool_left} mempool tx(s) left for the next block",
+            raw.len()
+        );
+    }
     generate_block(node, mine_address, &Vec::<String>::new())
 }
