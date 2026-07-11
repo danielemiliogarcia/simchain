@@ -289,3 +289,12 @@ Do not commit or stage anything — the user manual-tests first and commits hims
   (nice-to-have feature 1).
 - `SPAM_OUTPUTS_MAX` from the original sketch: size/output variance already exists
   (`SPAM_TX_DATA_MIN/MAX_BYTES`, `SPAM_SENDMANY_OUTPUTS`).
+
+
+--------
+
+- Fee-market pressure: raise fees by spamming more/bigger transactions, and also via
+  node policy parameters (`-minrelaytxfee` for the mempool floor, `-blockmintxfee`
+  for the miner's inclusion floor) so blocks fill up and transactions genuinely
+  compete for block space
+
