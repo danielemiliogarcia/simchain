@@ -30,17 +30,56 @@ REORG_DOUBLE_SPEND_PCT=100 ./scripts/simulate-reorg.sh 3        # drop all eligi
 REORG_DOUBLE_SPEND_PCT=50  ./scripts/simulate-reorg.sh 3        # drop half, re-mine the rest
 ```
 
-It logs the configured percentage, the eligible/selected counts, and every `old_txid -> new_txid` pair (with how many descendants each replacement pruned), so the drop is auditable. Details of the semantics:
+It logs the configured percentage, the eligible/selected counts, and every `old_txid -> new_txid` pair (with how many descendants each replacement pruned), so the drop is auditable.
 
-- **Only the reorg node's own wallet spam is eligible.** The conflict is signed with the reorg node's wallet (`REORG_WALLET_NAME`), so only txs it can re-sign qualify. The default spam engine is the *raw* engine (`USE_RAW_TX_SPAM=true`), whose txs are signed by keys the reorg node does not hold, so **with stock settings there are usually zero eligible txs** and the reorg runs normally with a "0 eligible" log line. Set `USE_RAW_TX_SPAM=false` (wallet engine) to produce eligible txs. User-owned external-key txs are also never eligible; to drop one of those, broadcast the conflict yourself after an `empty` reorg.
-- **Configuration mismatch warning.** If `REORG_DOUBLE_SPEND_PCT` is above zero,
-  `USE_RAW_TX_SPAM=true`, and the orphaned window has zero eligible wallet
-  transactions, the tool emits a highlighted `WARN` explaining that raw-engine
-  keys are unavailable to the reorg wallet and points to
-  `USE_RAW_TX_SPAM=false`.
-- **Root txs only.** A tx that spends the output of another orphaned tx is a descendant, not a root; the tool double-spends the ancestor and lets the descendant die with it (descendants are excluded from the replacement blocks, never mined).
-- **Ignored in `empty` mode** (empty means empty), with an explicit log line.
-- **Deterministic:** eligible txs are selected oldest-orphaned-block first, and `1`–`100` always selects at least one.
+### Eligibility and selection
+
+Eligibility is evaluated after invalidation, when the rolled-back chain UTXOs and the
+transactions returned to the mempool are both visible. A transaction qualifies only
+when the reorg wallet can sign a same-input conflict, all its inputs exist on the
+rolled-back chain, and it is a root rather than a descendant of another orphaned
+transaction. Replacing an ancestor and letting its descendants become invalid models
+the permanent drop correctly; rebuilding those descendants independently would not.
+
+The percentage applies to eligible roots, not to every transaction in the orphaned
+blocks. For a non-zero percentage and at least one eligible root, the selected count is
+`max(1, floor(eligible * percentage / 100))`. Selection is reproducible: roots are
+ordered by oldest orphaned block first and then by their original transaction order.
+Eligibility is based on whether the configured wallet can sign, not on whether a
+transaction was semantically created as spam.
+
+Only transactions whose keys are available to the reorg wallet qualify. The default
+raw spam engine (`USE_RAW_TX_SPAM=true`) signs with keys that wallet does not hold, so
+stock settings usually produce zero eligible transactions. Set
+`USE_RAW_TX_SPAM=false` to use wallet-engine spam. If the percentage is above zero,
+raw spam is enabled, and the orphaned window has zero eligible transactions, the tool
+emits a highlighted warning explaining the mismatch. Transactions signed by external
+user keys are likewise ineligible; their conflict must be supplied separately.
+
+### Why conflicts are mined directly
+
+The conflicting transactions are placed directly in the replacement blocks instead of
+being broadcast to the mempool first. An original transaction may not opt in to RBF,
+and mempool replacement policy is deliberately narrower than block consensus rules. A
+miner can still include a valid conflict in the winning chain, which is the behavior
+this feature is intended to simulate.
+
+Each selected root is replaced by a transaction that spends the same inputs to a fresh
+wallet destination while preserving the original fee. Its output graph intentionally
+changes: the original and any transactions that depended on its outputs are excluded
+from the winning branch.
+
+### Observable result and boundaries
+
+After a successful run, every logged replacement txid is confirmed on the winning
+branch; its selected original is absent from both the active chain and mempool, and its
+dependent descendants are gone. A zero-eligible result does not fail the reorg: the
+ordinary replacement chain is still mined and the reason is logged.
+
+`REORG_DOUBLE_SPEND_PCT` is ignored in `empty` mode, because that mode mines no
+transactions. Transactions created through `REORG_ADDS_NEW_TXS` are injected after
+invalidation and therefore are not double-spend candidates during that same run.
+Witness-based chain adoption and mining-controller behavior are unaffected.
 
 ## Continuous Reorgs
 
