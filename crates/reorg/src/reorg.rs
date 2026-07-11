@@ -4,7 +4,7 @@
 use crate::{
     chain::{
         branch_to_orphan, last_blocks, live_mempool_weighted, mine_exact, pack_by_weight,
-        print_blocks, BlockTx, BLOCK_WEIGHT_BUDGET,
+        print_blocks, weight_prefix_len, BlockTx, BLOCK_WEIGHT_BUDGET,
     },
     config::ReorgConfig,
     double_spend::{build_plan, DoubleSpendPlan},
@@ -107,14 +107,22 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
     let target_hash = node.get_block_hash(target_height)?;
     let target_time = node.get_block_info(&target_hash)?.time as u64;
 
+    // Snapshot the mempool size just before invalidation so the "returned"
+    // count below reflects only the orphaned blocks' txs, not the pre-existing
+    // spam backlog already sitting in the mempool.
+    let mempool_before = node.get_raw_mempool()?.len();
+
     tracing::info!("\nInvalidating block {target_height} ({target_hash})...");
     node.invalidate_block(&target_hash)?;
 
     // Count the txs the orphaned blocks returned to the mempool (for the
     // summary). The mining below reads the mempool live for each block, so RBF
     // replacements that arrive mid-reorg are handled without special-casing.
-    let returned = node.get_raw_mempool()?.len();
-    tracing::info!("{returned} transactions returned to the mempool from the orphaned blocks");
+    let mempool_after = node.get_raw_mempool()?.len();
+    let returned = mempool_after.saturating_sub(mempool_before);
+    tracing::info!(
+        "{returned} transactions returned to the mempool from the orphaned blocks (mempool now holds {mempool_after})"
+    );
 
     // A replacement block with the same timestamp and coinbase as the
     // invalidated one hashes identically and is rejected as known-invalid,
@@ -160,44 +168,53 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
 
         // Re-mine the returned mempool plus the double-spend conflicts across
         // the replacement blocks. The conflicts are raw hex that must land, so
-        // they are reserved first (spread across the blocks). The rest of each
-        // block's weight budget is packed from the mempool, read fresh each
-        // round -- so txs mined into earlier blocks drop out, RBF replacements
-        // are reflected, and the dropped originals + descendants stay filtered.
+        // they take budget priority; the rest of each block's weight budget is
+        // packed from the mempool, read fresh each round -- so txs mined into
+        // earlier blocks drop out, RBF replacements are reflected, and the
+        // dropped originals + descendants stay filtered.
         //
-        // Packing by *weight* (not by tx count) is essential: spam txs are fat,
-        // so only ~one block's worth fits per block. Splitting the whole backlog
-        // by block count instead would hand a single generateblock more weight
-        // than the 4M consensus limit, which Core rejects (`bad-blk-length`) and
-        // the recovery ladder then turns into an empty block -- the reorg would
-        // silently degrade to empty mode. Whatever exceeds the replacement
-        // blocks' total capacity stays in the mempool for later real blocks.
-        let mut raw = plan.raw_conflicts();
-        if raw.is_empty() {
+        // Everything is packed by *weight*, not tx count: spam txs are fat, so
+        // only ~one block's worth fits per block. Splitting the whole backlog by
+        // block count instead would hand a single generateblock more weight than
+        // the 4M consensus limit, which Core rejects (`bad-blk-length`) and the
+        // recovery ladder then turns into an empty block -- the reorg would
+        // silently degrade to empty mode. The conflicts are weight-batched the
+        // same way, so a large batch can never overflow a block on its own.
+        // Whatever exceeds the replacement blocks' total capacity stays in the
+        // mempool for later real blocks.
+        let mut pending = plan.raw_conflicts();
+        if pending.is_empty() {
             tracing::info!("Mining {blocks_to_mine} replacement blocks from the live mempool (one extra so the new chain wins network-wide)...");
         } else {
             tracing::info!(
                 "Mining {blocks_to_mine} replacement blocks from the live mempool plus {} double-spend conflict(s) (one extra so the new chain wins network-wide)...",
-                raw.len()
+                pending.len()
             );
         }
-        for index in 0..blocks_to_mine as usize {
-            let blocks_left = blocks_to_mine as usize - index;
-
-            // Reserve this block's share of the raw conflicts and subtract their
-            // weight from the budget before packing mempool txs.
-            let raw_take = raw.len().div_ceil(blocks_left).min(raw.len());
-            let raw_items: Vec<(String, u64)> = raw.drain(..raw_take).collect();
-            let raw_weight: u64 = raw_items.iter().map(|(_, w)| *w).sum();
-            let budget = BLOCK_WEIGHT_BUDGET.saturating_sub(raw_weight);
+        for _ in 0..blocks_to_mine {
+            // Take the heaviest conflict prefix that fits one block (conflicts
+            // first, so they are never starved by mempool txs); any remainder
+            // rolls into the next block. Then fill the leftover budget from the
+            // fresh mempool.
+            let conflict_weights: Vec<u64> = pending.iter().map(|(_, w)| *w).collect();
+            let take = weight_prefix_len(&conflict_weights, BLOCK_WEIGHT_BUDGET);
+            let conflicts: Vec<(String, u64)> = pending.drain(..take).collect();
+            let conflict_weight: u64 = conflicts.iter().map(|(_, w)| *w).sum();
+            let budget = BLOCK_WEIGHT_BUDGET.saturating_sub(conflict_weight);
 
             let mempool = live_mempool_weighted(node, &plan.excluded_mempool_txids)?;
             let packed = pack_by_weight(&mempool, budget);
 
-            let mut items: Vec<BlockTx> = Vec::with_capacity(raw_items.len() + packed.len());
-            items.extend(raw_items.into_iter().map(|(hex, _)| BlockTx::RawHex(hex)));
+            let mut items: Vec<BlockTx> = Vec::with_capacity(conflicts.len() + packed.len());
+            items.extend(conflicts.into_iter().map(|(hex, _)| BlockTx::RawHex(hex)));
             items.extend(packed.into_iter().map(BlockTx::Mempool));
             mine_exact(node, &config.mine_address, &items)?;
+        }
+        if !pending.is_empty() {
+            tracing::warn!(
+                "{} double-spend conflict(s) did not fit the replacement blocks and were not mined; their originals were not dropped",
+                pending.len()
+            );
         }
         Some(plan)
     };

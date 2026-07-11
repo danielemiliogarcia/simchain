@@ -138,22 +138,33 @@ pub fn live_mempool_weighted(
         .collect())
 }
 
+/// How many leading items of `weights` fit within `budget`, stopping at the
+/// first that would overflow rather than skipping it. Shared by mempool and
+/// raw-conflict packing so neither ever hands `generateblock` a list heavier
+/// than one block -- the size-limit rejection this whole path exists to avoid.
+/// Pure and deterministic.
+pub fn weight_prefix_len(weights: &[u64], budget: u64) -> usize {
+    let mut used: u64 = 0;
+    let mut n = 0;
+    for &w in weights {
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        n += 1;
+    }
+    n
+}
+
 /// Greedily take a parents-first prefix of `mempool` whose combined weight fits
 /// in `budget`. Stops at the first tx that would overflow rather than skipping
 /// it, so the result stays a valid topological prefix and no parent is split
 /// from a child. A standard mempool tx is far smaller than a block budget, so
 /// this never strands a tx that could otherwise be mined. Pure and deterministic.
 pub fn pack_by_weight(mempool: &[MempoolTx], budget: u64) -> Vec<Txid> {
-    let mut chosen = Vec::new();
-    let mut used: u64 = 0;
-    for tx in mempool {
-        if used + tx.weight > budget {
-            break;
-        }
-        used += tx.weight;
-        chosen.push(tx.txid);
-    }
-    chosen
+    let weights: Vec<u64> = mempool.iter().map(|tx| tx.weight).collect();
+    let n = weight_prefix_len(&weights, budget);
+    mempool[..n].iter().map(|tx| tx.txid).collect()
 }
 
 /// Issue one `generateblock` with an explicit item list. Returns `Ok(())` on
@@ -235,6 +246,29 @@ pub fn mine_exact(
         }
     }
 
+    // The conflicts could not be mined even in isolation, so they are unminable
+    // (e.g. an input got spent by an earlier replacement block). Rather than
+    // waste the whole block, salvage the surviving mempool txs -- the conflicts
+    // are dropped and log_dropped reports the miss, but the block stays full
+    // instead of empty and a single bad conflict no longer strands a block of
+    // otherwise-valid mempool txs.
+    let mempool_only: Vec<String> = filtered
+        .iter()
+        .filter(|s| !raw.contains(s))
+        .cloned()
+        .collect();
+    if !raw.is_empty() && !mempool_only.is_empty() {
+        tracing::warn!(
+            "  {} conflict(s) unminable; salvaging {} mempool tx(s) into this block instead",
+            raw.len(),
+            mempool_only.len()
+        );
+        match generate_block(node, mine_address, &mempool_only) {
+            Ok(()) => return Ok(()),
+            Err(e) => tracing::warn!("  mempool-only salvage rejected ({e})"),
+        }
+    }
+
     // All evicted, or the rejection was not about a missing tx: mine an empty
     // block; the untouched txs stay in the mempool for the next block's sweep.
     // If this block carried raw conflicts, they just failed to land -- warn
@@ -293,5 +327,26 @@ mod tests {
         let mempool = vec![mtx(1, 400), mtx(2, 400)];
         let chosen = pack_by_weight(&mempool, BLOCK_WEIGHT_BUDGET);
         assert_eq!(chosen.len(), 2);
+    }
+
+    #[test]
+    fn weight_prefix_len_counts_the_prefix_that_fits() {
+        // Same greedy rule the raw-conflict batching relies on: stop at the
+        // first item that would overflow, so a batch never exceeds one block.
+        assert_eq!(weight_prefix_len(&[400, 400, 400], 900), 2);
+        assert_eq!(weight_prefix_len(&[400, 400, 400], 1200), 3);
+        assert_eq!(weight_prefix_len(&[5000, 100], 1000), 0);
+        assert_eq!(weight_prefix_len(&[], 1000), 0);
+    }
+
+    #[test]
+    fn weight_prefix_len_rolls_remainder_to_the_next_block() {
+        // A conflict batch heavier than one block splits: the first call takes
+        // what fits, a second call over the remainder takes the rest.
+        let weights = [300u64, 300, 300, 300];
+        let first = weight_prefix_len(&weights, 700);
+        assert_eq!(first, 2);
+        let rest = weight_prefix_len(&weights[first..], 700);
+        assert_eq!(rest, 2);
     }
 }
