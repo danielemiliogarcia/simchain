@@ -2,6 +2,14 @@
 
 The reorg simulator (a Rust container using only bitcoind RPC calls) invalidates the last *N* blocks on a miner node and mines *N+1* replacements, so the new chain is strictly longer and **the whole network reorgs to it**. Transactions from the orphaned blocks fall back to the mempool; each replacement block is filled by re-reading the mempool live and mining a slice of it with `generateblock`, like the winning chain of a real reorg, so reorged blocks are not empty. Reading the mempool fresh for each block means an RBF replacement that evicts an orphaned tx mid-reorg (e.g. with `ENABLE_SPAM_REPLACES=true`) is picked up automatically. On top of the returned txs it seeds `REORG_ADDS_NEW_TXS` fresh wallet transactions into the mempool first, modelling a node that received transactions its peers have not yet seen. It prints each block's hash and tx count before/after plus a replaced-blocks summary.
 
+When fresh transactions are injected, the log includes the number created and one
+sample txid. Search that txid in the explorer (or with Bitcoin Core RPC) to verify
+that it appears only on the winning branch. The replaced-blocks summary is also an
+audit index: Bitcoin Core retains stale blocks in its datadir and they remain
+queryable by their old hash (unless the node is pruned or its volumes are deleted).
+The explorer's height timeline shows only the active chain, so retain the logged old
+hash when you want to inspect a replaced block directly.
+
 ## One-Shot Reorg
 
 Pass `empty` to mine **empty** replacement blocks instead (a chaos reorg that leaves the orphaned txs unconfirmed): `./scripts/simulate-reorg.sh 3 empty`. It is a per-run argument, not a setting, so a real reorg and an empty one can be issued against the same running chain.

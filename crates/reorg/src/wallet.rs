@@ -61,6 +61,7 @@ pub fn inject_transactions(node: &Client, count: u64) {
         }
     };
     let mut sent = 0;
+    let mut sample_txid = None;
     for _ in 0..count {
         match wallet.send_to_address(
             &address,
@@ -72,7 +73,10 @@ pub fn inject_transactions(node: &Client, count: u64) {
             None,
             None,
         ) {
-            Ok(_) => sent += 1,
+            Ok(txid) => {
+                sample_txid.get_or_insert(txid);
+                sent += 1;
+            }
             Err(error) => {
                 tracing::warn!("Tx injection stopped after {sent} txs: {error}");
                 break;
@@ -80,8 +84,9 @@ pub fn inject_transactions(node: &Client, count: u64) {
         }
     }
     if sent > 0 {
+        let sample_txid = sample_txid.expect("a successful send records its txid");
         tracing::info!(
-            "Added {sent} new transactions from wallet '{wallet_name}' (txs this node saw first) to mine into the winning chain"
+            "Added {sent} new transactions from wallet '{wallet_name}' (txs this node saw first) to mine into the winning chain; sample injected txid: {sample_txid}"
         );
     } else {
         tracing::warn!(
