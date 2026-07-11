@@ -9,3 +9,6 @@
 
 # Cargo.lock is intentionally committed: the three tools are binaries for a
 # reproducible test network, so the lockfile is tracked (do NOT ignore it).
+
+# Chain snapshots (./scripts/snapshot.sh): multi-MB machine-local archives
+/snapshots/

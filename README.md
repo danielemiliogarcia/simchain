@@ -158,8 +158,14 @@ docker compose logs -ft btc-simnet-node1
 # Everything at once
 docker compose logs -ft
 
-# Tear down (regtest keeps no volumes; the chain resets on next up)
+# Tear down; the chain persists on named volumes and resumes on the next up
 docker compose --profile all-tools down
+
+# Tear down AND wipe the chain (fresh bootstrap on the next up)
+docker compose --profile all-tools down -v
+
+# Or in one command: wipe + start a fresh chain (flags are passed to compose)
+./scripts/fresh-chain.sh --profile all-tools
 ```
 
 ### Retuning a live chain
@@ -168,6 +174,31 @@ Change mining controller and spammer settings without restarting nodes; chain st
 Quickest way to experiment with block cadence, fee floor, and block fill on a live chain.
 
 For full details and caveats, see [RETUNING.md](./docs/RETUNING.md).
+
+### Chain snapshots
+
+The node datadirs live on named volumes, so the chain survives `docker compose down`
+and resumes on the next `up` (the mining controller detects the height and skips the
+bootstrap); `down -v` wipes it for a fresh chain. On top of that,
+`./scripts/snapshot.sh` archives and restores the **full chain state**, blocks, UTXO
+set, miner wallets and mempool, so a bootstrapped, funded chain can be brought back in
+seconds instead of re-mining and re-funding:
+
+```bash
+./scripts/snapshot.sh save mysnap                       # archive the running chain
+./scripts/snapshot.sh restore mysnap                    # boot the simnet back at that state
+./scripts/snapshot.sh list                              # what is saved
+```
+
+A snapshot also records which services were running (tool profiles included), and
+restore brings back exactly that shape — no `--profile` flags needed (passing compose
+flags overrides it). Because the user's keys live outside the simnet, coins received
+on the saved chain are still spendable after a restore with the same external keys.
+Snapshots land in `./snapshots/` and are tied to the bitcoind image and wallet names
+they were taken with (restore checks and refuses a mismatch).
+
+Recipes for the common situations: **[SNAPSHOTS.md](./docs/SNAPSHOTS.md)**. Design
+and details: [snapshot-restore-plan.md](./docs/snapshot-restore-plan.md).
 
 ### Profiles
 
@@ -248,6 +279,10 @@ exclude = ["path/to/simchain"]
 - [RETUNING.md](./docs/RETUNING.md), how to retune mining cadence, fee floor, and block fill on a live chain.
 - [REORGS.md](./docs/REORGS.md), simulating chain reorganizations, commands, and modes.
 - [SETTINGS.md](./docs/SETTINGS.md), every setting, its default and what it does.
+- [SNAPSHOTS.md](./docs/SNAPSHOTS.md), chain snapshot/restore cookbook: concrete
+  commands for the common situations.
+- [snapshot-restore-plan.md](./docs/snapshot-restore-plan.md), chain snapshot/restore
+  design, rationale and usage details.
 - [NICE-TO-HAVE.md](./docs/NICE-TO-HAVE.md), all limitations, future enhancements and
   proposed features with rationale and implementation plans.
 - [RUNBOOK.md](./docs/RUNBOOK.md), handy `bitcoin-cli` one-liners against the simnet.
@@ -282,6 +317,6 @@ Fixed: the controller now loads the existing wallets and skips the funding seque
 the chain is already bootstrapped (height >= 204), so `stop`/`start` resumes cleanly
 where it left off.
 
-To reset the chain from scratch, remove the containers instead:
-`docker compose --profile all-tools down` (regtest keeps no volumes; everything resets
-on the next `up`).
+To reset the chain from scratch, remove the containers **and the chain volumes**:
+`docker compose --profile all-tools down -v` (a plain `down` keeps the named volumes,
+so the chain resumes on the next `up`).
