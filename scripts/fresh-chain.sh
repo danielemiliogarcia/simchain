@@ -10,6 +10,7 @@
 # Usage:
 #   ./scripts/fresh-chain.sh                     # fresh basic stack
 #   ./scripts/fresh-chain.sh --profile mempool   # fresh stack + explorer tools
+#   ./scripts/fresh-chain.sh --profile all-tools # fresh stack + all-tools
 #
 # Extra arguments are passed to docker compose as global flags (profiles etc).
 # The current chain is destroyed; snapshot it first if you care about it:

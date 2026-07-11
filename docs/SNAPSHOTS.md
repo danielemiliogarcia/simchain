@@ -93,6 +93,74 @@ rebuilds the stack from scratch.
 | Spammer/controller memory | no, by design | both are stateless: the controller re-reads the height, the spammer resyncs its branch UTXO set from the chain (`scantxoutset`) and the reloaded mempool |
 | electrs / explorer DB | no, by design | ephemeral; they re-index from node1 in seconds on start |
 
+
+## Risks and edge cases
+
+- **In-flight writes at stop time**: `docker compose stop` default grace is 10 s;
+  bitcoind normally flushes well within it, but set `stop_grace_period: 60s` on the
+  node services in the same PR so a slow flush (large mempool) is never killed
+  mid-write.
+- **Ownership across images**: official image and local image may use different UIDs
+  for the `bitcoin` user. `--numeric-owner` preserves whatever the snapshot had, and
+  the local entrypoint re-chowns on start; the official image handles its own
+  permissions. If a restore onto the *other* image is ever forced, ownership is the
+  first thing to check.
+- **Disk growth**: with volumes, chain data now accumulates on the host across
+  restarts (DATA-mode spam writes ~full blocks). `down -v` is the reset;
+  `snapshot.sh list` plus `du -sh snapshots/` keep it visible. Not mitigated further
+  in v1.
+- **Compose `start` vs profiles**: after `save`, `docker compose start` only restarts
+  containers that already existed, so whatever profile set was running resumes
+  unchanged — no profile bookkeeping needed in the script.
+
+
+## Appendix: rationale (from the original nice-to-have entry)
+
+**What:** Save the full state of a running chain — blocks, chainstate (the UTXO set)
+and node wallets — into a portable archive, and restore it later into a fresh simnet.
+A restored simnet boots already at the exported height and continues from there.
+
+**Why:** Every fresh `docker compose up` re-does the same bootstrap work: mining to
+height 204 for funding plus coinbase maturity, creating and funding the miner wallets,
+building up a mempool. A snapshot does that work once; every later run imports it and
+starts at block N with mature, spendable coins. And because the user's keys live
+outside the simnet (node1 is wallet-disabled by design), the user's addresses do not
+change between runs: coins received on the exported chain are still theirs after a
+restore, so the user can fund their addresses once, snapshot, and rerun tests from
+that state — "wait for bootstrap, then re-fund everything" becomes seconds. Snapshots
+are also shareable: a bug report or a CI job can pin the exact chain state it needs.
+
+**Why a datadir tar instead of Core's native `dumptxoutset`/`loadtxoutset`:** those
+RPCs are the assumeUTXO feature, built to speed up initial block download on mainnet,
+and its design fits that goal, not this one:
+
+- **Arbitrary snapshots are rejected by design.** So that users never have to trust a
+  downloaded UTXO set, `loadtxoutset` only accepts a snapshot whose base-block hash is
+  hard-coded in Core's chain params (`m_assumeutxo_data`), where each entry also pins
+  the expected hash of the serialized UTXO set. Regtest ships only a couple of fixed
+  test vectors used by Core's own functional tests, and there is no runtime option to
+  add entries. A chain simchain mined has different block hashes by construction, so
+  its snapshot can never match: `dumptxoutset` happily exports it, but no stock
+  bitcoind will import it — that would take patching the chain params and rebuilding
+  Core.
+- **The loaded snapshot is provisional, not final.** Even on a chain with a matching
+  entry, assumeUTXO treats the imported chainstate as unvalidated: the node keeps
+  downloading and re-verifying every block from genesis in the background and only
+  then promotes the snapshot chainstate. In a restored simnet no peer has those
+  historical blocks anymore, so background validation could never complete.
+- **It carries the UTXO set and nothing else.** No wallets, so the miner and spammer
+  funding is gone and the spam pipeline is dead on arrival; no raw blocks, so
+  `getblock` fails and electrs / the mempool explorer cannot index a chain whose
+  blocks do not exist; no `-txindex` data; no mempool contents.
+
+The datadir tar sidesteps all three problems: it is the node's own state
+byte-for-byte — blocks, chainstate, wallets, txindex, even `mempool.dat` — so there is
+no trust question to answer, no background validation to wait for, and every RPC and
+downstream indexer works immediately after restore. It delivers exactly what the UTXO
+export was after (the UTXO set as of block N, coin maturity already done) plus
+everything around it, with no consensus-level tricks.
+
+
 ## Q&A
 
 **Is the mempool saved?** Yes. `save` stops bitcoind with SIGTERM; on a clean
@@ -120,3 +188,4 @@ already spent by its own still-in-mempool transactions with
 `gettxout(include_mempool)`. What it loses is only ephemeral bookkeeping (branch
 cursors, RBF shape cache); the funds are in the miner wallets and on-chain. After a
 restore, spam resumes and the mempool refills without intervention.
+

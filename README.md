@@ -197,8 +197,7 @@ on the saved chain are still spendable after a restore with the same external ke
 Snapshots land in `./snapshots/` and are tied to the bitcoind image and wallet names
 they were taken with (restore checks and refuses a mismatch).
 
-Recipes for the common situations: **[SNAPSHOTS.md](./docs/SNAPSHOTS.md)**. Design
-and details: [snapshot-restore-plan.md](./docs/snapshot-restore-plan.md).
+Recipes for the common situations: **[SNAPSHOTS.md](./docs/SNAPSHOTS.md)**.
 
 ### Profiles
 
