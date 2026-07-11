@@ -1,5 +1,5 @@
-# Single build for all three simchain Rust tools. One builder stage compiles
-# the whole workspace against the committed Cargo.lock, then three tiny final
+# Single build for all four simchain Rust tools. One builder stage compiles
+# the whole workspace against the committed Cargo.lock, then four final
 # stages each copy out one release binary. Compose selects which binary an
 # image contains via `target:` in docker-compose.yml.
 #
@@ -32,3 +32,13 @@ ENTRYPOINT ["simchain-spammer"]
 FROM debian:trixie-slim AS reorg
 COPY --from=builder /app/target/release/simchain-reorg /usr/local/bin/simchain-reorg
 ENTRYPOINT ["simchain-reorg"]
+
+# ---- scenario-engine -------------------------------------------------------
+# The opt-in orchestrator invokes compose and repo helper scripts through the
+# host Docker socket, so its runtime includes the Docker CLI and Compose v2.
+FROM debian:trixie-slim AS scenario-engine
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates docker-cli docker-compose \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/simchain-scenario-engine /usr/local/bin/simchain-scenario-engine
+ENTRYPOINT ["simchain-scenario-engine"]

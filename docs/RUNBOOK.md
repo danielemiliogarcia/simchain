@@ -6,6 +6,40 @@ Handy `bitcoin-cli` one-liners against the simnet. This how all this started... 
 > are the defaults; replace them with your `BTC_RPC_USER` / `BTC_RPC_PASS` from
 > `.env`.
 
+## Declarative scenarios
+
+Start the regular simnet first, then run a one-shot scenario. The engine waits for
+bootstrap height 204 before executing any declared steps:
+
+```bash
+docker compose up -d
+SCENARIO_FILE=scenarios/pause-then-burst.yml \
+  docker compose --profile scenario run --rm --build btc-simnet-scenario
+```
+
+Other shipped histories:
+
+```bash
+SCENARIO_FILE=scenarios/reorg-during-sync.yml docker compose --profile scenario run --rm btc-simnet-scenario
+SCENARIO_FILE=scenarios/partition-node3.yml docker compose --profile scenario run --rm btc-simnet-scenario
+```
+
+Write a machine-readable CI artifact and propagate the container's exit code with:
+
+```bash
+SCENARIO_FILE=scenarios/reorg-during-sync.yml \
+SCENARIO_RESULT_FILE=/workspace/results/reorg.json \
+  docker compose --profile scenario run --rm btc-simnet-scenario
+```
+
+For a one-shot burst outside a YAML run:
+
+```bash
+./scripts/spam-burst.sh btc-simnet-node2 --txs 100 --outputs-per-tx 25
+```
+
+See [SCENARIOS.md](SCENARIOS.md) for the schema and failure cleanup policy.
+
 ## Peer management
 
 Add a peer:

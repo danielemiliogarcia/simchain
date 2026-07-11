@@ -618,3 +618,30 @@ Large, but mostly orchestration glue rather than core-protocol code.
 
 That order lands value incrementally while keeping the highest-risk external integrations
 for later steps.
+
+----------------------------------------
+
+codex
+
+• Implemented the declarative scenario engine described in the plan.
+
+  Key additions:
+
+  - New crates/scenario-engine/src/main.rs workspace binary supporting all eight step types, validation, timeouts, cleanup, logging, and optional JSON results.
+  - Opt-in scenario Compose profile with Docker socket access.
+  - Three executable scenarios under scenarios.
+  - Reusable scripts/spam-burst.sh.
+  - Shared deterministic burn-address helper in simchain-common.
+  - Complete user documentation in docs/SCENARIOS.md.
+
+  Validation passed:
+
+  - cargo ba
+  - cargo ca
+  - cargo fac
+  - cargo tt — 27 tests passed
+  - Compose configuration validation
+  - Scenario Docker image build
+  - Docker socket/project discovery
+  - Live read-only scenario smoke test against the running simnet, completing successfully at height 613.
+

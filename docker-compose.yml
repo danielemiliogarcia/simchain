@@ -10,6 +10,8 @@
 #   reorg             -> reorg simulator (run on demand, see README)
 #   partition         -> one-shot P2P latency/loss helpers
 #                        (intentionally excluded from all-tools)
+#   scenario          -> one-shot declarative scenario orchestrator
+#                        (intentionally excluded from all-tools)
 #
 # Examples:
 #   docker compose up
@@ -352,6 +354,48 @@ services:
       # Node polled after the reorg to confirm the network adopted the new
       # chain (extra blocks are mined until it does); "none" disables
       - REORG_WITNESS_NODE=${REORG_WITNESS_NODE:-btc-simnet-node1}
+
+  # ---------------------------------------------------------------------------
+  # Declarative scenario orchestrator (profile: scenario), one-shot.
+  # It is intentionally excluded from all-tools because the Docker socket is
+  # root-equivalent host access. See docs/SCENARIOS.md.
+  # ---------------------------------------------------------------------------
+  btc-simnet-scenario:
+    profiles: ["scenario"]
+    build:
+      context: .
+      dockerfile: docker/tools.Dockerfile
+      target: scenario-engine
+    container_name: btc-simnet-scenario
+    restart: "no"
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      btc-simnet-node1:
+        condition: service_healthy
+      btc-simnet-node2:
+        condition: service_healthy
+      btc-simnet-node3:
+        condition: service_healthy
+    networks:
+      - btc-simnet-control
+    environment:
+      - SIMCHAIN_REPO_ROOT=/workspace
+      # Preserve the host compose project across the /workspace bind path, so
+      # nested compose commands operate on the existing controller container.
+      - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-simchain}
+      - SCENARIO_FILE=${SCENARIO_FILE:-/workspace/scenarios/pause-then-burst.yml}
+      - SCENARIO_RESULT_FILE=${SCENARIO_RESULT_FILE:-}
+      - SCENARIO_TIMEOUT_SECS=${SCENARIO_TIMEOUT_SECS:-1800}
+      - BTC_RPC_USER=${BTC_RPC_USER:-foo}
+      - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
+      - NODE1_RPC_URL=${NODE1_RPC_URL:-http://btc-simnet-node1:18443}
+      - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
+      - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
+      - NODE2_WALLET_NAME=${NODE2_WALLET_NAME:-node2}
+      - NODE3_WALLET_NAME=${NODE3_WALLET_NAME:-node3}
 
   # ---------------------------------------------------------------------------
   # Tools: electrs (profiles: electrs, mempool, all-tools)

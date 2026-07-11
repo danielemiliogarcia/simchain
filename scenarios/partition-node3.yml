@@ -1,0 +1,9 @@
+version: 1
+steps:
+  - type: wait_height
+    height: 205
+
+  - type: partition
+    node: btc-simnet-node3
+    main_blocks: 3
+    isolated_blocks: 4
