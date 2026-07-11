@@ -22,6 +22,19 @@ networks:
   btc-simnet-network:
     name: btc-simnet-network
 
+# Node datadirs persist on named volumes: the chain survives `docker compose
+# down` (the controller detects the height and skips the bootstrap) and can be
+# archived/restored with ./scripts/snapshot.sh. `docker compose down -v` wipes
+# them for a fresh chain. Explicit names (like the container and network names
+# above) keep ./scripts/snapshot.sh independent of the compose project name.
+volumes:
+  node1-data:
+    name: btc-simnet-node1-data
+  node2-data:
+    name: btc-simnet-node2-data
+  node3-data:
+    name: btc-simnet-node3-data
+
 services:
   btc-simnet-node1:
     # Default: official registry image. Set BTC_IMAGE=simchainbitcoinnode:31.1
@@ -29,6 +42,14 @@ services:
     image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node1
     restart: unless-stopped
+    # Grace must outlive the slowest shutdown flush (chainstate + mempool.dat
+    # after a heavy spam run). bitcoind has no internal shutdown timeout -- it
+    # takes as long as the disk needs -- so docker's grace timer is the only
+    # thing that can kill it mid-write. 300s matches common bitcoind systemd
+    # practice; a clean stop is what makes resume and snapshots safe.
+    stop_grace_period: 300s
+    volumes:
+      - node1-data:/home/bitcoin/.bitcoin
     ports:
       - "${NODE1_RPC_PORT:-18443}:18443"
       - "${NODE1_P2P_PORT:-18444}:18444"
@@ -84,6 +105,9 @@ services:
     image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node2
     restart: unless-stopped
+    stop_grace_period: 300s
+    volumes:
+      - node2-data:/home/bitcoin/.bitcoin
     ports:
       - "${NODE2_RPC_PORT:-28443}:18443"
       - "${NODE2_P2P_PORT:-28444}:18444"
@@ -130,6 +154,9 @@ services:
     image: ${BTC_IMAGE:-bitcoin/bitcoin:31.1}
     container_name: btc-simnet-node3
     restart: unless-stopped
+    stop_grace_period: 300s
+    volumes:
+      - node3-data:/home/bitcoin/.bitcoin
     networks:
       - btc-simnet-network
     environment:

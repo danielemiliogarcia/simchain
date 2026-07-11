@@ -36,7 +36,7 @@ that allows to defining mining pace, block filling and fee rates.
 It consists on: multiple P2P-connected nodes, rotating miners,
 a non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus five bigger proposed features with their
+limitations and future enhancements, plus four bigger proposed features with their
 rationale and an implementation plan, and a section for parked features.
 
 ## 1. Declarative scenario engine
@@ -163,50 +163,6 @@ tools).
 
 ---
 
-## 5. Chain snapshot/restore (UTXO set export/import)
-
-**What:** Save the full state of a running chain — blocks, chainstate (the UTXO set) and
-node wallets — into a portable archive, and restore it later into a fresh simnet:
-`./scripts/snapshot.sh save <name>` / `./scripts/snapshot.sh restore <name>`. A restored
-simnet boots already at the exported height and continues from there.
-
-**Why it's a nice-to-have:** Every fresh `docker compose up` re-does the same bootstrap
-work: mining 102 blocks for coinbase maturity, creating and funding the miner and
-spammer wallets, building up a mempool. A snapshot does that work once; every later run
-imports it and starts at block N with mature, spendable coins. And because the user's
-keys live outside the simnet (node1 is wallet-disabled by design), the user's addresses
-do not change between runs: coins received on the exported chain are still theirs after
-a restore, so the user can fund their addresses once, snapshot, and rerun tests from
-that state — "wait for bootstrap, then re-fund everything" becomes seconds. Snapshots
-are also shareable: a bug report or a CI job can pin the exact chain state it needs.
-
-**Implementation plan:**
-1. Persist node datadirs on named volumes (mounted at `/home/bitcoin/.bitcoin` in each
-   node container); today all chain state is ephemeral inside the containers, so this
-   is the enabling change.
-2. `snapshot.sh save <name>`: `docker compose stop` the nodes (clean shutdown flushes
-   chainstate and wallets), run a scratch container that mounts the volumes and tars
-   them to `snapshots/<name>.tar.gz` together with a small metadata file (image tag,
-   height, relevant `.env` values), then restart.
-3. `snapshot.sh restore <name>`: `docker compose down`, recreate the volumes, untar
-   each datadir into its own node's volume, `docker compose up -d`. Nodes resume at the
-   snapshot height already in consensus; electrs and the mempool stack keep no volumes
-   and simply re-index from node1 on start.
-4. Validate metadata on restore: warn when the bitcoind image or the node topology
-   differs from the snapshot (datadir upgrades are one-way across major versions).
-
-Why a datadir tar instead of Core's native `dumptxoutset`/`loadtxoutset`: assumeUTXO
-only accepts snapshots whose base-block hash is hard-coded in the chain params, so an
-arbitrary user chain on regtest is rejected — and it would not carry wallets, so the
-miner and spammer funding would be lost. The datadir snapshot delivers the same outcome
-(the UTXO set as of block N, maturity already done) plus the wallets, with no
-consensus-level tricks.
-
-Effort: small–medium (compose volume change plus a shell helper; no image or Rust
-changes).
-
----
-
 ## Parked features
 
 Designed but deliberately not built. Each entry records why it is parked and what would
@@ -236,3 +192,8 @@ reproduce with the "tx per block" knob. Pairs well with the shipped Poisson bloc
 # Tech debt
 
 - Build from sources instead of downloading binaries
+
+Multi-platform
+- convert all bash scripts to rust compilable binaries, so its muti platform, or run the scripts indise an sphimeral container connected with networks and volumes?
+- save snapshots in a muti-platform format instead of .tar
+

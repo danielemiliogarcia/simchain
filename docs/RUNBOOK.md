@@ -58,6 +58,17 @@ Get total balance:
 docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword scantxoutset start '["addr(bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr)"]' | jq '[.unspents[].amount] | add'
 ```
 
+## Snapshots
+
+Archive the running chain (blocks, wallets, mempool) and bring it back later,
+skipping bootstrap and funding (recipes: [SNAPSHOTS.md](SNAPSHOTS.md)):
+
+```bash
+./scripts/snapshot.sh save mysnap
+./scripts/snapshot.sh restore mysnap
+./scripts/snapshot.sh list
+```
+
 ## Reorgs
 
 One-shot reorg of the last 3 blocks:
