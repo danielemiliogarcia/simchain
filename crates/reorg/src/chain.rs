@@ -8,6 +8,16 @@ use bitcoincore_rpc::{
 use serde_json::json;
 use std::collections::HashSet;
 
+/// Consensus cap on block weight. A block whose transactions push past this is
+/// rejected with `bad-blk-length`, so replacement blocks are packed below it.
+const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+
+/// Weight budget for one replacement block's explicit transaction list. Kept
+/// below [`MAX_BLOCK_WEIGHT`] with headroom for the coinbase `generateblock`
+/// appends and for the vsize*4 upper-bound estimate a pre-0.19 node would use,
+/// so a packed list never trips the consensus size check.
+pub const BLOCK_WEIGHT_BUDGET: u64 = MAX_BLOCK_WEIGHT - 100_000;
+
 /// One block on the branch a reorg is about to orphan, with its full ordered
 /// txid list (coinbase first). Captured before invalidation so the double-spend
 /// planner can walk the exact txs being rolled back.
@@ -87,37 +97,63 @@ pub fn print_blocks(blocks: &[(u64, String, usize)]) {
     }
 }
 
-/// Txids currently in the mempool, ordered parents-first (ascending ancestor
-/// count). A leading slice of this list is always a valid set to mine into one
-/// block: a child never precedes its parent, and every parent still in the
-/// mempool sorts ahead of it.
-pub fn live_mempool_topo(node: &Client) -> Result<Vec<Txid>, bitcoincore_rpc::Error> {
-    let mut entries: Vec<(u64, Txid)> = Vec::new();
-    for txid in node.get_raw_mempool()? {
-        let ancestors = node
-            .get_mempool_entry(&txid)
-            .map(|e| e.ancestor_count)
-            .unwrap_or(0);
-        entries.push((ancestors, txid));
-    }
-    entries.sort_by_key(|(ancestors, _)| *ancestors);
-    Ok(entries.into_iter().map(|(_, txid)| txid).collect())
+/// One mempool transaction with the block weight it contributes. Ordered
+/// parents-first by the list it lives in.
+#[derive(Clone, Copy, Debug)]
+pub struct MempoolTx {
+    pub txid: Txid,
+    pub weight: u64,
 }
 
-/// Like [`live_mempool_topo`] but with `excluded` txids removed. Used by the
-/// double-spend path to keep the deliberately-dropped originals and their
-/// descendants out of the replacement blocks. The parents-first invariant
-/// survives the filter: a kept child's parent can only be excluded if the child
-/// itself were an excluded descendant, so no leading slice ever splits a parent
-/// from a child.
-pub fn live_mempool_topo_filtered(
+/// Mempool transactions with their weights, ordered parents-first (ascending
+/// ancestor count, txid as a deterministic tiebreak) and with `excluded` txids
+/// removed. A leading slice is always a valid set to mine into one block: a
+/// child never precedes its parent, and every parent still in the mempool sorts
+/// ahead of it. The filter preserves that -- a kept child's parent could only
+/// be excluded if the child were itself an excluded descendant.
+///
+/// Reads the whole mempool in one verbose RPC (weights included) rather than a
+/// `getmempoolentry` per tx, so a multi-thousand-tx backlog costs one round-trip.
+pub fn live_mempool_weighted(
     node: &Client,
     excluded: &HashSet<Txid>,
-) -> Result<Vec<Txid>, bitcoincore_rpc::Error> {
-    Ok(live_mempool_topo(node)?
+) -> Result<Vec<MempoolTx>, bitcoincore_rpc::Error> {
+    let mut entries: Vec<(u64, Txid, u64)> = node
+        .get_raw_mempool_verbose()?
         .into_iter()
-        .filter(|txid| !excluded.contains(txid))
+        .filter(|(txid, _)| !excluded.contains(txid))
+        .map(|(txid, entry)| {
+            // `weight` is present on Core >= 0.19; fall back to vsize*4 (an
+            // upper bound, safe for budgeting) if an older node omits it.
+            let weight = entry.weight.unwrap_or(entry.vsize * 4);
+            (entry.ancestor_count, txid, weight)
+        })
+        .collect();
+    // Parents-first; txid tiebreak makes ties deterministic (the verbose
+    // mempool arrives as an unordered map).
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(entries
+        .into_iter()
+        .map(|(_, txid, weight)| MempoolTx { txid, weight })
         .collect())
+}
+
+/// Greedily take a parents-first prefix of `mempool` whose combined weight fits
+/// in `budget`. Stops at the first tx that would overflow rather than skipping
+/// it, so the result stays a valid topological prefix and no parent is split
+/// from a child. A standard mempool tx is far smaller than a block budget, so
+/// this never strands a tx that could otherwise be mined. Pure and deterministic.
+pub fn pack_by_weight(mempool: &[MempoolTx], budget: u64) -> Vec<Txid> {
+    let mut chosen = Vec::new();
+    let mut used: u64 = 0;
+    for tx in mempool {
+        if used + tx.weight > budget {
+            break;
+        }
+        used += tx.weight;
+        chosen.push(tx.txid);
+    }
+    chosen
 }
 
 /// Issue one `generateblock` with an explicit item list. Returns `Ok(())` on
@@ -216,4 +252,46 @@ pub fn mine_exact(
         );
     }
     generate_block(node, mine_address, &Vec::<String>::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoincore_rpc::bitcoin::hashes::Hash;
+
+    fn mtx(n: u8, weight: u64) -> MempoolTx {
+        MempoolTx {
+            txid: Txid::from_byte_array([n; 32]),
+            weight,
+        }
+    }
+
+    #[test]
+    fn pack_by_weight_takes_prefix_that_fits() {
+        let mempool = vec![mtx(1, 400), mtx(2, 400), mtx(3, 400)];
+        // Budget fits the first two but not the third.
+        let chosen = pack_by_weight(&mempool, 900);
+        assert_eq!(chosen, vec![mempool[0].txid, mempool[1].txid]);
+    }
+
+    #[test]
+    fn pack_by_weight_stops_at_first_overflow_keeping_topo_prefix() {
+        // A big tx in the middle stops packing there rather than skipping it to
+        // grab the smaller tx behind it, which would strand a parent.
+        let mempool = vec![mtx(1, 100), mtx(2, 5000), mtx(3, 100)];
+        let chosen = pack_by_weight(&mempool, 1000);
+        assert_eq!(chosen, vec![mempool[0].txid]);
+    }
+
+    #[test]
+    fn pack_by_weight_empty_when_first_tx_exceeds_budget() {
+        assert!(pack_by_weight(&[mtx(1, 5000)], 1000).is_empty());
+    }
+
+    #[test]
+    fn pack_by_weight_takes_all_when_budget_is_ample() {
+        let mempool = vec![mtx(1, 400), mtx(2, 400)];
+        let chosen = pack_by_weight(&mempool, BLOCK_WEIGHT_BUDGET);
+        assert_eq!(chosen.len(), 2);
+    }
 }

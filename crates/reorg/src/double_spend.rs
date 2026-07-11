@@ -34,6 +34,9 @@ pub struct ReplacementTx {
     pub original_txid: Txid,
     pub replacement_txid: Txid,
     pub raw_hex: String,
+    /// Block weight of `raw_hex`, so the mining loop can reserve room for the
+    /// conflict before packing mempool txs into the same block.
+    pub weight: u64,
     pub pruned_descendants: Vec<Txid>,
 }
 
@@ -67,11 +70,12 @@ impl DoubleSpendPlan {
         }
     }
 
-    /// Raw hex of every conflict, in selection order, for the mining loop.
-    pub fn raw_conflicts(&self) -> Vec<String> {
+    /// Raw hex of every conflict paired with its block weight, in selection
+    /// order, for the mining loop to reserve room and mine each conflict.
+    pub fn raw_conflicts(&self) -> Vec<(String, u64)> {
         self.replacements
             .iter()
-            .map(|r| r.raw_hex.clone())
+            .map(|r| (r.raw_hex.clone(), r.weight))
             .collect()
     }
 
@@ -243,6 +247,7 @@ pub fn build_plan(node: &Client, branch: &[BranchBlock], pct: u8) -> DoubleSpend
                     original_txid: candidate.original_txid,
                     replacement_txid: candidate.replacement_txid,
                     raw_hex: candidate.raw_hex,
+                    weight: candidate.weight,
                     pruned_descendants,
                 });
             }
@@ -281,6 +286,7 @@ struct Candidate {
     original_txid: Txid,
     replacement_txid: Txid,
     raw_hex: String,
+    weight: u64,
 }
 
 /// Cheap structural eligibility check for one orphaned wallet tx: is it a
@@ -369,6 +375,7 @@ fn sign_conflict(
         original_txid: root.original_txid,
         replacement_txid: replacement.compute_txid(),
         raw_hex: bitcoincore_rpc::bitcoin::consensus::encode::serialize_hex(&replacement),
+        weight: replacement.weight().to_wu(),
     }))
 }
 
@@ -476,12 +483,14 @@ mod tests {
                 original_txid: txid(1),
                 replacement_txid: txid(100),
                 raw_hex: String::new(),
+                weight: 0,
                 pruned_descendants: vec![txid(2), txid(3)],
             },
             ReplacementTx {
                 original_txid: txid(4),
                 replacement_txid: txid(101),
                 raw_hex: String::new(),
+                weight: 0,
                 pruned_descendants: vec![],
             },
         ];

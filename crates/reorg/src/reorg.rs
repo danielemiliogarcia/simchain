@@ -3,8 +3,8 @@
 
 use crate::{
     chain::{
-        branch_to_orphan, last_blocks, live_mempool_topo_filtered, mine_exact, print_blocks,
-        BlockTx,
+        branch_to_orphan, last_blocks, live_mempool_weighted, mine_exact, pack_by_weight,
+        print_blocks, BlockTx, BLOCK_WEIGHT_BUDGET,
     },
     config::ReorgConfig,
     double_spend::{build_plan, DoubleSpendPlan},
@@ -158,12 +158,20 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
             inject_transactions(node, config.adds_new_txs);
         }
 
-        // Re-mine the live mempool plus the double-spend conflicts, spread
-        // evenly across the replacement blocks. The conflicts are raw hex that
-        // must land; the mempool is read fresh each round (reflecting RBF
-        // replacements) with the dropped originals and their descendants
-        // filtered out. Each block's ceiling takes whatever remains, so no tx
-        // is stranded.
+        // Re-mine the returned mempool plus the double-spend conflicts across
+        // the replacement blocks. The conflicts are raw hex that must land, so
+        // they are reserved first (spread across the blocks). The rest of each
+        // block's weight budget is packed from the mempool, read fresh each
+        // round -- so txs mined into earlier blocks drop out, RBF replacements
+        // are reflected, and the dropped originals + descendants stay filtered.
+        //
+        // Packing by *weight* (not by tx count) is essential: spam txs are fat,
+        // so only ~one block's worth fits per block. Splitting the whole backlog
+        // by block count instead would hand a single generateblock more weight
+        // than the 4M consensus limit, which Core rejects (`bad-blk-length`) and
+        // the recovery ladder then turns into an empty block -- the reorg would
+        // silently degrade to empty mode. Whatever exceeds the replacement
+        // blocks' total capacity stays in the mempool for later real blocks.
         let mut raw = plan.raw_conflicts();
         if raw.is_empty() {
             tracing::info!("Mining {blocks_to_mine} replacement blocks from the live mempool (one extra so the new chain wins network-wide)...");
@@ -175,12 +183,20 @@ pub fn run(node: &Client, witness: Option<(&Client, &str)>) -> Result<(), bitcoi
         }
         for index in 0..blocks_to_mine as usize {
             let blocks_left = blocks_to_mine as usize - index;
+
+            // Reserve this block's share of the raw conflicts and subtract their
+            // weight from the budget before packing mempool txs.
             let raw_take = raw.len().div_ceil(blocks_left).min(raw.len());
-            let live = live_mempool_topo_filtered(node, &plan.excluded_mempool_txids)?;
-            let mem_take = live.len().div_ceil(blocks_left).min(live.len());
-            let mut items: Vec<BlockTx> = Vec::with_capacity(raw_take + mem_take);
-            items.extend(raw.drain(..raw_take).map(BlockTx::RawHex));
-            items.extend(live[..mem_take].iter().copied().map(BlockTx::Mempool));
+            let raw_items: Vec<(String, u64)> = raw.drain(..raw_take).collect();
+            let raw_weight: u64 = raw_items.iter().map(|(_, w)| *w).sum();
+            let budget = BLOCK_WEIGHT_BUDGET.saturating_sub(raw_weight);
+
+            let mempool = live_mempool_weighted(node, &plan.excluded_mempool_txids)?;
+            let packed = pack_by_weight(&mempool, budget);
+
+            let mut items: Vec<BlockTx> = Vec::with_capacity(raw_items.len() + packed.len());
+            items.extend(raw_items.into_iter().map(|(hex, _)| BlockTx::RawHex(hex)));
+            items.extend(packed.into_iter().map(BlockTx::Mempool));
             mine_exact(node, &config.mine_address, &items)?;
         }
         Some(plan)
