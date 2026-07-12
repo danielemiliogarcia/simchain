@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Apply P2P-only latency and packet loss to a running simchain node.
+# Apply P2P-only egress latency and packet loss to a running simchain node.
 #
 # Usage:
 #   ./scripts/netem.sh apply <node> --delay-ms N [--loss-pct P]

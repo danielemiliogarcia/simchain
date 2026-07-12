@@ -112,6 +112,22 @@ p2p_peer_count() {
     grep -Ec '"addr": "(172\.30\.0\.|node[123]-p2p:)' <<<"$peers" || true
 }
 
+p2p_ip() {
+    docker inspect -f '{{(index .NetworkSettings.Networks "btc-simnet-p2p").IPAddress}}' "$1" 2>/dev/null
+}
+
+# node1 sees the main-side miner as a live peer: outbound shows the alias,
+# inbound shows the miner's P2P IP. A lingering half-dead session to the
+# detached target matches neither, so this cannot pass on a stale entry.
+main_link_up() {
+    local main="$1" main_alias main_ip peers
+    main_alias="$(alias_for "$main")"
+    main_ip="$(p2p_ip "$main")"
+    [ -n "$main_ip" ] || return 1
+    peers="$(bcli btc-simnet-node1 getpeerinfo)" || return 1
+    grep -Eq "\"addr\": \"($main_alias:|${main_ip//./\\.}:)" <<<"$peers"
+}
+
 disconnect_current_peers() {
     local node="$1" id
     while read -r id; do
@@ -162,11 +178,10 @@ heal_node() {
 }
 
 wait_for_split() {
-    local target="$1" main_miner="$2" start=$SECONDS target_peers main_peers
+    local target="$1" main_miner="$2" start=$SECONDS target_peers
     while (( SECONDS - start < PEER_TIMEOUT )); do
         target_peers="$(p2p_peer_count "$target")"
-        main_peers="$(p2p_peer_count "$main_miner")"
-        if [ "$target_peers" -eq 0 ] && [ "$main_peers" -ge 1 ]; then
+        if [ "$target_peers" -eq 0 ] && main_link_up "$main_miner"; then
             return
         fi
         sleep 1
@@ -184,12 +199,15 @@ mine_blocks() {
 }
 
 wait_for_convergence() {
-    local start=$SECONDS h1 h2 h3
+    local expected_hash="${1:-}" start=$SECONDS h1 h2 h3
     while (( SECONDS - start < CONVERGENCE_TIMEOUT )); do
         h1="$(bcli btc-simnet-node1 getbestblockhash)"
         h2="$(bcli btc-simnet-node2 getbestblockhash)"
         h3="$(bcli btc-simnet-node3 getbestblockhash)"
         if [ "$h1" = "$h2" ] && [ "$h1" = "$h3" ]; then
+            if [ -n "$expected_hash" ] && [ "$h1" != "$expected_hash" ]; then
+                die "nodes converged on unexpected tip $h1 (expected longer-branch tip $expected_hash)"
+            fi
             ok "all nodes converged at height $(bcli btc-simnet-node1 getblockcount), tip $h1"
             return
         fi
@@ -231,7 +249,8 @@ cmd_status() {
 cmd_run() {
     local target="$1"; shift
     local main_blocks="$DEFAULT_MAIN_BLOCKS" isolated_blocks="$DEFAULT_ISOLATED_BLOCKS"
-    local keep_spammer=false main_miner controller_running=false spammer_running=false split_active=false
+    local keep_spammer=false main_miner controller_running=false spammer_running=false partition_started=false
+    local main_tip isolated_tip expected_tip
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -267,9 +286,13 @@ cmd_run() {
     cleanup() {
         local status=$?
         trap - EXIT
-        if $split_active; then
-            warn "healing $target during cleanup"
-            heal_node "$target" >/dev/null 2>&1 || true
+        if $partition_started; then
+            warn "ensuring $target is healed during cleanup"
+            if network_attached "$target"; then
+                trigger_reconnect "$target" >/dev/null 2>&1 || true
+            else
+                heal_node "$target" >/dev/null 2>&1 || true
+            fi
         fi
         if $controller_running; then compose start btc-simnet-mining-controller >/dev/null || true; fi
         if $spammer_running && ! $keep_spammer; then compose start btc-simnet-spammer >/dev/null || true; fi
@@ -286,19 +309,30 @@ cmd_run() {
         compose stop btc-simnet-spammer >/dev/null
     fi
 
+    # The controller waits for propagation after every block, but it can be
+    # stopped between mining and that wait. Never derive deterministic branch
+    # lengths from tips that were already unequal before the split.
+    wait_for_convergence
+
+    partition_started=true
     disconnect_node "$target"
-    split_active=true
     control_rpc_height "$target" >/dev/null \
         || die "target RPC is not reachable over btc-simnet-control after the split"
     wait_for_split "$target" "$main_miner"
     ok "P2P split verified; $main_miner remains connected to node1"
 
     mine_blocks "$main_miner" "$main_blocks"
+    main_tip="$(bcli "$main_miner" getbestblockhash)"
     mine_blocks "$target" "$isolated_blocks"
+    isolated_tip="$(bcli "$target" getbestblockhash)"
+    if [ "$main_blocks" -gt "$isolated_blocks" ]; then
+        expected_tip="$main_tip"
+    else
+        expected_tip="$isolated_tip"
+    fi
 
     heal_node "$target"
-    split_active=false
-    wait_for_convergence
+    wait_for_convergence "$expected_tip"
 
     if $controller_running; then
         compose start btc-simnet-mining-controller >/dev/null
@@ -310,6 +344,7 @@ cmd_run() {
         spammer_running=false
         info "restarted spammer"
     fi
+    partition_started=false
     trap - EXIT
 }
 

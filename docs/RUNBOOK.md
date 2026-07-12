@@ -46,11 +46,24 @@ docker compose start btc-simnet-mining-controller btc-simnet-spammer
 
 The allowed isolated miners are `btc-simnet-node2` and `btc-simnet-node3`. A failed
 `run` attempts to heal the P2P attachment and restores any services it stopped.
+Before disconnecting, `run` also waits for all three nodes to share one tip; after
+healing, it verifies that they converged specifically on the longer branch it mined.
+
+Partitions cut the Docker P2P network path only. Host-side P2P connections through the
+published ports (e.g. `localhost:18444` into node1) bypass the partition, so keep
+external nodes disconnected during partition experiments.
 
 ## P2P latency and packet loss
 
-Apply delay and optional loss to a node's P2P interface without affecting its RPC or
-helper traffic:
+Simple layer — degrade a node's P2P link for a bounded window, auto-restored
+(`60s` = seconds, `5b` = until 5 blocks are mined; Ctrl+C restores early):
+
+```bash
+./scripts/degrade.sh btc-simnet-node3 500 1 60s
+./scripts/degrade.sh btc-simnet-node3 2000 0 5b
+```
+
+Advanced layer — apply delay and optional loss with no time limit, remove it yourself:
 
 ```bash
 ./scripts/netem.sh apply btc-simnet-node3 --delay-ms 500 --loss-pct 1
@@ -61,6 +74,11 @@ helper traffic:
 The first command builds the small `docker/netem.Dockerfile` helper if needed. The helper
 is one-shot; only it receives `NET_ADMIN`. The qdisc lives in the target node's network
 namespace and therefore disappears when that node is restarted or recreated.
+
+Netem shapes egress only: it delays/drops packets the node sends, not packets it
+receives. `--delay-ms 500` adds 500ms one way (RTT +500ms, not +1000ms); apply it to
+both endpoints for symmetric latency. It also affects only the Docker P2P interface —
+host-side P2P traffic through the published ports bypasses it.
 
 ## Manual mining
 

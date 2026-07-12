@@ -228,33 +228,6 @@ One compose file serves every combination via
 With `mempool` or `all-tools`, browse the explorer at
 [http://localhost:1080/](http://localhost:1080/) (port: `MEMPOOL_WEB_PORT`).
 
-## Partitions and P2P latency
-
-After bootstrap reaches height 204, create a deterministic organic fork by isolating one
-miner, mining both branches, healing the P2P network, and waiting for the longer branch
-to win everywhere:
-
-```bash
-./scripts/partition.sh run btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
-./scripts/partition.sh disconnect btc-simnet-node3
-./scripts/partition.sh heal btc-simnet-node3
-./scripts/partition.sh status
-```
-
-The `run` command pauses and restores the mining controller and, unless
-`--keep-spammer` is passed, the spammer. Manual `disconnect` and `heal` do not manage
-either service. Add latency or loss to only a node's P2P interface with the one-shot
-netem helper:
-
-```bash
-./scripts/netem.sh apply btc-simnet-node3 --delay-ms 500 --loss-pct 1
-./scripts/netem.sh status btc-simnet-node3
-./scripts/netem.sh clear btc-simnet-node3
-```
-
-Netem state is ephemeral and clears when the target node is recreated or restarted.
-Operational recipes and guardrails are in [RUNBOOK.md](./docs/RUNBOOK.md).
-
 
 ## Simulating reorgs
 
@@ -262,6 +235,20 @@ Forces chain reorgs by invalidating N blocks and mining N+1 replacements; orphan
 Race-safe against mining controller; supports one-shot and continuous modes with configurable depth.
 
 For full details, commands, and modes, see [REORGS.md](./docs/REORGS.md).
+
+
+## Partitions and P2P latency
+
+Isolates one miner from the P2P mesh (RPC stays up), mines competing branches on both
+sides, then heals so the longer branch wins everywhere: an organic reorg caused by the
+real mechanism (a partition), unlike the administrative reorg simulator below.
+`degrade.sh` makes a node slower and/or lossy for N seconds or blocks (auto-restored);
+`netem.sh` underneath gives fine control. P2P traffic only — block/tx propagation
+becomes observable, RPC stays clean.
+
+For commands, manual walkthroughs, and caveats, see
+[PARTITIONS.md](./docs/PARTITIONS.md).
+
 
 ## ZMQ notifications
 
@@ -317,6 +304,8 @@ exclude = ["path/to/simchain"]
 - [INTRO.md](./docs/INTRO.md), detailed component descriptions and project objective.
 - [RETUNING.md](./docs/RETUNING.md), how to retune mining cadence, fee floor, and block fill on a live chain.
 - [REORGS.md](./docs/REORGS.md), simulating chain reorganizations, commands, and modes.
+- [PARTITIONS.md](./docs/PARTITIONS.md), network partitions and P2P latency: organic
+  reorgs, double-spend windows, propagation lag.
 - [SETTINGS.md](./docs/SETTINGS.md), every setting, its default and what it does.
 - [SNAPSHOTS.md](./docs/SNAPSHOTS.md), chain snapshot/restore cookbook: concrete
   commands for the common situations.

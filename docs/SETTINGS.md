@@ -402,9 +402,12 @@ can cascade the rest of the run to empty blocks.
 | `PARTITION_PEER_TIMEOUT_SECS` | `15` | Maximum time to wait for P2P peer connections to reflect a requested split. |
 
 Netem has no persistent settings: pass `--delay-ms` and `--loss-pct` to
-`scripts/netem.sh apply`. It affects only the interface routed to the fixed
-`btc-simnet-p2p` subnet (`172.30.0.0/24`), never the RPC/control interface. Its qdisc is
-ephemeral and disappears when the target node restarts.
+`scripts/netem.sh apply` (or use `scripts/degrade.sh`, the settings-free wrapper that
+adds a duration and auto-restore). It affects only the interface routed to the fixed
+`btc-simnet-p2p` subnet (`172.30.0.0/24`), never the RPC/control interface, and shapes
+egress only — `--delay-ms 500` adds 500ms one way (RTT +500ms); apply it on both
+endpoints for symmetric latency. Its qdisc is ephemeral and disappears when the target
+node restarts.
 
 ## Tools: electrs (profiles `electrs`, `mempool`, `all-tools`)
 
