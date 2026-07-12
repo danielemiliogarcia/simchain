@@ -31,6 +31,10 @@ restores the services it stopped:
 ./scripts/partition.sh run btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
 ```
 
+Note who wins with those defaults: the **isolated** miner. Its 4-block branch is longer,
+so on heal the connected side's three blocks are orphaned and every node reorgs onto
+node3's chain — "main" means "still connected to node1", not "the side that wins".
+
 Use `--keep-spammer` to leave the spammer running. The block counts must differ, otherwise
 the winning branch would be nondeterministic. Manual controls do not stop or restart any
 services:

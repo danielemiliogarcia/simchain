@@ -106,10 +106,23 @@ control_rpc_height() {
         -rpcuser="$BTC_RPC_USER" -rpcpassword="$BTC_RPC_PASS" getblockcount
 }
 
+# Counts only peers with P2P-network addresses (fixed subnet or *-p2p alias).
+# Isolation rests on an invariant: -addnode uses only the *-p2p aliases, so
+# addrman never learns a control-network address and nodes cannot re-peer over
+# btc-simnet-control even though bitcoind listens on every interface. If that
+# ever breaks (a control-name -addnode, address discovery), this filter would
+# miss those peers -- which is why wait_for_split asserts zero peers of ANY
+# kind on the target, not zero P2P-subnet peers.
 p2p_peer_count() {
     local peers
     peers="$(bcli "$1" getpeerinfo)" || return 1
     grep -Ec '"addr": "(172\.30\.0\.|node[123]-p2p:)' <<<"$peers" || true
+}
+
+peer_count() {
+    local peers
+    peers="$(bcli "$1" getpeerinfo)" || return 1
+    grep -Ec '^[[:space:]]*"id": [0-9]+,' <<<"$peers" || true
 }
 
 p2p_ip() {
@@ -180,13 +193,17 @@ heal_node() {
 wait_for_split() {
     local target="$1" main_miner="$2" start=$SECONDS target_peers
     while (( SECONDS - start < PEER_TIMEOUT )); do
-        target_peers="$(p2p_peer_count "$target")"
+        # A transient getpeerinfo failure is a retry, not an abort.
+        if ! target_peers="$(peer_count "$target")"; then
+            sleep 1
+            continue
+        fi
         if [ "$target_peers" -eq 0 ] && main_link_up "$main_miner"; then
             return
         fi
         sleep 1
     done
-    die "P2P split did not settle within ${PEER_TIMEOUT}s"
+    die "P2P split did not settle within ${PEER_TIMEOUT}s (a peer outside btc-simnet-p2p, e.g. a host-side node on a published port, also blocks the split)"
 }
 
 mine_blocks() {
@@ -220,6 +237,12 @@ cmd_disconnect() {
     local target="$1"
     validate_miner "$target"
     require_nodes
+    if container_running btc-simnet-mining-controller; then
+        warn "the mining controller is running and will stall across the split; stop it first: docker compose stop btc-simnet-mining-controller"
+    fi
+    if container_running btc-simnet-spammer; then
+        warn "the spammer is running and will keep feeding $target over control RPC during the split"
+    fi
     disconnect_node "$target" || true
 }
 

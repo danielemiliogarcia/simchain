@@ -58,6 +58,11 @@ longer branch it mined, and restarts the services it stopped. A failed run heals
 split and restores the stopped services on its way out. Defaults and timeouts
 (`PARTITION_*`) are in [SETTINGS.md](SETTINGS.md).
 
+With the default counts the **isolated** side wins: 4 > 3, so on heal the connected
+side's blocks are orphaned and the network reorgs onto the previously-isolated miner's
+chain. "Main" means "still connected to node1", not "the side that wins" — flip the
+counts to make the connected side win instead.
+
 ### Manual disconnect / heal
 
 For full control — pick what to pause, mine or inject transactions on each side, decide
