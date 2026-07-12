@@ -15,3 +15,7 @@
 
 # worktrees
 .worktrees/
+
+# spam-burst.sh temp scenarios (repo root so the container's /workspace mount
+# sees them; removed by the script's EXIT trap, but a SIGKILL leaves strays)
+.spam-burst.*

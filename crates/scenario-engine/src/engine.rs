@@ -145,6 +145,12 @@ impl Engine {
         }
     }
 
+    // Cleanup reverses ENGINE-owned state only: partitions this engine started
+    // and pauses this engine issued. Steps that shell out (reorg, partition)
+    // stop/restart the controller and spammer through those scripts' own EXIT
+    // traps -- e.g. a reorg failure that leaves the controller stopped is
+    // simulate-reorg.sh's cleanup responsibility and is deliberately not
+    // tracked here.
     fn cleanup(&mut self) {
         if let Some(node) = self.state.active_partition.take() {
             tracing::warn!(%node, "Healing partition after scenario failure");
