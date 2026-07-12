@@ -28,7 +28,23 @@ pub fn execute(
             );
         }
         Step::Sleep { secs } => thread::sleep(Duration::from_secs(*secs)),
-        Step::PauseMining => docker.pause_mining()?,
+        Step::PauseMining => {
+            docker.pause_mining()?;
+            // `compose stop` exits 0 even when it matched nothing (e.g. the
+            // stack runs under a different COMPOSE_PROJECT_NAME), so confirm
+            // the controller is actually down instead of trusting the exit
+            // code -- symmetric with the resume_mining check below.
+            let start = Instant::now();
+            while docker.container_running(crate::docker::MINING_CONTROLLER)? {
+                if start.elapsed() >= timeout {
+                    return Err(anyhow!(
+                        "timed out waiting for the mining controller to stop; \
+                         is the stack running under a different compose project name?"
+                    ));
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
         Step::ResumeMining => {
             docker.resume_mining()?;
             let start = Instant::now();

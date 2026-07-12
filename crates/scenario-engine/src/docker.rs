@@ -67,7 +67,16 @@ impl Docker {
     }
 
     pub fn resume_mining(&self) -> Result<()> {
-        self.run_checked(&self.compose(["up", "-d", MINING_CONTROLLER]))
+        // `up -d` (not `start`) so a removed container is recreated; the flags
+        // keep it the exact inverse of `stop`: never touch the node
+        // dependencies, never recreate a merely-stopped controller.
+        self.run_checked(&self.compose([
+            "up",
+            "-d",
+            "--no-deps",
+            "--no-recreate",
+            MINING_CONTROLLER,
+        ]))
     }
 
     pub fn container_running(&self, container: &str) -> Result<bool> {
