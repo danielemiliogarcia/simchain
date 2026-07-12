@@ -11,7 +11,7 @@ Handy `bitcoin-cli` one-liners against the simnet. This how all this started... 
 Add a peer:
 
 ```bash
-docker exec btc-simnet-node1 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword addnode btc-simnet-node2:18444 add
+docker exec btc-simnet-node1 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword addnode node2-p2p:18444 add
 ```
 
 Inspect connected peers:
@@ -19,6 +19,70 @@ Inspect connected peers:
 ```bash
 docker exec btc-simnet-node1 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword getpeerinfo
 ```
+
+## Network partitions
+
+Partition runs are post-bootstrap only (node1 must be at height 204 or higher). This
+command pauses the mining controller and spammer, disconnects node3 from P2P only, mines
+three blocks on the connected side and four on node3, heals, waits for convergence, and
+restores the services it stopped:
+
+```bash
+./scripts/partition.sh run btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
+```
+
+Note who wins with those defaults: the **isolated** miner. Its 4-block branch is longer,
+so on heal the connected side's three blocks are orphaned and every node reorgs onto
+node3's chain — "main" means "still connected to node1", not "the side that wins".
+
+Use `--keep-spammer` to leave the spammer running. The block counts must differ, otherwise
+the winning branch would be nondeterministic. Manual controls do not stop or restart any
+services:
+
+```bash
+docker compose stop btc-simnet-mining-controller btc-simnet-spammer
+./scripts/partition.sh disconnect btc-simnet-node3
+./scripts/partition.sh status
+# Mine or submit transactions on each side as needed.
+./scripts/partition.sh heal btc-simnet-node3
+docker compose start btc-simnet-mining-controller btc-simnet-spammer
+```
+
+The allowed isolated miners are `btc-simnet-node2` and `btc-simnet-node3`. A failed
+`run` attempts to heal the P2P attachment and restores any services it stopped.
+Before disconnecting, `run` also waits for all three nodes to share one tip; after
+healing, it verifies that they converged specifically on the longer branch it mined.
+
+Partitions cut the Docker P2P network path only. Host-side P2P connections through the
+published ports (e.g. `localhost:18444` into node1) bypass the partition, so keep
+external nodes disconnected during partition experiments.
+
+## P2P latency and packet loss
+
+Simple layer — degrade a node's P2P link for a bounded window, auto-restored
+(`60s` = seconds, `5b` = until 5 blocks are mined; Ctrl+C restores early):
+
+```bash
+./scripts/degrade.sh btc-simnet-node3 500 1 60s
+./scripts/degrade.sh btc-simnet-node3 2000 0 5b
+```
+
+Advanced layer — apply delay and optional loss with no time limit, remove it yourself:
+
+```bash
+./scripts/netem.sh apply btc-simnet-node3 --delay-ms 500 --loss-pct 1
+./scripts/netem.sh status btc-simnet-node3
+./scripts/netem.sh clear btc-simnet-node3
+```
+
+The first command builds the small `docker/netem.Dockerfile` helper if needed. The helper
+is one-shot; only it receives `NET_ADMIN`. The qdisc lives in the target node's network
+namespace and therefore disappears when that node is restarted or recreated.
+
+Netem shapes egress only: it delays/drops packets the node sends, not packets it
+receives. `--delay-ms 500` adds 500ms one way (RTT +500ms, not +1000ms); apply it to
+both endpoints for symmetric latency. It also affects only the Docker P2P interface —
+host-side P2P traffic through the published ports bypasses it.
 
 ## Manual mining
 

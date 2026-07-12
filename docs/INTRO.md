@@ -6,7 +6,12 @@ The objective of this project is to be a tool that helps the user write blockcha
 
 ## Network Components
 
-The network consists of 3 well-connected nodes plus helper containers:
+The network consists of 3 well-connected nodes plus helper containers. The nodes attach
+to two Docker networks: `btc-simnet-p2p` carries only node-to-node Bitcoin traffic, and
+`btc-simnet-control` carries RPC, health checks, and helper traffic. All tools attach only
+to the control network. P2P uses the explicit aliases `node1-p2p`, `node2-p2p`, and
+`node3-p2p`, so a node's P2P attachment can be removed without making its RPC
+unreachable.
 
 ### Node 1 `btc-simnet-node1`
 
@@ -31,6 +36,15 @@ Fills blocks so they are not empty. By default (raw engine) it can run in DATA/H
 ### Reorg Simulator `btc-simnet-reorg`
 
 A Rust tool (same stack as the other tools, pure RPC calls) that forces chain reorganizations. See [Simulating reorgs](../README.md#simulating-reorgs).
+
+### Partition and latency helpers
+
+`scripts/partition.sh` produces organic competing branches by disconnecting node2 or
+node3 from `btc-simnet-p2p`, mining both sides explicitly, reconnecting the node, and
+waiting for all tips to converge. `scripts/netem.sh` runs a short-lived helper with
+`NET_ADMIN` in a selected node's network namespace and applies delay/loss only to its
+P2P interface. Both are post-bootstrap tools; the funding sequence must reach height 204
+before a deterministic partition run.
 
 ### Tools (Profiles)
 

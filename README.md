@@ -16,11 +16,12 @@ For detailed component descriptions, see [INTRO.md](./docs/INTRO.md).
 
 ## Network topology
 
-All containers join a single Docker network (`btc-simnet-network`). The three bitcoind
-nodes form a full P2P mesh (`-addnode`, port 18444). The user lives on the host and
-talks to **node1**, the non-mining full node, over RPC on `localhost:18443`, exactly like
-talking to a 3rd-party production endpoint (node2's RPC on `localhost:28443` is also
-exposed, for the "owned node" scenarios).
+Traffic is split across two Docker networks. Only the three bitcoind nodes join
+`btc-simnet-p2p`, where `node1-p2p`, `node2-p2p`, and `node3-p2p` form the full P2P
+mesh on port 18444. Nodes and helper containers also join `btc-simnet-control` for RPC,
+health checks, and explorer traffic. This separation lets P2P links be partitioned or
+impaired without losing control access. The user talks to **node1** over RPC on
+`localhost:18443`; node2's RPC is also exposed on `localhost:28443`.
 
 ```mermaid
 flowchart TB
@@ -29,12 +30,13 @@ flowchart TB
         zmqc["ZMQ consumers<br/>LND / CLN / indexers / watchers"]
     end
 
-    subgraph net["Docker network: btc-simnet-network"]
-        subgraph mesh["bitcoind nodes — full P2P mesh (port 18444)"]
-            n1["node1 — full node, never mines<br/>txindex, wallet disabled<br/>production-like endpoint"]
-            n2["node2 — miner<br/>wallet enabled, owned node"]
-            n3["node3 — miner<br/>not exposed to host"]
-        end
+    subgraph mesh["btc-simnet-p2p — bitcoind full mesh (port 18444)"]
+        n1["node1 — full node, never mines<br/>txindex, wallet disabled<br/>production-like endpoint"]
+        n2["node2 — miner<br/>wallet enabled, owned node"]
+        n3["node3 — miner<br/>not exposed to host"]
+    end
+
+    subgraph control["btc-simnet-control — RPC and helper traffic"]
         mc["mining-controller<br/>bootstrap + configurable mining"]
         sp["spammer<br/>fills blocks with txs"]
         rg["reorg simulator<br/>profile: reorg, on demand"]
@@ -81,7 +83,7 @@ flowchart LR
     browser["Browser<br/>localhost:1080"]
     electrum["Electrum clients<br/>localhost:60001"]
 
-    subgraph net["btc-simnet-network (tool profiles)"]
+    subgraph net["btc-simnet-control (tool profiles)"]
         mweb["mempool-web"]
         mapi["mempool-api"]
         mdb["mempool-db<br/>MariaDB"]
@@ -234,6 +236,20 @@ Race-safe against mining controller; supports one-shot and continuous modes with
 
 For full details, commands, and modes, see [REORGS.md](./docs/REORGS.md).
 
+
+## Partitions and P2P latency
+
+Isolates one miner from the P2P mesh (RPC stays up), mines competing branches on both
+sides, then heals so the longer branch wins everywhere: an organic reorg caused by the
+real mechanism (a partition), unlike the administrative reorg simulator below.
+`degrade.sh` makes a node slower and/or lossy for N seconds or blocks (auto-restored);
+`netem.sh` underneath gives fine control. P2P traffic only — block/tx propagation
+becomes observable, RPC stays clean.
+
+For commands, manual walkthroughs, and caveats, see
+[PARTITIONS.md](./docs/PARTITIONS.md).
+
+
 ## ZMQ notifications
 
 node1 and node2 publish all five bitcoind ZMQ topics (`rawblock`, `rawtx`, `hashblock`,
@@ -288,6 +304,8 @@ exclude = ["path/to/simchain"]
 - [INTRO.md](./docs/INTRO.md), detailed component descriptions and project objective.
 - [RETUNING.md](./docs/RETUNING.md), how to retune mining cadence, fee floor, and block fill on a live chain.
 - [REORGS.md](./docs/REORGS.md), simulating chain reorganizations, commands, and modes.
+- [PARTITIONS.md](./docs/PARTITIONS.md), network partitions and P2P latency: organic
+  reorgs, double-spend windows, propagation lag.
 - [SETTINGS.md](./docs/SETTINGS.md), every setting, its default and what it does.
 - [SNAPSHOTS.md](./docs/SNAPSHOTS.md), chain snapshot/restore cookbook: concrete
   commands for the common situations.

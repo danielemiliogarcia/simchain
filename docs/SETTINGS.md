@@ -72,9 +72,10 @@ Smoke test: see the ZMQ section in the README.
 
 ## Container-internal RPC endpoints
 
-URLs the helper tools (mining controller, spammer) use to reach the nodes inside the
-compose network. Only change them if you rename the node services or point the tools
-at other nodes.
+URLs the helper tools (mining controller, spammer) use to reach the nodes on
+`btc-simnet-control`. Only change them if you rename the node services or point the tools
+at other nodes. Bitcoin P2P traffic uses the separate `btc-simnet-p2p` network and its
+`nodeX-p2p` aliases.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -387,6 +388,26 @@ they replace. Reading the mempool fresh for each block means an RBF replacement 
 evicts an orphaned tx mid-reorg (e.g. with `ENABLE_SPAM_REPLACES=true`) is picked up
 automatically instead of leaving the block referencing a stale txid — no single rejection
 can cascade the rest of the run to empty blocks.
+
+## Network partitions and P2P netem
+
+`scripts/partition.sh run` is post-bootstrap-only and refuses to proceed below height
+204. Its CLI block-count options override these script defaults:
+
+| Variable | Default | Description |
+|---|---|---|
+| `PARTITION_MAIN_BLOCKS` | `3` | Blocks mined by the connected-side miner during `partition.sh run`. Must be a positive integer and differ from `PARTITION_ISOLATED_BLOCKS`. |
+| `PARTITION_ISOLATED_BLOCKS` | `4` | Blocks mined by the isolated miner during `partition.sh run`. Must be a positive integer and differ from `PARTITION_MAIN_BLOCKS`. |
+| `PARTITION_CONVERGENCE_TIMEOUT_SECS` | `60` | Maximum time to wait after healing for all three best-block hashes to match. |
+| `PARTITION_PEER_TIMEOUT_SECS` | `15` | Maximum time to wait for P2P peer connections to reflect a requested split. |
+
+Netem has no persistent settings: pass `--delay-ms` and `--loss-pct` to
+`scripts/netem.sh apply` (or use `scripts/degrade.sh`, the settings-free wrapper that
+adds a duration and auto-restore). It affects only the interface routed to the fixed
+`btc-simnet-p2p` subnet (`172.30.0.0/24`), never the RPC/control interface, and shapes
+egress only — `--delay-ms 500` adds 500ms one way (RTT +500ms); apply it on both
+endpoints for symmetric latency. Its qdisc is ephemeral and disappears when the target
+node restarts.
 
 ## Tools: electrs (profiles `electrs`, `mempool`, `all-tools`)
 
