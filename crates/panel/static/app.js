@@ -1,0 +1,312 @@
+/* Schema-driven control panel: the form is rendered from /api/v1/schema and
+ * populated from /api/v1/state; nothing here hard-codes individual settings
+ * beyond the UI-only ignore rules below. */
+"use strict";
+
+const TOKEN = window.PANEL_TOKEN;
+const $ = (sel) => document.querySelector(sel);
+
+let schema = null;          // [{key, default, group, scope, control, options, optional, help, warning}]
+let lastState = null;       // last /api/v1/state payload
+let dirty = new Map();      // key -> edited value (string)
+let fieldErrors = new Map(); // key -> latest client/server validation message
+let applying = false;
+
+const GROUP_TITLES = {
+  "mining": "Mining",
+  "spam-basics": "Spam basics",
+  "spam-advanced": "Spam advanced",
+};
+
+/* UI-only relevance rules: fields that are ignored given other staged values. */
+function ignoredReason(key, values) {
+  const dataMode = Number(values.get("SPAM_TX_DATA_MAX_BYTES") || "0") > 0;
+  const fanoutAuto = values.get("SPAM_FANOUT_AUTO") === "true";
+  if (key === "SPAM_FANOUT_UTXOS" && fanoutAuto) return "ignored: SPAM_FANOUT_AUTO=true";
+  if ((key === "SPAM_FIXED_TXS_PER_BLOCK" || key === "SPAM_SENDMANY_OUTPUTS") && dataMode)
+    return "ignored in DATA/HYBRID mode (SPAM_TX_DATA_MAX_BYTES > 0)";
+  if ((key === "SPAM_TX_DATA_MIN_BYTES" || key === "SPAM_SMALL_TXS_PER_BLOCK" ||
+       key === "SPAM_FLOOR_POOL_TXS" || key === "SPAM_FILL_BLOCK_RATIO") && !dataMode)
+    return "ignored in OUTPUT mode (SPAM_TX_DATA_MAX_BYTES = 0)";
+  return null;
+}
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  const body = await response.json().catch(() => null);
+  return { ok: response.ok, status: response.status, body };
+}
+
+/* ------------------------------------------------------------------ status */
+
+function fmtBytes(n) {
+  if (n == null) return "–";
+  if (n > 1e6) return (n / 1e6).toFixed(2) + " MB";
+  if (n > 1e3) return (n / 1e3).toFixed(1) + " kB";
+  return n + " B";
+}
+
+function tile(k, v) {
+  return `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+}
+
+function renderStatus(s) {
+  const stale = !s.last_updated_ms || (Date.now() - s.last_updated_ms) > 8000;
+  const conn = $("#conn");
+  conn.textContent = stale ? (s.last_error ? `stale: ${s.last_error}` : "stale / RPC unavailable")
+                           : `live · height ${s.height ?? "?"}${s.last_error ? ` · warning: ${s.last_error}` : ""}`;
+  conn.className = "conn " + (stale || s.last_error ? "stale" : "ok");
+
+  const cadence = s.cadence ? `${s.cadence.mean_secs.toFixed(1)}s (n=${s.cadence.samples})` : "–";
+  const mp = s.mempool;
+  $("#tiles").innerHTML =
+    tile("height", s.height ?? "–") +
+    tile("cadence", cadence) +
+    tile("mempool txs", mp ? mp.tx_count : "–") +
+    tile("mempool size", mp ? fmtBytes(mp.vbytes) + " vB" : "–") +
+    tile("min fee", mp ? (mp.min_fee * 1e5).toFixed(1) + " sat/vB" : "–") +
+    tile("best hash", s.best_hash ? s.best_hash.slice(0, 12) + "…" : "–");
+
+  const rows = (s.recent_blocks || []).map((b) =>
+    `<tr><td>${b.height}</td><td>${b.delta_secs == null ? "–" : Math.max(0, b.delta_secs) + "s"}</td>` +
+    `<td>${b.tx_count}</td><td>${fmtBytes(b.size_bytes)}</td><td>${b.weight}</td></tr>`).join("");
+  $("#blocks tbody").innerHTML = rows || `<tr><td colspan="5">no blocks yet</td></tr>`;
+
+  const max = Math.max(1, ...(s.fee_histogram || []).map((b) => b.count));
+  $("#fees").innerHTML = (s.fee_histogram || []).map((b) =>
+    `<div class="bar-row"><span class="lbl">${b.label}</span>` +
+    `<div class="bar" style="width:${(100 * b.count / max).toFixed(1)}%"></div>` +
+    `<span class="n">${b.count}</span></div>`).join("") || "–";
+
+  $("#services").innerHTML = Object.entries(s.services || {}).map(([name, svc]) => {
+    let cls = "off", text = svc.status;
+    if (svc.restarting) { cls = "err"; text = "restarting"; }
+    else if (svc.running) { cls = "ok"; }
+    else if (svc.status === "exited") { cls = svc.exit_code === 0 ? "warn" : "err"; text = `exited(${svc.exit_code})`; }
+    else if (!svc.present) { text = "absent"; }
+    return `<div class="svc"><span class="dot ${cls}"></span>${name.replace("btc-simnet-", "")} · ${text}</div>`;
+  }).join("");
+}
+
+/* ---------------------------------------------------------------- settings */
+
+function stagedValues() {
+  const values = new Map(Object.entries(lastState ? lastState.staged : {}));
+  for (const [k, v] of dirty) values.set(k, v);
+  return values;
+}
+
+function runningValueFor(spec) {
+  if (!lastState) return null;
+  const svc = lastState.running[spec.scope];
+  if (!svc || !svc.present || !svc.values) return null;
+  return svc.values[spec.key] ?? "";
+}
+
+function buildForm() {
+  const container = $("#form");
+  container.innerHTML = "";
+  const groups = new Map();
+  for (const spec of schema.settings) {
+    if (!groups.has(spec.group)) groups.set(spec.group, []);
+    groups.get(spec.group).push(spec);
+  }
+  for (const [group, specs] of groups) {
+    const div = document.createElement("div");
+    div.className = "group";
+    div.innerHTML = `<div class="gtitle">${GROUP_TITLES[group] || group}</div>`;
+    for (const spec of specs) {
+      const field = document.createElement("div");
+      field.className = "field";
+      field.dataset.key = spec.key;
+
+      const label = document.createElement("label");
+      label.textContent = spec.key;
+      label.title = spec.help;
+
+      let input;
+      if (spec.control === "toggle") {
+        input = document.createElement("select");
+        input.innerHTML = `<option value="true">true</option><option value="false">false</option>`;
+      } else if (spec.control === "choice") {
+        input = document.createElement("select");
+        input.innerHTML = (spec.options || []).map((o) => `<option value="${o}">${o}</option>`).join("");
+      } else {
+        input = document.createElement("input");
+        input.type = (spec.control === "integer" || spec.control === "decimal") ? "number" : "text";
+        if (spec.control === "integer") input.step = "1";
+        if (spec.control === "decimal") input.step = "any";
+        if (spec.minimum != null) input.min = String(spec.minimum);
+        if (spec.maximum != null) input.max = String(spec.maximum);
+        input.placeholder = spec.optional ? "(empty = unset)" : `default: ${spec.default}`;
+      }
+      input.addEventListener("input", () => onEdit(spec.key, input.value));
+      input.addEventListener("change", () => onEdit(spec.key, input.value));
+
+      const running = document.createElement("div");
+      running.className = "running";
+      const validation = document.createElement("div");
+      validation.className = "field-error";
+
+      field.append(label, input, running, validation);
+      if (spec.warning) {
+        const warn = document.createElement("div");
+        warn.className = "fieldwarn";
+        warn.textContent = "⚠ " + spec.warning;
+        field.append(warn);
+      }
+      div.append(field);
+    }
+    container.append(div);
+  }
+}
+
+function onEdit(key, value) {
+  const staged = lastState ? (lastState.staged[key] ?? "") : "";
+  if (value === staged) dirty.delete(key); else dirty.set(key, value);
+  fieldErrors.delete(key);
+  refreshForm();
+}
+
+function refreshForm() {
+  if (!schema || !lastState) return;
+  const values = stagedValues();
+  for (const spec of schema.settings) {
+    const field = document.querySelector(`.field[data-key="${spec.key}"]`);
+    if (!field) continue;
+    const input = field.querySelector("input, select");
+    const isDirty = dirty.has(spec.key);
+    if (document.activeElement !== input) {
+      input.value = isDirty ? dirty.get(spec.key) : (lastState.staged[spec.key] ?? "");
+    }
+    field.classList.toggle("dirty", isDirty);
+
+    const reason = ignoredReason(spec.key, values);
+    field.classList.toggle("ignored", reason != null);
+    field.title = reason || "";
+    input.disabled = spec.key === "SPAM_FANOUT_UTXOS" && values.get("SPAM_FANOUT_AUTO") === "true";
+
+    const validationEl = field.querySelector(".field-error");
+    let validation = fieldErrors.get(spec.key) || "";
+    if (!validation && !input.checkValidity()) validation = input.validationMessage;
+    validationEl.textContent = validation;
+    field.classList.toggle("invalid", validation !== "");
+
+    const runningEl = field.querySelector(".running");
+    const running = runningValueFor(spec);
+    if (running == null) {
+      runningEl.textContent = "running: –";
+      runningEl.className = "running";
+    } else {
+      runningEl.textContent = "running: " + (running === "" ? "(unset)" : running);
+      const differs = (lastState.staged[spec.key] ?? "") !== running;
+      runningEl.className = "running" + (differs ? " differs" : "");
+    }
+  }
+
+  // Impact preview: server-computed pending restarts plus local dirty scopes.
+  const impacted = new Set(lastState.pending_restart || []);
+  for (const key of dirty.keys()) {
+    const spec = schema.settings.find((s) => s.key === key);
+    if (spec) impacted.add(spec.scope);
+  }
+  $("#impact").textContent = impacted.size
+    ? "apply recreates: " + [...impacted].map((s) => s.replace("btc-simnet-", "")).join(", ")
+    : "no service changes pending";
+  const invalid = [...document.querySelectorAll("#form input, #form select")]
+    .some((input) => !input.checkValidity()) || fieldErrors.size > 0;
+  $("#apply").disabled = applying || invalid || (dirty.size === 0 && impacted.size === 0);
+
+  const errors = [];
+  if (!lastState.staged_valid) {
+    const details = (lastState.staged_errors || [])
+      .map((d) => `${d.key ?? ""}${d.value != null ? "=" + d.value : ""}: ${d.cause}`).join("\n");
+    errors.push({ className: "pageerr", text: `.env contains invalid managed values:\n${details}` });
+  }
+  for (const warning of lastState.warnings || []) {
+    errors.push({ className: "pagewarn", text: warning });
+  }
+  const errorContainer = $("#page-errors");
+  errorContainer.replaceChildren(...errors.map(({ className, text }) => {
+    const message = document.createElement("div");
+    message.className = className;
+    message.textContent = text;
+    return message;
+  }));
+}
+
+async function refreshState() {
+  const { ok, body } = await api("/api/v1/state");
+  if (!ok || !body) return;
+  lastState = body;
+  refreshForm();
+}
+
+async function refreshStatus() {
+  const { ok, body } = await api("/api/v1/status");
+  if (ok && body) renderStatus(body);
+}
+
+/* ------------------------------------------------------------------- apply */
+
+function showResult(text, isError) {
+  const el = $("#result");
+  el.hidden = false;
+  el.textContent = text;
+  el.className = "result" + (isError ? " err" : "");
+}
+
+async function doApply() {
+  if (applying) return;
+  applying = true;
+  const button = $("#apply");
+  button.disabled = true;
+  button.textContent = "Applying…";
+  try {
+    const settings = Object.fromEntries(dirty);
+    const { ok, status, body } = await api("/api/v1/apply", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + TOKEN,
+      },
+      body: JSON.stringify({ settings, base_revision: lastState ? lastState.revision : null }),
+    });
+    if (ok) {
+      dirty.clear();
+      fieldErrors.clear();
+      showResult(JSON.stringify(body, null, 2), false);
+    } else if (status === 409 && body && body.error && body.error.code === "stale_revision") {
+      showResult("Conflict: .env changed since this page loaded (another tab or a manual edit).\n" +
+        "The form has been refreshed — review and apply again.\n\n" + JSON.stringify(body, null, 2), true);
+    } else {
+      fieldErrors.clear();
+      for (const detail of (body && body.error && body.error.details) || []) {
+        if (detail.key) fieldErrors.set(detail.key, detail.cause || "invalid value");
+      }
+      showResult(JSON.stringify(body, null, 2), true);
+    }
+  } catch (error) {
+    showResult(String(error), true);
+  } finally {
+    applying = false;
+    button.textContent = "Apply";
+    await refreshState();
+  }
+}
+
+/* -------------------------------------------------------------------- init */
+
+async function init() {
+  const { body } = await api("/api/v1/schema");
+  schema = body;
+  buildForm();
+  await refreshState();
+  await refreshStatus();
+  $("#apply").addEventListener("click", doApply);
+  $("#reset").addEventListener("click", () => { dirty.clear(); fieldErrors.clear(); refreshForm(); });
+  setInterval(refreshStatus, 2000);
+  setInterval(() => { if (!applying) refreshState(); }, 4000);
+}
+
+init();

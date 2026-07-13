@@ -1,7 +1,7 @@
-# Single build for all four simchain Rust tools. One builder stage compiles
-# the whole workspace against the committed Cargo.lock, then four final
-# stages each copy out one release binary. Compose selects which binary an
-# image contains via `target:` in docker-compose.yml.
+# Single build for all simchain Rust tools. One builder stage compiles the
+# whole workspace against the committed Cargo.lock, then one final stage per
+# tool copies out its release binary. Compose selects which binary an image
+# contains via `target:` in docker-compose.yml.
 #
 # This replaces the previous three independent Dockerfiles (one per tool, each
 # with its own `COPY . .` context) that resolved three separate dependency
@@ -42,3 +42,15 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/simchain-scenario-engine /usr/local/bin/simchain-scenario-engine
 ENTRYPOINT ["simchain-scenario-engine"]
+
+# ---- panel -----------------------------------------------------------------
+# The opt-in dashboard/control panel rewrites .env and recreates tool
+# services through the host Docker socket, so like the scenario engine its
+# runtime includes the Docker CLI and Compose v2 (Debian base: the builder
+# links against glibc, so an Alpine/docker:cli base would not run it).
+FROM debian:trixie-slim AS panel
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates docker-cli docker-compose \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/simchain-panel /usr/local/bin/simchain-panel
+ENTRYPOINT ["simchain-panel"]

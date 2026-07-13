@@ -11,6 +11,7 @@ mod address;
 mod burn;
 pub mod config;
 mod error;
+pub mod live_tuning;
 mod logging;
 mod rpc;
 

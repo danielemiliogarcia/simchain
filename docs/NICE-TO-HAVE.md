@@ -36,42 +36,7 @@ that allows to defining mining pace, block filling and fee rates.
 It consists on: multiple P2P-connected nodes, rotating miners,
 a non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus one bigger proposed feature with its
-rationale and an implementation plan, and a section for parked features.
-
-## 1. Dashboard / control panel
-
-**What:** A small web UI (one container, compose profile `panel`, localhost-only) that
-shows live chain state (height, block cadence, mempool depth/fees, current settings)
-and lets the user change the tool settings — block cadence, miner weights, fee floor,
-fill ratio, spam mode — and apply them with one click. Applying means rewriting the
-values in `.env` and force-recreating only the affected service(s), i.e. automating
-the manual flow documented in README "Retuning a live chain".
-
-**Why it's a nice-to-have:** Retuning a live chain today means editing `.env` by hand
-and knowing which compose service consumes which variable. That works, but a panel
-makes the knobs discoverable, removes the docker knowledge requirement for teammates
-using the simnet, and turns "try 3 different fee floors" from minutes of shell
-round-trips into seconds. It also gives one place to watch the effect (mempool
-histogram, block fullness) right next to the control that caused it.
-
-**Implementation plan:**
-1. Container with the project's `.env` bind-mounted and access to the Docker API
-   (mounted `docker.sock` + docker CLI with the compose plugin) to run
-   `docker compose up -d --force-recreate <service>`.
-2. Backend (Rust axum to match the stack) that reads current values from `.env` plus
-   defaults, validates edits, writes `.env`, and recreates only the services that
-   consume the changed variables (the variable→service mapping is static, taken from
-   docker-compose.yml).
-3. Status pane fed by node1 RPC: height, last blocks with tx counts, mempool size and
-   fee histogram, observed block interval.
-4. Security: `docker.sock` is root-equivalent on the host, so bind the panel to
-   localhost only and keep it out of the default profile.
-
-Effort: medium (UI plus a thin compose/RPC glue layer; no changes to the existing
-tools).
-
----
+limitations and future enhancements, and a section for parked features.
 
 ## Parked features
 

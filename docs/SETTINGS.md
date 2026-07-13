@@ -426,6 +426,33 @@ profile mounts `/var/run/docker.sock` because pause/resume, reorg, and partition
 drive existing compose/script surfaces. Treat access to this container as root-equivalent
 host access. Full schema and execution semantics: [SCENARIOS.md](SCENARIOS.md).
 
+## Dashboard / control panel (profile `panel`)
+
+The panel is an opt-in localhost web UI + HTTP API + MCP endpoint for live retuning
+(see [RETUNING.md](RETUNING.md)). Like the scenario engine it mounts
+`/var/run/docker.sock`; treat access to this container as root-equivalent host access.
+
+| Variable | Default | Description |
+|---|---|---|
+| `PANEL_WEB_PORT` | `8090` | Host port (bound to `127.0.0.1` only) for the browser UI, the `/api/v1` JSON API, and the `/mcp` MCP endpoint. |
+| `PANEL_API_TOKEN` | _(empty)_ | Bearer token required on `POST /api/v1/apply` and the whole `/mcp` endpoint. Empty means the panel generates one at first start and persists it to `.panel-token` (repo root, mode 0600, gitignored); it is reused across restarts. |
+
+Panel-managed settings in v1 (the panel validates, canonicalizes and rewrites exactly
+these keys in `.env`; everything else in the file is preserved verbatim):
+
+- Mining controller scope: `BLOCK_INTERVAL_MODE`, `BLOCK_INTERVAL_MEAN_SECS`,
+  `BLOCK_INTERVAL_MIN_SECS`, `BLOCK_INTERVAL_MAX_SECS`, `MINER_WEIGHTS`,
+  `MINING_RNG_SEED`.
+- Spammer scope: `ENABLE_SPAM`, `USE_RAW_TX_SPAM`, `FALLBACK_FEE`,
+  `SPAM_FIXED_TXS_PER_BLOCK`, `SPAM_SENDMANY_OUTPUTS`, `SPAM_TX_DATA_MAX_BYTES`,
+  `SPAM_TX_DATA_MIN_BYTES`, `SPAM_SMALL_TXS_PER_BLOCK`, `SPAM_FLOOR_POOL_TXS`,
+  `SPAM_FILL_BLOCK_RATIO`, `SPAM_FANOUT_AUTO`, `SPAM_FANOUT_UTXOS`,
+  `ENABLE_SPAM_REPLACES`, `SPAM_REPLACES_PER_MINER_PER_BLOCK`.
+
+Node-level settings (`BTC_IMAGE`, host ports, `MIN_RELAY_TX_FEE`, ZMQ,
+`BLOCK_RESERVED_WEIGHT`, credentials, ...) are deliberately not panel-managed: they are
+not safe live retunes.
+
 ## Tools: electrs (profiles `electrs`, `mempool`, `all-tools`)
 
 | Variable | Default | Description |
