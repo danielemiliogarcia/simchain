@@ -2,6 +2,19 @@
 
 Settings consumed by the mining controller and the spammer can be changed **without restarting the whole stack**: the nodes keep running and the chain is preserved, only the tool containers are replaced. This is the quickest way to experiment with mining cadence, the fee floor or how full blocks are, on a chain that is already bootstrapped and funded.
 
+Three equivalent paths perform the same operation:
+
+- **Manual** (below): edit `.env`, recreate the affected service(s).
+- **Panel UI**: `docker compose --profile panel up -d`, then
+  [http://localhost:8090/](http://localhost:8090/) — edit, Apply. The panel validates
+  first, rewrites `.env` (managed keys are canonicalized into one
+  `# Managed by simchain panel` block; your other lines are preserved), recreates only
+  the affected tool service(s), and rolls back automatically if the retuned tool fails
+  to come back up.
+- **Panel API / MCP**: `POST /api/v1/apply` with the `.panel-token` bearer token, or the
+  `apply_settings` MCP tool at `http://localhost:8090/mcp` — same semantics, built for
+  scripts and coding agents (see the README's "Dashboard / control panel" section).
+
 ## Steps
 
 1. Edit `.env`. For example:

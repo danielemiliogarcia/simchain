@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>simchain panel</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <script>window.PANEL_TOKEN = __PANEL_TOKEN_JSON__;</script>
+  <header>
+    <h1>simchain <span>panel</span></h1>
+    <div id="conn" class="conn">connecting…</div>
+  </header>
+
+  <main>
+    <section class="card" id="chain-card">
+      <h2>Chain</h2>
+      <div class="tiles" id="tiles"></div>
+      <div class="split">
+        <div>
+          <h3>Recent blocks</h3>
+          <table id="blocks">
+            <thead><tr><th>height</th><th>Δt</th><th>txs</th><th>size</th><th>weight</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div>
+          <h3>Mempool fees (sat/vB)</h3>
+          <div id="fees" class="fees"></div>
+          <h3>Services</h3>
+          <div id="services" class="services"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="settings-card">
+      <h2>Live retune</h2>
+      <p class="hint">Staged = .env + defaults · Running = what the container was started with.
+        Dirty fields are highlighted; Apply rewrites .env and recreates only the affected tool services.</p>
+      <div id="page-errors"></div>
+      <div id="form"></div>
+      <div class="applybar">
+        <span id="impact" class="impact"></span>
+        <button id="reset" type="button">Reset edits</button>
+        <button id="apply" type="button">Apply</button>
+      </div>
+      <pre id="result" class="result" hidden></pre>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

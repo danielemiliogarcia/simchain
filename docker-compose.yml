@@ -12,6 +12,8 @@
 #                        (intentionally excluded from all-tools)
 #   scenario          -> one-shot declarative scenario orchestrator
 #                        (intentionally excluded from all-tools)
+#   panel             -> dashboard / control panel (browser UI + API + MCP)
+#                        (intentionally excluded from all-tools)
 #
 # Examples:
 #   docker compose up
@@ -225,8 +227,10 @@ services:
       - USER_ADDRESS=${USER_ADDRESS:-bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr}
       - BLOCK_INTERVAL_MEAN_SECS=${BLOCK_INTERVAL_MEAN_SECS:-15}
       - BLOCK_INTERVAL_MODE=${BLOCK_INTERVAL_MODE:-poisson}
-      - BLOCK_INTERVAL_MIN_SECS=${BLOCK_INTERVAL_MIN_SECS:-10}
-      - BLOCK_INTERVAL_MAX_SECS=${BLOCK_INTERVAL_MAX_SECS:-20}
+      # `-` (not `:-`) preserves an explicitly empty value, which means an
+      # unbounded clamp; an unset variable still gets the documented default.
+      - BLOCK_INTERVAL_MIN_SECS=${BLOCK_INTERVAL_MIN_SECS-10}
+      - BLOCK_INTERVAL_MAX_SECS=${BLOCK_INTERVAL_MAX_SECS-20}
       - MINER_WEIGHTS=${MINER_WEIGHTS:-}
       - MINING_RNG_SEED=${MINING_RNG_SEED:-}
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
@@ -396,6 +400,49 @@ services:
       - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
       - NODE2_WALLET_NAME=${NODE2_WALLET_NAME:-node2}
       - NODE3_WALLET_NAME=${NODE3_WALLET_NAME:-node3}
+
+  # ---------------------------------------------------------------------------
+  # Dashboard / control panel (profile: panel), opt-in.
+  # Browser UI, versioned HTTP API and MCP endpoint on
+  # http://localhost:${PANEL_WEB_PORT:-8090}. It rewrites .env and recreates
+  # the tool services, so like the scenario engine it mounts the Docker
+  # socket and is intentionally excluded from all-tools (the socket is
+  # root-equivalent host access). See docs/RETUNING.md.
+  # ---------------------------------------------------------------------------
+  btc-simnet-panel:
+    profiles: ["panel"]
+    build:
+      context: .
+      dockerfile: docker/tools.Dockerfile
+      target: panel
+    container_name: btc-simnet-panel
+    restart: on-failure
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:${PANEL_WEB_PORT:-8090}:8080"
+    depends_on:
+      btc-simnet-node1:
+        condition: service_healthy
+    networks:
+      - btc-simnet-control
+    environment:
+      - SIMCHAIN_REPO_ROOT=/workspace
+      - SIMCHAIN_ENV_FILE=/workspace/.env
+      - PANEL_LISTEN_ADDR=0.0.0.0:8080
+      # Optional pre-set API token; empty means generate one and persist it
+      # to .panel-token in the repo root (bearer auth for API/MCP mutations)
+      - PANEL_API_TOKEN=${PANEL_API_TOKEN:-}
+      # Preserve the host compose project across the /workspace bind path, so
+      # nested compose commands operate on the existing tool containers.
+      - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-simchain}
+      - BTC_RPC_USER=${BTC_RPC_USER:-foo}
+      - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
+      - NODE1_RPC_URL=${NODE1_RPC_URL:-http://btc-simnet-node1:18443}
+      - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
+      - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
 
   # ---------------------------------------------------------------------------
   # Tools: electrs (profiles: electrs, mempool, all-tools)

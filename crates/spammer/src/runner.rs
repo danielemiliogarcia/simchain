@@ -7,7 +7,9 @@ use crate::{
     raw_transaction_spammer::RawSpammer,
     wallet::wait_for_funds,
 };
+use anyhow::Context;
 use bitcoincore_rpc::{bitcoin::Address, Client, RpcApi};
+use serde_json::json;
 use simchain_common::{create_client, create_jsonrpc_client, create_wallet_client, rpc_retry};
 use std::{thread, time::Duration};
 
@@ -52,9 +54,32 @@ pub fn run() -> anyhow::Result<()> {
     if config.use_raw {
         run_raw(&node1, wallet2, wallet3)
     } else {
+        // The wallet engine sends without an explicit fee rate, so each
+        // wallet's paytxfee decides what spam pays. Pin it to FALLBACK_FEE at
+        // startup: a live retune of the fee floor then takes effect on a
+        // spammer-only recreate, while the running nodes keep their old
+        // -fallbackfee (paytxfee overrides the wallet fallback). A rejected
+        // settxfee (e.g. below the node's minrelaytxfee) is a startup error,
+        // so a bad retune crashes fast instead of silently keeping old fees.
+        // `settxfee 0` is meaningful: it clears a previously persisted
+        // wallet paytxfee and returns to estimation/fallback behavior.
+        set_wallet_tx_fee(&wallet2, &config.wallet2_name, config.fallback_fee)?;
+        set_wallet_tx_fee(&wallet3, &config.wallet3_name, config.fallback_fee)?;
         run_node_wallets(&node1, wallet2, wallet3);
         Ok(())
     }
+}
+
+fn set_wallet_tx_fee(wallet: &Client, name: &str, fee_btc_per_kvb: f64) -> anyhow::Result<()> {
+    let accepted = wallet
+        .call::<bool>("settxfee", &[json!(fee_btc_per_kvb)])
+        .with_context(|| format!("settxfee {fee_btc_per_kvb} on wallet '{name}' failed"))?;
+    anyhow::ensure!(
+        accepted,
+        "wallet '{name}' rejected settxfee {fee_btc_per_kvb}"
+    );
+    tracing::info!("Wallet '{name}' paytxfee pinned to {fee_btc_per_kvb} BTC/kvB (FALLBACK_FEE)");
+    Ok(())
 }
 
 fn run_raw(node1: &Client, wallet2: Client, wallet3: Client) -> anyhow::Result<()> {
