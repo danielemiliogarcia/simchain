@@ -24,3 +24,6 @@
 # token (secret, mode 0600) and the apply flock file
 .panel-token
 .env.panel.lock
+
+# worktrees
+.worktrees/
