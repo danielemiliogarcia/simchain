@@ -12,3 +12,6 @@
 
 # Chain snapshots (./scripts/snapshot.sh): multi-MB machine-local archives
 /snapshots/
+
+# worktrees
+.worktrees/
