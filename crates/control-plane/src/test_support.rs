@@ -7,6 +7,8 @@ use crate::backend::{
 };
 use crate::control_state::ControlStateStore;
 use crate::envfile;
+use crate::jobs::JobManager;
+use crate::reorg_job::{ReorgExecution, ReorgExecutor, ReorgRecoveryContext};
 use crate::state::{AppState, ControlPlaneConfig, CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
 use crate::status::StatusSnapshot;
 use simchain_common::internal_api::{
@@ -19,6 +21,37 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+
+struct MockReorgExecutor;
+
+impl ReorgExecutor for MockReorgExecutor {
+    fn execute(
+        &self,
+        request: &simchain_common::control_api::ReorgJobRequest,
+        _use_raw_tx_spam: bool,
+        observer: &dyn simchain_reorg::ReorgObserver,
+    ) -> anyhow::Result<ReorgExecution> {
+        observer.observe(simchain_reorg::ReorgProgress {
+            phase: simchain_reorg::ReorgPhase::Completed,
+            message: "mock reorg completed".to_string(),
+            data: None,
+        });
+        Ok(ReorgExecution {
+            result: serde_json::json!({"depth": request.depth, "chain_changed": true}),
+            chain_changed: true,
+            aborted: observer.abort_requested(),
+        })
+    }
+
+    fn recover(
+        &self,
+        _request: &simchain_common::control_api::ReorgJobRequest,
+        _context: &ReorgRecoveryContext,
+        _observer: &dyn simchain_reorg::ReorgObserver,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
 
 /// What a service's container looks like after a mocked recreate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,8 +72,10 @@ pub struct MockWorld {
     pub kill_node1_on_recreate: bool,
     pub mining_state: DesiredState,
     pub mining_generation: u64,
+    pub mining_leases: HashMap<String, PauseLease>,
     pub spam_state: DesiredState,
     pub spam_generation: u64,
+    pub spam_leases: HashMap<String, PauseLease>,
 }
 
 pub struct MockBackend {
@@ -63,8 +98,10 @@ impl MockBackend {
                 kill_node1_on_recreate: false,
                 mining_state: DesiredState::Running,
                 mining_generation: 0,
+                mining_leases: HashMap::new(),
                 spam_state: DesiredState::Running,
                 spam_generation: 0,
+                spam_leases: HashMap::new(),
             }),
         }
     }
@@ -234,7 +271,9 @@ impl ComponentBackend for MockBackend {
                 world.containers.get(*name).map(|info| {
                     let mut info = info.clone();
                     if *name == CONTROLLER_CONTAINER {
-                        let phase = if world.mining_state == DesiredState::Paused {
+                        let paused = world.mining_state == DesiredState::Paused
+                            || !world.mining_leases.is_empty();
+                        let phase = if paused {
                             WorkerPhase::Paused
                         } else {
                             WorkerPhase::Running
@@ -243,15 +282,21 @@ impl ComponentBackend for MockBackend {
                         info.phase = Some(phase.as_str().to_string());
                         info.effective_generation = Some(world.mining_generation);
                         info.desired_state = Some(world.mining_state);
-                        info.effective_state = Some(world.mining_state);
+                        info.effective_state = Some(if paused {
+                            DesiredState::Paused
+                        } else {
+                            DesiredState::Running
+                        });
                         info.observed_height = Some(100);
                         info.uptime_secs = Some(1);
-                        info.active_lease_count = Some(0);
+                        info.active_lease_count = Some(world.mining_leases.len());
                     } else if *name == SPAMMER_CONTAINER && info.running {
                         let enabled = SpamTuning::from_source(&info.effective_config)
                             .map(|(policy, _)| policy.enabled)
                             .unwrap_or(true);
-                        let phase = if world.spam_state == DesiredState::Paused {
+                        let paused = world.spam_state == DesiredState::Paused
+                            || !world.spam_leases.is_empty();
+                        let phase = if paused {
                             WorkerPhase::Paused
                         } else if enabled {
                             WorkerPhase::Active
@@ -262,10 +307,14 @@ impl ComponentBackend for MockBackend {
                         info.phase = Some(phase.as_str().to_string());
                         info.effective_generation = Some(world.spam_generation);
                         info.desired_state = Some(world.spam_state);
-                        info.effective_state = Some(world.spam_state);
+                        info.effective_state = Some(if paused {
+                            DesiredState::Paused
+                        } else {
+                            DesiredState::Running
+                        });
                         info.observed_height = Some(100);
                         info.uptime_secs = Some(1);
-                        info.active_lease_count = Some(0);
+                        info.active_lease_count = Some(world.spam_leases.len());
                         info.cycle_phase = Some("waiting_for_block".to_string());
                         info.accepted_transactions = Some(10);
                         info.reconciliation_pending = Some(false);
@@ -305,22 +354,27 @@ impl MiningControlBackend for MockBackend {
             .get(CONTROLLER_CONTAINER)
             .ok_or_else(|| anyhow::anyhow!("mining worker unavailable"))?;
         let policy = MiningTuning::from_source(&component.effective_config)?;
+        let paused = world.mining_state == DesiredState::Paused || !world.mining_leases.is_empty();
         Ok(MiningWorkerStatus {
             component: "mining".to_string(),
-            phase: if world.mining_state == DesiredState::Paused {
+            phase: if paused {
                 WorkerPhase::Paused
             } else {
                 WorkerPhase::Running
             },
             desired_state: world.mining_state,
-            effective_state: world.mining_state,
+            effective_state: if paused {
+                DesiredState::Paused
+            } else {
+                DesiredState::Running
+            },
             effective_rng_seed: policy.rng_seed.unwrap_or(1),
             policy,
             effective_generation: world.mining_generation,
             height: Some(100),
             next_scheduled_attempt_ms: None,
             last_mined_block: None,
-            active_leases: Vec::<PauseLease>::new(),
+            active_leases: world.mining_leases.values().cloned().collect(),
             uptime_secs: 1,
             last_error: None,
         })
@@ -365,17 +419,37 @@ impl MiningControlBackend for MockBackend {
     }
 
     fn acquire_lease(&self, request: LeaseRequest) -> anyhow::Result<CommandAck> {
-        MiningControlBackend::set_state(self, DesiredState::Paused).map(|mut ack| {
-            ack.request_id = request.request_id;
-            ack
+        let mut world = self.world.lock().expect("world lock");
+        world.mining_leases.insert(
+            request.lease_id.clone(),
+            PauseLease {
+                lease_id: request.lease_id,
+                owner_job_id: request.owner_job_id,
+                purpose: request.purpose,
+                expires_at_ms: u64::MAX,
+            },
+        );
+        Ok(CommandAck {
+            request_id: request.request_id,
+            phase: WorkerPhase::Paused,
+            effective_generation: world.mining_generation,
         })
     }
 
     fn renew_lease(
         &self,
-        _lease_id: &str,
+        lease_id: &str,
         request: LeaseRenewRequest,
     ) -> anyhow::Result<CommandAck> {
+        if !self
+            .world
+            .lock()
+            .expect("world lock")
+            .mining_leases
+            .contains_key(lease_id)
+        {
+            anyhow::bail!("lease not found");
+        }
         let status = MiningControlBackend::status(self)?;
         Ok(CommandAck {
             request_id: request.request_id,
@@ -386,12 +460,20 @@ impl MiningControlBackend for MockBackend {
 
     fn release_lease(
         &self,
-        _lease_id: &str,
+        lease_id: &str,
         request: LeaseReleaseRequest,
     ) -> anyhow::Result<CommandAck> {
-        MiningControlBackend::set_state(self, DesiredState::Running).map(|mut ack| {
-            ack.request_id = request.request_id;
-            ack
+        let mut world = self.world.lock().expect("world lock");
+        world.mining_leases.remove(lease_id);
+        let paused = world.mining_state == DesiredState::Paused || !world.mining_leases.is_empty();
+        Ok(CommandAck {
+            request_id: request.request_id,
+            phase: if paused {
+                WorkerPhase::Paused
+            } else {
+                WorkerPhase::Running
+            },
+            effective_generation: world.mining_generation,
         })
     }
 }
@@ -405,7 +487,8 @@ impl SpamControlBackend for MockBackend {
             .filter(|component| component.running)
             .ok_or_else(|| anyhow::anyhow!("spam worker unavailable"))?;
         let (policy, _) = SpamTuning::from_source(&component.effective_config)?;
-        let phase = if world.spam_state == DesiredState::Paused {
+        let paused = world.spam_state == DesiredState::Paused || !world.spam_leases.is_empty();
+        let phase = if paused {
             WorkerPhase::Paused
         } else if policy.enabled {
             WorkerPhase::Active
@@ -416,13 +499,17 @@ impl SpamControlBackend for MockBackend {
             component: "spam".to_string(),
             phase,
             desired_state: world.spam_state,
-            effective_state: world.spam_state,
+            effective_state: if paused {
+                DesiredState::Paused
+            } else {
+                DesiredState::Running
+            },
             policy,
             effective_generation: world.spam_generation,
             observed_height: Some(100),
             cycle_phase: Some("waiting_for_block".to_string()),
             accepted_transactions: 10,
-            active_leases: Vec::<PauseLease>::new(),
+            active_leases: world.spam_leases.values().cloned().collect(),
             reconciliation_pending: false,
             uptime_secs: 1,
             last_error: None,
@@ -489,17 +576,37 @@ impl SpamControlBackend for MockBackend {
     }
 
     fn acquire_lease(&self, request: LeaseRequest) -> anyhow::Result<CommandAck> {
-        SpamControlBackend::set_state(self, DesiredState::Paused).map(|mut ack| {
-            ack.request_id = request.request_id;
-            ack
+        let mut world = self.world.lock().expect("world lock");
+        world.spam_leases.insert(
+            request.lease_id.clone(),
+            PauseLease {
+                lease_id: request.lease_id,
+                owner_job_id: request.owner_job_id,
+                purpose: request.purpose,
+                expires_at_ms: u64::MAX,
+            },
+        );
+        Ok(CommandAck {
+            request_id: request.request_id,
+            phase: WorkerPhase::Paused,
+            effective_generation: world.spam_generation,
         })
     }
 
     fn renew_lease(
         &self,
-        _lease_id: &str,
+        lease_id: &str,
         request: LeaseRenewRequest,
     ) -> anyhow::Result<CommandAck> {
+        if !self
+            .world
+            .lock()
+            .expect("world lock")
+            .spam_leases
+            .contains_key(lease_id)
+        {
+            anyhow::bail!("lease not found");
+        }
         let status = SpamControlBackend::status(self)?;
         Ok(CommandAck {
             request_id: request.request_id,
@@ -510,12 +617,28 @@ impl SpamControlBackend for MockBackend {
 
     fn release_lease(
         &self,
-        _lease_id: &str,
+        lease_id: &str,
         request: LeaseReleaseRequest,
     ) -> anyhow::Result<CommandAck> {
-        SpamControlBackend::set_state(self, DesiredState::Running).map(|mut ack| {
-            ack.request_id = request.request_id;
-            ack
+        let mut world = self.world.lock().expect("world lock");
+        world.spam_leases.remove(lease_id);
+        let paused = world.spam_state == DesiredState::Paused || !world.spam_leases.is_empty();
+        let enabled = world
+            .containers
+            .get(SPAMMER_CONTAINER)
+            .and_then(|component| SpamTuning::from_source(&component.effective_config).ok())
+            .map(|(policy, _)| policy.enabled)
+            .unwrap_or(true);
+        Ok(CommandAck {
+            request_id: request.request_id,
+            phase: if paused {
+                WorkerPhase::Paused
+            } else if enabled {
+                WorkerPhase::Active
+            } else {
+                WorkerPhase::Disabled
+            },
+            effective_generation: world.spam_generation,
         })
     }
 }
@@ -526,6 +649,13 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
     let desired =
         crate::control_state::desired_from_legacy_env(&dir.join(".env")).expect("initial desired");
     let control_state = store.load_or_initialize(desired).expect("control state");
+    let jobs = JobManager::open(
+        &state_dir,
+        backend.clone(),
+        backend.clone(),
+        Arc::new(MockReorgExecutor),
+    )
+    .expect("job manager");
     AppState {
         config: ControlPlaneConfig {
             listen_addr: "127.0.0.1:0".parse().expect("addr"),
@@ -546,6 +676,7 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
         job_actions: backend.clone(),
         mining: backend.clone(),
         spam: backend.clone(),
+        jobs,
         control_state: RwLock::new(control_state),
         control_store: store,
         status: RwLock::new(StatusSnapshot::default()),

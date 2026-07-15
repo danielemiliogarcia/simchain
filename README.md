@@ -274,9 +274,12 @@ helper containers left by an earlier run, use
 
 The localhost control plane combines the dashboard, versioned API, and MCP endpoint
 (profile: `control-plane`; `panel` is a temporary alias). Mining and spam policy plus
-pause/resume use private worker APIs and never recreate their containers. The service
-remains opt-in and excluded from `all-tools` while later node/job paths still require
-the transitional Compose adapter:
+pause/resume use private worker APIs and never recreate their containers. Reorgs are
+durable server-side jobs: the control plane owns the mutation lock, pauses both workers
+with expiring leases, calls the reusable reorg library through Bitcoin RPC, and requires
+node1 to witness convergence before releasing the workers. The service remains opt-in
+and excluded from `all-tools` while boot-only lifecycle paths still use the transitional
+Compose adapter:
 
 ```bash
 docker compose --profile control-plane up -d --build
@@ -286,8 +289,9 @@ Open [http://localhost:8090/](http://localhost:8090/) (port: `CONTROL_PLANE_PORT
 chain height, block cadence, mempool depth and the fee histogram, and to change the
 live-retunable mining/spam settings. Mining cadence and weights apply at a scheduler
 safe point; spam hot changes apply between cycles and structural changes reconcile a
-replacement engine before commit. The nodes and the chain are never touched, and a
-mixed apply rolls back transactionally. See
+replacement engine before commit. The reorg view starts jobs, streams their structured
+progress, exposes bounded history, and requests cooperative abort. Configuration applies
+never touch the nodes or chain, and a mixed apply rolls back transactionally. See
 [RETUNING.md](./docs/RETUNING.md).
 
 Everything the UI shows comes from the versioned localhost HTTP API
@@ -304,11 +308,19 @@ curl -s -X PUT localhost:8090/api/v1/mining/state \
   -H "Authorization: Bearer $(cat .simchain-control/token)" \
   -H "Content-Type: application/json" \
   -d '{"state": "paused"}'
+job_id="$(curl -s -X POST localhost:8090/api/v1/jobs/reorg \
+  -H "Authorization: Bearer $(cat .simchain-control/token)" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: example-reorg-1" \
+  -d '{"depth":3,"empty":true,"node":"node3"}' | jq -r .job_id)"
+curl -s "localhost:8090/api/v1/jobs/$job_id/events?after=0" | jq .
 ```
 
 The same operations are exposed over MCP (streamable HTTP) at
 `http://localhost:8090/mcp`, so coding agents can inspect and retune the simnet
-directly. Register it in Claude Code with:
+directly. The Phase 4 tool set includes `start_reorg`, `get_job`, `list_jobs`, and
+`abort_job` over the same coordinator and validation as HTTP. Register it in Claude
+Code with:
 
 ```bash
 claude mcp add --transport http simchain-control-plane \
@@ -323,7 +335,18 @@ cargo run -p simchainctl -- status
 cargo run -p simchainctl -- config show --json
 cargo run -p simchainctl -- mining pause
 cargo run -p simchainctl -- mining resume
+cargo run -p simchainctl -- reorg --depth 3 --empty --wait
+cargo run -p simchainctl -- jobs list
+cargo run -p simchainctl -- jobs watch JOB_ID --timeout 900
+cargo run -p simchainctl -- jobs abort JOB_ID
 ```
+
+`reorg --wait` streams progress and exits `0` only after successful cleanup. Stable
+automation exit codes are `1` for operation/job failure, `2` for CLI usage, `3` for
+API/authentication failure, `4` for wait timeout, and `5` for aborted/interrupted jobs
+or cleanup failure. Job metadata and the most recent 100 summaries are stored under
+`.simchain-control/jobs/`; a control-plane restart marks an unfinished job interrupted
+and keeps the coordinator locked until its worker leases are confirmed clear.
 
 ## Scenarios
 

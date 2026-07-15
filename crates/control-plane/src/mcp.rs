@@ -5,8 +5,10 @@
 
 use crate::apply::{apply, ApplyRequest};
 use crate::service::{
-    config, schema, set_mining_state as set_mining_state_service,
-    set_spam_state as set_spam_state_service, status, ServiceError,
+    abort_job as abort_job_service, config, get_job as get_job_service,
+    list_jobs as list_jobs_service, schema, set_mining_state as set_mining_state_service,
+    set_spam_state as set_spam_state_service, start_reorg as start_reorg_service, status,
+    ServiceError,
 };
 use crate::state::SharedState;
 use rmcp::handler::server::wrapper::Parameters;
@@ -61,6 +63,42 @@ pub struct SetMiningStateParams {
 pub struct SetSpamStateParams {
     /// Desired manual state: `running` or `paused`.
     pub state: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct StartReorgParams {
+    /// Number of tip blocks to replace (1-100).
+    #[serde(default = "default_reorg_depth")]
+    pub depth: u64,
+    /// Mine empty replacement blocks, leaving orphaned transactions pending.
+    #[serde(default)]
+    pub empty: bool,
+    /// Replacement-chain miner: `node2` or `node3`.
+    #[serde(default = "default_reorg_node")]
+    pub node: String,
+    /// Fresh wallet transactions to add to a non-empty replacement.
+    #[serde(default)]
+    pub adds_new_txs: u64,
+    /// Percentage of eligible orphaned wallet transactions to conflict.
+    #[serde(default)]
+    pub double_spend_pct: u8,
+    /// Optional retry key. Reusing it with the same request returns the original job.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+fn default_reorg_depth() -> u64 {
+    3
+}
+
+fn default_reorg_node() -> String {
+    "node3".to_string()
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct JobIdParams {
+    /// Server-assigned job identifier.
+    pub job_id: String,
 }
 
 #[tool_router(vis = "pub(crate)")]
@@ -211,6 +249,91 @@ impl ControlPlaneMcp {
             Err(error) => error_json(error),
         }
     }
+
+    #[tool(
+        name = "start_reorg",
+        description = "Start one bounded server-side reorg job. The coordinator pauses mining and spam with owned leases, rewrites history through Bitcoin RPC, and requires node1 witness convergence before cleanup.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn start_reorg(
+        &self,
+        Parameters(params): Parameters<StartReorgParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let app = self.app.clone();
+        let request = simchain_common::control_api::ReorgJobRequest {
+            depth: params.depth,
+            empty: params.empty,
+            node: params.node,
+            adds_new_txs: params.adds_new_txs,
+            double_spend_pct: params.double_spend_pct,
+        };
+        match tokio::task::spawn_blocking(move || {
+            start_reorg_service(&app, request, params.idempotency_key)
+        })
+        .await
+        .map_err(join_error)?
+        {
+            Ok(response) => success_json(&response),
+            Err(error) => error_json(error),
+        }
+    }
+
+    #[tool(
+        name = "get_job",
+        description = "Get one job's normalized request, state, phase, leases, result or failure, and separate cleanup outcome.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn get_job(
+        &self,
+        Parameters(params): Parameters<JobIdParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match get_job_service(&self.app, &params.job_id) {
+            Ok(job) => success_json(&job),
+            Err(error) => error_json(error),
+        }
+    }
+
+    #[tool(
+        name = "list_jobs",
+        description = "List the active mutation job and bounded recent job history, newest first.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn list_jobs(&self) -> Result<CallToolResult, ErrorData> {
+        success_json(&list_jobs_service(&self.app))
+    }
+
+    #[tool(
+        name = "abort_job",
+        description = "Request cooperative abort of a job. A reorg that already changed history finishes its minimum safe rewrite and owned-resource cleanup before becoming terminal.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn abort_job(
+        &self,
+        Parameters(params): Parameters<JobIdParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match abort_job_service(&self.app, &params.job_id) {
+            Ok(response) => success_json(&response),
+            Err(error) => error_json(error),
+        }
+    }
 }
 
 #[tool_handler]
@@ -220,8 +343,9 @@ impl ServerHandler for ControlPlaneMcp {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
             "Simchain control plane: inspect the live regtest simnet and manage its \
-             desired runtime configuration. Start with get_config_schema, then use \
-             get_config and set_config with only the keys to change."
+             desired runtime configuration and bounded mutation jobs. Start with \
+             get_status and get_config_schema. Reorgs are asynchronous: start one, \
+             then inspect it with get_job or list_jobs."
                 .to_string(),
         );
         info

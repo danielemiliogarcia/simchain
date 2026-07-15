@@ -1,5 +1,4 @@
 //! Control-plane bootstrap configuration and shared application state.
-//! application state.
 //!
 //! The panel deliberately does NOT load `.env` into its own process
 //! environment: compose gives shell variables precedence over the project
@@ -11,6 +10,7 @@ use crate::backend::{
     ComponentBackend, ConfigurationBackend, JobActions, MiningControlBackend, SpamControlBackend,
 };
 use crate::control_state::{ControlState, ControlStateStore};
+use crate::jobs::JobManager;
 use crate::status::StatusSnapshot;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -96,6 +96,7 @@ pub struct AppState {
     pub job_actions: Arc<dyn JobActions>,
     pub mining: Arc<dyn MiningControlBackend>,
     pub spam: Arc<dyn SpamControlBackend>,
+    pub jobs: Arc<JobManager>,
     pub control_state: RwLock<ControlState>,
     pub control_store: ControlStateStore,
     pub status: RwLock<StatusSnapshot>,

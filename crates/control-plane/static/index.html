@@ -50,6 +50,52 @@
       </div>
     </section>
 
+    <section class="card" id="jobs-card">
+      <h2>Reorg jobs</h2>
+      <p class="hint">Reorgs run as durable server-side jobs. The coordinator pauses mining and
+        spam with owned leases, waits for node1 to witness the replacement chain, then restores
+        the workers. Closing this page does not cancel a job.</p>
+      <div id="mutation-lock" class="mutation-lock">mutation coordinator is idle</div>
+      <form id="reorg-form" class="action-form">
+        <label>Depth
+          <input id="reorg-depth" type="number" min="1" max="100" value="3" required>
+        </label>
+        <label>Replacement miner
+          <select id="reorg-node">
+            <option value="node3">node3</option>
+            <option value="node2">node2</option>
+          </select>
+        </label>
+        <label>New transactions
+          <input id="reorg-adds" type="number" min="0" max="10000" value="0" required>
+        </label>
+        <label>Double spend %
+          <input id="reorg-double-spend" type="number" min="0" max="100" value="0" required>
+        </label>
+        <label class="check-field">
+          <input id="reorg-empty" type="checkbox">
+          Mine empty replacements
+        </label>
+        <button id="reorg-start" type="submit">Start reorg</button>
+      </form>
+      <div id="reorg-action-result" class="action-result"></div>
+
+      <div class="job-heading">
+        <h3>Selected job</h3>
+        <button id="job-abort" class="danger" type="button" hidden>Request abort</button>
+      </div>
+      <div id="job-detail" class="job-detail muted">no jobs yet</div>
+      <ol id="job-events" class="job-events"></ol>
+
+      <h3>Recent jobs</h3>
+      <div class="table-scroll">
+        <table id="jobs">
+          <thead><tr><th>job</th><th>kind</th><th>state</th><th>phase</th><th></th></tr></thead>
+          <tbody><tr><td colspan="5">no jobs yet</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="card" id="settings-card">
       <h2>Live retune</h2>
       <p class="hint">Desired configuration is managed by the control plane; effective values are

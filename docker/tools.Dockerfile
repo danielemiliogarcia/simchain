@@ -44,10 +44,10 @@ COPY --from=builder /app/target/release/simchain-scenario-engine /usr/local/bin/
 ENTRYPOINT ["simchain-scenario-engine"]
 
 # ---- control-plane ---------------------------------------------------------
-# The Phase-2 control plane uses a private API for mining but still rewrites
-# .env and recreates spam through the host Docker socket, so its
-# runtime includes the Docker CLI and Compose v2 (Debian base: the builder
-# links against glibc, so an Alpine/docker:cli base would not run it).
+# Mining, spam, and reorg paths use worker APIs/Bitcoin RPC. The transitional
+# boot/lifecycle adapter still needs Compose until Phase 7 removes it and this
+# image's Docker CLI/socket access. Debian is required because the builder
+# links against glibc.
 FROM debian:trixie-slim AS control-plane
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates docker-cli docker-compose \

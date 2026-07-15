@@ -63,6 +63,10 @@ pub enum Command {
     Mining(MiningArgs),
     /// Pause or resume spam at a cooperative worker safe point.
     Spam(SpamArgs),
+    /// Start a bounded server-side chain reorganization job.
+    Reorg(ReorgArgs),
+    /// Inspect, watch, or abort server-side jobs.
+    Jobs(JobsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -119,6 +123,67 @@ pub enum SpamCommand {
     Resume,
 }
 
+#[derive(Debug, Args)]
+pub struct ReorgArgs {
+    /// Number of tip blocks to replace.
+    #[arg(long, default_value_t = 3)]
+    pub depth: u64,
+    /// Mine empty replacement blocks and leave orphaned transactions pending.
+    #[arg(long)]
+    pub empty: bool,
+    /// Node that builds the replacement chain.
+    #[arg(long, default_value = "node3")]
+    pub node: String,
+    /// Fresh wallet transactions to add to a non-empty replacement.
+    #[arg(long, default_value_t = 0)]
+    pub adds_new_txs: u64,
+    /// Percentage of eligible orphaned wallet transactions to conflict.
+    #[arg(long, default_value_t = 0)]
+    pub double_spend_pct: u8,
+    /// Wait for the job to reach a terminal state.
+    #[arg(long)]
+    pub wait: bool,
+    /// Maximum wait in seconds when --wait is set.
+    #[arg(long, default_value_t = 900)]
+    pub timeout: u64,
+    /// Emit stable JSON instead of human-oriented output.
+    #[arg(long)]
+    pub json: bool,
+    /// Optional retry key; the server returns the original matching job.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct JobsArgs {
+    #[command(subcommand)]
+    pub command: JobsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JobsCommand {
+    /// List bounded recent job history.
+    List(JsonArgs),
+    /// Poll structured events until a job is terminal.
+    Watch(JobWatchArgs),
+    /// Request cooperative abort and owned-resource cleanup.
+    Abort(JobIdArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct JobWatchArgs {
+    pub job_id: String,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long, default_value_t = 900)]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct JobIdArgs {
+    pub job_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +220,28 @@ mod tests {
             mining.command,
             Command::Mining(MiningArgs {
                 command: MiningCommand::Pause
+            })
+        ));
+
+        let reorg =
+            Cli::try_parse_from(["simchainctl", "reorg", "--depth", "4", "--empty", "--wait"])
+                .expect("reorg command");
+        assert!(matches!(
+            reorg.command,
+            Command::Reorg(ReorgArgs {
+                depth: 4,
+                empty: true,
+                wait: true,
+                ..
+            })
+        ));
+
+        let jobs = Cli::try_parse_from(["simchainctl", "jobs", "watch", "job-1", "--json"])
+            .expect("jobs command");
+        assert!(matches!(
+            jobs.command,
+            Command::Jobs(JobsArgs {
+                command: JobsCommand::Watch(JobWatchArgs { json: true, .. })
             })
         ));
     }
