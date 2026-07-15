@@ -37,14 +37,14 @@ Fills blocks so they are not empty. By default (raw engine) it can run in DATA/H
 
 A Rust tool (same stack as the other tools, pure RPC calls) that forces chain reorganizations. See [Simulating reorgs](../README.md#simulating-reorgs).
 
-### Partition and latency helpers
+### Partition and network agents
 
-`scripts/partition.sh` produces organic competing branches by disconnecting node2 or
-node3 from `btc-simnet-p2p`, mining both sides explicitly, reconnecting the node, and
-waiting for all tips to converge. `scripts/netem.sh` runs a short-lived helper with
-`NET_ADMIN` in a selected node's network namespace and applies delay/loss only to its
-P2P interface. Both are post-bootstrap tools; the funding sequence must reach height 204
-before a deterministic partition run.
+The control plane produces organic competing branches by leasing a namespace-local
+network agent on node2 or node3, blocking P2P ingress and egress, mining both sides
+explicitly, healing, and waiting for the deterministic winner on every node. The same
+agents apply bounded P2P-only delay/loss jobs. They have only `NET_ADMIN`, no host port
+or Docker socket, and clear an impairment when its lease TTL expires. Both operations
+are post-bootstrap; the funding sequence must reach height 204 first.
 
 ### Tools (Profiles)
 

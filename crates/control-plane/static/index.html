@@ -108,6 +108,42 @@
       </form>
       <div id="reorg-action-result" class="action-result"></div>
 
+      <h3>Network</h3>
+      <div id="network-status" class="component-state">all P2P links clear</div>
+      <div class="bounded-actions">
+        <form id="partition-form" class="mini-action-form">
+          <h3>Hard partition</h3>
+          <label>Isolated miner
+            <select id="partition-node"><option value="node3">node3</option><option value="node2">node2</option></select>
+          </label>
+          <label>Main-side blocks
+            <input id="partition-main-blocks" type="number" min="1" max="100" value="3" required>
+          </label>
+          <label>Isolated blocks
+            <input id="partition-isolated-blocks" type="number" min="1" max="100" value="4" required>
+          </label>
+          <button id="partition-start" type="submit">Start partition</button>
+          <div id="partition-action-result" class="action-result"></div>
+        </form>
+        <form id="degrade-form" class="mini-action-form">
+          <h3>Timed degradation</h3>
+          <label>Node
+            <select id="degrade-node"><option value="node3">node3</option><option value="node2">node2</option><option value="node1">node1</option></select>
+          </label>
+          <label>Delay ms
+            <input id="degrade-delay" type="number" min="0" max="600000" value="500" required>
+          </label>
+          <label>Loss %
+            <input id="degrade-loss" type="number" min="0" max="100" step="any" value="1" required>
+          </label>
+          <label>Seconds
+            <input id="degrade-seconds" type="number" min="1" max="86400" value="30" required>
+          </label>
+          <button id="degrade-start" type="submit">Start degradation</button>
+          <div id="degrade-action-result" class="action-result"></div>
+        </form>
+      </div>
+
       <h3>Scenario</h3>
       <form id="scenario-form" class="scenario-form">
         <label>Scenario YAML

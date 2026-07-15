@@ -7,7 +7,8 @@
 //! in-memory maps.
 
 use crate::backend::{
-    ComponentBackend, ConfigurationBackend, JobActions, MiningControlBackend, SpamControlBackend,
+    ComponentBackend, ConfigurationBackend, JobActions, MiningControlBackend,
+    NetworkControlBackend, SpamControlBackend,
 };
 use crate::control_state::{ControlState, ControlStateStore};
 use crate::jobs::JobManager;
@@ -34,6 +35,9 @@ pub struct ControlPlaneConfig {
     pub state_dir: PathBuf,
     pub mining_control_url: String,
     pub spam_control_url: String,
+    pub node1_network_agent_url: String,
+    pub node2_network_agent_url: String,
+    pub node3_network_agent_url: String,
     pub internal_token: String,
 }
 
@@ -67,6 +71,12 @@ impl ControlPlaneConfig {
             .unwrap_or_else(|_| "http://btc-simnet-mining-controller:9081".to_string());
         let spam_control_url = std::env::var("SPAM_CONTROL_URL")
             .unwrap_or_else(|_| "http://btc-simnet-spammer:9082".to_string());
+        let node1_network_agent_url = std::env::var("NODE1_NETWORK_AGENT_URL")
+            .unwrap_or_else(|_| "http://btc-simnet-node1:9083".to_string());
+        let node2_network_agent_url = std::env::var("NODE2_NETWORK_AGENT_URL")
+            .unwrap_or_else(|_| "http://btc-simnet-node2:9083".to_string());
+        let node3_network_agent_url = std::env::var("NODE3_NETWORK_AGENT_URL")
+            .unwrap_or_else(|_| "http://btc-simnet-node3:9083".to_string());
         let internal_token = std::env::var("SIMCHAIN_INTERNAL_TOKEN")
             .unwrap_or_else(|_| "simchain-internal-dev-token".to_string());
         if internal_token.trim().is_empty() {
@@ -83,6 +93,9 @@ impl ControlPlaneConfig {
             state_dir,
             mining_control_url,
             spam_control_url,
+            node1_network_agent_url,
+            node2_network_agent_url,
+            node3_network_agent_url,
             internal_token,
         })
     }
@@ -96,6 +109,7 @@ pub struct AppState {
     pub job_actions: Arc<dyn JobActions>,
     pub mining: Arc<dyn MiningControlBackend>,
     pub spam: Arc<dyn SpamControlBackend>,
+    pub network: Arc<dyn NetworkControlBackend>,
     pub jobs: Arc<JobManager>,
     pub control_state: RwLock<ControlState>,
     pub control_store: ControlStateStore,

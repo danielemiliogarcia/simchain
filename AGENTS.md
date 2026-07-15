@@ -21,6 +21,7 @@ scripts/                    # host-side helper scripts
 crates/
   simchain-common/          # shared helpers (RPC clients, config parsing)
   mining-controller/        # bootstrap + configurable mining
+  network-agent/            # private leased P2P impairment control
   reorg/                    # on-demand chain reorganizations
   spammer/                  # block-filling transaction spam
   scenario-engine/          # ordered declarative scenario orchestration
@@ -56,6 +57,9 @@ network). Do not add it to any `.gitignore`.
   dashboard adapters over the same domain service layer; never add a second backend.
 - `crates/simchainctl` — a thin control-plane API client. It must not call Docker or
   Bitcoin RPC directly.
+- `crates/network-agent` — the private namespace-local owner of `tc`/`nft` P2P
+  impairments. Keep it lease/TTL bounded, authenticated, and unreachable from host
+  ports or public networks.
 - `crates/mining-controller`, `crates/reorg`, `crates/spammer`,
   `crates/scenario-engine` — worker/operation binaries, each a thin RPC driver or orchestrator
   over bitcoind. They must imitate mainnet **behavior**; do not add

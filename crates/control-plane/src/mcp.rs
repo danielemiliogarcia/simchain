@@ -7,7 +7,8 @@ use crate::apply::{apply, ApplyRequest};
 use crate::service::{
     abort_job as abort_job_service, config, get_job as get_job_service,
     list_jobs as list_jobs_service, schema, set_mining_state as set_mining_state_service,
-    set_spam_state as set_spam_state_service, start_reorg as start_reorg_service,
+    set_spam_state as set_spam_state_service, start_degrade as start_degrade_service,
+    start_partition as start_partition_service, start_reorg as start_reorg_service,
     start_scenario as start_scenario_service, status, ServiceError,
 };
 use crate::state::SharedState;
@@ -106,6 +107,48 @@ pub struct StartScenarioParams {
     /// Complete validated version-1 scenario document as YAML text.
     pub yaml: String,
     /// Optional retry key. Reusing it with identical YAML returns the original job.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct StartPartitionParams {
+    /// Miner to isolate: `node2` or `node3`.
+    #[serde(default = "default_reorg_node")]
+    pub node: String,
+    /// Blocks mined by the miner that remains connected to node1.
+    #[serde(default = "default_main_blocks")]
+    pub main_blocks: u64,
+    /// Blocks mined by the isolated miner. Must differ from main_blocks.
+    #[serde(default = "default_isolated_blocks")]
+    pub isolated_blocks: u64,
+    /// Optional retry key for an identical request.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+fn default_main_blocks() -> u64 {
+    3
+}
+
+fn default_isolated_blocks() -> u64 {
+    4
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct StartDegradeParams {
+    /// Node whose P2P interface is impaired: `node1`, `node2`, or `node3`.
+    #[serde(default = "default_reorg_node")]
+    pub node: String,
+    /// Added one-way egress delay in milliseconds.
+    #[serde(default)]
+    pub delay_ms: u64,
+    /// Percentage of egress packets dropped, from 0 through 100.
+    #[serde(default)]
+    pub loss_pct: f64,
+    /// Observation duration in seconds.
+    pub seconds: u64,
+    /// Optional retry key for an identical request.
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -319,6 +362,69 @@ impl ControlPlaneMcp {
         let app = self.app.clone();
         match tokio::task::spawn_blocking(move || {
             start_scenario_service(&app, params.yaml, params.idempotency_key)
+        })
+        .await
+        .map_err(join_error)?
+        {
+            Ok(response) => success_json(&response),
+            Err(error) => error_json(error),
+        }
+    }
+
+    #[tool(
+        name = "start_partition",
+        description = "Start a deterministic hard-partition job. The coordinator leases worker pauses and one namespace-local network agent, mines unequal branches, heals P2P, and witnesses the winning tip on every node.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn start_partition(
+        &self,
+        Parameters(params): Parameters<StartPartitionParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let app = self.app.clone();
+        let request = simchain_common::control_api::PartitionJobRequest {
+            node: params.node,
+            main_blocks: params.main_blocks,
+            isolated_blocks: params.isolated_blocks,
+        };
+        match tokio::task::spawn_blocking(move || {
+            start_partition_service(&app, request, params.idempotency_key)
+        })
+        .await
+        .map_err(join_error)?
+        {
+            Ok(response) => success_json(&response),
+            Err(error) => error_json(error),
+        }
+    }
+
+    #[tool(
+        name = "start_degrade",
+        description = "Start a timed P2P-only delay/loss job using a TTL-healed namespace-local network-agent lease.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn start_degrade(
+        &self,
+        Parameters(params): Parameters<StartDegradeParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let app = self.app.clone();
+        let request = simchain_common::control_api::DegradeJobRequest {
+            node: params.node,
+            delay_ms: params.delay_ms,
+            loss_pct: params.loss_pct,
+            seconds: params.seconds,
+        };
+        match tokio::task::spawn_blocking(move || {
+            start_degrade_service(&app, request, params.idempotency_key)
         })
         .await
         .map_err(join_error)?

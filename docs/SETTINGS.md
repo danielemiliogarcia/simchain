@@ -391,23 +391,19 @@ can cascade the rest of the run to empty blocks.
 
 ## Network partitions and P2P netem
 
-`scripts/partition.sh run` is post-bootstrap-only and refuses to proceed below height
-204. Its CLI block-count options override these script defaults:
+Partition jobs are post-bootstrap-only and refuse to proceed below height 204. Branch
+lengths are request fields (`simchainctl partition --main-blocks ...
+--isolated-blocks ...`); only settling timeouts are process settings:
 
 | Variable | Default | Description |
 |---|---|---|
-| `PARTITION_MAIN_BLOCKS` | `3` | Blocks mined by the connected-side miner during `partition.sh run`. Must be a positive integer and differ from `PARTITION_ISOLATED_BLOCKS`. |
-| `PARTITION_ISOLATED_BLOCKS` | `4` | Blocks mined by the isolated miner during `partition.sh run`. Must be a positive integer and differ from `PARTITION_MAIN_BLOCKS`. |
 | `PARTITION_CONVERGENCE_TIMEOUT_SECS` | `60` | Maximum time to wait after healing for all three best-block hashes to match. |
 | `PARTITION_PEER_TIMEOUT_SECS` | `15` | Maximum time to wait for P2P peer connections to reflect a requested split. |
 
-Netem has no persistent settings: pass `--delay-ms` and `--loss-pct` to
-`scripts/netem.sh apply` (or use `scripts/degrade.sh`, the settings-free wrapper that
-adds a duration and auto-restore). It affects only the interface routed to the fixed
+Degradation has no persistent tuning setting: `delay_ms`, `loss_pct`, and `seconds` are
+bounded job request fields. It affects only the interface routed to the fixed
 `btc-simnet-p2p` subnet (`172.30.0.0/24`), never the RPC/control interface, and shapes
-egress only — `--delay-ms 500` adds 500ms one way (RTT +500ms); apply it on both
-endpoints for symmetric latency. Its qdisc is ephemeral and disappears when the target
-node restarts.
+egress only. The agent clears its qdisc on lease expiry or restart.
 
 ## Scenario compatibility client (profile `scenario`)
 
@@ -425,16 +421,17 @@ prefer `simchainctl scenario`; the profile exists for old invocations.
 | `SIMCHAIN_CONTROL_TOKEN` | _(empty)_ | Optional bearer token override. Otherwise the client reads the shared control-state token. |
 
 The image contains no Docker CLI and the service mounts no Docker socket. Bitcoin RPC,
-worker leases, reorg safety, progress, and cleanup are owned by the control plane. Full
+worker/network leases, mutation safety, progress, and cleanup are owned by the control plane. Full
 schema and CI checkpoint semantics: [SCENARIOS.md](SCENARIOS.md).
 
 ## Simchain control plane (profile `control-plane`; alias `panel`)
 
 The control plane is an opt-in localhost web UI + HTTP API + MCP endpoint for live retuning
 (see [RETUNING.md](RETUNING.md)). Mining and spam control use private authenticated
-worker APIs, and reorg jobs use those worker leases plus Bitcoin RPC directly. The
+worker APIs; reorg, scenario, partition, and degradation jobs use worker/network leases
+plus Bitcoin RPC directly. The
 service still mounts `/var/run/docker.sock` only for transitional boot/lifecycle
-compatibility scheduled for removal in Phase 7; runtime worker control and reorg jobs
+compatibility scheduled for removal in Phase 7; runtime worker, job, and network control
 do not use it. Treat access to this container as root-equivalent host access until that
 migration removes the mount.
 
@@ -447,7 +444,12 @@ migration removes the mount.
 | `MINING_CONTROL_LISTEN_ADDR` | `0.0.0.0:9081` | Mining worker's private control listener. Boot-only. |
 | `SPAM_CONTROL_URL` | `http://btc-simnet-spammer:9082` | Private Compose-network spam endpoint; never publish this port to the host. |
 | `SPAM_CONTROL_LISTEN_ADDR` | `0.0.0.0:9082` | Resident spam worker's private control listener. Boot-only. |
-| `SIMCHAIN_INTERNAL_TOKEN` | `simchain-internal-dev-token` | Shared bearer token for control-plane-to-worker requests. Supply the same non-empty value to all three services when overriding it. |
+| `NODE1_NETWORK_AGENT_URL` | `http://btc-simnet-node1:9083` | Node1 namespace agent endpoint on the private control interface. |
+| `NODE2_NETWORK_AGENT_URL` | `http://btc-simnet-node2:9083` | Node2 namespace agent endpoint on the private control interface. |
+| `NODE3_NETWORK_AGENT_URL` | `http://btc-simnet-node3:9083` | Node3 namespace agent endpoint on the private control interface. |
+| `NETWORK_AGENT_LISTEN_ADDR` | `0.0.0.0:9083` | Agent listener inside its shared node namespace; never published to the host. |
+| `P2P_PROBE_IP` | `172.30.0.254` | Unused address in the fixed P2P subnet used with `ip route get` to select only the P2P interface. |
+| `SIMCHAIN_INTERNAL_TOKEN` | `simchain-internal-dev-token` | Shared bearer token for control-plane-to-worker/agent requests. Supply the same non-empty value to the control plane, both workers, and all three agents when overriding it. |
 
 Control-plane-managed runtime settings (durable desired values live in
 `.simchain-control/state.json`; Phase 3 still mirrors these keys to `.env` for manual

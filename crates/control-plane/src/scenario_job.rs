@@ -1,8 +1,8 @@
 //! Production action adapter for the pure scenario engine. Chain and wallet
-//! actions use Bitcoin RPC; only the Phase-6 partition placeholder delegates
-//! to the control plane's existing transitional adapter.
+//! actions use Bitcoin RPC; partition coordination belongs to the job manager
+//! and namespace-local network agents.
 
-use crate::backend::{JobActions, MiningControlBackend, SpamControlBackend};
+use crate::backend::{MiningControlBackend, SpamControlBackend};
 use crate::state::ControlPlaneConfig;
 use anyhow::{Context, Result};
 use bitcoincore_rpc::bitcoin::Amount;
@@ -30,13 +30,6 @@ pub trait ScenarioActionBackend: Send + Sync {
         outputs_per_tx: u64,
         control: &dyn ScenarioControl,
     ) -> Result<Value>;
-    fn run_partition(
-        &self,
-        node: MinerNode,
-        main_blocks: u64,
-        isolated_blocks: u64,
-        control: &dyn ScenarioControl,
-    ) -> Result<Value>;
     fn live_summary(&self) -> Result<Value>;
 }
 
@@ -47,7 +40,6 @@ pub struct RpcScenarioActionBackend {
     node2_wallet: String,
     node3_wallet: String,
     timeout: Duration,
-    transitional: Arc<dyn JobActions>,
     mining: Arc<dyn MiningControlBackend>,
     spam: Arc<dyn SpamControlBackend>,
 }
@@ -55,7 +47,6 @@ pub struct RpcScenarioActionBackend {
 impl RpcScenarioActionBackend {
     pub fn from_config(
         config: &ControlPlaneConfig,
-        transitional: Arc<dyn JobActions>,
         mining: Arc<dyn MiningControlBackend>,
         spam: Arc<dyn SpamControlBackend>,
     ) -> Result<Self> {
@@ -74,7 +65,6 @@ impl RpcScenarioActionBackend {
             node2_wallet: non_empty_env("NODE2_WALLET_NAME", DEFAULT_NODE2_WALLET_NAME),
             node3_wallet: non_empty_env("NODE3_WALLET_NAME", DEFAULT_NODE3_WALLET_NAME),
             timeout: Duration::from_secs(timeout_secs),
-            transitional,
             mining,
             spam,
         })
@@ -198,23 +188,6 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
             "accepted_transactions": accepted,
             "outputs_per_transaction": outputs_per_tx,
             "aborted": control.abort_requested()
-        }))
-    }
-
-    fn run_partition(
-        &self,
-        node: MinerNode,
-        main_blocks: u64,
-        isolated_blocks: u64,
-        _control: &dyn ScenarioControl,
-    ) -> Result<Value> {
-        self.transitional
-            .run_partition(&node.to_string(), main_blocks, isolated_blocks)?;
-        Ok(json!({
-            "node": node.to_string(),
-            "main_blocks": main_blocks,
-            "isolated_blocks": isolated_blocks,
-            "adapter": "transitional_control_plane"
         }))
     }
 

@@ -18,6 +18,7 @@ mod internal_client;
 mod job_store;
 mod jobs;
 mod mcp;
+mod network_job;
 mod reconcile;
 mod reorg_job;
 mod scenario_job;
@@ -112,6 +113,12 @@ async fn main() -> anyhow::Result<()> {
         config.spam_control_url.clone(),
         config.internal_token.clone(),
     ));
+    let network = Arc::new(internal_client::NetworkClients::new(
+        config.node1_network_agent_url.clone(),
+        config.node2_network_agent_url.clone(),
+        config.node3_network_agent_url.clone(),
+        config.internal_token.clone(),
+    ));
     let backend = Arc::new(hybrid_backend::HybridBackend::new(
         legacy,
         mining.clone(),
@@ -122,16 +129,20 @@ async fn main() -> anyhow::Result<()> {
     let reorg_executor = Arc::new(reorg_job::RpcReorgExecutor::from_config(&config)?);
     let scenario_backend = Arc::new(scenario_job::RpcScenarioActionBackend::from_config(
         &config,
-        backend.clone(),
         mining.clone(),
         spam.clone(),
     )?);
+    let network_actions = Arc::new(network_job::RpcNetworkActionBackend::from_config(&config)?);
     let jobs = jobs::JobManager::open(
         &config.state_dir,
-        mining.clone(),
-        spam.clone(),
-        reorg_executor,
-        scenario_backend,
+        jobs::JobDependencies {
+            mining: mining.clone(),
+            spam: spam.clone(),
+            network: network.clone(),
+            reorg: reorg_executor,
+            scenario: scenario_backend,
+            network_actions,
+        },
     )?;
     let app = Arc::new(AppState {
         config: config.clone(),
@@ -141,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         job_actions: backend,
         mining,
         spam,
+        network,
         jobs,
         control_state: RwLock::new(control_state),
         control_store: store,
@@ -181,6 +193,9 @@ mod token_tests {
             state_dir: dir.join(".simchain-control"),
             mining_control_url: "http://mining:9081".to_string(),
             spam_control_url: "http://spam:9082".to_string(),
+            node1_network_agent_url: "http://node1:9083".to_string(),
+            node2_network_agent_url: "http://node2:9083".to_string(),
+            node3_network_agent_url: "http://node3:9083".to_string(),
             internal_token: "test-internal-token".to_string(),
         }
     }

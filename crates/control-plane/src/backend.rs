@@ -4,7 +4,8 @@
 
 use simchain_common::internal_api::{
     CommandAck, DesiredState, LastMinedBlock, LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest,
-    MiningWorkerStatus, SpamWorkerStatus,
+    MiningWorkerStatus, NetworkAgentStatus, NetworkCommandAck, NetworkLeaseReleaseRequest,
+    NetworkLeaseRequest, SpamWorkerStatus,
 };
 use simchain_common::live_tuning::{MiningTuning, SpamTuning};
 use std::collections::{BTreeMap, HashMap};
@@ -118,18 +119,33 @@ pub trait SpamControlBackend: Send + Sync {
     ) -> anyhow::Result<CommandAck>;
 }
 
+/// Private namespace-local network-agent clients. Node names are normalized
+/// to `node1`, `node2`, or `node3` by implementations.
+pub trait NetworkControlBackend: Send + Sync {
+    fn status(&self, node: &str) -> anyhow::Result<NetworkAgentStatus>;
+    fn acquire_lease(
+        &self,
+        node: &str,
+        request: NetworkLeaseRequest,
+    ) -> anyhow::Result<NetworkCommandAck>;
+    fn renew_lease(
+        &self,
+        node: &str,
+        lease_id: &str,
+        request: LeaseRenewRequest,
+    ) -> anyhow::Result<NetworkCommandAck>;
+    fn release_lease(
+        &self,
+        node: &str,
+        lease_id: &str,
+        request: NetworkLeaseReleaseRequest,
+    ) -> anyhow::Result<NetworkCommandAck>;
+}
+
 /// Bounded action/probe port used by configuration and, in later phases, by
 /// jobs. It contains no process-lifecycle or Docker vocabulary.
 pub trait JobActions: Send + Sync {
     fn node1_height(&self) -> anyhow::Result<u64>;
     fn spam_min_fee(&self) -> anyhow::Result<f64>;
     fn wait(&self, duration: Duration);
-    /// Transitional Phase-5 partition path. Phase 6 replaces this adapter
-    /// with leased namespace-local network agents.
-    fn run_partition(
-        &self,
-        node: &str,
-        main_blocks: u64,
-        isolated_blocks: u64,
-    ) -> anyhow::Result<()>;
 }

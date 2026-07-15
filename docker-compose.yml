@@ -8,8 +8,6 @@
 #                        (mempool-web/mempool-api/mempool-db)
 #   all-tools         -> basic + all long-running tools above
 #   reorg             -> reorg simulator (run on demand, see README)
-#   partition         -> one-shot P2P latency/loss helpers
-#                        (intentionally excluded from all-tools)
 #   scenario          -> one-shot declarative scenario orchestrator
 #                        (intentionally excluded from all-tools)
 #   control-plane     -> control plane (browser UI + API + MCP)
@@ -207,6 +205,70 @@ services:
       - -addnode=node1-p2p:18444
       - -addnode=node2-p2p:18444
 
+  # Namespace-local network agents. Each shares exactly one node's network
+  # namespace, has no independent network membership or host port, and drops
+  # every Linux capability except NET_ADMIN. Its authenticated lease expires
+  # to a clear P2P interface if the control plane disappears.
+  btc-simnet-network-agent-node1:
+    build:
+      context: .
+      dockerfile: docker/tools.Dockerfile
+      target: network-agent
+    container_name: btc-simnet-network-agent-node1
+    restart: on-failure
+    network_mode: "service:btc-simnet-node1"
+    cap_drop: ["ALL"]
+    cap_add: ["NET_ADMIN"]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      btc-simnet-node1:
+        condition: service_started
+    environment:
+      - NETWORK_AGENT_NODE=node1
+      - NETWORK_AGENT_LISTEN_ADDR=0.0.0.0:9083
+      - P2P_PROBE_IP=172.30.0.254
+      - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
+
+  btc-simnet-network-agent-node2:
+    build:
+      context: .
+      dockerfile: docker/tools.Dockerfile
+      target: network-agent
+    container_name: btc-simnet-network-agent-node2
+    restart: on-failure
+    network_mode: "service:btc-simnet-node2"
+    cap_drop: ["ALL"]
+    cap_add: ["NET_ADMIN"]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      btc-simnet-node2:
+        condition: service_started
+    environment:
+      - NETWORK_AGENT_NODE=node2
+      - NETWORK_AGENT_LISTEN_ADDR=0.0.0.0:9083
+      - P2P_PROBE_IP=172.30.0.254
+      - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
+
+  btc-simnet-network-agent-node3:
+    build:
+      context: .
+      dockerfile: docker/tools.Dockerfile
+      target: network-agent
+    container_name: btc-simnet-network-agent-node3
+    restart: on-failure
+    network_mode: "service:btc-simnet-node3"
+    cap_drop: ["ALL"]
+    cap_add: ["NET_ADMIN"]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      btc-simnet-node3:
+        condition: service_started
+    environment:
+      - NETWORK_AGENT_NODE=node3
+      - NETWORK_AGENT_LISTEN_ADDR=0.0.0.0:9083
+      - P2P_PROBE_IP=172.30.0.254
+      - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
+
   btc-simnet-mining-controller:
     build:
       context: .
@@ -401,7 +463,8 @@ services:
   # Simchain control plane (profiles: control-plane, legacy alias panel).
   # Browser UI, versioned HTTP API and MCP endpoint on
   # http://localhost:${CONTROL_PLANE_PORT:-8090}. Mining and spam state and
-  # policy use private worker APIs; reorg jobs use leases plus Bitcoin RPC.
+  # policy use private worker APIs; mutation jobs use worker/network leases
+  # plus Bitcoin RPC. Network agents have no host ports.
   # Transitional boot/lifecycle inspection still keeps the Docker socket,
   # so this service remains excluded from all-tools until Phase 7.
   # ---------------------------------------------------------------------------
@@ -422,6 +485,12 @@ services:
     depends_on:
       btc-simnet-node1:
         condition: service_healthy
+      btc-simnet-network-agent-node1:
+        condition: service_started
+      btc-simnet-network-agent-node2:
+        condition: service_started
+      btc-simnet-network-agent-node3:
+        condition: service_started
     networks:
       - btc-simnet-control
     environment:
@@ -431,6 +500,9 @@ services:
       - CONTROL_PLANE_LISTEN_ADDR=0.0.0.0:8080
       - MINING_CONTROL_URL=http://btc-simnet-mining-controller:9081
       - SPAM_CONTROL_URL=http://btc-simnet-spammer:9082
+      - NODE1_NETWORK_AGENT_URL=http://btc-simnet-node1:9083
+      - NODE2_NETWORK_AGENT_URL=http://btc-simnet-node2:9083
+      - NODE3_NETWORK_AGENT_URL=http://btc-simnet-node3:9083
       - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
       # Optional pre-set API token; empty means generate one and persist it
       # to .simchain-control/token (bearer auth for API/MCP mutations)
@@ -539,47 +611,3 @@ services:
     stop_grace_period: 10s
     networks:
       - btc-simnet-control
-
-  # ---------------------------------------------------------------------------
-  # P2P latency/loss helpers (profile: partition), run on demand by netem.sh.
-  # Each helper shares a node's network namespace, but only the short-lived
-  # helper receives NET_ADMIN. No helper joins a network independently.
-  # ---------------------------------------------------------------------------
-  btc-simnet-netem-node1:
-    profiles: ["partition"]
-    build:
-      context: .
-      dockerfile: docker/netem.Dockerfile
-    network_mode: "service:btc-simnet-node1"
-    cap_add: ["NET_ADMIN"]
-    environment:
-      - P2P_PEER_ALIAS=node2-p2p
-    depends_on:
-      btc-simnet-node1:
-        condition: service_started
-
-  btc-simnet-netem-node2:
-    profiles: ["partition"]
-    build:
-      context: .
-      dockerfile: docker/netem.Dockerfile
-    network_mode: "service:btc-simnet-node2"
-    cap_add: ["NET_ADMIN"]
-    environment:
-      - P2P_PEER_ALIAS=node1-p2p
-    depends_on:
-      btc-simnet-node2:
-        condition: service_started
-
-  btc-simnet-netem-node3:
-    profiles: ["partition"]
-    build:
-      context: .
-      dockerfile: docker/netem.Dockerfile
-    network_mode: "service:btc-simnet-node3"
-    cap_add: ["NET_ADMIN"]
-    environment:
-      - P2P_PEER_ALIAS=node1-p2p
-    depends_on:
-      btc-simnet-node3:
-        condition: service_started
