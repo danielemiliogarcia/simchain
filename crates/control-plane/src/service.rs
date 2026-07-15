@@ -62,7 +62,7 @@ pub fn schema() -> SchemaResponse {
                 maximum: validation_bounds(spec.key).1,
                 apply_mode: match spec.scope {
                     ServiceScope::MiningController => ApplyMode::NextSafePoint,
-                    ServiceScope::Spammer => ApplyMode::LegacyRecreate,
+                    ServiceScope::Spammer => spam_apply_mode(spec.key),
                 },
                 help: spec.help.to_string(),
                 warning: spec.warning.map(str::to_string),
@@ -72,6 +72,18 @@ pub fn schema() -> SchemaResponse {
             .iter()
             .map(|alias| (*alias).to_string())
             .collect(),
+    }
+}
+
+fn spam_apply_mode(key: &str) -> ApplyMode {
+    match key {
+        "ENABLE_SPAM"
+        | "USE_RAW_TX_SPAM"
+        | "FALLBACK_FEE"
+        | "SPAM_SENDMANY_OUTPUTS"
+        | "SPAM_TX_DATA_MIN_BYTES"
+        | "SPAM_TX_DATA_MAX_BYTES" => ApplyMode::EngineRebuild,
+        _ => ApplyMode::NextSafePoint,
     }
 }
 
@@ -235,7 +247,7 @@ pub fn settings_state(app: &AppState) -> Result<SettingsStateView, ServiceError>
     {
         Ok(inspected) => (inspected, None),
         Err(error) => {
-            let message = format!("docker inspect failed: {error}");
+            let message = format!("component inspection failed: {error}");
             warnings.push(message.clone());
             (HashMap::new(), Some(message))
         }
@@ -292,9 +304,8 @@ pub fn settings_state(app: &AppState) -> Result<SettingsStateView, ServiceError>
     })
 }
 
-/// Stable v1 configuration response. During Phase 1 `desired` is still
-/// sourced from the legacy env adapter and `effective` from component
-/// inspection; consumers do not need to know which backend supplied either.
+/// Stable desired/effective configuration response. Both runtime workers
+/// report their own effective generation and canonical policy.
 pub fn config(app: &AppState) -> Result<ConfigResponse, ServiceError> {
     let legacy = settings_state(app)?;
     let control = app
@@ -372,6 +383,9 @@ pub fn status(app: &AppState) -> StatusSnapshot {
     if let Some(mining) = status.components.get_mut(CONTROLLER_CONTAINER) {
         mining.desired_state = Some(control.mining_state);
     }
+    if let Some(spam) = status.components.get_mut(SPAMMER_CONTAINER) {
+        spam.desired_state = Some(control.spam_state);
+    }
     status
 }
 
@@ -413,6 +427,51 @@ pub fn set_mining_state(
     })?;
     Ok(ComponentControlResponse {
         component: "mining".to_string(),
+        desired_state: status.desired_state,
+        effective_state: status.effective_state,
+        phase: status.phase,
+        effective_generation: status.effective_generation,
+    })
+}
+
+pub fn set_spam_state(
+    app: &AppState,
+    desired_state: DesiredState,
+) -> Result<ComponentControlResponse, ServiceError> {
+    let Ok(_guard) = app.apply_lock.try_lock() else {
+        return Err(ServiceError::new(
+            ErrorCode::ApplyInProgress,
+            "another desired-state mutation is already in progress",
+        ));
+    };
+    let mut next = app
+        .control_state
+        .read()
+        .expect("control state lock")
+        .clone();
+    next.spam_state = desired_state;
+    app.control_store.save(&next).map_err(|error| {
+        ServiceError::new(
+            ErrorCode::Internal,
+            format!("failed to persist desired spam state: {error}"),
+        )
+    })?;
+    *app.control_state.write().expect("control state lock") = next;
+
+    app.spam.set_state(desired_state).map_err(|error| {
+        ServiceError::new(
+            ErrorCode::ComponentUnavailable,
+            format!("spam worker did not acknowledge the state change: {error}"),
+        )
+    })?;
+    let status = app.spam.status().map_err(|error| {
+        ServiceError::new(
+            ErrorCode::ComponentUnavailable,
+            format!("spam worker status is unavailable after state change: {error}"),
+        )
+    })?;
+    Ok(ComponentControlResponse {
+        component: "spam".to_string(),
         desired_state: status.desired_state,
         effective_state: status.effective_state,
         phase: status.phase,
@@ -508,6 +567,17 @@ mod tests {
             .find(|setting| setting.key == "BLOCK_INTERVAL_MEAN_SECS")
             .expect("mining cadence in schema");
         assert_eq!(cadence.apply_mode, ApplyMode::NextSafePoint);
+        let fill = view
+            .settings
+            .iter()
+            .find(|setting| setting.key == "SPAM_FILL_BLOCK_RATIO")
+            .expect("spam fill ratio in schema");
+        assert_eq!(fill.apply_mode, ApplyMode::NextSafePoint);
+        assert_eq!(fee.apply_mode, ApplyMode::EngineRebuild);
+        assert!(view
+            .settings
+            .iter()
+            .all(|setting| setting.apply_mode != ApplyMode::LegacyRecreate));
     }
 
     #[test]

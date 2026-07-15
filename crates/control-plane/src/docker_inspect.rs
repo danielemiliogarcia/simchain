@@ -78,6 +78,9 @@ pub fn parse_inspect_output(stdout: &str) -> anyhow::Result<HashMap<String, Comp
                     next_scheduled_attempt_ms: None,
                     last_mined_block: None,
                     active_lease_count: None,
+                    cycle_phase: None,
+                    accepted_transactions: None,
+                    reconciliation_pending: None,
                 },
             )
         })

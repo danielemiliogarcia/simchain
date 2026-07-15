@@ -104,7 +104,15 @@ async fn main() -> anyhow::Result<()> {
         config.mining_control_url.clone(),
         config.internal_token.clone(),
     ));
-    let backend = Arc::new(hybrid_backend::HybridBackend::new(legacy, mining.clone()));
+    let spam = Arc::new(internal_client::SpamClient::new(
+        config.spam_control_url.clone(),
+        config.internal_token.clone(),
+    ));
+    let backend = Arc::new(hybrid_backend::HybridBackend::new(
+        legacy,
+        mining.clone(),
+        spam.clone(),
+    ));
     let app = Arc::new(AppState {
         config: config.clone(),
         token,
@@ -112,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         configuration: backend.clone(),
         job_actions: backend,
         mining,
+        spam,
         control_state: RwLock::new(
             store.load_or_initialize(control_state::desired_from_legacy_env(&config.env_file)?)?,
         ),
@@ -152,6 +161,7 @@ mod token_tests {
             node3_url: "http://node3:18443".to_string(),
             state_dir: dir.join(".simchain-control"),
             mining_control_url: "http://mining:9081".to_string(),
+            spam_control_url: "http://spam:9082".to_string(),
             internal_token: "test-internal-token".to_string(),
         }
     }

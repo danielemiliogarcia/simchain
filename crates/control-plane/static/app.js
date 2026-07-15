@@ -12,7 +12,7 @@ let dirty = new Map();      // key -> edited value (string)
 let fieldErrors = new Map(); // key -> latest client/server validation message
 let applying = false;
 let latestStatus = null;
-let changingMiningState = false;
+const changingComponentState = { mining: false, spam: false };
 
 const GROUP_TITLES = {
   "mining": "Mining",
@@ -109,8 +109,28 @@ function renderStatus(s) {
     const next = mining.next_scheduled_attempt_ms == null
       ? "" : ` · next attempt ${new Date(mining.next_scheduled_attempt_ms).toLocaleTimeString()}`;
     miningState.textContent = `desired ${desired} · effective ${effective} · phase ${mining.phase || mining.status}${next}`;
-    pause.disabled = changingMiningState || desired === "paused";
-    resume.disabled = changingMiningState || desired === "running";
+    pause.disabled = changingComponentState.mining || desired === "paused";
+    resume.disabled = changingComponentState.mining || desired === "running";
+  }
+
+  const spam = (s.components || {})["btc-simnet-spammer"];
+  const spamState = $("#spam-state");
+  const spamPause = $("#spam-pause");
+  const spamResume = $("#spam-resume");
+  if (!spam || !spam.present) {
+    spamState.textContent = spam && spam.last_error
+      ? `spam worker unreachable: ${spam.last_error}` : "spam worker unavailable";
+    spamPause.disabled = true;
+    spamResume.disabled = true;
+  } else {
+    const desired = spam.desired_state || "unknown";
+    const effective = spam.effective_state || "unknown";
+    const cycle = spam.cycle_phase ? ` · cycle ${spam.cycle_phase}` : "";
+    const accepted = spam.accepted_transactions == null
+      ? "" : ` · accepted ${spam.accepted_transactions}`;
+    spamState.textContent = `desired ${desired} · effective ${effective} · phase ${spam.phase || spam.status}${cycle}${accepted}`;
+    spamPause.disabled = changingComponentState.spam || desired === "paused";
+    spamResume.disabled = changingComponentState.spam || desired === "running";
   }
 }
 
@@ -278,15 +298,15 @@ async function refreshStatus() {
   if (ok && body) renderStatus(body);
 }
 
-async function setMiningState(state) {
-  if (changingMiningState) return;
-  changingMiningState = true;
+async function setComponentState(component, state) {
+  if (changingComponentState[component]) return;
+  changingComponentState[component] = true;
   renderStatus(latestStatus || { components: {} });
-  const result = $("#mining-action-result");
+  const result = $(`#${component}-action-result`);
   result.textContent = `${state === "paused" ? "Pausing" : "Resuming"}…`;
   result.className = "action-result";
   try {
-    const { ok, body } = await api("/api/v1/mining/state", {
+    const { ok, body } = await api(`/api/v1/${component}/state`, {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
@@ -296,13 +316,13 @@ async function setMiningState(state) {
     });
     result.textContent = ok
       ? `acknowledged at phase ${body.phase}`
-      : ((body && body.error && body.error.message) || "mining state change failed");
+      : ((body && body.error && body.error.message) || `${component} state change failed`);
     result.className = "action-result" + (ok ? "" : " err");
   } catch (error) {
     result.textContent = String(error);
     result.className = "action-result err";
   } finally {
-    changingMiningState = false;
+    changingComponentState[component] = false;
     await refreshStatus();
     await refreshState();
   }
@@ -366,8 +386,10 @@ async function init() {
   await refreshStatus();
   $("#apply").addEventListener("click", doApply);
   $("#reset").addEventListener("click", () => { dirty.clear(); fieldErrors.clear(); refreshForm(); });
-  $("#mining-pause").addEventListener("click", () => setMiningState("paused"));
-  $("#mining-resume").addEventListener("click", () => setMiningState("running"));
+  $("#mining-pause").addEventListener("click", () => setComponentState("mining", "paused"));
+  $("#mining-resume").addEventListener("click", () => setComponentState("mining", "running"));
+  $("#spam-pause").addEventListener("click", () => setComponentState("spam", "paused"));
+  $("#spam-resume").addEventListener("click", () => setComponentState("spam", "running"));
   setInterval(refreshStatus, 2000);
   setInterval(() => { if (!applying) refreshState(); }, 4000);
 }

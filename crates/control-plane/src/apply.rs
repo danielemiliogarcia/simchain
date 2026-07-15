@@ -1,6 +1,6 @@
-//! The apply transaction: validate -> persist legacy compatibility state ->
-//! apply through component backends -> verify -> rollback. Everything here is blocking; callers run it in
-//! `spawn_blocking`.
+//! The apply transaction: validate -> persist compatibility state -> apply
+//! through resident workers -> verify -> rollback. Everything here is
+//! blocking; callers run it in `spawn_blocking`.
 
 use crate::backend::ComponentInfo;
 use crate::control_state;
@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::time::Duration;
 
-/// Post-recreate stabilization: 4 polls, 2s apart (~8s window), catching the
-/// "compose returned 0 but the tool crashed on its new config" class.
+/// Post-apply stabilization: 4 polls, 2s apart (~8s window), catching a
+/// worker that acknowledged policy installation and then failed.
 const STABILIZE_POLLS: u32 = 4;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -43,11 +43,10 @@ pub struct ApplyReport {
     pub changed: bool,
     pub file_changed: bool,
     /// Components whose runtime policy was changed. This is transport
-    /// neutral: mining applies in-process while the transitional spam adapter
-    /// still recreates its container.
+    /// neutral: both workers apply without process recreation.
     pub components_applied: Vec<String>,
-    /// Explicitly identifies the remaining Phase-2 Compose compatibility
-    /// path so callers never infer that mining was recreated.
+    /// Retained for compatibility with Phase-1 clients; empty after both
+    /// runtime workers migrated.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub legacy_services_recreated: Vec<String>,
     pub revision: String,
@@ -156,7 +155,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     }
 
     // Durable control state is authoritative once initialized. The legacy
-    // env file is only mirrored while spam still uses the Compose adapter.
+    // env file remains a compatibility mirror until Phase 7 removes it.
     let mut merged_map = state_before.desired.clone();
     for (key, value) in &proposed {
         // Keep an explicit empty marker so reset-to-default cannot fall back
@@ -197,7 +196,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     }
 
     // Two independent change sets (finding 6): the file diff decides the
-    // write, the running-container diff decides the recreates.
+    // compatibility write, while effective worker policy decides runtime work.
     let canonical = tuning.canonical_values();
     let desired: BTreeMap<String, String> = canonical
         .iter()
@@ -231,21 +230,20 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
         }
     }
 
-    if services
-        .iter()
-        .any(|service| service == ServiceScope::MiningController.service_name())
-        && inspected
-            .get(ServiceScope::MiningController.service_name())
+    for service in &services {
+        if inspected
+            .get(service)
             .is_none_or(|component| !component.present)
-    {
-        let detail = inspected
-            .get(ServiceScope::MiningController.service_name())
-            .and_then(|component| component.last_error.as_deref())
-            .unwrap_or("worker status is unavailable");
-        return Err(ServiceError::new(
-            ErrorCode::ComponentUnavailable,
-            format!("mining worker is unavailable: {detail}"),
-        ));
+        {
+            let detail = inspected
+                .get(service)
+                .and_then(|component| component.last_error.as_deref())
+                .unwrap_or("worker status is unavailable");
+            return Err(ServiceError::new(
+                ErrorCode::ComponentUnavailable,
+                format!("{service} worker is unavailable: {detail}"),
+            ));
+        }
     }
 
     if !file_changed && services.is_empty() && !state_changed {
@@ -343,7 +341,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     }
 
     // A manual writer does not honor our control-plane flock. Detect one after the
-    // slow recreate/verification window instead of returning a revision that
+    // slow apply/verification window instead of returning a revision that
     // is already stale. Roll runtime back, but never overwrite that newer
     // external file in the rollback CAS.
     let current = envfile::read_env_file(&app.config.env_file).map_err(|error| {
@@ -376,7 +374,8 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
             .any(|s| s == ServiceScope::Spammer.service_name())
     {
         warnings.push(
-            "spam is disabled: the spammer container starts, logs and exits cleanly".to_string(),
+            "spam is disabled: the resident worker remains available for status and runtime re-enable"
+                .to_string(),
         );
     }
 
@@ -401,11 +400,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     Ok(ApplyReport {
         changed: true,
         file_changed,
-        legacy_services_recreated: services
-            .iter()
-            .filter(|service| service.as_str() == ServiceScope::Spammer.service_name())
-            .cloned()
-            .collect(),
+        legacy_services_recreated: Vec::new(),
         components_applied: services,
         revision,
         generation: next_state.generation,
@@ -414,21 +409,17 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     })
 }
 
-fn failure_code(components: &[String], rollback: &RollbackReport) -> ErrorCode {
+fn failure_code(_components: &[String], rollback: &RollbackReport) -> ErrorCode {
     if !rollback.env_restored || !rollback.recreate_ok {
         ErrorCode::RollbackFailed
-    } else if components.len() == 1
-        && components[0] == ServiceScope::MiningController.service_name()
-    {
-        ErrorCode::ComponentUnavailable
     } else {
-        ErrorCode::ComposeFailed
+        ErrorCode::ComponentUnavailable
     }
 }
 
-/// The spammer exits before parsing any other spam setting when disabled.
-/// Mirror that recovery behavior in the panel: if dormant spam values are
-/// invalid, disabling spam resets only that dormant scope to safe defaults.
+/// Preserve the disabled-start recovery guarantee: if dormant spam values are
+/// invalid, disabling spam resets only that dormant scope to safe defaults so
+/// the resident worker remains reachable.
 fn parse_merged_tuning(
     merged: &BTreeMap<String, String>,
 ) -> Result<(LiveTuning, Vec<String>), ServiceError> {
@@ -443,8 +434,7 @@ fn parse_merged_tuning(
                 .with_details(config_error_details(&error))
             })?;
 
-            // The binary exits before parsing dormant spam settings. Repair
-            // only fields that actually fail validation so an apply of
+            // Repair only fields that actually fail validation so an apply of
             // ENABLE_SPAM=false does not erase unrelated valid staged values.
             let mut repaired = merged.clone();
             let defaults = live_tuning::staged_map(&BTreeMap::new());
@@ -510,9 +500,8 @@ fn parse_merged_tuning(
     }
 }
 
-/// Setting-aware post-recreate verification (finding 3): the controller must
-/// keep running; the spammer must keep running when spam is enabled but must
-/// exit 0 when it is disabled.
+/// Setting-aware post-apply verification: both workers stay resident and
+/// report the exact effective policy, including spam's disabled phase.
 fn verify(
     app: &AppState,
     staged: &LiveTuning,
@@ -520,8 +509,6 @@ fn verify(
     node1_reachable_before: bool,
 ) -> Result<(), String> {
     let names: Vec<&str> = services.iter().map(String::as_str).collect();
-    let spam_enabled = staged.spam.enabled;
-
     for poll in 0..STABILIZE_POLLS {
         let last = poll == STABILIZE_POLLS - 1;
         let inspected = app
@@ -536,7 +523,7 @@ fn verify(
                 ServiceScope::Spammer
             };
             let Some(info) = inspected.get(service) else {
-                return Err(format!("{service} not found after recreate"));
+                return Err(format!("{service} not found after runtime apply"));
             };
             if info.restarting || info.restart_count > 0 {
                 return Err(format!(
@@ -544,41 +531,34 @@ fn verify(
                     info.status, info.exit_code
                 ));
             }
-            // The container env is fixed at creation; a mismatch will not
-            // heal, so fail immediately.
+            // An acknowledged worker-policy mismatch will not heal within
+            // this transaction, so fail immediately.
             if scope_needs_restart(staged, Some(&info.effective_config), scope) {
                 return Err(format!(
                     "{service} started with an environment that does not match the applied settings"
                 ));
             }
-            let expect_running = scope == ServiceScope::MiningController || spam_enabled;
-            if expect_running {
-                if info.status == "exited" || info.status == "dead" {
-                    return Err(format!(
-                        "{service} exited during the stabilization window (exit code {})",
-                        info.exit_code
-                    ));
-                }
-                if last && !info.running {
-                    return Err(format!(
-                        "{service} is not running at the end of the stabilization window (status {})",
-                        info.status
-                    ));
-                }
-            } else {
-                // Disabled spammer: a clean exit 0 is the success state.
-                if info.status == "exited" && info.exit_code != 0 {
-                    return Err(format!(
-                        "{service} exited with code {} (expected a clean exit for ENABLE_SPAM=false)",
-                        info.exit_code
-                    ));
-                }
-                if last && info.status != "exited" {
-                    return Err(format!(
-                        "{service} did not exit cleanly with ENABLE_SPAM=false (status {})",
-                        info.status
-                    ));
-                }
+            if info.status == "exited" || info.status == "dead" {
+                return Err(format!(
+                    "{service} exited during the stabilization window (exit code {})",
+                    info.exit_code
+                ));
+            }
+            if last && !info.running {
+                return Err(format!(
+                    "{service} is not running at the end of the stabilization window (status {})",
+                    info.status
+                ));
+            }
+            if last
+                && scope == ServiceScope::Spammer
+                && !staged.spam.enabled
+                && info.phase.as_deref() != Some("disabled")
+            {
+                return Err(format!(
+                    "{service} did not reach the disabled phase (phase {})",
+                    info.phase.as_deref().unwrap_or("unknown")
+                ));
             }
         }
         if !last {
@@ -672,7 +652,7 @@ fn rollback(
         }
     }
 
-    let recreated = if restore_services.is_empty() {
+    let restored = if restore_services.is_empty() {
         true
     } else {
         match app.configuration.restore_configuration(
@@ -682,20 +662,20 @@ fn rollback(
         ) {
             Ok(output) if output.success => {
                 logs.push(format!(
-                    "rollback: recreated {} from the pre-apply runtime environment",
+                    "rollback: restored {} to the pre-apply runtime policy",
                     restore_services.join(", ")
                 ));
                 true
             }
             Ok(output) => {
                 messages.push(format!(
-                    "rollback recreate exited non-zero: {}",
+                    "rollback restore exited non-zero: {}",
                     output.tail(5)
                 ));
                 false
             }
             Err(error) => {
-                messages.push(format!("rollback recreate failed to launch: {error}"));
+                messages.push(format!("rollback restore failed: {error}"));
                 false
             }
         }
@@ -724,7 +704,7 @@ fn rollback(
             }
         }
     };
-    let verified = recreated
+    let verified = restored
         && removed
         && verify_runtime_restored(app, services, runtime_before).map_or_else(
             |error| {
@@ -814,7 +794,7 @@ fn verify_runtime_restored(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::MiningControlBackend;
+    use crate::backend::{MiningControlBackend, SpamControlBackend};
     use crate::state::{AppState, CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
     use crate::test_support::{test_app, MockBackend, RecreateOutcome};
     use std::sync::Arc;
@@ -886,16 +866,17 @@ mod tests {
     }
 
     #[test]
-    fn spam_only_change_recreates_only_the_spammer() {
+    fn spam_only_change_uses_worker_api_without_compose() {
         let fx = fixture(None);
         let report =
             apply(&fx.app, request(&[("SPAM_FILL_BLOCK_RATIO", "0.5")])).expect("apply succeeds");
         assert_eq!(report.components_applied, vec![SPAMMER_CONTAINER]);
-        assert_eq!(report.legacy_services_recreated, vec![SPAMMER_CONTAINER]);
+        assert!(report.legacy_services_recreated.is_empty());
+        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[test]
-    fn mixed_change_recreates_both_tools() {
+    fn mixed_change_applies_both_workers_without_compose() {
         let fx = fixture(None);
         let report = apply(
             &fx.app,
@@ -906,21 +887,13 @@ mod tests {
             report.components_applied,
             vec![CONTROLLER_CONTAINER, SPAMMER_CONTAINER]
         );
-        assert_eq!(
-            fx.mock.compose_calls(),
-            vec![vec![SPAMMER_CONTAINER.to_string()]]
-        );
+        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[test]
     fn mixed_apply_failure_restores_the_previous_mining_generation() {
         let fx = fixture(None);
-        fx.mock
-            .world
-            .lock()
-            .expect("lock")
-            .after_recreate
-            .insert(SPAMMER_CONTAINER.to_string(), RecreateOutcome::Crash);
+        fx.mock.world.lock().expect("lock").compose_fail_times = 1;
         let error = apply(
             &fx.app,
             request(&[
@@ -930,16 +903,10 @@ mod tests {
         )
         .expect_err("spammer failure rolls back the transaction");
         assert!(error.rollback.expect("rollback").recreate_ok);
-        let mining = fx.mock.status().expect("mining status");
+        let mining = MiningControlBackend::status(&*fx.mock).expect("mining status");
         assert_eq!(mining.effective_generation, 0);
         assert_eq!(mining.policy.mean_secs, 15);
-        assert_eq!(
-            fx.mock.compose_calls(),
-            vec![
-                vec![SPAMMER_CONTAINER.to_string()],
-                vec![SPAMMER_CONTAINER.to_string()],
-            ]
-        );
+        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[test]
@@ -1093,12 +1060,12 @@ mod tests {
     }
 
     #[test]
-    fn compose_failure_rolls_back_the_file() {
+    fn worker_policy_failure_rolls_back_the_file() {
         let original = "FALLBACK_FEE=0.0002\n";
         let fx = fixture(Some(original));
         fx.mock.world.lock().expect("lock").compose_fail_times = 1;
         let error = apply(&fx.app, request(&[("FALLBACK_FEE", "0.0003")])).expect_err("must fail");
-        assert_eq!(error.code, ErrorCode::ComposeFailed);
+        assert_eq!(error.code, ErrorCode::ComponentUnavailable);
         let rollback = error.rollback.expect("rollback report");
         assert!(rollback.env_restored);
         assert!(rollback.recreate_ok);
@@ -1106,8 +1073,7 @@ mod tests {
             std::fs::read_to_string(&fx.app.config.env_file).expect("read"),
             original
         );
-        // First call failed, second call is the rollback recreate.
-        assert_eq!(fx.mock.compose_calls().len(), 2);
+        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[test]
@@ -1132,7 +1098,7 @@ mod tests {
             .after_recreate
             .insert(SPAMMER_CONTAINER.to_string(), RecreateOutcome::Crash);
         let error = apply(&fx.app, request(&[("FALLBACK_FEE", "0.0003")])).expect_err("must fail");
-        assert_eq!(error.code, ErrorCode::ComposeFailed);
+        assert_eq!(error.code, ErrorCode::ComponentUnavailable);
         assert!(error.message.contains("verification failed"));
         assert_eq!(
             std::fs::read_to_string(&fx.app.config.env_file).expect("read"),
@@ -1153,20 +1119,20 @@ mod tests {
     }
 
     #[test]
-    fn disabling_spam_accepts_a_clean_exit() {
+    fn disabling_spam_keeps_the_worker_resident() {
         let fx = fixture(None);
-        fx.mock
-            .world
-            .lock()
-            .expect("lock")
-            .after_recreate
-            .insert(SPAMMER_CONTAINER.to_string(), RecreateOutcome::ExitedClean);
         let report = apply(&fx.app, request(&[("ENABLE_SPAM", "false")])).expect("apply");
         assert_eq!(report.components_applied, vec![SPAMMER_CONTAINER]);
         assert!(report
             .warnings
             .iter()
             .any(|w| w.contains("spam is disabled")));
+        let status = SpamControlBackend::status(&*fx.mock).expect("spam status");
+        assert_eq!(
+            status.phase,
+            simchain_common::internal_api::WorkerPhase::Disabled
+        );
+        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[test]
@@ -1174,12 +1140,6 @@ mod tests {
         let fx = fixture(Some(
             "SPAM_FILL_BLOCK_RATIO=not-a-number\nFALLBACK_FEE=0.0002\nSPAM_FLOOR_POOL_TXS=1234\n",
         ));
-        fx.mock
-            .world
-            .lock()
-            .expect("lock")
-            .after_recreate
-            .insert(SPAMMER_CONTAINER.to_string(), RecreateOutcome::ExitedClean);
         let report = apply(&fx.app, request(&[("ENABLE_SPAM", "false")]))
             .expect("disabling must not parse settings the spammer will ignore");
         assert!(report
@@ -1217,7 +1177,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_removes_a_service_that_was_originally_absent() {
+    fn absent_spam_worker_fails_before_any_mutation() {
         let fx = fixture(None);
         fx.mock
             .world
@@ -1225,16 +1185,10 @@ mod tests {
             .expect("lock")
             .containers
             .remove(SPAMMER_CONTAINER);
-        fx.mock
-            .world
-            .lock()
-            .expect("lock")
-            .after_recreate
-            .insert(SPAMMER_CONTAINER.to_string(), RecreateOutcome::Crash);
-
         let error = apply(&fx.app, request(&[("FALLBACK_FEE", "0.0003")]))
-            .expect_err("new runtime crashes");
-        assert!(error.rollback.expect("rollback").recreate_ok);
+            .expect_err("worker is unavailable");
+        assert_eq!(error.code, ErrorCode::ComponentUnavailable);
+        assert!(error.rollback.is_none());
         assert!(!fx
             .mock
             .world
@@ -1278,29 +1232,18 @@ mod tests {
             .after_recreate
             .insert(SPAMMER_CONTAINER.to_string(), RecreateOutcome::Crash);
         let error = apply(&fx.app, request(&[("ENABLE_SPAM", "false")])).expect_err("fail");
-        assert!(error.message.contains("exited with code 1"));
+        assert!(error.message.contains("exit code 1"));
     }
 
     #[test]
     fn reenabling_spam_requires_running_again() {
         let fx = fixture(None);
-        // Disable first (clean exit).
-        fx.mock
-            .world
-            .lock()
-            .expect("lock")
-            .after_recreate
-            .insert(SPAMMER_CONTAINER.to_string(), RecreateOutcome::ExitedClean);
+        // Disable first; the worker remains resident.
         apply(&fx.app, request(&[("ENABLE_SPAM", "false")])).expect("disable");
-        // Re-enable: mock now keeps it running, apply must succeed.
-        fx.mock
-            .world
-            .lock()
-            .expect("lock")
-            .after_recreate
-            .insert(SPAMMER_CONTAINER.to_string(), RecreateOutcome::Running);
+        // Re-enable without process recreation.
         let report = apply(&fx.app, request(&[("ENABLE_SPAM", "true")])).expect("enable");
         assert_eq!(report.components_applied, vec![SPAMMER_CONTAINER]);
+        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[test]

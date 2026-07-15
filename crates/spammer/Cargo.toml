@@ -7,8 +7,10 @@ license = "GPL-3.0-or-later"
 [dependencies]
 bitcoincore-rpc = "0.19.0"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 simchain-common = { path = "../simchain-common" }
 anyhow = "1"
 dotenvy = "0.15"
 thiserror = "2"
+tiny_http = "0.12"
 tracing = "0.1"

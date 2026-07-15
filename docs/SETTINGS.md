@@ -429,10 +429,10 @@ host access. Full schema and execution semantics: [SCENARIOS.md](SCENARIOS.md).
 ## Simchain control plane (profile `control-plane`; alias `panel`)
 
 The control plane is an opt-in localhost web UI + HTTP API + MCP endpoint for live retuning
-(see [RETUNING.md](RETUNING.md)). Like the scenario engine it mounts
-`/var/run/docker.sock` only for the transitional spam adapter; mining control uses a
-private authenticated worker API. Treat access to this container as root-equivalent
-host access until the spam migration removes that mount.
+(see [RETUNING.md](RETUNING.md)). Mining and spam control use private authenticated
+worker APIs. The service still mounts `/var/run/docker.sock` for transitional node/job
+paths scheduled for later phases; neither worker policy path uses it. Treat access to
+this container as root-equivalent host access until that migration removes the mount.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -441,10 +441,12 @@ host access until the spam migration removes that mount.
 | `SIMCHAIN_CONTROL_STATE_DIR` | `.simchain-control` | Narrow directory for the token and atomically written, versioned control state. |
 | `MINING_CONTROL_URL` | `http://btc-simnet-mining-controller:9081` | Private Compose-network endpoint used by the control plane; never publish this port to the host. |
 | `MINING_CONTROL_LISTEN_ADDR` | `0.0.0.0:9081` | Mining worker's private control listener. Boot-only. |
-| `SIMCHAIN_INTERNAL_TOKEN` | `simchain-internal-dev-token` | Shared bearer token for control-plane-to-worker requests. Supply the same non-empty value to both services when overriding it. |
+| `SPAM_CONTROL_URL` | `http://btc-simnet-spammer:9082` | Private Compose-network spam endpoint; never publish this port to the host. |
+| `SPAM_CONTROL_LISTEN_ADDR` | `0.0.0.0:9082` | Resident spam worker's private control listener. Boot-only. |
+| `SIMCHAIN_INTERNAL_TOKEN` | `simchain-internal-dev-token` | Shared bearer token for control-plane-to-worker requests. Supply the same non-empty value to all three services when overriding it. |
 
 Control-plane-managed runtime settings (durable desired values live in
-`.simchain-control/state.json`; Phase 2 also mirrors these keys to `.env` for spam
+`.simchain-control/state.json`; Phase 3 still mirrors these keys to `.env` for manual
 compatibility, preserving everything else verbatim):
 
 - Mining controller scope: `BLOCK_INTERVAL_MODE`, `BLOCK_INTERVAL_MEAN_SECS`,

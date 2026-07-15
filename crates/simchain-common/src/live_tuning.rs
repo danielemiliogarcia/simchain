@@ -858,7 +858,7 @@ pub struct SettingSpec {
     pub warning: Option<&'static str>,
 }
 
-pub const FALLBACK_FEE_WARNING: &str = "FALLBACK_FEE is shared with the nodes' -fallbackfee: a live apply recreates only the spammer, so the spam fee floor moves immediately, but the node wallets keep their old fallback until the nodes are recreated outside the panel.";
+pub const FALLBACK_FEE_WARNING: &str = "FALLBACK_FEE changes the resident spam engine at a safe rebuild boundary. The nodes' boot-time -fallbackfee remains unchanged; wallet-mode spam uses an explicit wallet paytxfee.";
 
 /// The panel-managed catalog, in display order.
 pub const MANAGED_SETTINGS: &[SettingSpec] = &[
@@ -929,7 +929,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Toggle,
         optional: false,
-        help: "Enable the spammer. When false the spammer container starts, logs and exits cleanly.",
+        help: "Enable spam generation. When false the worker remains resident in its disabled phase and can be re-enabled without restart.",
         warning: None,
     },
     SettingSpec {

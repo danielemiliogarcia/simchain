@@ -61,6 +61,8 @@ pub enum Command {
     Config(ConfigArgs),
     /// Pause or resume continuous mining at a worker safe point.
     Mining(MiningArgs),
+    /// Pause or resume spam at a cooperative worker safe point.
+    Spam(SpamArgs),
 }
 
 #[derive(Debug, Args)]
@@ -103,6 +105,20 @@ pub enum MiningCommand {
     Resume,
 }
 
+#[derive(Debug, Args)]
+pub struct SpamArgs {
+    #[command(subcommand)]
+    pub command: SpamCommand,
+}
+
+#[derive(Clone, Copy, Debug, Subcommand)]
+pub enum SpamCommand {
+    /// Pause after already-submitted spam reaches a consistent boundary.
+    Pause,
+    /// Resume spam unless disabled by policy or held by a job-owned lease.
+    Resume,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +130,14 @@ mod tests {
         assert!(matches!(
             status.command,
             Command::Status(StatusArgs { json: true })
+        ));
+
+        let spam = Cli::try_parse_from(["simchainctl", "spam", "resume"]).expect("spam command");
+        assert!(matches!(
+            spam.command,
+            Command::Spam(SpamArgs {
+                command: SpamCommand::Resume
+            })
         ));
 
         let config =

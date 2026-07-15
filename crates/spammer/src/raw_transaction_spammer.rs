@@ -63,6 +63,8 @@ use serde_json::json;
 use simchain_common::rpc_retry;
 use std::{collections::HashSet, thread, time::Duration};
 
+const FLOOR_BATCH_SIZE: usize = 250;
+
 // 546-sat burn/gap-sealer outputs: safely above the P2PKH dust floor for any
 // address type, same amount as the wallet engine so shapes match.
 const DUST_SAT: u64 = 546;
@@ -562,6 +564,50 @@ impl RawSpammer {
             .collect()
     }
 
+    fn try_scan_address_utxos(&self, address: &Address) -> anyhow::Result<Vec<Utxo>> {
+        let scan = self
+            .node
+            .scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(format!("addr({address})"))])?;
+        let mut utxos = Vec::new();
+        for unspent in scan.unspents {
+            if self
+                .node
+                .get_tx_out(&unspent.txid, unspent.vout, Some(true))?
+                .is_some()
+            {
+                utxos.push(Utxo {
+                    outpoint: OutPoint::new(unspent.txid, unspent.vout),
+                    amount: unspent.amount,
+                });
+            }
+        }
+        Ok(utxos)
+    }
+
+    /// Rebuild mutable branch and floor-pool state after a chain mutation or
+    /// before atomically installing a replacement engine.
+    pub fn reconcile(&mut self) -> anyhow::Result<()> {
+        let utxos = self.try_scan_address_utxos(&self.address)?;
+        let pool_utxos = self.try_scan_address_utxos(&self.pool_address)?;
+        let mut fills_inflight = Vec::new();
+        for fill in &self.fills_inflight {
+            if self
+                .node
+                .get_tx_out(&fill.outpoint.txid, fill.outpoint.vout, Some(true))?
+                .is_some()
+                && !pool_utxos.iter().any(|utxo| utxo.outpoint == fill.outpoint)
+            {
+                fills_inflight.push(*fill);
+            }
+        }
+        self.utxos = utxos;
+        self.cursor = 0;
+        self.pool_utxos = pool_utxos;
+        self.fills_inflight = fills_inflight;
+        self.pool_seen_height = self.node.get_block_count()?;
+        Ok(())
+    }
+
     // Rebuild the data-branch UTXO set from the chain.
     fn resync(&mut self) {
         self.utxos = self.scan_address_utxos(&self.address);
@@ -580,20 +626,30 @@ impl RawSpammer {
     // tx that re-splits into `target` equal branches. Waits for that fan-out
     // to confirm before returning: an unconfirmed parent caps its descendant
     // count at 25 (mempool policy), which would strangle the first blocks.
-    fn ensure_funds(&mut self, need: u64, target: u64) {
+    fn ensure_funds(&mut self, need: u64, target: u64, checkpoint: &impl Fn(&str) -> bool) -> bool {
+        if !checkpoint("raw_funds_check") {
+            return false;
+        }
         let required = self.per_tx_required();
         if self.usable_branches(required) >= need {
-            return;
+            return true;
         }
         self.resync();
+        if !checkpoint("raw_funds_resynced") {
+            return false;
+        }
         if self.usable_branches(required) >= need {
-            return;
+            return true;
         }
 
         let total: Amount = self.utxos.iter().map(|u| u.amount).sum();
         let refill_floor = required * (target * BRANCH_MIN_TXS);
         if total < refill_floor {
-            wallet::wait_for_funds(&self.wallet, &self.wallet_name);
+            if !wallet::wait_for_funds_until(&self.wallet, &self.wallet_name, || {
+                checkpoint("raw_waiting_for_funds")
+            }) {
+                return false;
+            }
             let trusted = rpc_retry("get raw-engine wallet balance", || {
                 self.wallet.get_balances()
             })
@@ -623,9 +679,10 @@ impl RawSpammer {
                         "{} => Raw engine funding pull failed ({error}), deferring until the next block",
                         self.label
                     );
-                    return;
+                    return true;
                 }
             };
+            let mut continue_work = checkpoint("raw_funding_submitted");
             while self
                 .wallet
                 .get_transaction(&txid, None)
@@ -633,9 +690,15 @@ impl RawSpammer {
                 .unwrap_or(0)
                 < 1
             {
+                if !checkpoint("raw_funding_confirmation") {
+                    continue_work = false;
+                }
                 thread::sleep(Duration::from_millis(500));
             }
             self.resync();
+            if !continue_work || !checkpoint("raw_funding_confirmed") {
+                return false;
+            }
         }
 
         let total: Amount = self.utxos.iter().map(|u| u.amount).sum();
@@ -644,7 +707,7 @@ impl RawSpammer {
                 "{} => Raw engine has no confirmed funds to fan out yet, deferring",
                 self.label
             );
-            return;
+            return true;
         }
         let fee = self.consolidation_fee(self.utxos.len(), target as usize);
         let per_branch = match total.checked_sub(fee) {
@@ -656,7 +719,7 @@ impl RawSpammer {
                 "{} => Raw engine funds too low to split {total} into {target} usable branches, deferring",
                 self.label
             );
-            return;
+            return true;
         }
 
         tracing::info!(
@@ -670,13 +733,21 @@ impl RawSpammer {
             })
             .collect();
         let inputs = std::mem::take(&mut self.utxos);
+        if !checkpoint("raw_fanout_submit") {
+            self.utxos = inputs;
+            return false;
+        }
         match self.send_tx(&inputs, outputs, false) {
             Ok(txid) => {
                 tracing::info!(
                     "{} => Fan-out tx {txid} sent, waiting for it to confirm...",
                     self.label
                 );
+                let mut continue_work = checkpoint("raw_fanout_submitted");
                 while !matches!(self.node.get_tx_out(&txid, 0, Some(false)), Ok(Some(_))) {
+                    if !checkpoint("raw_fanout_confirmation") {
+                        continue_work = false;
+                    }
                     thread::sleep(Duration::from_millis(500));
                 }
                 self.utxos = (0..target)
@@ -687,6 +758,9 @@ impl RawSpammer {
                     .collect();
                 self.cursor = 0;
                 tracing::info!("{} => Fan-out confirmed", self.label);
+                if !continue_work || !checkpoint("raw_fanout_confirmed") {
+                    return false;
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -696,6 +770,7 @@ impl RawSpammer {
                 self.resync();
             }
         }
+        true
     }
 
     // Next branch (round-robin) that can afford one spam tx. Round-robin
@@ -767,11 +842,11 @@ impl RawSpammer {
     // TIPS can be replaced -- if a later tx already chained off this one's
     // change, replacing it would orphan that child -- and the tip check is
     // simply "is this tx's change outpoint still in our UTXO set".
-    fn bump_spam_txs(&mut self, sent: &[SentSpam], count: u64) {
+    fn bump_spam_txs(&mut self, sent: &[SentSpam], count: u64, checkpoint: &impl Fn(&str) -> bool) {
         let mut bumped = 0;
         let mut first_error: Option<String> = None;
         for s in sent.iter().rev() {
-            if bumped >= count {
+            if bumped >= count || !checkpoint("raw_rbf_before_submit") {
                 break;
             }
             let vout = self.shape_change_vout(&s.shape);
@@ -799,6 +874,9 @@ impl RawSpammer {
                         first_error = Some(e.to_string());
                     }
                 }
+            }
+            if !checkpoint("raw_rbf_after_submit") {
+                break;
             }
         }
         match first_error {
@@ -879,21 +957,36 @@ impl RawSpammer {
     // buffer covers UTXOs locked under in-flight fills). Waits for the fan-out
     // to confirm before returning: fills must spend CONFIRMED outputs only, or
     // they stop being standalone and the floor reopens.
-    fn ensure_pool_funds(&mut self, need: u64, target: u64) {
+    fn ensure_pool_funds(
+        &mut self,
+        need: u64,
+        target: u64,
+        checkpoint: &impl Fn(&str) -> bool,
+    ) -> bool {
+        if !checkpoint("floor_pool_funds_check") {
+            return false;
+        }
         let required = self.fill_fee() + MIN_CHANGE;
         if self.usable_fill_ammo(required) >= need {
-            return;
+            return true;
         }
         self.pool_resync();
+        if !checkpoint("floor_pool_resynced") {
+            return false;
+        }
         if self.usable_fill_ammo(required) >= need {
-            return;
+            return true;
         }
 
         let seed_count = target + target.div_ceil(4);
         let total: Amount = self.pool_utxos.iter().map(|u| u.amount).sum();
         let refill_floor = required * seed_count;
         if total < refill_floor {
-            wallet::wait_for_funds(&self.wallet, &self.wallet_name);
+            if !wallet::wait_for_funds_until(&self.wallet, &self.wallet_name, || {
+                checkpoint("floor_pool_waiting_for_funds")
+            }) {
+                return false;
+            }
             let trusted = rpc_retry("get floor-pool wallet balance", || {
                 self.wallet.get_balances()
             })
@@ -923,9 +1016,10 @@ impl RawSpammer {
                         "{} => Floor-pool funding pull failed ({error}), deferring until the next block",
                         self.label
                     );
-                    return;
+                    return true;
                 }
             };
+            let mut continue_work = checkpoint("floor_pool_funding_submitted");
             while self
                 .wallet
                 .get_transaction(&txid, None)
@@ -933,9 +1027,15 @@ impl RawSpammer {
                 .unwrap_or(0)
                 < 1
             {
+                if !checkpoint("floor_pool_funding_confirmation") {
+                    continue_work = false;
+                }
                 thread::sleep(Duration::from_millis(500));
             }
             self.pool_resync();
+            if !continue_work || !checkpoint("floor_pool_funding_confirmed") {
+                return false;
+            }
         }
 
         let total: Amount = self.pool_utxos.iter().map(|u| u.amount).sum();
@@ -944,7 +1044,7 @@ impl RawSpammer {
                 "{} => Floor pool has no confirmed funds to fan out yet, deferring",
                 self.label
             );
-            return;
+            return true;
         }
         let fee = self.consolidation_fee(self.pool_utxos.len(), seed_count as usize);
         let per_utxo = match total.checked_sub(fee) {
@@ -956,7 +1056,7 @@ impl RawSpammer {
                 "{} => Floor pool funds too low to split {total} into {seed_count} usable fill UTXOs, deferring",
                 self.label
             );
-            return;
+            return true;
         }
 
         tracing::info!(
@@ -972,6 +1072,11 @@ impl RawSpammer {
         let mut outputs_left = seed_count as usize;
 
         while outputs_left > 0 {
+            if !checkpoint("floor_pool_fanout_prepare") {
+                self.pool_utxos = available;
+                self.pool_utxos.extend(fresh);
+                return false;
+            }
             let n_fill = outputs_left.min(POOL_FANOUT_CHUNK_OUTPUTS);
             let fill_value = per_utxo * n_fill as u64;
             let mut inputs = Vec::new();
@@ -989,7 +1094,7 @@ impl RawSpammer {
                     available.extend(inputs);
                     self.pool_utxos = available;
                     self.pool_utxos.extend(fresh);
-                    return;
+                    return true;
                 };
                 input_total += input.amount;
                 inputs.push(input);
@@ -1026,7 +1131,11 @@ impl RawSpammer {
                         "{} => Pool fan-out tx {txid} sent ({n_fill} fill outputs), waiting for it to confirm...",
                         self.label
                     );
+                    let mut continue_work = checkpoint("floor_pool_fanout_submitted");
                     while !matches!(self.node.get_tx_out(&txid, 0, Some(false)), Ok(Some(_))) {
+                        if !checkpoint("floor_pool_fanout_confirmation") {
+                            continue_work = false;
+                        }
                         thread::sleep(Duration::from_millis(500));
                     }
                     fresh.extend((0..n_fill).map(|i| Utxo {
@@ -1040,6 +1149,11 @@ impl RawSpammer {
                         });
                     }
                     outputs_left -= n_fill;
+                    if !continue_work || !checkpoint("floor_pool_fanout_confirmed") {
+                        self.pool_utxos = available;
+                        self.pool_utxos.extend(fresh);
+                        return false;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1047,13 +1161,14 @@ impl RawSpammer {
                         self.label
                     );
                     self.pool_resync();
-                    return;
+                    return true;
                 }
             }
         }
         self.pool_utxos = available;
         self.pool_utxos.extend(fresh);
         tracing::info!("{} => Pool fan-out confirmed", self.label);
+        true
     }
 
     // Keep a standing pool of `target` standalone floor-priced fills sitting
@@ -1062,8 +1177,11 @@ impl RawSpammer {
     // Each fill spends one CONFIRMED pool UTXO, so its ancestor package is
     // itself and the block assembler can drop it into residual packing gaps.
     // Returns the number of fills sent.
-    pub fn floor_round(&mut self, target: u64) -> usize {
+    pub fn floor_round(&mut self, target: u64, checkpoint: &impl Fn(&str) -> bool) -> usize {
         if target == 0 {
+            return 0;
+        }
+        if !checkpoint("floor_pool_harvest") {
             return 0;
         }
         self.harvest_mined_fills();
@@ -1076,59 +1194,80 @@ impl RawSpammer {
             );
             return 0;
         }
-        self.ensure_pool_funds(need, target);
-
-        let mut sent = 0u64;
-        let mut sent_vsize = 0u64;
-        let mut first_error: Option<String> = None;
-        let mut raw_fills: Vec<(String, Amount)> = Vec::new();
-        let required = self.fill_fee() + MIN_CHANGE;
-        let fee = self.fill_fee();
-        while (raw_fills.len() as u64) < need {
-            let Some(idx) = self.pool_utxos.iter().position(|u| u.amount >= required) else {
-                break;
-            };
-            let utxo = self.pool_utxos.swap_remove(idx);
-            let change = utxo.amount - fee;
-            let outputs = vec![TxOut {
-                value: change,
-                script_pubkey: self.pool_script.clone(),
-            }];
-            let tx = self.signed_tx(
-                &[utxo],
-                outputs,
-                false,
-                &self.pool_script,
-                &self.pool_secret,
-                &self.pool_pubkey,
-            );
-            raw_fills.push((serialize_hex(&tx), change));
+        if !self.ensure_pool_funds(need, target, checkpoint) {
+            return 0;
         }
 
-        let raw_txs: Vec<String> = raw_fills.iter().map(|(raw, _)| raw.clone()).collect();
-        let results = Self::send_raw_batch(&self.node_batch, &raw_txs);
-        let mut relays = Vec::new();
-        for ((raw_tx, change), result) in raw_fills.into_iter().zip(results) {
-            match result {
-                Ok(txid) => {
-                    self.fills_inflight.push(Utxo {
-                        outpoint: OutPoint::new(txid, 0),
-                        amount: change,
-                    });
-                    relays.push(raw_tx);
-                    sent += 1;
-                    sent_vsize += FILL_VSIZE;
-                }
-                Err(e) => {
-                    // The UTXO stays dropped either way: if our view of it
-                    // was stale, the next pool resync recovers the truth.
-                    if first_error.is_none() {
-                        first_error = Some(e.to_string());
+        let mut sent = 0u64;
+        let mut attempted = 0u64;
+        let mut sent_vsize = 0u64;
+        let mut first_error: Option<String> = None;
+        let required = self.fill_fee() + MIN_CHANGE;
+        let fee = self.fill_fee();
+        while attempted < need {
+            if !checkpoint("floor_batch_prepare") {
+                break;
+            }
+            let batch_target = ((need - attempted) as usize).min(FLOOR_BATCH_SIZE);
+            let mut raw_fills: Vec<(String, Amount, Utxo)> = Vec::new();
+            while raw_fills.len() < batch_target {
+                let Some(idx) = self.pool_utxos.iter().position(|u| u.amount >= required) else {
+                    break;
+                };
+                let utxo = self.pool_utxos.swap_remove(idx);
+                let change = utxo.amount - fee;
+                let outputs = vec![TxOut {
+                    value: change,
+                    script_pubkey: self.pool_script.clone(),
+                }];
+                let tx = self.signed_tx(
+                    &[utxo],
+                    outputs,
+                    false,
+                    &self.pool_script,
+                    &self.pool_secret,
+                    &self.pool_pubkey,
+                );
+                raw_fills.push((serialize_hex(&tx), change, utxo));
+            }
+            if raw_fills.is_empty() {
+                break;
+            }
+            if !checkpoint("floor_batch_submit") {
+                self.pool_utxos
+                    .extend(raw_fills.into_iter().map(|(_, _, utxo)| utxo));
+                break;
+            }
+
+            attempted += raw_fills.len() as u64;
+            let raw_txs: Vec<String> = raw_fills.iter().map(|(raw, _, _)| raw.clone()).collect();
+            let results = Self::send_raw_batch(&self.node_batch, &raw_txs);
+            let mut relays = Vec::new();
+            for ((raw_tx, change, _), result) in raw_fills.into_iter().zip(results) {
+                match result {
+                    Ok(txid) => {
+                        self.fills_inflight.push(Utxo {
+                            outpoint: OutPoint::new(txid, 0),
+                            amount: change,
+                        });
+                        relays.push(raw_tx);
+                        sent += 1;
+                        sent_vsize += FILL_VSIZE;
+                    }
+                    Err(e) => {
+                        // The UTXO stays dropped either way: if our view of it
+                        // was stale, the next pool resync recovers the truth.
+                        if first_error.is_none() {
+                            first_error = Some(e.to_string());
+                        }
                     }
                 }
             }
+            self.relay_raw_batch(&relays);
+            if !checkpoint("floor_batch_submitted") {
+                break;
+            }
         }
-        self.relay_raw_batch(&relays);
 
         tracing::info!(
             "{} => Floor pool: {standing} standing + {sent} new fills (~{}k vB; target {target})",
@@ -1156,9 +1295,10 @@ impl RawSpammer {
         fanout: u64,
         replaceable: bool,
         replaces: u64,
+        checkpoint: &impl Fn(&str) -> bool,
     ) -> Vec<Txid> {
-        if fanout > 0 {
-            self.ensure_funds(share.min(fanout), fanout);
+        if fanout > 0 && !self.ensure_funds(share.min(fanout), fanout, checkpoint) {
+            return Vec::new();
         }
         let n_burns = self.burn_scripts.len();
         if n_burns == 1 {
@@ -1178,7 +1318,10 @@ impl RawSpammer {
         let mut first_error: Option<String> = None;
         let mut consecutive_failures = 0;
         while (txids.len() as u64) < share {
-            if self.utxos.is_empty() || consecutive_failures >= self.utxos.len() {
+            if self.utxos.is_empty()
+                || consecutive_failures >= self.utxos.len()
+                || !checkpoint("raw_output_before_submit")
+            {
                 break;
             }
             match self.send_shape(SpamShape::Burns, replaceable) {
@@ -1194,6 +1337,9 @@ impl RawSpammer {
                     consecutive_failures += 1;
                 }
             }
+            if !checkpoint("raw_output_after_submit") {
+                break;
+            }
         }
         if (txids.len() as u64) < share {
             let detail = first_error
@@ -1202,7 +1348,7 @@ impl RawSpammer {
             tracing::warn!("only {}/{share} raw spam txs accepted{detail}", txids.len());
         }
         if replaceable {
-            self.bump_spam_txs(&sent, replaces);
+            self.bump_spam_txs(&sent, replaces, checkpoint);
         }
         txids
     }
@@ -1221,8 +1367,11 @@ impl RawSpammer {
         fanout: u64,
         replaceable: bool,
         replaces: u64,
+        checkpoint: &impl Fn(&str) -> bool,
     ) -> (Vec<Txid>, u64) {
-        self.ensure_funds(fanout, fanout);
+        if !self.ensure_funds(fanout, fanout, checkpoint) {
+            return (Vec::new(), 0);
+        }
 
         let mut txids: Vec<Txid> = Vec::new();
         let mut sent: Vec<SentSpam> = Vec::new();
@@ -1235,7 +1384,10 @@ impl RawSpammer {
         // mempool. (The airtight packing guarantee is the floor_round pool.)
         let mut fails = 0;
         while sealer_count < small_txs {
-            if self.utxos.is_empty() || fails >= self.utxos.len() {
+            if self.utxos.is_empty()
+                || fails >= self.utxos.len()
+                || !checkpoint("raw_sealer_before_submit")
+            {
                 break;
             }
             match self.send_shape(SpamShape::Sealer, replaceable) {
@@ -1253,12 +1405,18 @@ impl RawSpammer {
                     fails += 1;
                 }
             }
+            if !checkpoint("raw_sealer_after_submit") {
+                break;
+            }
         }
 
         // Bulk fill with varied-size data txs up to the requested weight.
         fails = 0;
         while added < deficit_vsize {
-            if self.utxos.is_empty() || fails >= self.utxos.len() {
+            if self.utxos.is_empty()
+                || fails >= self.utxos.len()
+                || !checkpoint("raw_data_before_submit")
+            {
                 break;
             }
             let size = self.draw_data_size();
@@ -1276,6 +1434,9 @@ impl RawSpammer {
                     }
                     fails += 1;
                 }
+            }
+            if !checkpoint("raw_data_after_submit") {
+                break;
             }
         }
 
@@ -1297,7 +1458,7 @@ impl RawSpammer {
             );
         }
         if replaceable {
-            self.bump_spam_txs(&sent, replaces);
+            self.bump_spam_txs(&sent, replaces, checkpoint);
         }
         (txids, added)
     }

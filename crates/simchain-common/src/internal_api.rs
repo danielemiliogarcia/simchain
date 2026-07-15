@@ -105,6 +105,8 @@ pub struct SetSpamPolicyRequest {
     pub generation: u64,
     pub policy: SpamTuning,
     pub request_id: String,
+    #[serde(default)]
+    pub rollback: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -135,6 +137,23 @@ pub struct MiningWorkerStatus {
     pub next_scheduled_attempt_ms: Option<u64>,
     pub last_mined_block: Option<LastMinedBlock>,
     pub active_leases: Vec<PauseLease>,
+    pub uptime_secs: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SpamWorkerStatus {
+    pub component: String,
+    pub phase: WorkerPhase,
+    pub desired_state: DesiredState,
+    pub effective_state: DesiredState,
+    pub policy: SpamTuning,
+    pub effective_generation: u64,
+    pub observed_height: Option<u64>,
+    pub cycle_phase: Option<String>,
+    pub accepted_transactions: u64,
+    pub active_leases: Vec<PauseLease>,
+    pub reconciliation_pending: bool,
     pub uptime_secs: u64,
     pub last_error: Option<String>,
 }

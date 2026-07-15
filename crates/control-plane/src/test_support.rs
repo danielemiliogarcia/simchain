@@ -3,7 +3,7 @@
 
 use crate::backend::{
     BackendOutput, ComponentBackend, ComponentInfo, ConfigurationBackend, JobActions,
-    MiningControlBackend,
+    MiningControlBackend, SpamControlBackend,
 };
 use crate::control_state::ControlStateStore;
 use crate::envfile;
@@ -11,10 +11,10 @@ use crate::state::{AppState, ControlPlaneConfig, CONTROLLER_CONTAINER, SPAMMER_C
 use crate::status::StatusSnapshot;
 use simchain_common::internal_api::{
     CommandAck, DesiredState, LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest,
-    MiningWorkerStatus, PauseLease, WorkerPhase,
+    MiningWorkerStatus, PauseLease, SpamWorkerStatus, WorkerPhase,
 };
 use simchain_common::live_tuning;
-use simchain_common::live_tuning::MiningTuning;
+use simchain_common::live_tuning::{MiningTuning, SpamTuning};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -24,7 +24,6 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecreateOutcome {
     Running,
-    ExitedClean,
     Crash,
     RestartLoop,
 }
@@ -40,6 +39,8 @@ pub struct MockWorld {
     pub kill_node1_on_recreate: bool,
     pub mining_state: DesiredState,
     pub mining_generation: u64,
+    pub spam_state: DesiredState,
+    pub spam_generation: u64,
 }
 
 pub struct MockBackend {
@@ -62,6 +63,8 @@ impl MockBackend {
                 kill_node1_on_recreate: false,
                 mining_state: DesiredState::Running,
                 mining_generation: 0,
+                spam_state: DesiredState::Running,
+                spam_generation: 0,
             }),
         }
     }
@@ -77,7 +80,6 @@ impl MockBackend {
     fn container_for(outcome: RecreateOutcome, env: HashMap<String, String>) -> ComponentInfo {
         let (status, running, restarting, exit_code, restart_count) = match outcome {
             RecreateOutcome::Running => ("running", true, false, 0, 0),
-            RecreateOutcome::ExitedClean => ("exited", false, false, 0, 0),
             RecreateOutcome::Crash => ("exited", false, false, 1, 0),
             RecreateOutcome::RestartLoop => ("restarting", false, true, 1, 2),
         };
@@ -99,6 +101,9 @@ impl MockBackend {
             next_scheduled_attempt_ms: None,
             last_mined_block: None,
             active_lease_count: None,
+            cycle_phase: None,
+            accepted_transactions: None,
+            reconciliation_pending: None,
         }
     }
 
@@ -106,13 +111,35 @@ impl MockBackend {
     /// compose would currently render (i.e. running == staged).
     pub fn sync_containers(&self) {
         let env = self.rendered_env();
+        let mining_env: HashMap<String, String> = MiningTuning::from_source(&env)
+            .unwrap_or_else(|_| {
+                MiningTuning::from_source(&live_tuning::staged_map(&BTreeMap::new()))
+                    .expect("default mock mining policy")
+            })
+            .canonical_values()
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
+        let spam_env: HashMap<String, String> = SpamTuning::from_source(&env)
+            .map(|(policy, _)| policy)
+            .unwrap_or_else(|_| {
+                SpamTuning::from_source(&live_tuning::staged_map(&BTreeMap::new()))
+                    .expect("default mock spam policy")
+                    .0
+            })
+            .canonical_values()
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
         let mut world = self.world.lock().expect("world lock");
-        for name in [CONTROLLER_CONTAINER, SPAMMER_CONTAINER] {
-            world.containers.insert(
-                name.to_string(),
-                Self::container_for(RecreateOutcome::Running, env.clone()),
-            );
-        }
+        world.containers.insert(
+            CONTROLLER_CONTAINER.to_string(),
+            Self::container_for(RecreateOutcome::Running, mining_env),
+        );
+        world.containers.insert(
+            SPAMMER_CONTAINER.to_string(),
+            Self::container_for(RecreateOutcome::Running, spam_env),
+        );
     }
 
     pub fn set_container_env(&self, name: &str, key: &str, value: &str) {
@@ -125,40 +152,6 @@ impl MockBackend {
 
     pub fn compose_calls(&self) -> Vec<Vec<String>> {
         self.world.lock().expect("world lock").compose_calls.clone()
-    }
-
-    fn recreate_with_env(
-        &self,
-        services: &[String],
-        env: HashMap<String, String>,
-    ) -> anyhow::Result<BackendOutput> {
-        let mut world = self.world.lock().expect("world lock");
-        world.compose_calls.push(services.to_vec());
-        if world.kill_node1_on_recreate {
-            world.node1_ok = false;
-        }
-        if world.compose_fail_times > 0 {
-            world.compose_fail_times -= 1;
-            return Ok(BackendOutput {
-                success: false,
-                stdout: String::new(),
-                stderr: "simulated compose failure".to_string(),
-            });
-        }
-        for service in services {
-            let outcome = world
-                .after_recreate
-                .remove(service)
-                .unwrap_or(RecreateOutcome::Running);
-            world
-                .containers
-                .insert(service.clone(), Self::container_for(outcome, env.clone()));
-        }
-        Ok(BackendOutput {
-            success: true,
-            stdout: format!("recreated {}", services.join(",")),
-            stderr: String::new(),
-        })
     }
 }
 
@@ -174,29 +167,17 @@ impl ConfigurationBackend for MockBackend {
             .any(|service| service == CONTROLLER_CONTAINER)
         {
             let policy = MiningTuning::from_source(desired)?;
-            self.set_policy(generation, policy)?;
+            MiningControlBackend::set_policy(self, generation, policy)?;
         }
-        let services: Vec<String> = services
-            .iter()
-            .filter(|service| service.as_str() != CONTROLLER_CONTAINER)
-            .cloned()
-            .collect();
-        if services.is_empty() {
-            return Ok(BackendOutput {
-                success: true,
-                stdout: "applied mining policy through worker API".to_string(),
-                stderr: String::new(),
-            });
+        if services.iter().any(|service| service == SPAMMER_CONTAINER) {
+            let (policy, _) = SpamTuning::from_source(desired)?;
+            SpamControlBackend::set_policy(self, generation, policy)?;
         }
-        let env = {
-            // Read the file the apply just wrote, exactly like compose would.
-            let content = std::fs::read_to_string(&self.env_file).unwrap_or_default();
-            let overrides = envfile::managed_overrides(&content);
-            live_tuning::staged_map(&overrides)
-                .into_iter()
-                .collect::<HashMap<_, _>>()
-        };
-        self.recreate_with_env(&services, env)
+        Ok(BackendOutput {
+            success: true,
+            stdout: "applied policies through worker APIs".to_string(),
+            stderr: String::new(),
+        })
     }
 
     fn restore_configuration(
@@ -210,24 +191,25 @@ impl ConfigurationBackend for MockBackend {
             .any(|service| service == CONTROLLER_CONTAINER)
         {
             let policy = MiningTuning::from_source(managed_env)?;
-            self.set_policy(
+            MiningControlBackend::restore_policy(
+                self,
                 generations.get(CONTROLLER_CONTAINER).copied().unwrap_or(0),
                 policy,
             )?;
         }
-        let services: Vec<String> = services
-            .iter()
-            .filter(|service| service.as_str() != CONTROLLER_CONTAINER)
-            .cloned()
-            .collect();
-        if services.is_empty() {
-            return Ok(BackendOutput {
-                success: true,
-                stdout: "restored mining policy through worker API".to_string(),
-                stderr: String::new(),
-            });
+        if services.iter().any(|service| service == SPAMMER_CONTAINER) {
+            let (policy, _) = SpamTuning::from_source(managed_env)?;
+            SpamControlBackend::restore_policy(
+                self,
+                generations.get(SPAMMER_CONTAINER).copied().unwrap_or(0),
+                policy,
+            )?;
         }
-        self.recreate_with_env(&services, managed_env.clone().into_iter().collect())
+        Ok(BackendOutput {
+            success: true,
+            stdout: "restored policies through worker APIs".to_string(),
+            stderr: String::new(),
+        })
     }
 
     fn remove_components(&self, names: &[String]) -> anyhow::Result<BackendOutput> {
@@ -265,6 +247,28 @@ impl ComponentBackend for MockBackend {
                         info.observed_height = Some(100);
                         info.uptime_secs = Some(1);
                         info.active_lease_count = Some(0);
+                    } else if *name == SPAMMER_CONTAINER && info.running {
+                        let enabled = SpamTuning::from_source(&info.effective_config)
+                            .map(|(policy, _)| policy.enabled)
+                            .unwrap_or(true);
+                        let phase = if world.spam_state == DesiredState::Paused {
+                            WorkerPhase::Paused
+                        } else if enabled {
+                            WorkerPhase::Active
+                        } else {
+                            WorkerPhase::Disabled
+                        };
+                        info.status = phase.as_str().to_string();
+                        info.phase = Some(phase.as_str().to_string());
+                        info.effective_generation = Some(world.spam_generation);
+                        info.desired_state = Some(world.spam_state);
+                        info.effective_state = Some(world.spam_state);
+                        info.observed_height = Some(100);
+                        info.uptime_secs = Some(1);
+                        info.active_lease_count = Some(0);
+                        info.cycle_phase = Some("waiting_for_block".to_string());
+                        info.accepted_transactions = Some(10);
+                        info.reconciliation_pending = Some(false);
                     }
                     (name.to_string(), info)
                 })
@@ -357,11 +361,11 @@ impl MiningControlBackend for MockBackend {
     }
 
     fn restore_policy(&self, generation: u64, policy: MiningTuning) -> anyhow::Result<CommandAck> {
-        self.set_policy(generation, policy)
+        MiningControlBackend::set_policy(self, generation, policy)
     }
 
     fn acquire_lease(&self, request: LeaseRequest) -> anyhow::Result<CommandAck> {
-        self.set_state(DesiredState::Paused).map(|mut ack| {
+        MiningControlBackend::set_state(self, DesiredState::Paused).map(|mut ack| {
             ack.request_id = request.request_id;
             ack
         })
@@ -372,7 +376,7 @@ impl MiningControlBackend for MockBackend {
         _lease_id: &str,
         request: LeaseRenewRequest,
     ) -> anyhow::Result<CommandAck> {
-        let status = self.status()?;
+        let status = MiningControlBackend::status(self)?;
         Ok(CommandAck {
             request_id: request.request_id,
             phase: status.phase,
@@ -385,7 +389,131 @@ impl MiningControlBackend for MockBackend {
         _lease_id: &str,
         request: LeaseReleaseRequest,
     ) -> anyhow::Result<CommandAck> {
-        self.set_state(DesiredState::Running).map(|mut ack| {
+        MiningControlBackend::set_state(self, DesiredState::Running).map(|mut ack| {
+            ack.request_id = request.request_id;
+            ack
+        })
+    }
+}
+
+impl SpamControlBackend for MockBackend {
+    fn status(&self) -> anyhow::Result<SpamWorkerStatus> {
+        let world = self.world.lock().expect("world lock");
+        let component = world
+            .containers
+            .get(SPAMMER_CONTAINER)
+            .filter(|component| component.running)
+            .ok_or_else(|| anyhow::anyhow!("spam worker unavailable"))?;
+        let (policy, _) = SpamTuning::from_source(&component.effective_config)?;
+        let phase = if world.spam_state == DesiredState::Paused {
+            WorkerPhase::Paused
+        } else if policy.enabled {
+            WorkerPhase::Active
+        } else {
+            WorkerPhase::Disabled
+        };
+        Ok(SpamWorkerStatus {
+            component: "spam".to_string(),
+            phase,
+            desired_state: world.spam_state,
+            effective_state: world.spam_state,
+            policy,
+            effective_generation: world.spam_generation,
+            observed_height: Some(100),
+            cycle_phase: Some("waiting_for_block".to_string()),
+            accepted_transactions: 10,
+            active_leases: Vec::<PauseLease>::new(),
+            reconciliation_pending: false,
+            uptime_secs: 1,
+            last_error: None,
+        })
+    }
+
+    fn set_state(&self, state: DesiredState) -> anyhow::Result<CommandAck> {
+        let mut world = self.world.lock().expect("world lock");
+        if !world.containers.contains_key(SPAMMER_CONTAINER) {
+            anyhow::bail!("spam worker unavailable");
+        }
+        world.spam_state = state;
+        Ok(CommandAck {
+            request_id: "mock-spam-state".to_string(),
+            phase: if state == DesiredState::Paused {
+                WorkerPhase::Paused
+            } else {
+                WorkerPhase::Active
+            },
+            effective_generation: world.spam_generation,
+        })
+    }
+
+    fn set_policy(&self, generation: u64, policy: SpamTuning) -> anyhow::Result<CommandAck> {
+        let mut world = self.world.lock().expect("world lock");
+        if world.kill_node1_on_recreate {
+            world.node1_ok = false;
+        }
+        if world.compose_fail_times > 0 {
+            world.compose_fail_times -= 1;
+            anyhow::bail!("simulated worker policy failure");
+        }
+        if !world.containers.contains_key(SPAMMER_CONTAINER) {
+            anyhow::bail!("spam worker unavailable");
+        }
+        let env = policy
+            .canonical_values()
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
+        let outcome = world
+            .after_recreate
+            .remove(SPAMMER_CONTAINER)
+            .unwrap_or(RecreateOutcome::Running);
+        let mut component = Self::container_for(outcome, env);
+        component.effective_generation = Some(generation);
+        world
+            .containers
+            .insert(SPAMMER_CONTAINER.to_string(), component);
+        world.spam_generation = generation;
+        Ok(CommandAck {
+            request_id: "mock-spam-policy".to_string(),
+            phase: if policy.enabled {
+                WorkerPhase::Active
+            } else {
+                WorkerPhase::Disabled
+            },
+            effective_generation: generation,
+        })
+    }
+
+    fn restore_policy(&self, generation: u64, policy: SpamTuning) -> anyhow::Result<CommandAck> {
+        SpamControlBackend::set_policy(self, generation, policy)
+    }
+
+    fn acquire_lease(&self, request: LeaseRequest) -> anyhow::Result<CommandAck> {
+        SpamControlBackend::set_state(self, DesiredState::Paused).map(|mut ack| {
+            ack.request_id = request.request_id;
+            ack
+        })
+    }
+
+    fn renew_lease(
+        &self,
+        _lease_id: &str,
+        request: LeaseRenewRequest,
+    ) -> anyhow::Result<CommandAck> {
+        let status = SpamControlBackend::status(self)?;
+        Ok(CommandAck {
+            request_id: request.request_id,
+            phase: status.phase,
+            effective_generation: status.effective_generation,
+        })
+    }
+
+    fn release_lease(
+        &self,
+        _lease_id: &str,
+        request: LeaseReleaseRequest,
+    ) -> anyhow::Result<CommandAck> {
+        SpamControlBackend::set_state(self, DesiredState::Running).map(|mut ack| {
             ack.request_id = request.request_id;
             ack
         })
@@ -409,6 +537,7 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
             node3_url: "http://mock-node3:18443".to_string(),
             state_dir,
             mining_control_url: "http://mock-mining:9081".to_string(),
+            spam_control_url: "http://mock-spam:9082".to_string(),
             internal_token: "test-internal-token".to_string(),
         },
         token: "test-token".to_string(),
@@ -416,6 +545,7 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
         configuration: backend.clone(),
         job_actions: backend.clone(),
         mining: backend.clone(),
+        spam: backend.clone(),
         control_state: RwLock::new(control_state),
         control_store: store,
         status: RwLock::new(StatusSnapshot::default()),

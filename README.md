@@ -205,8 +205,9 @@ docker compose --profile "*" down -v
 
 ### Retuning a live chain
 
-Change mining controller and spammer settings without restarting nodes; chain state preserved, only tool containers replaced.
-Quickest way to experiment with block cadence, fee floor, and block fill on a live chain.
+Change mining-controller and spammer settings without restarting nodes or either
+worker; chain state and worker identity are preserved. This is the quickest way to
+experiment with block cadence, fee floor, and block fill on a live chain.
 
 For full details and caveats, see [RETUNING.md](./docs/RETUNING.md).
 
@@ -272,10 +273,10 @@ helper containers left by an earlier run, use
 ## Simchain control plane
 
 The localhost control plane combines the dashboard, versioned API, and MCP endpoint
-(profile: `control-plane`; `panel` is a temporary alias). During Phase 2 it retains the
-existing Compose adapter only for spam, so it remains opt-in and excluded from
-`all-tools` while that migration is unfinished. Mining policy and pause/resume already
-use the mining worker's private API and never recreate its container:
+(profile: `control-plane`; `panel` is a temporary alias). Mining and spam policy plus
+pause/resume use private worker APIs and never recreate their containers. The service
+remains opt-in and excluded from `all-tools` while later node/job paths still require
+the transitional Compose adapter:
 
 ```bash
 docker compose --profile control-plane up -d --build
@@ -284,8 +285,9 @@ docker compose --profile control-plane up -d --build
 Open [http://localhost:8090/](http://localhost:8090/) (port: `CONTROL_PLANE_PORT`) to watch
 chain height, block cadence, mempool depth and the fee histogram, and to change the
 live-retunable mining/spam settings. Mining cadence and weights apply at a scheduler
-safe point; spam still uses the transitional `.env`/Compose adapter. The nodes and the
-chain are never touched, and a mixed apply rolls back transactionally. See
+safe point; spam hot changes apply between cycles and structural changes reconcile a
+replacement engine before commit. The nodes and the chain are never touched, and a
+mixed apply rolls back transactionally. See
 [RETUNING.md](./docs/RETUNING.md).
 
 Everything the UI shows comes from the versioned localhost HTTP API

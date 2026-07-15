@@ -3,7 +3,8 @@
 
 use crate::apply::{apply, ApplyRequest};
 use crate::service::{
-    config, schema, set_mining_state, settings_state, status, ErrorCode, ServiceError,
+    config, schema, set_mining_state, set_spam_state, settings_state, status, ErrorCode,
+    ServiceError,
 };
 use crate::state::SharedState;
 use axum::extract::rejection::JsonRejection;
@@ -41,6 +42,7 @@ pub fn router(app: SharedState) -> Router {
         )
         .route("/api/v1/config/schema", get(schema_handler))
         .route("/api/v1/mining/state", put(mining_state_handler))
+        .route("/api/v1/spam/state", put(spam_state_handler))
         // Phase-1 compatibility routes; removed with the Compose adapter.
         .route("/api/v1/state", get(state_handler))
         .route("/api/v1/status", get(status_handler))
@@ -300,6 +302,37 @@ async fn mining_state_handler(State(app): State<SharedState>, request: Request) 
     }
 }
 
+async fn spam_state_handler(State(app): State<SharedState>, request: Request) -> Response {
+    if !request_has_token(&app, &request) {
+        return error_response(&ServiceError::new(
+            ErrorCode::Unauthorized,
+            "missing or invalid bearer token (see .simchain-control/token)",
+        ));
+    }
+    let payload: Result<
+        Json<simchain_common::control_api::SetComponentStateRequest>,
+        JsonRejection,
+    > = Json::from_request(request, &()).await;
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return error_response(&ServiceError::new(
+                ErrorCode::ValidationFailed,
+                format!("invalid request body: {rejection}"),
+            ));
+        }
+    };
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || set_spam_state(&worker, payload.state)).await {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
 // Json::from_request needs the trait in scope.
 use axum::extract::FromRequest;
 
@@ -383,6 +416,18 @@ mod tests {
 
     fn put_mining_state(state: &str, token: Option<&str>) -> HttpRequest<Body> {
         let mut builder = HttpRequest::put("/api/v1/mining/state")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder
+            .body(Body::from(serde_json::json!({"state": state}).to_string()))
+            .expect("request")
+    }
+
+    fn put_spam_state(state: &str, token: Option<&str>) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::put("/api/v1/spam/state")
             .header(header::HOST, "localhost")
             .header(header::CONTENT_TYPE, "application/json");
         if let Some(token) = token {
@@ -507,6 +552,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spam_pause_uses_worker_api_and_never_compose() {
+        let fx = fixture(None);
+        let (status, body) = send(&fx.router, put_spam_state("paused", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = send(&fx.router, put_spam_state("paused", Some("test-token"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["component"], "spam");
+        assert_eq!(body["desired_state"], "paused");
+        assert_eq!(body["effective_state"], "paused");
+        assert!(fx.mock.compose_calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn invalid_value_yields_validation_failed() {
         let fx = fixture(None);
         let payload = serde_json::json!({"settings": {"ENABLE_SPAM": "maybe"}});
@@ -601,7 +661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_lists_phase_two_tools() {
+    async fn mcp_lists_phase_three_tools() {
         let router = crate::mcp::ControlPlaneMcp::tool_router();
         let mut names: Vec<String> = router
             .list_all()
@@ -617,6 +677,7 @@ mod tests {
                 "get_status",
                 "set_config",
                 "set_mining_state",
+                "set_spam_state",
             ]
         );
     }
