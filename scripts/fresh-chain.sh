@@ -24,7 +24,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 compose() { docker compose -f "$REPO_ROOT/docker-compose.yml" --project-directory "$REPO_ROOT" "$@"; }
 
 echo "[fresh-chain] wiping the stack and the chain volumes..."
-compose --profile all-tools down -v --remove-orphans
+compose --profile "*" down -v --remove-orphans
 
 echo "[fresh-chain] starting a fresh chain..."
 compose "$@" up -d
