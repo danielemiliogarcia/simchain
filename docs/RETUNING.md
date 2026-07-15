@@ -1,76 +1,83 @@
 # Retuning a Live Chain
 
-Settings consumed by the mining controller and the spammer can be changed **without restarting either worker**. The control plane applies mining settings at a scheduler safe point and spam settings at cooperative cycle boundaries. Structural spam changes build and reconcile a replacement engine before the old policy is replaced. The nodes keep running and the chain is preserved.
+Mining and spam policy can change without restarting nodes or either resident worker.
+The control plane owns durable desired state in `.simchain-control/state.json`, applies a
+complete typed policy through private worker APIs, verifies the effective generation,
+and restores the prior runtime policy if a multi-worker transaction fails.
 
-Three equivalent paths perform the same operation:
+Start the ordinary stack and open [http://localhost:8090/](http://localhost:8090/):
 
-- **Manual** (below): edit `.env`, recreate the affected service(s).
-- **Control-plane UI**: `docker compose --profile control-plane up -d`, then
-  [http://localhost:8090/](http://localhost:8090/) — edit, Apply. The control plane validates
-  first, stores durable desired state, mirrors `.env` for compatibility (managed keys are canonicalized into one
-  `# Managed by simchain panel` block; your other lines are preserved), applies both
-  worker policies in place, and rolls back automatically if any component rejects the apply.
-- **Control-plane API / MCP**: `PATCH /api/v1/config` with the
-  `.simchain-control/token` bearer token, or the `set_config` MCP tool at
-  `http://localhost:8090/mcp` — same semantics, built for scripts and coding agents.
+```bash
+docker compose up -d --build
+```
 
-Mining can also be paused and resumed cooperatively with the dashboard controls,
-`PUT /api/v1/mining/state`, the `set_mining_state` MCP tool, or:
+The dashboard, CLI, HTTP API, and MCP tool are adapters over the same operation. For
+example:
+
+```bash
+cargo run -p simchainctl -- config show
+cargo run -p simchainctl -- config set \
+  BLOCK_INTERVAL_MEAN_SECS=12 SPAM_FILL_BLOCK_RATIO=3
+cargo run -p simchainctl -- status --watch
+```
+
+Use `--base-generation N` with `config set` for compare-and-swap behavior. A stale
+editor receives `409 stale_revision` and does not mutate either worker.
+
+The equivalent HTTP request is:
+
+```bash
+token="$(cat .simchain-control/token)"
+generation="$(curl -s localhost:8090/api/v1/config | jq .generation)"
+curl -s -X PATCH localhost:8090/api/v1/config \
+  -H "Authorization: Bearer $token" \
+  -H 'Content-Type: application/json' \
+  -d "{\"settings\":{\"FALLBACK_FEE\":\"0.0002\"},\"base_generation\":$generation}"
+```
+
+MCP exposes the same operation as `set_config` at `http://localhost:8090/mcp`.
+
+## Safe-point behavior
+
+- Mining cadence, bounds, weights, and RNG seed apply at a scheduler safe point. The
+  interruptible scheduler wakes immediately for a new generation. Changing
+  `MINING_RNG_SEED` reinitializes the RNG and alternation state deterministically.
+- Spam target/count changes apply between cooperative cycle boundaries. Fee, engine,
+  data shape, and fanout changes build and reconcile a replacement engine before the
+  old policy is discarded.
+- `ENABLE_SPAM=false` leaves the spam worker resident in `disabled`, so status and live
+  re-enable remain available.
+
+Pause and resume are separate durable desired-state controls:
 
 ```bash
 cargo run -p simchainctl -- mining pause
 cargo run -p simchainctl -- mining resume
-```
-
-A pause acknowledgement means any in-flight `generate` RPC and propagation check has
-completed. Changing cadence, weights, or `MINING_RNG_SEED` wakes an interruptible wait;
-the new generation takes effect at the next scheduler boundary. A seed change resets
-the worker RNG and miner-alternation toggle deterministically.
-
-Spam has matching controls through `PUT /api/v1/spam/state`, the `set_spam_state`
-MCP tool, the dashboard, or:
-
-```bash
 cargo run -p simchainctl -- spam pause
 cargo run -p simchainctl -- spam resume
 ```
 
-A spam pause is acknowledged only after already-submitted work reaches a consistent
-boundary. `ENABLE_SPAM=false` keeps the worker resident in its `disabled` phase, so it
-can be inspected and re-enabled without a container restart.
+A pause acknowledgement means the worker reached its documented safe point. Job-owned
+pause leases remain independent of manual desired state, so releasing a job cannot
+resume a manually paused worker.
 
-## Steps
+## Configuration ownership
 
-1. Edit `.env`. For example:
-   - Mining cadence: `BLOCK_INTERVAL_MEAN_SECS`, `BLOCK_INTERVAL_MODE`,
-     `BLOCK_INTERVAL_MIN_SECS`/`MAX_SECS`, `MINER_WEIGHTS` (mining controller).
-   - Fee floor and block filling: `FALLBACK_FEE`, `SPAM_FILL_BLOCK_RATIO`,
-     `SPAM_FLOOR_POOL_TXS`, `SPAM_TX_DATA_MAX_BYTES`/`MIN_BYTES`, `ENABLE_SPAM`,
-     `ENABLE_SPAM_REPLACES` (spammer).
+`.env` is Compose boot input. It still owns infrastructure such as images, credentials,
+ports, RPC endpoints, node policy, and the initial mining/spam policy used when no
+control-state file exists. The control plane never rewrites `.env`; after first boot,
+runtime desired policy lives only in `.simchain-control/state.json`.
+The same private directory holds the mutation and process-instance locks, so a second
+control-plane process cannot coordinate jobs against the same state concurrently.
 
-2. Recreate only the affected service(s), both:
+To intentionally reset runtime desired policy to new boot values, stop the stack,
+remove `.simchain-control/state.json`, edit `.env`, and start again. Removing that file
+is an explicit reset and also resets its generation.
 
-   ```bash
-   docker compose up -d --force-recreate btc-simnet-mining-controller btc-simnet-spammer
-   ```
+Node settings such as `BTC_IMAGE`, host ports, `MIN_RELAY_TX_FEE`, ZMQ ports, and
+`BLOCK_RESERVED_WEIGHT` are boot-only. Change those through Compose with the normal
+operational care for node restarts; they are deliberately absent from the live schema.
 
-   or just the one you changed:
-
-   ```bash
-   docker compose up -d --force-recreate btc-simnet-spammer
-   ```
-
-## Safety & Behavior
-
-The manual fallback is safe mid-run because `--force-recreate` replaces only the named services; the node dependencies remain running, so the chain, wallets, and mempool survive. The control-plane path does not replace either worker and reports desired/effective generations plus exact safe-point phases.
-
-## Caveats
-
-- Settings consumed by the **nodes** (`BTC_IMAGE`, host ports, `MIN_RELAY_TX_FEE`,
-  ZMQ ports, ...) do require recreating the nodes, and node containers keep the chain
-  in their filesystem, so that resets the chain: use a full
-  `docker compose --profile all-tools down` / `up`.
-- `FALLBACK_FEE` is shared: the spammer prices its floor fills with it, and the nodes
-  take it as `-fallbackfee` (wallet-side fallback). A spam engine rebuild moves the
-  spam fee floor immediately; wallet mode also sets wallet `paytxfee`. The nodes keep
-  their boot fallback until a full restart, which is usually irrelevant.
+`FALLBACK_FEE` is shared at boot: nodes use it for wallet fallback, while the spammer
+uses it as the live fee floor. A runtime change updates the spam engine (and wallet
+`paytxfee` in wallet mode) but does not rewrite a running node's boot fallback fee.

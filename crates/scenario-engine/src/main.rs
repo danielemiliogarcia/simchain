@@ -1,4 +1,4 @@
-//! Compatibility client for the historical `scenario` Compose profile.
+//! Thin file-based client for the control plane's scenario job API.
 //! Scenario validation and execution live in the control plane; this binary
 //! only submits YAML and follows the durable job.
 

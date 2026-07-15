@@ -2,8 +2,8 @@
 //!
 //! The live-retunable subset (engine selection, fee floor, fill targets,
 //! fanout, RBF traffic) is parsed and validated by
-//! `simchain_common::live_tuning`, the same module the panel uses, so a
-//! configuration the panel accepts is exactly a configuration this binary
+//! `simchain_common::live_tuning`, the same module the control plane uses, so a
+//! configuration the control plane accepts is exactly a configuration this binary
 //! accepts on restart.
 
 use crate::burn::MINER_COUNT;

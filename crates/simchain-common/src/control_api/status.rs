@@ -34,14 +34,11 @@ pub struct FeeBucket {
     pub count: usize,
 }
 
-/// Component state is intentionally domain-oriented. The transitional
-/// Docker adapter populates the legacy process fields; worker APIs can add
-/// phase, generation, and uptime without changing the outer status shape.
+/// Component state observed through a domain API or an RPC health probe.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ComponentState {
-    pub present: bool,
+    pub reachable: bool,
     pub status: String,
-    pub running: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,12 +65,6 @@ pub struct ComponentState {
     pub accepted_transactions: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciliation_pending: Option<bool>,
-    #[serde(default)]
-    pub restarting: bool,
-    #[serde(default)]
-    pub exit_code: i64,
-    #[serde(default)]
-    pub restart_count: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

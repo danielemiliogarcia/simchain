@@ -1,5 +1,5 @@
 #!/bin/bash
-# Compatibility wrapper for the durable control-plane partition job.
+# Convenience wrapper for the durable control-plane partition job.
 # Usage: ./scripts/partition.sh run <miner-node> [--main-blocks N] [--isolated-blocks N]
 
 set -euo pipefail

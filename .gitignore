@@ -13,16 +13,9 @@
 # Chain snapshots (./scripts/snapshot.sh): multi-MB machine-local archives
 /snapshots/
 
-# spam-burst.sh temp scenarios (repo root so the container's /workspace mount
-# sees them; removed by the script's EXIT trap, but a SIGKILL leaves strays)
-.spam-burst.*
-
 # Control-plane state (token, durable desired state, job metadata/results).
-/.simchain-control/
-
-# Transitional panel-generated files retained during migration.
-.panel-token
-.env.panel.lock
+/.simchain-control/*
+!/.simchain-control/.gitkeep
 
 # worktrees
 .worktrees/

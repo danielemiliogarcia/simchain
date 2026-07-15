@@ -9,8 +9,6 @@ pub enum ApplyMode {
     NextSafePoint,
     EngineRebuild,
     BootOnly,
-    /// Phase-1 compatibility adapter. Removed with Compose control.
-    LegacyRecreate,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -36,8 +34,27 @@ pub struct SettingSchema {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct SchemaResponse {
     pub settings: Vec<SettingSchema>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ConfigPatchRequest {
+    /// Partial desired-state update. An empty value resets a setting to its
+    /// default, or unsets an optional setting.
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
+    /// Optional compare-and-swap guard against a stale editor.
+    #[serde(default)]
+    pub base_generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ApplyReport {
+    pub changed: bool,
+    pub components_applied: Vec<String>,
+    pub generation: u64,
+    pub logs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub legacy_aliases: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -64,9 +81,4 @@ pub struct ConfigResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_apply: Vec<String>,
     pub components: BTreeMap<String, ComponentState>,
-    /// Transitional CAS value for the legacy `.env` adapter.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_revision: Option<String>,
-    #[serde(default)]
-    pub legacy_env_file_exists: bool,
 }

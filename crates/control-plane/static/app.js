@@ -31,7 +31,7 @@ const GROUP_TITLES = {
   "spam-advanced": "Spam advanced",
 };
 
-/* UI-only relevance rules: fields that are ignored given other staged values. */
+/* UI-only relevance rules: fields ignored by the current desired policy. */
 function ignoredReason(key, values) {
   const dataMode = Number(values.get("SPAM_TX_DATA_MAX_BYTES") || "0") > 0;
   const fanoutAuto = values.get("SPAM_FANOUT_AUTO") === "true";
@@ -70,7 +70,47 @@ function fmtBytes(n) {
 }
 
 function tile(k, v) {
-  return `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+  return `<div class="tile"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div></div>`;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function httpUrl(value) {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") ? url : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function explorerBlockUrl(explorer, hash) {
+  const base = explorer && httpUrl(explorer.url);
+  if (!base || !/^[0-9a-f]{64}$/i.test(hash)) return null;
+  return new URL(`/block/${hash}`, base).toString();
+}
+
+function renderExplorer(explorer) {
+  const container = $("#explorer-status");
+  const dot = container.querySelector(".dot");
+  const label = container.querySelector("span:not(.dot)");
+  const link = $("#explorer-link");
+  const url = explorer && httpUrl(explorer.url);
+  dot.className = "dot " + (explorer && explorer.reachable ? "ok" : "warn");
+  label.textContent = explorer
+    ? `mempool.space ${explorer.reachable ? "reachable" : "unreachable"}`
+    : "mempool.space unavailable";
+  link.hidden = !url;
+  if (url) link.href = url.toString();
+  else link.removeAttribute("href");
+  container.title = (explorer && explorer.error) || "";
 }
 
 function renderStatus(s) {
@@ -90,36 +130,75 @@ function renderStatus(s) {
     tile("mempool size", mp ? fmtBytes(mp.vbytes) + " vB" : "–") +
     tile("min fee", mp ? (mp.min_fee * 1e5).toFixed(1) + " sat/vB" : "–") +
     tile("best hash", s.best_hash ? s.best_hash.slice(0, 12) + "…" : "–");
+  renderExplorer(s.explorer);
 
-  const rows = (s.recent_blocks || []).map((b) =>
-    `<tr><td>${b.height}</td><td>${b.delta_secs == null ? "–" : Math.max(0, b.delta_secs) + "s"}</td>` +
-    `<td>${b.tx_count}</td><td>${fmtBytes(b.size_bytes)}</td><td>${b.weight}</td></tr>`).join("");
-  $("#blocks tbody").innerHTML = rows || `<tr><td colspan="5">no blocks yet</td></tr>`;
+  const blockBody = $("#blocks tbody");
+  blockBody.replaceChildren();
+  for (const block of s.recent_blocks || []) {
+    const row = blockBody.insertRow();
+    const height = row.insertCell();
+    const blockUrl = explorerBlockUrl(s.explorer, block.hash);
+    if (blockUrl) {
+      const link = document.createElement("a");
+      link.href = blockUrl;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = String(block.height);
+      height.append(link);
+    } else {
+      height.textContent = String(block.height);
+    }
+    for (const value of [
+      block.hash ? block.hash.slice(0, 10) + "…" : "–",
+      block.delta_secs == null ? "–" : Math.max(0, block.delta_secs) + "s",
+      block.tx_count,
+      fmtBytes(block.size_bytes),
+      block.weight,
+    ]) {
+      const cell = row.insertCell();
+      cell.textContent = String(value);
+    }
+  }
+  if (blockBody.rows.length === 0) {
+    const cell = blockBody.insertRow().insertCell();
+    cell.colSpan = 6;
+    cell.textContent = "no blocks yet";
+  }
 
   const max = Math.max(1, ...(s.fee_histogram || []).map((b) => b.count));
   $("#fees").innerHTML = (s.fee_histogram || []).map((b) =>
-    `<div class="bar-row"><span class="lbl">${b.label}</span>` +
+    `<div class="bar-row"><span class="lbl">${escapeHtml(b.label)}</span>` +
     `<div class="bar" style="width:${(100 * b.count / max).toFixed(1)}%"></div>` +
-    `<span class="n">${b.count}</span></div>`).join("") || "–";
+    `<span class="n">${escapeHtml(b.count)}</span></div>`).join("") || "–";
 
-  $("#services").innerHTML = Object.entries(s.components || {}).map(([name, svc]) => {
-    let cls = "off", text = svc.phase || svc.status;
-    if (svc.restarting) { cls = "err"; text = "restarting"; }
-    else if (svc.running) { cls = "ok"; }
-    else if (svc.status === "exited") { cls = svc.exit_code === 0 ? "warn" : "err"; text = `exited(${svc.exit_code})`; }
-    else if (!svc.present) { text = "absent"; }
+  const services = $("#services");
+  services.replaceChildren();
+  for (const [name, component] of Object.entries(s.components || {})) {
+    const row = document.createElement("div");
+    row.className = "svc";
+    const dot = document.createElement("span");
+    const warning = component.reachable && component.last_error;
+    dot.className = "dot " + (!component.reachable ? "err" : warning ? "warn" : "ok");
+    const text = document.createElement("span");
     const details = [];
-    if (svc.effective_generation != null) details.push(`gen ${svc.effective_generation}`);
-    if (svc.uptime_secs != null) details.push(`up ${svc.uptime_secs}s`);
-    return `<div class="svc"><span class="dot ${cls}"></span>${name.replace("btc-simnet-", "")} · ${text}` +
-      `${details.length ? " · " + details.join(" · ") : ""}</div>`;
-  }).join("");
+    if (component.effective_generation != null) details.push(`gen ${component.effective_generation}`);
+    if (component.uptime_secs != null) details.push(`up ${component.uptime_secs}s`);
+    if (component.observed_height != null) details.push(`height ${component.observed_height}`);
+    if (component.active_lease_count) details.push(`${component.active_lease_count} lease(s)`);
+    if (component.cycle_phase) details.push(`cycle ${component.cycle_phase}`);
+    if (component.reconciliation_pending) details.push("reconciliation pending");
+    text.textContent = `${name} · ${component.phase || component.status}` +
+      (details.length ? ` · ${details.join(" · ")}` : "") +
+      (component.last_error ? ` · ${component.last_error}` : "");
+    row.append(dot, text);
+    services.append(row);
+  }
 
-  const mining = (s.components || {})["btc-simnet-mining-controller"];
+  const mining = (s.components || {}).mining;
   const miningState = $("#mining-state");
   const pause = $("#mining-pause");
   const resume = $("#mining-resume");
-  if (!mining || !mining.present) {
+  if (!mining || !mining.reachable) {
     miningState.textContent = mining && mining.last_error
       ? `mining worker unreachable: ${mining.last_error}` : "mining worker unavailable";
     pause.disabled = true;
@@ -135,11 +214,11 @@ function renderStatus(s) {
     resume.disabled = changingComponentState.mining || desired === "running" || activeMutationId() != null;
   }
 
-  const spam = (s.components || {})["btc-simnet-spammer"];
+  const spam = (s.components || {}).spam;
   const spamState = $("#spam-state");
   const spamPause = $("#spam-pause");
   const spamResume = $("#spam-resume");
-  if (!spam || !spam.present) {
+  if (!spam || !spam.reachable) {
     spamState.textContent = spam && spam.last_error
       ? `spam worker unreachable: ${spam.last_error}` : "spam worker unavailable";
     spamPause.disabled = true;
@@ -156,21 +235,27 @@ function renderStatus(s) {
     spamResume.disabled = changingComponentState.spam || desired === "running" || activeMutationId() != null;
   }
   const impairments = s.impairments || [];
-  $("#network-status").textContent = impairments.length === 0
+  const unavailableAgents = Object.entries(s.components || {})
+    .filter(([name, component]) => name.startsWith("network-agent-") && !component.reachable)
+    .map(([name]) => name.replace("network-agent-", ""));
+  const networkDetails = impairments.map((item) =>
+    `${item.node}: ${item.kind} · owner ${item.owner_job_id}`);
+  if (unavailableAgents.length) networkDetails.push(`agents unreachable: ${unavailableAgents.join(", ")}`);
+  $("#network-status").textContent = networkDetails.length === 0
     ? "all P2P links clear"
-    : impairments.map((item) => `${item.node}: ${item.kind} · owner ${item.owner_job_id}`).join(" · ");
+    : networkDetails.join(" · ");
   refreshForm();
 }
 
 /* ---------------------------------------------------------------- settings */
 
-function stagedValues() {
+function desiredValues() {
   const values = new Map(Object.entries(lastState ? lastState.desired : {}));
   for (const [k, v] of dirty) values.set(k, v);
   return values;
 }
 
-function runningValueFor(spec) {
+function effectiveValueFor(spec) {
   if (!lastState) return null;
   const svc = lastState.effective[spec.component];
   if (!svc || !svc.reachable || !svc.values) return null;
@@ -179,7 +264,7 @@ function runningValueFor(spec) {
 
 function buildForm() {
   const container = $("#form");
-  container.innerHTML = "";
+  container.replaceChildren();
   const groups = new Map();
   for (const spec of schema.settings) {
     if (!groups.has(spec.group)) groups.set(spec.group, []);
@@ -188,7 +273,10 @@ function buildForm() {
   for (const [group, specs] of groups) {
     const div = document.createElement("div");
     div.className = "group";
-    div.innerHTML = `<div class="gtitle">${GROUP_TITLES[group] || group}</div>`;
+    const title = document.createElement("div");
+    title.className = "gtitle";
+    title.textContent = GROUP_TITLES[group] || group;
+    div.append(title);
     for (const spec of specs) {
       const field = document.createElement("div");
       field.className = "field";
@@ -201,10 +289,20 @@ function buildForm() {
       let input;
       if (spec.control === "toggle") {
         input = document.createElement("select");
-        input.innerHTML = `<option value="true">true</option><option value="false">false</option>`;
+        for (const value of ["true", "false"]) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = value;
+          input.append(option);
+        }
       } else if (spec.control === "choice") {
         input = document.createElement("select");
-        input.innerHTML = (spec.options || []).map((o) => `<option value="${o}">${o}</option>`).join("");
+        for (const value of spec.options || []) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = value;
+          input.append(option);
+        }
       } else {
         input = document.createElement("input");
         input.type = (spec.control === "integer" || spec.control === "decimal") ? "number" : "text";
@@ -236,15 +334,15 @@ function buildForm() {
 }
 
 function onEdit(key, value) {
-  const staged = lastState ? (lastState.desired[key] ?? "") : "";
-  if (value === staged) dirty.delete(key); else dirty.set(key, value);
+  const desired = lastState ? (lastState.desired[key] ?? "") : "";
+  if (value === desired) dirty.delete(key); else dirty.set(key, value);
   fieldErrors.delete(key);
   refreshForm();
 }
 
 function refreshForm() {
   if (!schema || !lastState) return;
-  const values = stagedValues();
+  const values = desiredValues();
   for (const spec of schema.settings) {
     const field = document.querySelector(`.field[data-key="${spec.key}"]`);
     if (!field) continue;
@@ -268,13 +366,13 @@ function refreshForm() {
     field.classList.toggle("invalid", validation !== "");
 
     const runningEl = field.querySelector(".running");
-    const running = runningValueFor(spec);
-    if (running == null) {
+    const effective = effectiveValueFor(spec);
+    if (effective == null) {
       runningEl.textContent = "effective: –";
       runningEl.className = "running";
     } else {
-      runningEl.textContent = "effective: " + (running === "" ? "(unset)" : running);
-      const differs = (lastState.desired[spec.key] ?? "") !== running;
+      runningEl.textContent = "effective: " + (effective === "" ? "(unset)" : effective);
+      const differs = (lastState.desired[spec.key] ?? "") !== effective;
       runningEl.className = "running" + (differs ? " differs" : "");
     }
   }
@@ -288,7 +386,7 @@ function refreshForm() {
   const impacts = [...impacted].map((component) => {
     const edited = schema.settings.find((spec) => spec.component === component && dirty.has(spec.key));
     const mode = edited ? edited.apply_mode.replaceAll("_", " ") : "pending reconciliation";
-    return `${component.replace("btc-simnet-", "")} (${mode})`;
+    return `${component} (${mode})`;
   });
   $("#impact").textContent = impacted.size
     ? "pending apply: " + impacts.join(", ")

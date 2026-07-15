@@ -1,10 +1,10 @@
 use serde::de::DeserializeOwned;
 use simchain_common::control_api::{
-    AbortJobResponse, ApiErrorEnvelope, ComponentControlResponse, ConfigResponse,
-    DegradeJobRequest, JobCheckpointResponse, JobCreatedResponse, JobDetail, JobEventsResponse,
-    JobListResponse, MineJobRequest, PartitionJobRequest, ReleaseCheckpointRequest,
-    ReorgJobRequest, ScenarioJobRequest, SetComponentStateRequest, SpamBurstJobRequest,
-    StatusResponse, API_PREFIX,
+    AbortJobResponse, ApiErrorEnvelope, ApplyReport, ComponentControlResponse, ConfigPatchRequest,
+    ConfigResponse, DegradeJobRequest, JobCheckpointResponse, JobCreatedResponse, JobDetail,
+    JobEventsResponse, JobListResponse, MineJobRequest, PartitionJobRequest,
+    ReleaseCheckpointRequest, ReorgJobRequest, ScenarioJobRequest, SetComponentStateRequest,
+    SpamBurstJobRequest, StatusResponse, API_PREFIX,
 };
 use simchain_common::internal_api::DesiredState;
 use std::fmt;
@@ -57,6 +57,10 @@ impl ControlClient {
 
     pub fn config(&self) -> Result<ConfigResponse, ClientError> {
         self.get(&format!("{API_PREFIX}/config"))
+    }
+
+    pub fn patch_config(&self, request: &ConfigPatchRequest) -> Result<ApplyReport, ClientError> {
+        self.patch_json(&format!("{API_PREFIX}/config"), request)
     }
 
     pub fn set_mining_state(
@@ -255,6 +259,27 @@ impl ControlClient {
         self.decode(&url, response)
     }
 
+    fn patch_json<B: serde::Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<R, ClientError> {
+        let url = format!("{}{path}", self.base_url);
+        let body =
+            serde_json::to_string(body).map_err(|error| ClientError::Output(error.to_string()))?;
+        let mut request = minreq::patch(&url)
+            .with_timeout(35)
+            .with_header("Content-Type", "application/json")
+            .with_body(body);
+        if let Some(token) = self.token.as_deref() {
+            request = request.with_header("Authorization", format!("Bearer {token}"));
+        }
+        let response = request
+            .send()
+            .map_err(|error| ClientError::Unavailable(format!("cannot reach {url}: {error}")))?;
+        self.decode(&url, response)
+    }
+
     fn decode<T: DeserializeOwned>(
         &self,
         url: &str,
@@ -350,6 +375,49 @@ mod tests {
             .set_mining_state(DesiredState::Paused)
             .expect("pause response");
         assert_eq!(response.effective_state, DesiredState::Paused);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn config_patch_uses_authenticated_generation_cas() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("PATCH /api/v1/config HTTP/1.1"));
+            assert!(request.contains("Authorization: Bearer secret"));
+            assert!(request.contains(r#""base_generation":7"#));
+            assert!(request.contains(r#""BLOCK_INTERVAL_MEAN_SECS":"12""#));
+
+            let response_body = serde_json::to_string(&ApplyReport {
+                changed: true,
+                components_applied: vec!["mining".to_string(), "spam".to_string()],
+                generation: 8,
+                logs: Vec::new(),
+                warnings: Vec::new(),
+            })
+            .expect("response JSON");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).expect("response");
+        });
+
+        let client = ControlClient::new(format!("http://{address}"), Some("secret".to_string()));
+        let response = client
+            .patch_config(&ConfigPatchRequest {
+                settings: [("BLOCK_INTERVAL_MEAN_SECS".to_string(), "12".to_string())]
+                    .into_iter()
+                    .collect(),
+                base_generation: Some(7),
+            })
+            .expect("patch response");
+        assert_eq!(response.generation, 8);
         server.join().expect("server");
     }
 

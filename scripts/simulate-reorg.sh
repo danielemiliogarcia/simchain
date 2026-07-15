@@ -1,5 +1,5 @@
 #!/bin/bash
-# Compatibility wrapper for the first-party control-plane client.
+# Convenience wrapper for the first-party control-plane client.
 # Usage: ./scripts/simulate-reorg.sh [depth] [empty]
 
 set -euo pipefail

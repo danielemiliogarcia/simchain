@@ -1,5 +1,5 @@
 #!/bin/bash
-# Compatibility wrapper for `simchainctl spam burst`.
+# Convenience wrapper for `simchainctl spam burst`.
 # Usage: ./scripts/spam-burst.sh <miner-node> --txs N [--outputs-per-tx M]
 
 set -euo pipefail

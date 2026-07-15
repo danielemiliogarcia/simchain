@@ -28,6 +28,11 @@ h1 { font-size: 1.1rem; margin: 0; }
 h1 span { color: var(--accent); }
 h2 { font-size: 1rem; margin: 0 0 0.6rem; color: var(--accent); }
 h3 { font-size: 0.85rem; margin: 0.8rem 0 0.35rem; color: var(--dim); }
+.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.section-heading h2 { margin-bottom: 0.6rem; }
+.explorer-status { display: flex; align-items: center; gap: 0.45rem; color: var(--dim); font-size: 0.76rem; margin-bottom: 0.6rem; }
+.explorer-status a, #blocks a { color: var(--accent); text-decoration: none; }
+.explorer-status a:hover, #blocks a:hover { text-decoration: underline; }
 .conn { font-size: 0.8rem; color: var(--dim); }
 .conn.ok { color: var(--ok); }
 .conn.stale { color: var(--err); }
@@ -66,7 +71,8 @@ td:first-child, th:first-child { text-align: left; }
 .fees .lbl { width: 4.2rem; color: var(--dim); text-align: right; }
 .fees .bar { height: 10px; background: var(--accent); border-radius: 2px; min-width: 1px; }
 .fees .n { color: var(--dim); }
-.services .svc { display: flex; gap: 0.5rem; align-items: center; margin: 2px 0; font-size: 0.8rem; }
+.services .svc { display: flex; gap: 0.5rem; align-items: flex-start; margin: 4px 0; font-size: 0.76rem; overflow-wrap: anywhere; }
+.services .svc .dot { flex: 0 0 auto; margin-top: 0.25rem; }
 .component-control {
   margin-top: 0.7rem;
   padding-top: 0.7rem;

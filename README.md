@@ -4,8 +4,8 @@
 
 A regtest Bitcoin simulation network that tries to stay as close to mainnet reality as
 regtest allows: several P2P-connected nodes, rotating miners, a non-mining full node as
-the user endpoint, non-empty blocks, and simulated reorgs, all controlled from a `.env`
-file.
+the user endpoint, non-empty blocks, and simulated reorgs. Compose boot infrastructure
+comes from `.env`; live policy and experiments are owned by one control plane.
 
 ## Intro
 
@@ -18,10 +18,12 @@ For detailed component descriptions, see [INTRO.md](./docs/INTRO.md).
 
 Traffic is split across two Docker networks. Only the three bitcoind nodes join
 `btc-simnet-p2p`, where `node1-p2p`, `node2-p2p`, and `node3-p2p` form the full P2P
-mesh on port 18444. Nodes and helper containers also join `btc-simnet-control` for RPC,
-health checks, and explorer traffic. This separation lets P2P links be partitioned or
-impaired without losing control access. The user talks to **node1** over RPC on
-`localhost:18443`; node2's RPC is also exposed on `localhost:28443`.
+mesh on port 18444. Nodes, workers, and the control plane also join
+`btc-simnet-control` for RPC, private APIs, health checks, and explorer traffic;
+namespace-local agents share their node's two interfaces. This separation lets P2P
+links be partitioned or impaired without losing control access. The user talks to
+**node1** over RPC on `localhost:18443`; node2's RPC is also exposed on
+`localhost:28443`.
 
 ```mermaid
 flowchart TB
@@ -37,8 +39,10 @@ flowchart TB
     end
 
     subgraph control["btc-simnet-control — RPC and helper traffic"]
+        cp["control-plane<br/>dashboard + API + MCP + jobs"]
         mc["mining-controller<br/>bootstrap + configurable mining"]
         sp["spammer<br/>fills blocks with txs"]
+        na["3 namespace-local network agents<br/>leased P2P tc/nft only"]
         rg["reorg simulator<br/>profile: reorg, on demand"]
     end
 
@@ -51,6 +55,7 @@ flowchart TB
     zmq2(( )):::waypoint
 
     user ==>|"RPC localhost:18443"| n1
+    user -->|"UI / API / MCP localhost:8090"| cp
     zmqc -.-|"ZMQ 28332-28336"| zmq1
     zmq1 -.-> n1
 
@@ -69,6 +74,15 @@ flowchart TB
     sp -->|"RPC: watch height"| n1
     sp -->|"RPC: raw spam + floor fills"| n2
     sp -->|"RPC: raw spam + floor fills"| n3
+    cp -->|"private policy + lease API"| mc
+    cp -->|"private policy + lease API"| sp
+    cp -->|"Bitcoin RPC jobs"| n1
+    cp -->|"Bitcoin RPC jobs"| n2
+    cp -->|"Bitcoin RPC jobs"| n3
+    cp -->|"private impairment leases"| na
+    na -.->|"P2P interface only"| n1
+    na -.->|"P2P interface only"| n2
+    na -.->|"P2P interface only"| n3
     rg -->|"RPC: invalidate + re-mine"| n3
     rg -.->|"witness poll"| n1
 
@@ -101,8 +115,8 @@ flowchart LR
 
 ## Configuration
 
-Everything is driven by `.env`, and **every setting has a default**, the stack runs with
-no `.env` file at all. To customize:
+Every Compose boot setting has a default, so the stack runs with no `.env` file. Use it
+for images, credentials, ports, node policy, and the initial mining/spam policy:
 
 ```bash
 cp .env.example .env        # the most used settings (image, credentials, blocktime, spam)
@@ -110,9 +124,10 @@ cp .env.example .env        # the most used settings (image, credentials, blockt
 cp .env.full.example .env
 ```
 
-Every setting (node image, credentials, host ports, fee policy, user address, block
-interval, spam volume, reorg behavior, tool images/ports, explorer DB credentials) is
-documented with its default in **[SETTINGS.md](./docs/SETTINGS.md)**.
+After first startup, live mining/spam desired policy is stored in
+`.simchain-control/state.json` and changed through the dashboard, CLI, API, or MCP; the
+control plane never rewrites `.env`. Every setting and its ownership is documented in
+**[SETTINGS.md](./docs/SETTINGS.md)**.
 
 ### Choosing the bitcoin node image
 
@@ -139,7 +154,7 @@ by compose itself.
 ## How to run
 
 ```bash
-docker compose --profile all-tools up -d
+docker compose up -d --build
 ```
 
 That's it (with the default registry image there is nothing to build). Useful follow-ups:
@@ -220,31 +235,29 @@ One compose file serves every combination via
 
 | Command | What comes up |
 |---|---|
-| `docker compose up` | basic simnet: 3 nodes + mining controller + spammer + 3 private network agents |
+| `docker compose up` | basic simnet + 3 private network agents + control plane/dashboard |
 | `docker compose --profile basic up` | same as above (alias) |
 | `docker compose --profile electrs up` | basic + electrs (Electrum RPC on 60001, HTTP on 3000) |
 | `docker compose --profile mempool up` | basic + electrs + mempool.space explorer |
 | `docker compose --profile all-tools up` | basic + all the tools above |
-| `docker compose --profile control-plane up` | basic + the control plane (browser UI, HTTP API, MCP) |
-| `SCENARIO_FILE=scenarios/reorg-during-sync.yml docker compose --profile scenario run --rm btc-simnet-scenario` | compatibility client: submit one durable control-plane scenario job, wait, then exit |
 
 With `mempool` or `all-tools`, browse the explorer at
 [http://localhost:1080/](http://localhost:1080/) (port: `MEMPOOL_WEB_PORT`).
 
 ## Simchain control plane
 
-The localhost control plane combines the dashboard, versioned API, and MCP endpoint
-(profile: `control-plane`; `panel` is a temporary alias). Mining and spam policy plus
-pause/resume use private worker APIs and never recreate their containers. Reorgs,
+The default localhost control plane combines the dashboard, versioned API, and MCP
+endpoint. Mining and spam policy plus pause/resume use private worker APIs and never
+recreate their containers. Reorgs,
 partitions, timed network degradation, manual mine/burst actions, and scenarios are
 durable server-side jobs under one mutation lock. Reorgs and partitions pause workers
 with expiring leases; namespace-local network agents also heal on TTL expiry. Scenarios
-persist ordered steps, checkpoints, results, and owned cleanup. The service
-remains opt-in and excluded from `all-tools` while boot-only lifecycle paths still use
-the transitional Compose adapter:
+persist ordered steps, checkpoints, results, and owned cleanup. Its distroless image
+contains no Docker CLI, has no Docker socket, drops all capabilities, uses a read-only
+root filesystem, and mounts only `.simchain-control`:
 
 ```bash
-docker compose --profile control-plane up -d --build
+docker compose up -d --build
 ```
 
 Open [http://localhost:8090/](http://localhost:8090/) (port: `CONTROL_PLANE_PORT`) to watch
@@ -252,8 +265,10 @@ chain height, block cadence, mempool depth and the fee histogram, and to change 
 live-retunable mining/spam settings. Mining cadence and weights apply at a scheduler
 safe point; spam hot changes apply between cycles and structural changes reconcile a
 replacement engine before commit. The reorg view starts jobs, streams their structured
-progress, exposes bounded history, and requests cooperative abort. Configuration applies
-never touch the nodes or chain, and a mixed apply rolls back transactionally. See
+progress, exposes bounded history, and requests cooperative abort. It also shows the
+local mempool.space health/link and deep-links recent blocks when the `mempool` profile
+is active. Configuration applies never touch the nodes or chain, and a mixed apply rolls
+back transactionally. See
 [RETUNING.md](./docs/RETUNING.md).
 
 Everything the UI shows comes from the versioned localhost HTTP API
@@ -295,7 +310,9 @@ The CLI uses the same API and service operations:
 
 ```bash
 cargo run -p simchainctl -- status
+cargo run -p simchainctl -- status --watch
 cargo run -p simchainctl -- config show --json
+cargo run -p simchainctl -- config set BLOCK_INTERVAL_MEAN_SECS=12 SPAM_FILL_BLOCK_RATIO=3
 cargo run -p simchainctl -- mining pause
 cargo run -p simchainctl -- mining resume
 cargo run -p simchainctl -- reorg --depth 3 --empty --wait
@@ -321,7 +338,7 @@ witnessed, and worker leases are confirmed clear.
 Reproduce an ordered chain history from YAML after the simnet has bootstrapped:
 
 ```bash
-docker compose --profile control-plane up -d --build
+docker compose up -d --build
 cargo run -p simchainctl -- scenario run scenarios/reorg-during-sync.yml \
   --result results/reorg.json
 ```
@@ -329,9 +346,8 @@ cargo run -p simchainctl -- scenario run scenarios/reorg-during-sync.yml \
 The control plane validates the document before reserving its single mutation coordinator,
 waits for height 204, persists step events/results, and cleans only job-owned leases. Named
 checkpoints let CI hold an exact state, run external assertions, and release by generation;
-disconnecting the client does not cancel the job. The old `scenario` Compose profile is a
-thin HTTP client with no Docker CLI or socket. Schema, checkpoint workflow, cleanup, and
-examples are in [SCENARIOS.md](./docs/SCENARIOS.md).
+disconnecting the client does not cancel the job. Schema, checkpoint workflow, cleanup,
+and examples are in [SCENARIOS.md](./docs/SCENARIOS.md).
 
 ## Partitions and P2P latency
 
@@ -355,15 +371,17 @@ cargo run -p simchainctl -- degrade \
 
 Each node has a private namespace-local agent with only `NET_ADMIN`, no host port or
 Docker socket. Agent TTL expiry clears abandoned nft/tc state if the control plane dies.
-The compatibility `partition.sh` and `degrade.sh` scripts submit these same jobs; raw
+The convenience `partition.sh` and `degrade.sh` scripts submit these same jobs; raw
 manual detach and unbounded netem commands were removed.
 Operational recipes and guardrails are in [RUNBOOK.md](./docs/RUNBOOK.md).
 
 
 ## Simulating reorgs
 
-Forces chain reorgs by invalidating N blocks and mining N+1 replacements; orphaned txs fall back to mempool, new blocks rebuilt from live mempool.
-Race-safe against mining controller; supports one-shot and continuous modes with configurable depth.
+The primary control-plane job forces a reorg by invalidating N blocks and mining N+1
+replacements. It owns worker pause leases, rebuilds replacement blocks from the live
+mempool, witnesses convergence, and records cleanup. A lower-level standalone RPC tool
+also remains available for one-shot and continuous experiments.
 
 For full details, commands, and modes, see [REORGS.md](./docs/REORGS.md).
 
@@ -413,7 +431,7 @@ of a given commit ships identical dependency versions.
 | [crates/network-agent](crates/network-agent) | Private namespace-local P2P impairment agent with TTL healing |
 | [crates/spammer](crates/spammer) | Fills blocks with transactions (`btc-simnet-spammer`) |
 | [crates/reorg](crates/reorg) | Forces chain reorganizations on demand (`btc-simnet-reorg`) |
-| [crates/scenario-engine](crates/scenario-engine) | Pure scenario schema/executor library plus compatibility HTTP client |
+| [crates/scenario-engine](crates/scenario-engine) | Pure scenario schema/executor library and thin HTTP client binary |
 | [crates/control-plane](crates/control-plane) | Single dashboard/API/MCP backend and durable job coordinator |
 | [crates/simchainctl](crates/simchainctl) | Thin first-party HTTP client for humans and CI |
 
@@ -464,9 +482,10 @@ crate directory):
 
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs `cargo ba`, clippy
 (`-D warnings`), `cargo fmt --check`, and the test suite on every pull request, all
-with `--locked` so a stale `Cargo.lock` fails the build. The three tool Docker images
-build from one shared [docker/tools.Dockerfile](docker/tools.Dockerfile) (one builder
-stage, three targets), also with `--locked`.
+with `--locked` so a stale `Cargo.lock` fails the build. All Rust-tool images build from
+one shared [docker/tools.Dockerfile](docker/tools.Dockerfile), also with `--locked`.
+CI renders the Compose trust boundary, builds every final target, and inspects the
+control-plane root filesystem for forbidden lifecycle tooling.
 
 # Trouble shotting
 

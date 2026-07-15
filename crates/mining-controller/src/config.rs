@@ -3,7 +3,7 @@
 //!
 //! The live-retunable subset (interval mode/mean/bounds, miner weights, RNG
 //! seed) is parsed and validated by `simchain_common::live_tuning`, the same
-//! module the panel uses, so a configuration the panel accepts is exactly a
+//! module the control plane uses, so a configuration the control plane accepts is exactly a
 //! configuration this binary accepts on restart.
 
 use bitcoincore_rpc::bitcoin::{address::NetworkUnchecked, Address};

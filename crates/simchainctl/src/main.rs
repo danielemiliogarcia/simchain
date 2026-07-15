@@ -8,11 +8,12 @@ use commands::{
     Cli, Command, ConfigCommand, JobsCommand, MiningCommand, ScenarioCommand, SpamCommand,
 };
 use simchain_common::control_api::{
-    CheckpointState, CleanupState, DegradeJobRequest, JobCheckpointResponse, JobDetail,
-    JobEventsResponse, JobState, MineJobRequest, PartitionJobRequest, ReorgJobRequest,
+    CheckpointState, CleanupState, ConfigPatchRequest, DegradeJobRequest, JobCheckpointResponse,
+    JobDetail, JobEventsResponse, JobState, MineJobRequest, PartitionJobRequest, ReorgJobRequest,
     SpamBurstJobRequest,
 };
 use simchain_common::internal_api::DesiredState;
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 pub const EXIT_SUCCESS: u8 = 0;
@@ -38,13 +39,31 @@ fn run(cli: Cli) -> Result<(), ClientError> {
     let client = ControlClient::new(connection.url, connection.token);
     match cli.command {
         Command::Status(args) => {
-            let status = client.status()?;
-            output::print_status(&status, args.json)?;
+            if args.watch && args.interval_secs == 0 {
+                return Err(ClientError::Local(
+                    "--interval-secs must be positive".to_string(),
+                ));
+            }
+            loop {
+                output::print_status(&client.status()?, args.json)?;
+                if !args.watch {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(args.interval_secs));
+            }
         }
         Command::Config(config) => match config.command {
             ConfigCommand::Show(args) => {
                 let config = client.config()?;
                 output::print_config(&config, args.json)?;
+            }
+            ConfigCommand::Set(args) => {
+                let settings = parse_assignments(&args.assignments)?;
+                let report = client.patch_config(&ConfigPatchRequest {
+                    settings,
+                    base_generation: args.base_generation,
+                })?;
+                output::print_apply_report(&report, args.json)?;
             }
         },
         Command::Mining(mining) => {
@@ -204,6 +223,32 @@ fn run(cli: Cli) -> Result<(), ClientError> {
         },
     }
     Ok(())
+}
+
+fn parse_assignments(assignments: &[String]) -> Result<BTreeMap<String, String>, ClientError> {
+    let mut settings = BTreeMap::new();
+    for assignment in assignments {
+        let Some((key, value)) = assignment.split_once('=') else {
+            return Err(ClientError::Local(format!(
+                "invalid setting '{assignment}': expected KEY=VALUE"
+            )));
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(ClientError::Local(
+                "setting key must not be empty".to_string(),
+            ));
+        }
+        if settings
+            .insert(key.to_string(), value.to_string())
+            .is_some()
+        {
+            return Err(ClientError::Local(format!(
+                "setting '{key}' was provided more than once"
+            )));
+        }
+    }
+    Ok(settings)
 }
 
 fn read_scenario(path: &std::path::Path) -> Result<String, ClientError> {
@@ -411,5 +456,18 @@ mod tests {
             exit_code(&ClientError::Local("missing file".to_string())),
             EXIT_USAGE
         );
+    }
+
+    #[test]
+    fn config_assignments_preserve_empty_resets_and_reject_duplicates() {
+        let values = parse_assignments(&[
+            "BLOCK_INTERVAL_MEAN_SECS=12".to_string(),
+            "MINING_RNG_SEED=".to_string(),
+        ])
+        .expect("assignments");
+        assert_eq!(values["BLOCK_INTERVAL_MEAN_SECS"], "12");
+        assert_eq!(values["MINING_RNG_SEED"], "");
+        assert!(parse_assignments(&["NO_EQUALS".to_string()]).is_err());
+        assert!(parse_assignments(&["A=1".to_string(), "A=2".to_string()]).is_err());
     }
 }

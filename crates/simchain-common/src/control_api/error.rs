@@ -12,7 +12,6 @@ pub enum ErrorCode {
     ComponentUnavailable,
     JobNotFound,
     CheckpointConflict,
-    ComposeFailed,
     RollbackFailed,
     RpcUnavailable,
     Unauthorized,
@@ -30,7 +29,7 @@ impl ErrorCode {
             Self::ComponentUnavailable | Self::RpcUnavailable => 503,
             Self::JobNotFound => 404,
             Self::Unauthorized => 401,
-            Self::ComposeFailed | Self::RollbackFailed | Self::Internal => 500,
+            Self::RollbackFailed | Self::Internal => 500,
         }
     }
 }
@@ -46,8 +45,8 @@ pub struct ErrorDetail {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RollbackReport {
-    pub env_restored: bool,
-    pub recreate_ok: bool,
+    pub desired_state_preserved: bool,
+    pub runtime_restored: bool,
     pub message: String,
 }
 
