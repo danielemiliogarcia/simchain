@@ -3,12 +3,18 @@
 
 use crate::backend::{
     BackendOutput, ComponentBackend, ComponentInfo, ConfigurationBackend, JobActions,
+    MiningControlBackend,
 };
 use crate::control_state::ControlStateStore;
 use crate::envfile;
 use crate::state::{AppState, ControlPlaneConfig, CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
 use crate::status::StatusSnapshot;
+use simchain_common::internal_api::{
+    CommandAck, DesiredState, LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest,
+    MiningWorkerStatus, PauseLease, WorkerPhase,
+};
 use simchain_common::live_tuning;
+use simchain_common::live_tuning::MiningTuning;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -32,6 +38,8 @@ pub struct MockWorld {
     pub node1_ok: bool,
     /// Simulate the recreate taking node1 down (exercises the RPC guard).
     pub kill_node1_on_recreate: bool,
+    pub mining_state: DesiredState,
+    pub mining_generation: u64,
 }
 
 pub struct MockBackend {
@@ -52,6 +60,8 @@ impl MockBackend {
                 after_recreate: HashMap::new(),
                 node1_ok: true,
                 kill_node1_on_recreate: false,
+                mining_state: DesiredState::Running,
+                mining_generation: 0,
             }),
         }
     }
@@ -72,12 +82,23 @@ impl MockBackend {
             RecreateOutcome::RestartLoop => ("restarting", false, true, 1, 2),
         };
         ComponentInfo {
+            present: true,
             status: status.to_string(),
             running,
             restarting,
             exit_code,
             restart_count,
             effective_config: env,
+            phase: None,
+            effective_generation: None,
+            uptime_secs: None,
+            last_error: None,
+            desired_state: None,
+            effective_state: None,
+            observed_height: None,
+            next_scheduled_attempt_ms: None,
+            last_mined_block: None,
+            active_lease_count: None,
         }
     }
 
@@ -142,7 +163,31 @@ impl MockBackend {
 }
 
 impl ConfigurationBackend for MockBackend {
-    fn apply_configuration(&self, services: &[String]) -> anyhow::Result<BackendOutput> {
+    fn apply_configuration(
+        &self,
+        services: &[String],
+        desired: &BTreeMap<String, String>,
+        generation: u64,
+    ) -> anyhow::Result<BackendOutput> {
+        if services
+            .iter()
+            .any(|service| service == CONTROLLER_CONTAINER)
+        {
+            let policy = MiningTuning::from_source(desired)?;
+            self.set_policy(generation, policy)?;
+        }
+        let services: Vec<String> = services
+            .iter()
+            .filter(|service| service.as_str() != CONTROLLER_CONTAINER)
+            .cloned()
+            .collect();
+        if services.is_empty() {
+            return Ok(BackendOutput {
+                success: true,
+                stdout: "applied mining policy through worker API".to_string(),
+                stderr: String::new(),
+            });
+        }
         let env = {
             // Read the file the apply just wrote, exactly like compose would.
             let content = std::fs::read_to_string(&self.env_file).unwrap_or_default();
@@ -151,15 +196,38 @@ impl ConfigurationBackend for MockBackend {
                 .into_iter()
                 .collect::<HashMap<_, _>>()
         };
-        self.recreate_with_env(services, env)
+        self.recreate_with_env(&services, env)
     }
 
     fn restore_configuration(
         &self,
         services: &[String],
         managed_env: &BTreeMap<String, String>,
+        generations: &BTreeMap<String, u64>,
     ) -> anyhow::Result<BackendOutput> {
-        self.recreate_with_env(services, managed_env.clone().into_iter().collect())
+        if services
+            .iter()
+            .any(|service| service == CONTROLLER_CONTAINER)
+        {
+            let policy = MiningTuning::from_source(managed_env)?;
+            self.set_policy(
+                generations.get(CONTROLLER_CONTAINER).copied().unwrap_or(0),
+                policy,
+            )?;
+        }
+        let services: Vec<String> = services
+            .iter()
+            .filter(|service| service.as_str() != CONTROLLER_CONTAINER)
+            .cloned()
+            .collect();
+        if services.is_empty() {
+            return Ok(BackendOutput {
+                success: true,
+                stdout: "restored mining policy through worker API".to_string(),
+                stderr: String::new(),
+            });
+        }
+        self.recreate_with_env(&services, managed_env.clone().into_iter().collect())
     }
 
     fn remove_components(&self, names: &[String]) -> anyhow::Result<BackendOutput> {
@@ -181,10 +249,25 @@ impl ComponentBackend for MockBackend {
         Ok(names
             .iter()
             .filter_map(|name| {
-                world
-                    .containers
-                    .get(*name)
-                    .map(|info| (name.to_string(), info.clone()))
+                world.containers.get(*name).map(|info| {
+                    let mut info = info.clone();
+                    if *name == CONTROLLER_CONTAINER {
+                        let phase = if world.mining_state == DesiredState::Paused {
+                            WorkerPhase::Paused
+                        } else {
+                            WorkerPhase::Running
+                        };
+                        info.status = phase.as_str().to_string();
+                        info.phase = Some(phase.as_str().to_string());
+                        info.effective_generation = Some(world.mining_generation);
+                        info.desired_state = Some(world.mining_state);
+                        info.effective_state = Some(world.mining_state);
+                        info.observed_height = Some(100);
+                        info.uptime_secs = Some(1);
+                        info.active_lease_count = Some(0);
+                    }
+                    (name.to_string(), info)
+                })
             })
             .collect())
     }
@@ -210,6 +293,105 @@ impl JobActions for MockBackend {
     fn wait(&self, _duration: Duration) {}
 }
 
+impl MiningControlBackend for MockBackend {
+    fn status(&self) -> anyhow::Result<MiningWorkerStatus> {
+        let world = self.world.lock().expect("world lock");
+        let component = world
+            .containers
+            .get(CONTROLLER_CONTAINER)
+            .ok_or_else(|| anyhow::anyhow!("mining worker unavailable"))?;
+        let policy = MiningTuning::from_source(&component.effective_config)?;
+        Ok(MiningWorkerStatus {
+            component: "mining".to_string(),
+            phase: if world.mining_state == DesiredState::Paused {
+                WorkerPhase::Paused
+            } else {
+                WorkerPhase::Running
+            },
+            desired_state: world.mining_state,
+            effective_state: world.mining_state,
+            effective_rng_seed: policy.rng_seed.unwrap_or(1),
+            policy,
+            effective_generation: world.mining_generation,
+            height: Some(100),
+            next_scheduled_attempt_ms: None,
+            last_mined_block: None,
+            active_leases: Vec::<PauseLease>::new(),
+            uptime_secs: 1,
+            last_error: None,
+        })
+    }
+
+    fn set_state(&self, state: DesiredState) -> anyhow::Result<CommandAck> {
+        let mut world = self.world.lock().expect("world lock");
+        world.mining_state = state;
+        Ok(CommandAck {
+            request_id: "mock-state".to_string(),
+            phase: if state == DesiredState::Paused {
+                WorkerPhase::Paused
+            } else {
+                WorkerPhase::Running
+            },
+            effective_generation: world.mining_generation,
+        })
+    }
+
+    fn set_policy(&self, generation: u64, policy: MiningTuning) -> anyhow::Result<CommandAck> {
+        let mut world = self.world.lock().expect("world lock");
+        let component = world
+            .containers
+            .get_mut(CONTROLLER_CONTAINER)
+            .ok_or_else(|| anyhow::anyhow!("mining worker unavailable"))?;
+        component.effective_config = policy
+            .canonical_values()
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
+        component.effective_generation = Some(generation);
+        world.mining_generation = generation;
+        Ok(CommandAck {
+            request_id: "mock-policy".to_string(),
+            phase: WorkerPhase::Running,
+            effective_generation: generation,
+        })
+    }
+
+    fn restore_policy(&self, generation: u64, policy: MiningTuning) -> anyhow::Result<CommandAck> {
+        self.set_policy(generation, policy)
+    }
+
+    fn acquire_lease(&self, request: LeaseRequest) -> anyhow::Result<CommandAck> {
+        self.set_state(DesiredState::Paused).map(|mut ack| {
+            ack.request_id = request.request_id;
+            ack
+        })
+    }
+
+    fn renew_lease(
+        &self,
+        _lease_id: &str,
+        request: LeaseRenewRequest,
+    ) -> anyhow::Result<CommandAck> {
+        let status = self.status()?;
+        Ok(CommandAck {
+            request_id: request.request_id,
+            phase: status.phase,
+            effective_generation: status.effective_generation,
+        })
+    }
+
+    fn release_lease(
+        &self,
+        _lease_id: &str,
+        request: LeaseReleaseRequest,
+    ) -> anyhow::Result<CommandAck> {
+        self.set_state(DesiredState::Running).map(|mut ack| {
+            ack.request_id = request.request_id;
+            ack
+        })
+    }
+}
+
 pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
     let state_dir = dir.join(".simchain-control");
     let store = ControlStateStore::open(state_dir.clone()).expect("control store");
@@ -226,11 +408,14 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
             node2_url: "http://mock-node2:18443".to_string(),
             node3_url: "http://mock-node3:18443".to_string(),
             state_dir,
+            mining_control_url: "http://mock-mining:9081".to_string(),
+            internal_token: "test-internal-token".to_string(),
         },
         token: "test-token".to_string(),
         components: backend.clone(),
         configuration: backend.clone(),
-        job_actions: backend,
+        job_actions: backend.clone(),
+        mining: backend.clone(),
         control_state: RwLock::new(control_state),
         control_store: store,
         status: RwLock::new(StatusSnapshot::default()),

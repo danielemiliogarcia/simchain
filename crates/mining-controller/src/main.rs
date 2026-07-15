@@ -4,9 +4,11 @@
 mod bootstrap;
 mod chain_view;
 mod config;
+mod control;
 mod mining;
 mod rng;
 mod runner;
+mod server;
 mod wallet;
 
 use config::MiningConfig;

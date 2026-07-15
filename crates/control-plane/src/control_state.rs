@@ -4,6 +4,7 @@
 
 use crate::envfile;
 use serde::{Deserialize, Serialize};
+use simchain_common::internal_api::DesiredState;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -26,6 +27,10 @@ pub struct ControlState {
     pub schema_version: u32,
     pub generation: u64,
     pub desired: BTreeMap<String, String>,
+    #[serde(default = "running_state")]
+    pub mining_state: DesiredState,
+    #[serde(default = "running_state")]
+    pub spam_state: DesiredState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_apply: Option<ApplyOutcome>,
 }
@@ -37,6 +42,8 @@ impl Default for ControlState {
             schema_version: STATE_SCHEMA_VERSION,
             generation: 0,
             desired,
+            mining_state: DesiredState::Running,
+            spam_state: DesiredState::Running,
             last_apply: None,
         }
     }
@@ -131,12 +138,18 @@ pub fn successful_apply(
         schema_version: STATE_SCHEMA_VERSION,
         generation: previous.generation + u64::from(changed),
         desired,
+        mining_state: previous.mining_state,
+        spam_state: previous.spam_state,
         last_apply: Some(ApplyOutcome {
             status: "succeeded".to_string(),
             updated_at_ms: now_ms(),
             message: None,
         }),
     }
+}
+
+fn running_state() -> DesiredState {
+    DesiredState::Running
 }
 
 fn now_ms() -> u64 {

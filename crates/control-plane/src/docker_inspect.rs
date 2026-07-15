@@ -61,12 +61,23 @@ pub fn parse_inspect_output(stdout: &str) -> anyhow::Result<HashMap<String, Comp
             (
                 name,
                 ComponentInfo {
+                    present: true,
                     status: entry.state.status,
                     running: entry.state.running,
                     restarting: entry.state.restarting,
                     exit_code: entry.state.exit_code,
                     restart_count: entry.restart_count,
                     effective_config: env,
+                    phase: None,
+                    effective_generation: None,
+                    uptime_secs: None,
+                    last_error: None,
+                    desired_state: None,
+                    effective_state: None,
+                    observed_height: None,
+                    next_scheduled_attempt_ms: None,
+                    last_mined_block: None,
+                    active_lease_count: None,
                 },
             )
         })

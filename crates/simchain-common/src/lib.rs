@@ -12,6 +12,7 @@ mod burn;
 pub mod config;
 pub mod control_api;
 mod error;
+pub mod internal_api;
 pub mod live_tuning;
 mod logging;
 mod rpc;

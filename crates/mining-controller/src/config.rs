@@ -14,24 +14,21 @@ use simchain_common::config::{
 };
 use simchain_common::live_tuning::{EnvSource, MiningTuning};
 use simchain_common::require_regtest_address;
+use std::net::SocketAddr;
 use std::sync::OnceLock;
-
-pub use simchain_common::live_tuning::{BlockIntervalMode, IntervalBounds, MinerWeights};
 
 static MINING_CONFIG: OnceLock<MiningConfig> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct MiningConfig {
     pub user_address: Address,
-    pub mean_secs: u64,
-    pub interval_mode: BlockIntervalMode,
-    pub interval_bounds: IntervalBounds,
-    pub miner_weights: Option<MinerWeights>,
-    pub configured_seed: Option<u64>,
+    pub initial_policy: MiningTuning,
     pub node2_url: RpcUrl,
     pub node3_url: RpcUrl,
     pub wallet2_name: String,
     pub wallet3_name: String,
+    pub control_listen_addr: SocketAddr,
+    pub internal_token: String,
 }
 
 impl MiningConfig {
@@ -71,6 +68,14 @@ impl MiningConfig {
             &mut errors,
             simchain_common::config::non_empty_or("NODE3_WALLET_NAME", DEFAULT_NODE3_WALLET_NAME),
         );
+        let control_listen_addr = take(&mut errors, parse_control_listen_addr());
+        let internal_token = take(
+            &mut errors,
+            simchain_common::config::non_empty_or(
+                "SIMCHAIN_INTERNAL_TOKEN",
+                "simchain-internal-dev-token",
+            ),
+        );
 
         finish(errors)?;
 
@@ -81,6 +86,8 @@ impl MiningConfig {
             Some(node3_url),
             Some(wallet2_name),
             Some(wallet3_name),
+            Some(control_listen_addr),
+            Some(internal_token),
         ) = (
             user_address,
             tuning,
@@ -88,6 +95,8 @@ impl MiningConfig {
             node3_url,
             wallet2_name,
             wallet3_name,
+            control_listen_addr,
+            internal_token,
         )
         else {
             unreachable!("MiningConfig fields must be present after validation");
@@ -95,17 +104,26 @@ impl MiningConfig {
 
         Ok(Self {
             user_address,
-            mean_secs: tuning.mean_secs,
-            interval_mode: tuning.interval_mode,
-            interval_bounds: tuning.interval_bounds,
-            miner_weights: tuning.miner_weights,
-            configured_seed: tuning.rng_seed,
+            initial_policy: tuning,
             node2_url,
             node3_url,
             wallet2_name,
             wallet3_name,
+            control_listen_addr,
+            internal_token,
         })
     }
+}
+
+fn parse_control_listen_addr() -> Result<SocketAddr, ConfigError> {
+    let value = string_or("MINING_CONTROL_LISTEN_ADDR", "0.0.0.0:9081");
+    value.parse().map_err(|error| {
+        ConfigError::invalid(
+            "MINING_CONTROL_LISTEN_ADDR",
+            value,
+            format!("expected IP:port ({error})"),
+        )
+    })
 }
 
 fn parse_user_address() -> Result<Address, ConfigError> {

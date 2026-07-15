@@ -235,6 +235,10 @@ services:
       - BLOCK_INTERVAL_MAX_SECS=${BLOCK_INTERVAL_MAX_SECS-20}
       - MINER_WEIGHTS=${MINER_WEIGHTS:-}
       - MINING_RNG_SEED=${MINING_RNG_SEED:-}
+      # Private worker API: joined only to btc-simnet-control and never
+      # published to the host.
+      - MINING_CONTROL_LISTEN_ADDR=0.0.0.0:9081
+      - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
       - NODE2_WALLET_NAME=${NODE2_WALLET_NAME:-node2}
@@ -406,9 +410,9 @@ services:
   # ---------------------------------------------------------------------------
   # Simchain control plane (profiles: control-plane, legacy alias panel).
   # Browser UI, versioned HTTP API and MCP endpoint on
-  # http://localhost:${CONTROL_PLANE_PORT:-8090}. During Phase 1 it still
-  # mirrors desired settings to .env and recreates
-  # the tool services, so like the scenario engine it mounts the Docker
+  # http://localhost:${CONTROL_PLANE_PORT:-8090}. During Phase 2, mining
+  # state and policy use the private worker API; spam remains on the
+  # transitional Compose adapter, so the service still mounts the Docker
   # socket and is intentionally excluded from all-tools (the socket is
   # root-equivalent host access). See docs/RETUNING.md.
   # ---------------------------------------------------------------------------
@@ -436,6 +440,8 @@ services:
       - SIMCHAIN_ENV_FILE=/workspace/.env
       - SIMCHAIN_CONTROL_STATE_DIR=/workspace/.simchain-control
       - CONTROL_PLANE_LISTEN_ADDR=0.0.0.0:8080
+      - MINING_CONTROL_URL=http://btc-simnet-mining-controller:9081
+      - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
       # Optional pre-set API token; empty means generate one and persist it
       # to .simchain-control/token (bearer auth for API/MCP mutations)
       - CONTROL_PLANE_API_TOKEN=${CONTROL_PLANE_API_TOKEN:-}

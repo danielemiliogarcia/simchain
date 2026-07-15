@@ -11,8 +11,10 @@ pub use simchain_common::control_api::{
     ApiError as ServiceError, ErrorCode, ErrorDetail, RollbackReport,
 };
 use simchain_common::control_api::{
-    ApplyMode, ConfigResponse, EffectiveComponentConfig, SchemaResponse, SettingSchema,
+    ApplyMode, ComponentControlResponse, ConfigResponse, EffectiveComponentConfig, SchemaResponse,
+    SettingSchema,
 };
+use simchain_common::internal_api::DesiredState;
 use simchain_common::live_tuning::{
     self, ControlKind, LiveTuning, MiningTuning, ServiceScope, SpamTuning,
 };
@@ -58,7 +60,10 @@ pub fn schema() -> SchemaResponse {
                 optional: spec.optional,
                 minimum: validation_bounds(spec.key).0,
                 maximum: validation_bounds(spec.key).1,
-                apply_mode: ApplyMode::LegacyRecreate,
+                apply_mode: match spec.scope {
+                    ServiceScope::MiningController => ApplyMode::NextSafePoint,
+                    ServiceScope::Spammer => ApplyMode::LegacyRecreate,
+                },
                 help: spec.help.to_string(),
                 warning: spec.warning.map(str::to_string),
             })
@@ -93,6 +98,8 @@ pub struct RunningService {
     /// Managed values (this service's scope) from the running container env.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub values: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -253,9 +260,12 @@ pub fn settings_state(app: &AppState) -> Result<SettingsStateView, ServiceError>
         running.insert(
             service.to_string(),
             RunningService {
-                present: info.is_some(),
+                present: info.is_some_and(|component| component.present),
                 values,
-                error: inspect_error.clone(),
+                generation: info.and_then(|component| component.effective_generation),
+                error: inspect_error
+                    .clone()
+                    .or_else(|| info.and_then(|component| component.last_error.clone())),
             },
         );
         if inspect_error.is_none() {
@@ -287,11 +297,37 @@ pub fn settings_state(app: &AppState) -> Result<SettingsStateView, ServiceError>
 /// inspection; consumers do not need to know which backend supplied either.
 pub fn config(app: &AppState) -> Result<ConfigResponse, ServiceError> {
     let legacy = settings_state(app)?;
-    let generation = app
+    let control = app
         .control_state
         .read()
         .expect("control state lock")
-        .generation;
+        .clone();
+    let (desired_valid, desired_errors, mut warnings, tuning) =
+        match LiveTuning::from_source(&control.desired) {
+            Ok((tuning, warnings)) => (true, Vec::new(), warnings, Some(tuning)),
+            Err(error) => (false, config_error_details(&error), Vec::new(), None),
+        };
+    warnings.extend(legacy.warnings);
+    let mut pending_apply = Vec::new();
+    if let Some(tuning) = &tuning {
+        for scope in [ServiceScope::MiningController, ServiceScope::Spammer] {
+            let component = scope.service_name();
+            let running = legacy.running.get(component);
+            let values = running
+                .and_then(|running| running.values.as_ref())
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<HashMap<_, _>>()
+                });
+            if running.is_none_or(|running| !running.present || running.error.is_some())
+                || scope_needs_restart(tuning, values.as_ref(), scope)
+            {
+                pending_apply.push(component.to_string());
+            }
+        }
+    }
     let effective = legacy
         .running
         .into_iter()
@@ -300,7 +336,7 @@ pub fn config(app: &AppState) -> Result<ConfigResponse, ServiceError> {
                 component,
                 EffectiveComponentConfig {
                     reachable: running.present && running.error.is_none(),
-                    generation: None,
+                    generation: running.generation,
                     values: running.values,
                     error: running.error,
                 },
@@ -308,13 +344,13 @@ pub fn config(app: &AppState) -> Result<ConfigResponse, ServiceError> {
         })
         .collect();
     Ok(ConfigResponse {
-        generation,
-        desired: legacy.staged,
-        desired_valid: legacy.staged_valid,
-        desired_errors: legacy.staged_errors,
-        warnings: legacy.warnings,
+        generation: control.generation,
+        desired: control.desired,
+        desired_valid,
+        desired_errors,
+        warnings,
         effective,
-        pending_apply: legacy.pending_restart,
+        pending_apply,
         components: legacy.services,
         legacy_revision: Some(legacy.revision),
         legacy_env_file_exists: legacy.env_file_exists,
@@ -327,12 +363,61 @@ pub fn config(app: &AppState) -> Result<ConfigResponse, ServiceError> {
 
 pub fn status(app: &AppState) -> StatusSnapshot {
     let mut status = app.status.read().expect("status lock").clone();
-    status.desired_generation = app
+    let control = app
         .control_state
         .read()
         .expect("control state lock")
-        .generation;
+        .clone();
+    status.desired_generation = control.generation;
+    if let Some(mining) = status.components.get_mut(CONTROLLER_CONTAINER) {
+        mining.desired_state = Some(control.mining_state);
+    }
     status
+}
+
+pub fn set_mining_state(
+    app: &AppState,
+    desired_state: DesiredState,
+) -> Result<ComponentControlResponse, ServiceError> {
+    let Ok(_guard) = app.apply_lock.try_lock() else {
+        return Err(ServiceError::new(
+            ErrorCode::ApplyInProgress,
+            "another desired-state mutation is already in progress",
+        ));
+    };
+    let mut next = app
+        .control_state
+        .read()
+        .expect("control state lock")
+        .clone();
+    next.mining_state = desired_state;
+    app.control_store.save(&next).map_err(|error| {
+        ServiceError::new(
+            ErrorCode::Internal,
+            format!("failed to persist desired mining state: {error}"),
+        )
+    })?;
+    *app.control_state.write().expect("control state lock") = next;
+
+    app.mining.set_state(desired_state).map_err(|error| {
+        ServiceError::new(
+            ErrorCode::ComponentUnavailable,
+            format!("mining worker did not acknowledge the state change: {error}"),
+        )
+    })?;
+    let status = app.mining.status().map_err(|error| {
+        ServiceError::new(
+            ErrorCode::ComponentUnavailable,
+            format!("mining worker status is unavailable after state change: {error}"),
+        )
+    })?;
+    Ok(ComponentControlResponse {
+        component: "mining".to_string(),
+        desired_state: status.desired_state,
+        effective_state: status.effective_state,
+        phase: status.phase,
+        effective_generation: status.effective_generation,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +502,12 @@ mod tests {
             .expect("FALLBACK_FEE in schema");
         assert!(fee.warning.is_some(), "node-restart caveat must be visible");
         assert_eq!(fee.component, SPAMMER_CONTAINER);
+        let cadence = view
+            .settings
+            .iter()
+            .find(|setting| setting.key == "BLOCK_INTERVAL_MEAN_SECS")
+            .expect("mining cadence in schema");
+        assert_eq!(cadence.apply_mode, ApplyMode::NextSafePoint);
     }
 
     #[test]
@@ -477,5 +568,19 @@ mod tests {
         assert!(view.staged_valid);
         assert_eq!(view.staged["BLOCK_INTERVAL_MEAN_SECS"], "15");
         assert!(view.pending_restart.is_empty());
+    }
+
+    #[test]
+    fn public_config_uses_durable_desired_state_after_initialization() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env_file = dir.path().join(".env");
+        let mock = Arc::new(MockBackend::new(env_file.clone()));
+        mock.sync_containers();
+        let app = test_app(dir.path(), mock);
+
+        std::fs::write(&env_file, "BLOCK_INTERVAL_MEAN_SECS=99\n").expect("external legacy edit");
+        let view = config(&app).expect("config");
+        assert_eq!(view.desired["BLOCK_INTERVAL_MEAN_SECS"], "15");
+        assert_eq!(view.effective[CONTROLLER_CONTAINER].generation, Some(0));
     }
 }

@@ -13,7 +13,10 @@ mod compose;
 mod control_state;
 mod docker_inspect;
 mod envfile;
+mod hybrid_backend;
+mod internal_client;
 mod mcp;
+mod reconcile;
 mod service;
 mod state;
 mod status;
@@ -87,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let store = control_state::ControlStateStore::open(config.state_dir.clone())?;
     let token = load_or_create_token(&config)?;
 
-    let backend = Arc::new(compose::ComposeBackend::new(
+    let legacy = compose::ComposeBackend::new(
         config.repo_root.clone(),
         config.env_file.clone(),
         config.compose_project.clone(),
@@ -96,13 +99,19 @@ async fn main() -> anyhow::Result<()> {
             config.node2_url.clone(),
             config.node3_url.clone(),
         ],
+    );
+    let mining = Arc::new(internal_client::MiningClient::new(
+        config.mining_control_url.clone(),
+        config.internal_token.clone(),
     ));
+    let backend = Arc::new(hybrid_backend::HybridBackend::new(legacy, mining.clone()));
     let app = Arc::new(AppState {
         config: config.clone(),
         token,
         components: backend.clone(),
         configuration: backend.clone(),
         job_actions: backend,
+        mining,
         control_state: RwLock::new(
             store.load_or_initialize(control_state::desired_from_legacy_env(&config.env_file)?)?,
         ),
@@ -112,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     status::spawn_sampler(app.clone());
+    reconcile::spawn(app.clone());
 
     let router = api::router(app);
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
@@ -141,6 +151,8 @@ mod token_tests {
             node2_url: "http://node2:18443".to_string(),
             node3_url: "http://node3:18443".to_string(),
             state_dir: dir.join(".simchain-control"),
+            mining_control_url: "http://mining:9081".to_string(),
+            internal_token: "test-internal-token".to_string(),
         }
     }
 

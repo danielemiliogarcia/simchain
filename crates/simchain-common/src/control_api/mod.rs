@@ -11,8 +11,9 @@ pub use config::{
 };
 pub use error::{ApiError, ApiErrorEnvelope, ErrorCode, ErrorDetail, RollbackReport};
 pub use status::{
-    BlockSummary, Cadence, ComponentState, ExplorerStatus, FeeBucket, HealthResponse,
-    ImpairmentSummary, MempoolSummary, OperationSummary, StatusResponse,
+    BlockSummary, Cadence, ComponentControlResponse, ComponentState, ExplorerStatus, FeeBucket,
+    HealthResponse, ImpairmentSummary, MempoolSummary, OperationSummary, SetComponentStateRequest,
+    StatusResponse,
 };
 
 pub const API_PREFIX: &str = "/api/v1";

@@ -65,6 +65,17 @@ td:first-child, th:first-child { text-align: left; }
 .fees .bar { height: 10px; background: var(--accent); border-radius: 2px; min-width: 1px; }
 .fees .n { color: var(--dim); }
 .services .svc { display: flex; gap: 0.5rem; align-items: center; margin: 2px 0; font-size: 0.8rem; }
+.component-control {
+  margin-top: 0.7rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--line);
+}
+.component-state { color: var(--dim); font-size: 0.76rem; margin-bottom: 0.45rem; }
+.component-buttons { display: flex; gap: 0.5rem; }
+.component-buttons button { padding: 0.3rem 0.65rem; font-size: 0.76rem; }
+#mining-resume { background: var(--ok); }
+.action-result { color: var(--dim); font-size: 0.72rem; min-height: 1rem; margin-top: 0.35rem; }
+.action-result.err { color: var(--err); }
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .dot.ok { background: var(--ok); }
 .dot.warn { background: var(--warn); }

@@ -103,13 +103,22 @@ fn fast_sample(app: &SharedState, client: Option<&Client>, init_error: Option<St
             .map(|name| {
                 let state = match inspected.get(*name) {
                     Some(info) => ComponentState {
-                        present: true,
+                        present: info.present,
                         status: info.status.clone(),
                         running: info.running,
+                        phase: info.phase.clone(),
+                        effective_generation: info.effective_generation,
+                        uptime_secs: info.uptime_secs,
+                        last_error: info.last_error.clone(),
+                        desired_state: info.desired_state,
+                        effective_state: info.effective_state,
+                        observed_height: info.observed_height,
+                        next_scheduled_attempt_ms: info.next_scheduled_attempt_ms,
+                        last_mined_block: info.last_mined_block.clone(),
+                        active_lease_count: info.active_lease_count,
                         restarting: info.restarting,
                         exit_code: info.exit_code,
                         restart_count: info.restart_count,
-                        ..ComponentState::default()
                     },
                     None => ComponentState {
                         present: false,
@@ -139,6 +148,14 @@ fn fast_sample(app: &SharedState, client: Option<&Client>, init_error: Option<St
     }
     match components {
         Ok(components) => {
+            snapshot.effective_generations = components
+                .iter()
+                .filter_map(|(name, component)| {
+                    component
+                        .effective_generation
+                        .map(|generation| (name.clone(), generation))
+                })
+                .collect();
             snapshot.components = components;
             snapshot.component_error = None;
         }

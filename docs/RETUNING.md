@@ -1,19 +1,31 @@
 # Retuning a Live Chain
 
-Settings consumed by the mining controller and the spammer can be changed **without restarting the whole stack**: the nodes keep running and the chain is preserved, only the tool containers are replaced. This is the quickest way to experiment with mining cadence, the fee floor or how full blocks are, on a chain that is already bootstrapped and funded.
+Settings consumed by the mining controller and the spammer can be changed **without restarting the whole stack**. The control plane applies mining settings inside the resident worker at a scheduler safe point; the transitional spam path replaces only the spammer container. The nodes keep running and the chain is preserved.
 
 Three equivalent paths perform the same operation:
 
 - **Manual** (below): edit `.env`, recreate the affected service(s).
 - **Control-plane UI**: `docker compose --profile control-plane up -d`, then
   [http://localhost:8090/](http://localhost:8090/) — edit, Apply. The control plane validates
-  first, rewrites `.env` (managed keys are canonicalized into one
+  first, stores durable desired state, mirrors the transitional `.env` settings (managed keys are canonicalized into one
   `# Managed by simchain panel` block; your other lines are preserved), recreates only
-  the affected tool service(s), and rolls back automatically if the retuned tool fails
-  to come back up.
+  the spammer when needed, and rolls back automatically if any component rejects the apply.
 - **Control-plane API / MCP**: `PATCH /api/v1/config` with the
   `.simchain-control/token` bearer token, or the `set_config` MCP tool at
   `http://localhost:8090/mcp` — same semantics, built for scripts and coding agents.
+
+Mining can also be paused and resumed cooperatively with the dashboard controls,
+`PUT /api/v1/mining/state`, the `set_mining_state` MCP tool, or:
+
+```bash
+cargo run -p simchainctl -- mining pause
+cargo run -p simchainctl -- mining resume
+```
+
+A pause acknowledgement means any in-flight `generate` RPC and propagation check has
+completed. Changing cadence, weights, or `MINING_RNG_SEED` wakes an interruptible wait;
+the new generation takes effect at the next scheduler boundary. A seed change resets
+the worker RNG and miner-alternation toggle deterministically.
 
 ## Steps
 
@@ -38,7 +50,7 @@ Three equivalent paths perform the same operation:
 
 ## Safety & Behavior
 
-This is safe mid-run: `--force-recreate` only replaces the services named on the command line (the node dependencies are left running, so the chain, wallets and mempool survive). The mining controller sees the chain is already bootstrapped (height >= 204), skips the funding sequence and resumes mining with the new cadence; the spammer is stateless between cycles and resumes with the new fill/fee settings.
+The manual fallback is safe mid-run because `--force-recreate` replaces only the named services; the node dependencies remain running, so the chain, wallets, and mempool survive. The control-plane path is safer for mining because it does not replace the worker and can report desired/effective generations and its exact safe-point phase.
 
 ## Caveats
 

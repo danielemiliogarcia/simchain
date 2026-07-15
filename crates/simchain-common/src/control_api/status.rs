@@ -1,3 +1,4 @@
+use crate::internal_api::{DesiredState, LastMinedBlock, WorkerPhase};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -49,6 +50,18 @@ pub struct ComponentState {
     pub uptime_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_state: Option<DesiredState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_state: Option<DesiredState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_scheduled_attempt_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mined_block: Option<LastMinedBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_lease_count: Option<usize>,
     #[serde(default)]
     pub restarting: bool,
     #[serde(default)]
@@ -114,4 +127,18 @@ pub struct StatusResponse {
 pub struct HealthResponse {
     pub status: String,
     pub ready: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SetComponentStateRequest {
+    pub state: DesiredState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ComponentControlResponse {
+    pub component: String,
+    pub desired_state: DesiredState,
+    pub effective_state: DesiredState,
+    pub phase: WorkerPhase,
+    pub effective_generation: u64,
 }
