@@ -4,8 +4,13 @@ mod output;
 
 use clap::Parser;
 use client::{ClientError, ControlClient};
-use commands::{Cli, Command, ConfigCommand, JobsCommand, MiningCommand, SpamCommand};
-use simchain_common::control_api::{CleanupState, JobDetail, JobState, ReorgJobRequest};
+use commands::{
+    Cli, Command, ConfigCommand, JobsCommand, MiningCommand, ScenarioCommand, SpamCommand,
+};
+use simchain_common::control_api::{
+    CheckpointState, CleanupState, JobCheckpointResponse, JobDetail, JobEventsResponse, JobState,
+    MineJobRequest, ReorgJobRequest, SpamBurstJobRequest,
+};
 use simchain_common::internal_api::DesiredState;
 use std::process::ExitCode;
 
@@ -49,13 +54,53 @@ fn run(cli: Cli) -> Result<(), ClientError> {
             let response = client.set_mining_state(state)?;
             output::print_component_control(&response)?;
         }
-        Command::Spam(spam) => {
-            let state = match spam.command {
-                SpamCommand::Pause => DesiredState::Paused,
-                SpamCommand::Resume => DesiredState::Running,
-            };
-            let response = client.set_spam_state(state)?;
-            output::print_component_control(&response)?;
+        Command::Spam(spam) => match spam.command {
+            command @ (SpamCommand::Pause | SpamCommand::Resume) => {
+                let state = match command {
+                    SpamCommand::Pause => DesiredState::Paused,
+                    SpamCommand::Resume => DesiredState::Running,
+                    SpamCommand::Burst(_) => unreachable!("handled by outer match"),
+                };
+                let response = client.set_spam_state(state)?;
+                output::print_component_control(&response)?;
+            }
+            SpamCommand::Burst(args) => {
+                if args.txs == 0 {
+                    return Err(ClientError::Local("--txs must be positive".to_string()));
+                }
+                let node = scenario_node(&args.node)?;
+                let response = client.start_spam_burst(
+                    &SpamBurstJobRequest {
+                        node: node.to_string(),
+                        txs: args.txs,
+                        outputs_per_tx: args.outputs_per_tx,
+                    },
+                    args.idempotency_key.as_deref(),
+                )?;
+                output::print_job_created(&response, args.json)?;
+                if args.wait {
+                    let job = watch_job(&client, &response.job_id, args.json, args.timeout)?;
+                    terminal_result(&job)?;
+                }
+            }
+        },
+        Command::Mine(args) => {
+            if args.blocks == 0 {
+                return Err(ClientError::Local("--blocks must be positive".to_string()));
+            }
+            let node = scenario_node(&args.node)?;
+            let response = client.start_mine(
+                &MineJobRequest {
+                    node: node.to_string(),
+                    blocks: args.blocks,
+                },
+                args.idempotency_key.as_deref(),
+            )?;
+            output::print_job_created(&response, args.json)?;
+            if args.wait {
+                let job = watch_job(&client, &response.job_id, args.json, args.timeout)?;
+                terminal_result(&job)?;
+            }
         }
         Command::Reorg(args) => {
             let response = client.start_reorg(
@@ -74,6 +119,47 @@ fn run(cli: Cli) -> Result<(), ClientError> {
                 terminal_result(&job)?;
             }
         }
+        Command::Scenario(args) => match args.command {
+            ScenarioCommand::Start(args) => {
+                let yaml = read_scenario(&args.file)?;
+                let response = client.start_scenario(yaml, args.idempotency_key.as_deref())?;
+                if args.id_only {
+                    output::print_job_id(&response)?;
+                } else {
+                    output::print_job_created(&response, args.json)?;
+                }
+            }
+            ScenarioCommand::Run(args) => {
+                let yaml = read_scenario(&args.file)?;
+                let response = client.start_scenario(yaml, args.idempotency_key.as_deref())?;
+                output::print_job_created(&response, args.json)?;
+                let job = watch_job(&client, &response.job_id, args.json, args.timeout)?;
+                if let Some(path) = args.result {
+                    write_result_artifact(&client, &job, &path)?;
+                }
+                terminal_result(&job)?;
+            }
+            ScenarioCommand::Wait(args) => {
+                let checkpoint =
+                    wait_checkpoint(&client, &args.job_id, &args.checkpoint, args.timeout)?;
+                output::print_checkpoint(&checkpoint, args.json)?;
+            }
+            ScenarioCommand::Release(args) => {
+                let checkpoint = client.checkpoint(&args.job_id, &args.checkpoint)?;
+                if checkpoint.checkpoint.generation == 0 {
+                    return Err(ClientError::Api(format!(
+                        "checkpoint '{}' has not been reached",
+                        args.checkpoint
+                    )));
+                }
+                let released = client.release_checkpoint(
+                    &args.job_id,
+                    &args.checkpoint,
+                    checkpoint.checkpoint.generation,
+                )?;
+                output::print_checkpoint(&released, args.json)?;
+            }
+        },
         Command::Jobs(args) => match args.command {
             JobsCommand::List(args) => output::print_jobs(&client.jobs()?, args.json)?,
             JobsCommand::Watch(args) => {
@@ -84,6 +170,95 @@ fn run(cli: Cli) -> Result<(), ClientError> {
         },
     }
     Ok(())
+}
+
+fn read_scenario(path: &std::path::Path) -> Result<String, ClientError> {
+    std::fs::read_to_string(path).map_err(|error| {
+        ClientError::Local(format!(
+            "cannot read scenario file {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn scenario_node(node: &str) -> Result<&'static str, ClientError> {
+    match node {
+        "node2" | "btc-simnet-node2" => Ok("node2"),
+        "node3" | "btc-simnet-node3" => Ok("node3"),
+        _ => Err(ClientError::Local(
+            "--node must be node2 or node3".to_string(),
+        )),
+    }
+}
+
+fn wait_checkpoint(
+    client: &ControlClient,
+    job_id: &str,
+    checkpoint: &str,
+    timeout_secs: u64,
+) -> Result<JobCheckpointResponse, ClientError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        let response = client.checkpoint(job_id, checkpoint)?;
+        match response.checkpoint.state {
+            CheckpointState::Reached | CheckpointState::Released => return Ok(response),
+            CheckpointState::TimedOut => {
+                return Err(ClientError::Api(format!(
+                    "checkpoint '{checkpoint}' timed out"
+                )))
+            }
+            CheckpointState::Pending => {}
+        }
+        let job = client.job(job_id)?;
+        if job.summary.state.is_terminal() {
+            terminal_result(&job)?;
+            return Err(ClientError::Api(format!(
+                "job {job_id} ended before checkpoint '{checkpoint}' was reached"
+            )));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ClientError::Timeout(format!(
+                "timed out waiting for checkpoint '{checkpoint}' on job {job_id}"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ScenarioArtifact<'a> {
+    job: &'a JobDetail,
+    events: JobEventsResponse,
+}
+
+fn write_result_artifact(
+    client: &ControlClient,
+    job: &JobDetail,
+    path: &std::path::Path,
+) -> Result<(), ClientError> {
+    let mut after = 0u64;
+    let mut all_events = Vec::new();
+    loop {
+        let page = client.job_events(&job.summary.id, after, 500)?;
+        let page_len = page.events.len();
+        after = page.next_sequence.max(after);
+        all_events.extend(page.events);
+        if page_len < 500 {
+            break;
+        }
+    }
+    let events = JobEventsResponse {
+        events: all_events,
+        next_sequence: after,
+    };
+    let artifact = serde_json::to_string_pretty(&ScenarioArtifact { job, events })
+        .map_err(|error| ClientError::Output(error.to_string()))?;
+    std::fs::write(path, format!("{artifact}\n")).map_err(|error| {
+        ClientError::Local(format!(
+            "cannot write scenario result {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn watch_job(
@@ -148,6 +323,7 @@ fn exit_code(error: &ClientError) -> u8 {
         ClientError::Unavailable(_) | ClientError::Authentication(_) => EXIT_UNAVAILABLE,
         ClientError::Timeout(_) => EXIT_TIMEOUT,
         ClientError::Interrupted(_) => EXIT_INTERRUPTED_OR_CLEANUP,
+        ClientError::Local(_) => EXIT_USAGE,
         ClientError::Api(_) | ClientError::Decode(_) | ClientError::Output(_) => {
             EXIT_OPERATION_FAILED
         }
@@ -185,6 +361,10 @@ mod tests {
         assert_eq!(
             exit_code(&ClientError::Interrupted("aborted".to_string())),
             EXIT_INTERRUPTED_OR_CLEANUP
+        );
+        assert_eq!(
+            exit_code(&ClientError::Local("missing file".to_string())),
+            EXIT_USAGE
         );
     }
 }

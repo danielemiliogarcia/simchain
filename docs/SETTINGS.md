@@ -409,22 +409,24 @@ egress only — `--delay-ms 500` adds 500ms one way (RTT +500ms); apply it on bo
 endpoints for symmetric latency. Its qdisc is ephemeral and disappears when the target
 node restarts.
 
-## Scenario engine (profile `scenario`)
+## Scenario compatibility client (profile `scenario`)
 
-The scenario engine is a one-shot post-bootstrap orchestrator. Relative file paths are
-resolved from the repository root mounted at `/workspace` in the container.
+The compatibility container is a one-shot HTTP client for the control plane's durable
+scenario jobs. Relative paths resolve from `/workspace`. Normal host and CI use should
+prefer `simchainctl scenario`; the profile exists for old invocations.
 
 | Variable | Default | Description |
 |---|---|---|
 | `SCENARIO_FILE` | `/workspace/scenarios/pause-then-burst.yml` | YAML scenario to validate and execute. On the host, paths such as `scenarios/reorg-during-sync.yml` are accepted. |
-| `SCENARIO_TIMEOUT_SECS` | `1800` | Positive global timeout used while waiting for RPC, bootstrap, requested heights, and mining-controller restart. |
-| `SCENARIO_RESULT_FILE` | _(empty)_ | Optional JSON result path. Relative paths resolve under `/workspace`; the artifact records success, executed/total steps, duration, final height/hash, and the first error. |
-| `SIMCHAIN_REPO_ROOT` | `/workspace` | Repository mount containing compose, helper scripts, and scenario files. Normally set only by compose. |
+| `SCENARIO_TIMEOUT_SECS` | `1800` | Positive client wait timeout. Server-side checkpoint timeouts are declared in YAML and continue if this client disconnects. |
+| `SCENARIO_RESULT_FILE` | _(empty)_ | Optional terminal job JSON path. Relative paths resolve under `/workspace`. |
+| `SIMCHAIN_REPO_ROOT` | `/workspace` | Base path used only to resolve compatibility-client files. |
+| `SIMCHAIN_CONTROL_URL` | `http://127.0.0.1:8090` | Control-plane base URL; Compose sets the private service URL. |
+| `SIMCHAIN_CONTROL_TOKEN` | _(empty)_ | Optional bearer token override. Otherwise the client reads the shared control-state token. |
 
-Node RPC URLs, credentials, and miner wallet names use the shared settings above. The
-profile mounts `/var/run/docker.sock` because pause/resume, reorg, and partition actions
-drive existing compose/script surfaces. Treat access to this container as root-equivalent
-host access. Full schema and execution semantics: [SCENARIOS.md](SCENARIOS.md).
+The image contains no Docker CLI and the service mounts no Docker socket. Bitcoin RPC,
+worker leases, reorg safety, progress, and cleanup are owned by the control plane. Full
+schema and CI checkpoint semantics: [SCENARIOS.md](SCENARIOS.md).
 
 ## Simchain control plane (profile `control-plane`; alias `panel`)
 

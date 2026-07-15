@@ -1,7 +1,7 @@
 use crate::client::ClientError;
 use simchain_common::control_api::{
-    AbortJobResponse, ComponentControlResponse, ConfigResponse, JobCreatedResponse, JobDetail,
-    JobEvent, JobListResponse, StatusResponse,
+    AbortJobResponse, ComponentControlResponse, ConfigResponse, JobCheckpointResponse,
+    JobCreatedResponse, JobDetail, JobEvent, JobListResponse, StatusResponse,
 };
 use std::io::{self, Write};
 
@@ -74,6 +74,28 @@ pub fn print_job_created(response: &JobCreatedResponse, json: bool) -> Result<()
         response.job_id,
         response.state.as_str(),
         reused
+    )?;
+    Ok(())
+}
+
+pub fn print_job_id(response: &JobCreatedResponse) -> Result<(), ClientError> {
+    let mut out = io::stdout().lock();
+    writeln!(out, "{}", response.job_id)?;
+    Ok(())
+}
+
+pub fn print_checkpoint(response: &JobCheckpointResponse, json: bool) -> Result<(), ClientError> {
+    if json {
+        return print_json(response);
+    }
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
+        "{} / {}: {} (generation {})",
+        response.job_id,
+        response.checkpoint.name,
+        response.checkpoint.state.as_str(),
+        response.checkpoint.generation
     )?;
     Ok(())
 }

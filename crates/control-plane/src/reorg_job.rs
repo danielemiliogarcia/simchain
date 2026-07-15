@@ -30,6 +30,8 @@ pub struct ReorgExecution {
 pub struct ReorgRecoveryContext {
     pub mutation_may_have_occurred: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<ReorgJobRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub invalidated_block_hash: Option<String>,
 }
 

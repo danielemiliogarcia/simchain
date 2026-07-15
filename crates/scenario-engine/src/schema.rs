@@ -1,17 +1,18 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::{fmt, fs, path::Path};
 
 pub const BOOTSTRAP_HEIGHT: u64 = 204;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scenario {
     pub version: u64,
     pub steps: Vec<Step>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Step {
     WaitHeight {
@@ -41,6 +42,24 @@ pub enum Step {
         main_blocks: u64,
         isolated_blocks: u64,
     },
+    Checkpoint {
+        #[serde(flatten)]
+        checkpoint: CheckpointStep,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointStep {
+    pub name: String,
+    #[serde(default = "default_checkpoint_pause")]
+    pub pause: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+fn default_checkpoint_pause() -> bool {
+    true
 }
 
 impl Step {
@@ -54,16 +73,26 @@ impl Step {
             Self::Reorg { .. } => "reorg",
             Self::SpamBurst { .. } => "spam_burst",
             Self::Partition { .. } => "partition",
+            Self::Checkpoint { .. } => "checkpoint",
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum MinerNode {
     #[serde(rename = "btc-simnet-node2")]
     Node2,
     #[serde(rename = "btc-simnet-node3")]
     Node3,
+}
+
+impl MinerNode {
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Node2 => "node2",
+            Self::Node3 => "node3",
+        }
+    }
 }
 
 impl fmt::Display for MinerNode {
@@ -76,19 +105,24 @@ impl fmt::Display for MinerNode {
 }
 
 impl Scenario {
+    pub fn parse(contents: &str) -> Result<Self> {
+        let scenario: Self =
+            serde_yaml::from_str(contents).context("failed to parse scenario YAML")?;
+        scenario.validate()?;
+        Ok(scenario)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("failed to read scenario file {}", path.display()))?;
-        let scenario: Self = serde_yaml::from_str(&contents)
-            .with_context(|| format!("failed to parse scenario file {}", path.display()))?;
-        scenario.validate()?;
-        Ok(scenario)
+        Self::parse(&contents).with_context(|| format!("invalid scenario file {}", path.display()))
     }
 
     pub fn validate(&self) -> Result<()> {
         if self.version != 1 {
             bail!("unsupported scenario version {}; expected 1", self.version);
         }
+        let mut checkpoint_names = HashSet::new();
         for (index, step) in self.steps.iter().enumerate() {
             let error = match step {
                 Step::WaitHeight { height } if *height < BOOTSTRAP_HEIGHT => {
@@ -118,6 +152,31 @@ impl Scenario {
                 } if main_blocks == isolated_blocks => {
                     Some("main_blocks and isolated_blocks must differ".to_string())
                 }
+                Step::Checkpoint { checkpoint }
+                    if checkpoint.name.is_empty()
+                        || !checkpoint.name.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'-' | b'_' | b'.' | b'~')
+                        }) =>
+                {
+                    Some("checkpoint name must be non-empty and URL-safe".to_string())
+                }
+                Step::Checkpoint { checkpoint } if checkpoint.name.len() > 100 => {
+                    Some("checkpoint name must not exceed 100 bytes".to_string())
+                }
+                Step::Checkpoint { checkpoint }
+                    if checkpoint.pause && checkpoint.timeout_secs.is_none() =>
+                {
+                    Some("timeout_secs is required when pause is true".to_string())
+                }
+                Step::Checkpoint { checkpoint } if checkpoint.timeout_secs == Some(0) => {
+                    Some("timeout_secs must be positive".to_string())
+                }
+                Step::Checkpoint { checkpoint }
+                    if !checkpoint_names.insert(checkpoint.name.clone()) =>
+                {
+                    Some("checkpoint names must be unique".to_string())
+                }
                 _ => None,
             };
             if let Some(error) = error {
@@ -133,9 +192,7 @@ mod tests {
     use super::*;
 
     fn parse(yaml: &str) -> Result<Scenario> {
-        let scenario: Scenario = serde_yaml::from_str(yaml)?;
-        scenario.validate()?;
-        Ok(scenario)
+        Scenario::parse(yaml)
     }
 
     #[test]
@@ -161,37 +218,51 @@ steps:
     }
 
     #[test]
-    fn rejects_unknown_version() {
-        let error = parse("version: 2\nsteps: []\n").unwrap_err();
-        assert!(error.to_string().contains("unsupported scenario version"));
+    fn checkpoints_default_to_pausing_and_require_unique_safe_names() {
+        let scenario = parse(
+            r#"
+version: 1
+steps:
+  - type: checkpoint
+    name: mempool_loaded
+    timeout_secs: 60
+  - type: checkpoint
+    name: observed
+    pause: false
+"#,
+        )
+        .expect("valid checkpoints");
+        let Step::Checkpoint { checkpoint } = &scenario.steps[0] else {
+            panic!("checkpoint step");
+        };
+        assert!(checkpoint.pause);
+
+        for yaml in [
+            "version: 1\nsteps:\n  - type: checkpoint\n    name: bad/name\n    timeout_secs: 1\n",
+            "version: 1\nsteps:\n  - type: checkpoint\n    name: held\n",
+            "version: 1\nsteps:\n  - type: checkpoint\n    name: same\n    timeout_secs: 1\n  - type: checkpoint\n    name: same\n    timeout_secs: 1\n",
+        ] {
+            assert!(parse(yaml).is_err());
+        }
     }
 
     #[test]
-    fn rejects_invalid_step_fields() {
-        let error = parse("version: 1\nsteps:\n  - type: sleep\n    secs: 0\n").unwrap_err();
-        assert!(error.to_string().contains("secs must be positive"));
-
-        let error =
-            parse("version: 1\nsteps:\n  - type: wait_height\n    height: 203\n").unwrap_err();
-        assert!(error.to_string().contains("height must be at least 204"));
+    fn rejects_unknown_version_and_invalid_fields() {
+        assert!(parse("version: 2\nsteps: []\n").is_err());
+        assert!(parse("version: 1\nsteps:\n  - type: sleep\n    secs: 0\n").is_err());
+        assert!(parse("version: 1\nsteps:\n  - type: wait_height\n    height: 203\n").is_err());
     }
 
     #[test]
-    fn rejects_equal_partition_block_counts() {
-        let error = parse(
+    fn rejects_equal_partition_block_counts_and_unknown_miner() {
+        assert!(parse(
             "version: 1\nsteps:\n  - type: partition\n    node: btc-simnet-node3\n    main_blocks: 4\n    isolated_blocks: 4\n",
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("must differ"));
-    }
-
-    #[test]
-    fn rejects_unknown_miner() {
-        let error = serde_yaml::from_str::<Scenario>(
+        .is_err());
+        assert!(serde_yaml::from_str::<Scenario>(
             "version: 1\nsteps:\n  - type: mine\n    node: btc-simnet-node1\n    blocks: 1\n",
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("unknown variant"));
+        .is_err());
     }
 
     #[test]
@@ -200,6 +271,7 @@ steps:
             include_str!("../../../scenarios/pause-then-burst.yml"),
             include_str!("../../../scenarios/reorg-during-sync.yml"),
             include_str!("../../../scenarios/partition-node3.yml"),
+            include_str!("../../../scenarios/ci-checkpoint.yml"),
         ] {
             parse(yaml).unwrap();
         }

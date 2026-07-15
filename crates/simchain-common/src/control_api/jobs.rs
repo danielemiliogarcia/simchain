@@ -83,6 +83,70 @@ pub struct ReorgJobRequest {
     pub double_spend_pct: u8,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScenarioJobRequest {
+    pub yaml: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MineJobRequest {
+    pub node: String,
+    pub blocks: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SpamBurstJobRequest {
+    pub node: String,
+    pub txs: u64,
+    #[serde(default)]
+    pub outputs_per_tx: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointState {
+    Pending,
+    Reached,
+    Released,
+    TimedOut,
+}
+
+impl CheckpointState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Reached => "reached",
+            Self::Released => "released",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct JobCheckpoint {
+    pub name: String,
+    pub generation: u64,
+    pub state: CheckpointState,
+    pub pause: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    pub step_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arrived_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_summary: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScenarioStepStatus {
+    pub index: usize,
+    pub total: usize,
+    pub kind: String,
+    pub state: String,
+}
+
 impl Default for ReorgJobRequest {
     fn default() -> Self {
         Self {
@@ -154,6 +218,10 @@ pub struct JobDetail {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub leases: Vec<JobLease>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_step: Option<ScenarioStepStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoints: Vec<JobCheckpoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<JobFailure>,
@@ -200,6 +268,17 @@ pub struct JobEventsResponse {
 pub struct AbortJobResponse {
     pub job_id: String,
     pub state: JobState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReleaseCheckpointRequest {
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct JobCheckpointResponse {
+    pub job_id: String,
+    pub checkpoint: JobCheckpoint,
 }
 
 #[cfg(test)]

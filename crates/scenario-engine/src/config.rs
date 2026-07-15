@@ -1,21 +1,14 @@
 use anyhow::{bail, Context, Result};
-use simchain_common::config::{
-    DEFAULT_NODE1_RPC_URL, DEFAULT_NODE2_RPC_URL, DEFAULT_NODE2_WALLET_NAME, DEFAULT_NODE3_RPC_URL,
-    DEFAULT_NODE3_WALLET_NAME,
-};
+use simchain_common::control_api::DEFAULT_CONTROL_URL;
 use std::{env, path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub scenario_file: PathBuf,
-    pub repo_root: PathBuf,
     pub result_file: Option<PathBuf>,
     pub timeout: Duration,
-    pub node1_url: String,
-    pub node2_url: String,
-    pub node3_url: String,
-    pub node2_wallet: String,
-    pub node3_wallet: String,
+    pub control_url: String,
+    pub token: String,
 }
 
 impl Config {
@@ -39,18 +32,45 @@ impl Config {
         if timeout_secs == 0 {
             bail!("SCENARIO_TIMEOUT_SECS must be a positive integer");
         }
+        let state_dir = env::var("SIMCHAIN_CONTROL_STATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| repo_root.join(".simchain-control"));
+        let configured_token = env::var("SIMCHAIN_CONTROL_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty())
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
+        let token = match configured_token {
+            Some(token) => token,
+            None => wait_for_token(&state_dir.join("token"))?,
+        };
 
         Ok(Self {
             scenario_file,
-            repo_root,
             result_file,
             timeout: Duration::from_secs(timeout_secs),
-            node1_url: env_or("NODE1_RPC_URL", DEFAULT_NODE1_RPC_URL),
-            node2_url: env_or("NODE2_RPC_URL", DEFAULT_NODE2_RPC_URL),
-            node3_url: env_or("NODE3_RPC_URL", DEFAULT_NODE3_RPC_URL),
-            node2_wallet: env_or("NODE2_WALLET_NAME", DEFAULT_NODE2_WALLET_NAME),
-            node3_wallet: env_or("NODE3_WALLET_NAME", DEFAULT_NODE3_WALLET_NAME),
+            control_url: env_or("SIMCHAIN_CONTROL_URL", DEFAULT_CONTROL_URL)
+                .trim_end_matches('/')
+                .to_string(),
+            token,
         })
+    }
+}
+
+fn wait_for_token(path: &std::path::Path) -> Result<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(token) = std::fs::read_to_string(path)
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+        {
+            return Ok(token);
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("control-plane token is unavailable at {}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 

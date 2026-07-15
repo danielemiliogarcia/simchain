@@ -8,29 +8,31 @@ Handy `bitcoin-cli` one-liners against the simnet. This how all this started... 
 
 ## Declarative scenarios
 
-Start the regular simnet first, then run a one-shot scenario. The engine waits for
-bootstrap height 204 before executing any declared steps:
+Start the simnet plus its single control plane, then upload a scenario. The server waits
+for bootstrap height 204 before executing any declared steps:
 
 ```bash
-docker compose up -d
-SCENARIO_FILE=scenarios/pause-then-burst.yml \
-  docker compose --profile scenario run --rm --build btc-simnet-scenario
+docker compose --profile control-plane up -d --build
+cargo run -p simchainctl -- scenario run scenarios/pause-then-burst.yml
 ```
 
 Other shipped histories:
 
 ```bash
-SCENARIO_FILE=scenarios/reorg-during-sync.yml docker compose --profile scenario run --rm btc-simnet-scenario
-SCENARIO_FILE=scenarios/partition-node3.yml docker compose --profile scenario run --rm btc-simnet-scenario
+cargo run -p simchainctl -- scenario run scenarios/reorg-during-sync.yml
+cargo run -p simchainctl -- scenario run scenarios/partition-node3.yml
 ```
 
-Write a machine-readable CI artifact and propagate the container's exit code with:
+Write a machine-readable CI artifact and propagate the job's stable exit code with:
 
 ```bash
-SCENARIO_FILE=scenarios/reorg-during-sync.yml \
-SCENARIO_RESULT_FILE=/workspace/results/reorg.json \
-  docker compose --profile scenario run --rm btc-simnet-scenario
+cargo run -p simchainctl -- scenario run scenarios/reorg-during-sync.yml \
+  --result results/reorg.json
 ```
+
+For an external-test barrier, start `scenarios/ci-checkpoint.yml`, wait for
+`mempool_loaded`, run the downstream assertions, then release it. See
+[SCENARIOS.md](SCENARIOS.md) for the complete copy-paste workflow.
 
 For a one-shot burst outside a YAML run:
 

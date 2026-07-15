@@ -7,8 +7,8 @@ use crate::apply::{apply, ApplyRequest};
 use crate::service::{
     abort_job as abort_job_service, config, get_job as get_job_service,
     list_jobs as list_jobs_service, schema, set_mining_state as set_mining_state_service,
-    set_spam_state as set_spam_state_service, start_reorg as start_reorg_service, status,
-    ServiceError,
+    set_spam_state as set_spam_state_service, start_reorg as start_reorg_service,
+    start_scenario as start_scenario_service, status, ServiceError,
 };
 use crate::state::SharedState;
 use rmcp::handler::server::wrapper::Parameters;
@@ -99,6 +99,25 @@ fn default_reorg_node() -> String {
 pub struct JobIdParams {
     /// Server-assigned job identifier.
     pub job_id: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct StartScenarioParams {
+    /// Complete validated version-1 scenario document as YAML text.
+    pub yaml: String,
+    /// Optional retry key. Reusing it with identical YAML returns the original job.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct ReleaseCheckpointParams {
+    /// Server-assigned scenario job identifier.
+    pub job_id: String,
+    /// URL-safe checkpoint name from the submitted scenario.
+    pub checkpoint: String,
+    /// Generation returned when this checkpoint occurrence was reached.
+    pub generation: u64,
 }
 
 #[tool_router(vis = "pub(crate)")]
@@ -284,6 +303,32 @@ impl ControlPlaneMcp {
     }
 
     #[tool(
+        name = "start_scenario",
+        description = "Validate and start a durable server-side scenario job from YAML. Execution continues independently of the MCP client and may pause at bounded named checkpoints.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn start_scenario(
+        &self,
+        Parameters(params): Parameters<StartScenarioParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let app = self.app.clone();
+        match tokio::task::spawn_blocking(move || {
+            start_scenario_service(&app, params.yaml, params.idempotency_key)
+        })
+        .await
+        .map_err(join_error)?
+        {
+            Ok(response) => success_json(&response),
+            Err(error) => error_json(error),
+        }
+    }
+
+    #[tool(
         name = "get_job",
         description = "Get one job's normalized request, state, phase, leases, result or failure, and separate cleanup outcome.",
         annotations(
@@ -334,6 +379,33 @@ impl ControlPlaneMcp {
             Err(error) => error_json(error),
         }
     }
+
+    #[tool(
+        name = "release_checkpoint",
+        description = "Release one reached pausing checkpoint using its current generation. Repeating the same release is idempotent; stale generations are rejected.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn release_checkpoint(
+        &self,
+        Parameters(params): Parameters<ReleaseCheckpointParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match crate::service::release_checkpoint(
+            &self.app,
+            &params.job_id,
+            &params.checkpoint,
+            simchain_common::control_api::ReleaseCheckpointRequest {
+                generation: params.generation,
+            },
+        ) {
+            Ok(response) => success_json(&response),
+            Err(error) => error_json(error),
+        }
+    }
 }
 
 #[tool_handler]
@@ -344,8 +416,9 @@ impl ServerHandler for ControlPlaneMcp {
         info.instructions = Some(
             "Simchain control plane: inspect the live regtest simnet and manage its \
              desired runtime configuration and bounded mutation jobs. Start with \
-             get_status and get_config_schema. Reorgs are asynchronous: start one, \
-             then inspect it with get_job or list_jobs."
+             get_status and get_config_schema. Jobs are asynchronous: start one, \
+             then inspect it with get_job or list_jobs; scenario checkpoints require \
+             their returned generation when released."
                 .to_string(),
         );
         info

@@ -3,8 +3,9 @@
 
 use crate::apply::{apply, ApplyRequest};
 use crate::service::{
-    abort_job, config, get_job, job_events, list_jobs, schema, set_mining_state, set_spam_state,
-    settings_state, start_reorg, status, ErrorCode, ServiceError,
+    abort_job, config, get_checkpoint, get_job, job_events, list_jobs, release_checkpoint, schema,
+    set_mining_state, set_spam_state, settings_state, start_mine, start_reorg, start_scenario,
+    start_spam_burst, status, ErrorCode, ServiceError,
 };
 use crate::state::SharedState;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -47,9 +48,20 @@ pub fn router(app: SharedState) -> Router {
         .route("/api/v1/events", get(global_events_handler))
         .route("/api/v1/jobs", get(jobs_handler))
         .route("/api/v1/jobs/reorg", post(reorg_job_handler))
+        .route("/api/v1/jobs/scenario", post(scenario_job_handler))
+        .route("/api/v1/jobs/mine", post(mine_job_handler))
+        .route("/api/v1/jobs/spam-burst", post(spam_burst_job_handler))
         .route("/api/v1/jobs/{job_id}", get(job_handler))
         .route("/api/v1/jobs/{job_id}/events", get(job_events_handler))
         .route("/api/v1/jobs/{job_id}/abort", post(abort_job_handler))
+        .route(
+            "/api/v1/jobs/{job_id}/checkpoints/{name}",
+            get(checkpoint_handler),
+        )
+        .route(
+            "/api/v1/jobs/{job_id}/checkpoints/{name}/release",
+            post(release_checkpoint_handler),
+        )
         // Phase-1 compatibility routes; removed with the Compose adapter.
         .route("/api/v1/state", get(state_handler))
         .route("/api/v1/status", get(status_handler))
@@ -464,6 +476,202 @@ async fn reorg_job_handler(State(app): State<SharedState>, request: Request) -> 
     }
 }
 
+async fn scenario_job_handler(State(app): State<SharedState>, request: Request) -> Response {
+    if !request_has_token(&app, &request) {
+        return error_response(&ServiceError::new(
+            ErrorCode::Unauthorized,
+            "missing or invalid bearer token (see .simchain-control/token)",
+        ));
+    }
+    let idempotency_key = match request.headers().get("idempotency-key") {
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value.to_string()),
+            Err(_) => {
+                return error_response(&ServiceError::new(
+                    ErrorCode::ValidationFailed,
+                    "Idempotency-Key must be valid UTF-8",
+                ));
+            }
+        },
+        None => None,
+    };
+    let is_json = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        });
+    // JSON escaping can nearly double a valid 1 MiB YAML document. The job
+    // manager enforces the decoded YAML limit for both submission forms.
+    let body = match axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024 + 64 * 1024).await {
+        Ok(body) => body,
+        Err(error) => {
+            return error_response(&ServiceError::new(
+                ErrorCode::ValidationFailed,
+                format!("invalid scenario request body: {error}"),
+            ));
+        }
+    };
+    let yaml = if is_json {
+        match serde_json::from_slice::<simchain_common::control_api::ScenarioJobRequest>(&body) {
+            Ok(payload) => payload.yaml,
+            Err(error) => {
+                return error_response(&ServiceError::new(
+                    ErrorCode::ValidationFailed,
+                    format!("invalid scenario JSON envelope: {error}"),
+                ));
+            }
+        }
+    } else {
+        match String::from_utf8(body.to_vec()) {
+            Ok(yaml) => yaml,
+            Err(error) => {
+                return error_response(&ServiceError::new(
+                    ErrorCode::ValidationFailed,
+                    format!("scenario YAML must be UTF-8: {error}"),
+                ));
+            }
+        }
+    };
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || start_scenario(&worker, yaml, idempotency_key)).await
+    {
+        Ok(Ok(response)) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
+async fn mine_job_handler(State(app): State<SharedState>, request: Request) -> Response {
+    if !request_has_token(&app, &request) {
+        return error_response(&ServiceError::new(
+            ErrorCode::Unauthorized,
+            "missing or invalid bearer token (see .simchain-control/token)",
+        ));
+    }
+    let idempotency_key = match request_idempotency_key(&request) {
+        Ok(key) => key,
+        Err(error) => return error_response(&error),
+    };
+    let payload: Result<Json<simchain_common::control_api::MineJobRequest>, JsonRejection> =
+        Json::from_request(request, &()).await;
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return error_response(&ServiceError::new(
+                ErrorCode::ValidationFailed,
+                format!("invalid request body: {rejection}"),
+            ));
+        }
+    };
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || start_mine(&worker, payload, idempotency_key)).await {
+        Ok(Ok(response)) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
+async fn spam_burst_job_handler(State(app): State<SharedState>, request: Request) -> Response {
+    if !request_has_token(&app, &request) {
+        return error_response(&ServiceError::new(
+            ErrorCode::Unauthorized,
+            "missing or invalid bearer token (see .simchain-control/token)",
+        ));
+    }
+    let idempotency_key = match request_idempotency_key(&request) {
+        Ok(key) => key,
+        Err(error) => return error_response(&error),
+    };
+    let payload: Result<Json<simchain_common::control_api::SpamBurstJobRequest>, JsonRejection> =
+        Json::from_request(request, &()).await;
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return error_response(&ServiceError::new(
+                ErrorCode::ValidationFailed,
+                format!("invalid request body: {rejection}"),
+            ));
+        }
+    };
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || start_spam_burst(&worker, payload, idempotency_key))
+        .await
+    {
+        Ok(Ok(response)) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
+fn request_idempotency_key(request: &Request) -> Result<Option<String>, ServiceError> {
+    match request.headers().get("idempotency-key") {
+        Some(value) => value
+            .to_str()
+            .map(|value| Some(value.to_string()))
+            .map_err(|_| {
+                ServiceError::new(
+                    ErrorCode::ValidationFailed,
+                    "Idempotency-Key must be valid UTF-8",
+                )
+            }),
+        None => Ok(None),
+    }
+}
+
+async fn checkpoint_handler(
+    State(app): State<SharedState>,
+    AxumPath((job_id, name)): AxumPath<(String, String)>,
+) -> Response {
+    match get_checkpoint(&app, &job_id, &name) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error_response(&error),
+    }
+}
+
+async fn release_checkpoint_handler(
+    State(app): State<SharedState>,
+    AxumPath((job_id, name)): AxumPath<(String, String)>,
+    request: Request,
+) -> Response {
+    if !request_has_token(&app, &request) {
+        return error_response(&ServiceError::new(
+            ErrorCode::Unauthorized,
+            "missing or invalid bearer token (see .simchain-control/token)",
+        ));
+    }
+    let payload: Result<
+        Json<simchain_common::control_api::ReleaseCheckpointRequest>,
+        JsonRejection,
+    > = Json::from_request(request, &()).await;
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return error_response(&ServiceError::new(
+                ErrorCode::ValidationFailed,
+                format!("invalid request body: {rejection}"),
+            ));
+        }
+    };
+    match release_checkpoint(&app, &job_id, &name, payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error_response(&error),
+    }
+}
+
 async fn abort_job_handler(
     State(app): State<SharedState>,
     AxumPath(job_id): AxumPath<String>,
@@ -612,6 +820,64 @@ mod tests {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
         builder.body(Body::empty()).expect("request")
+    }
+
+    fn post_scenario(
+        body: impl Into<Body>,
+        content_type: &str,
+        token: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::post("/api/v1/jobs/scenario")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, content_type);
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if let Some(key) = idempotency_key {
+            builder = builder.header("Idempotency-Key", key);
+        }
+        builder.body(body.into()).expect("request")
+    }
+
+    fn post_checkpoint_release(
+        job_id: &str,
+        name: &str,
+        generation: u64,
+        token: Option<&str>,
+    ) -> HttpRequest<Body> {
+        let mut builder =
+            HttpRequest::post(format!("/api/v1/jobs/{job_id}/checkpoints/{name}/release"))
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder
+            .body(Body::from(
+                serde_json::json!({"generation": generation}).to_string(),
+            ))
+            .expect("request")
+    }
+
+    fn post_action(
+        action: &str,
+        payload: serde_json::Value,
+        token: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::post(format!("/api/v1/jobs/{action}"))
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if let Some(key) = idempotency_key {
+            builder = builder.header("Idempotency-Key", key);
+        }
+        builder
+            .body(Body::from(payload.to_string()))
+            .expect("request")
     }
 
     #[tokio::test]
@@ -816,6 +1082,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scenario_yaml_and_json_envelopes_share_checkpoint_contract() {
+        let fx = fixture(None);
+        let yaml = r#"
+version: 1
+steps:
+  - type: pause_mining
+  - type: checkpoint
+    name: ci_hold
+    timeout_secs: 5
+  - type: resume_mining
+"#;
+        let (status, body) = send(
+            &fx.router,
+            post_scenario(yaml, "application/yaml", None, None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = send(
+            &fx.router,
+            post_scenario(
+                yaml,
+                "application/yaml",
+                Some("test-token"),
+                Some("scenario-http-retry"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job_id = body["job_id"].as_str().expect("job ID").to_string();
+
+        let envelope = serde_json::json!({"yaml": yaml}).to_string();
+        let (status, body) = send(
+            &fx.router,
+            post_scenario(
+                envelope,
+                "application/json; charset=utf-8",
+                Some("test-token"),
+                Some("scenario-http-retry"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["job_id"], job_id);
+        assert_eq!(body["reused"], true);
+
+        let checkpoint_path = format!("/api/v1/jobs/{job_id}/checkpoints/ci_hold");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let checkpoint = loop {
+            let (status, body) = send(&fx.router, get(&checkpoint_path)).await;
+            assert_eq!(status, StatusCode::OK);
+            if body["checkpoint"]["state"] == "reached" {
+                break body;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "checkpoint was not reached"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        let generation = checkpoint["checkpoint"]["generation"]
+            .as_u64()
+            .expect("generation");
+        assert!(checkpoint["checkpoint"]["live_summary"].is_object());
+
+        let (status, body) = send(
+            &fx.router,
+            post_checkpoint_release(&job_id, "ci_hold", generation, None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+        let (status, body) = send(
+            &fx.router,
+            post_checkpoint_release(&job_id, "ci_hold", generation + 1, Some("test-token")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "checkpoint_conflict");
+
+        for _ in 0..2 {
+            let (status, body) = send(
+                &fx.router,
+                post_checkpoint_release(&job_id, "ci_hold", generation, Some("test-token")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["checkpoint"]["state"], "released");
+        }
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let (status, body) = send(&fx.router, get(&format!("/api/v1/jobs/{job_id}"))).await;
+            assert_eq!(status, StatusCode::OK);
+            if body["state"] == "succeeded" {
+                assert!(body["result"].is_object());
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scenario did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(fx.mock.compose_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_scenario_is_rejected_before_reserving_the_coordinator() {
+        let fx = fixture(None);
+        let invalid = "version: 1\nsteps:\n  - type: checkpoint\n    name: held\n";
+        let (status, body) = send(
+            &fx.router,
+            post_scenario(invalid, "text/yaml", Some("test-token"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "validation_failed");
+        let (status, body) = send(&fx.router, get("/api/v1/jobs")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["jobs"].as_array().expect("jobs").is_empty());
+        assert!(body["active_job_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn manual_mine_and_spam_burst_use_dedicated_job_contracts() {
+        let fx = fixture(None);
+        let (status, body) = send(
+            &fx.router,
+            post_action(
+                "mine",
+                serde_json::json!({"node": "node2", "blocks": 2}),
+                None,
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = send(
+            &fx.router,
+            post_action(
+                "mine",
+                serde_json::json!({"node": "node2", "blocks": 2}),
+                Some("test-token"),
+                Some("mine-http"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let mine_id = body["job_id"].as_str().expect("mine ID").to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let (_, job) = send(&fx.router, get(&format!("/api/v1/jobs/{mine_id}"))).await;
+            if job["state"] == "succeeded" {
+                assert_eq!(job["kind"], "mine");
+                assert_eq!(job["result"]["blocks"], 2);
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let (status, body) = send(
+            &fx.router,
+            post_action(
+                "spam-burst",
+                serde_json::json!({"node": "node3", "txs": 3, "outputs_per_tx": 2}),
+                Some("test-token"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let burst_id = body["job_id"].as_str().expect("burst ID").to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let (_, job) = send(&fx.router, get(&format!("/api/v1/jobs/{burst_id}"))).await;
+            if job["state"] == "succeeded" {
+                assert_eq!(job["kind"], "spam_burst");
+                assert_eq!(job["result"]["accepted_transactions"], 3);
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(fx.mock.compose_calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn invalid_value_yields_validation_failed() {
         let fx = fixture(None);
         let payload = serde_json::json!({"settings": {"ENABLE_SPAM": "maybe"}});
@@ -910,7 +1368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_lists_phase_four_tools() {
+    async fn mcp_lists_phase_five_tools() {
         let router = crate::mcp::ControlPlaneMcp::tool_router();
         let mut names: Vec<String> = router
             .list_all()
@@ -927,10 +1385,12 @@ mod tests {
                 "get_job",
                 "get_status",
                 "list_jobs",
+                "release_checkpoint",
                 "set_config",
                 "set_mining_state",
                 "set_spam_state",
                 "start_reorg",
+                "start_scenario",
             ]
         );
     }
@@ -974,6 +1434,71 @@ mod tests {
         let job: serde_json::Value = serde_json::from_str(&text.text).expect("job JSON");
         assert_eq!(job["kind"], "reorg");
         assert_eq!(job["request"]["depth"], 2);
+    }
+
+    #[tokio::test]
+    async fn mcp_scenario_and_checkpoint_use_the_shared_job_contract() {
+        use rmcp::handler::server::wrapper::Parameters;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mock = Arc::new(MockBackend::new(dir.path().join(".env")));
+        mock.sync_containers();
+        let app = Arc::new(test_app(dir.path(), mock));
+        let mcp = crate::mcp::ControlPlaneMcp::new(app.clone());
+        let result = mcp
+            .start_scenario(Parameters(crate::mcp::StartScenarioParams {
+                yaml: r#"
+version: 1
+steps:
+  - type: checkpoint
+    name: mcp_hold
+    timeout_secs: 5
+"#
+                .to_string(),
+                idempotency_key: Some("mcp-scenario".to_string()),
+            }))
+            .await
+            .expect("tool result");
+        assert_ne!(result.is_error, Some(true));
+        let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let created: serde_json::Value = serde_json::from_str(&text.text).expect("job JSON");
+        let job_id = created["job_id"].as_str().expect("job ID").to_string();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let generation = loop {
+            if let Ok(response) = app.jobs.checkpoint(&job_id, "mcp_hold") {
+                if response.checkpoint.state
+                    == simchain_common::control_api::CheckpointState::Reached
+                {
+                    break response.checkpoint.generation;
+                }
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        let result = mcp
+            .release_checkpoint(Parameters(crate::mcp::ReleaseCheckpointParams {
+                job_id: job_id.clone(),
+                checkpoint: "mcp_hold".to_string(),
+                generation,
+            }))
+            .await
+            .expect("release tool result");
+        assert_ne!(result.is_error, Some(true));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let job = app.jobs.get(&job_id).expect("job");
+            if job.summary.state.is_terminal() {
+                assert_eq!(
+                    job.summary.state,
+                    simchain_common::control_api::JobState::Succeeded
+                );
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test]

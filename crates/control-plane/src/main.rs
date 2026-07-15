@@ -20,6 +20,7 @@ mod jobs;
 mod mcp;
 mod reconcile;
 mod reorg_job;
+mod scenario_job;
 mod service;
 mod state;
 mod status;
@@ -119,11 +120,18 @@ async fn main() -> anyhow::Result<()> {
     let control_state =
         store.load_or_initialize(control_state::desired_from_legacy_env(&config.env_file)?)?;
     let reorg_executor = Arc::new(reorg_job::RpcReorgExecutor::from_config(&config)?);
+    let scenario_backend = Arc::new(scenario_job::RpcScenarioActionBackend::from_config(
+        &config,
+        backend.clone(),
+        mining.clone(),
+        spam.clone(),
+    )?);
     let jobs = jobs::JobManager::open(
         &config.state_dir,
         mining.clone(),
         spam.clone(),
         reorg_executor,
+        scenario_backend,
     )?;
     let app = Arc::new(AppState {
         config: config.clone(),

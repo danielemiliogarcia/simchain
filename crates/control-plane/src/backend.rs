@@ -124,4 +124,12 @@ pub trait JobActions: Send + Sync {
     fn node1_height(&self) -> anyhow::Result<u64>;
     fn spam_min_fee(&self) -> anyhow::Result<f64>;
     fn wait(&self, duration: Duration);
+    /// Transitional Phase-5 partition path. Phase 6 replaces this adapter
+    /// with leased namespace-local network agents.
+    fn run_partition(
+        &self,
+        node: &str,
+        main_blocks: u64,
+        isolated_blocks: u64,
+    ) -> anyhow::Result<()>;
 }

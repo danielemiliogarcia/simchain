@@ -51,11 +51,39 @@
     </section>
 
     <section class="card" id="jobs-card">
-      <h2>Reorg jobs</h2>
-      <p class="hint">Reorgs run as durable server-side jobs. The coordinator pauses mining and
-        spam with owned leases, waits for node1 to witness the replacement chain, then restores
-        the workers. Closing this page does not cancel a job.</p>
+      <h2>Jobs and scenarios</h2>
+      <p class="hint">Mutations run as durable server-side jobs. Closing this page does not cancel
+        one; owned worker leases are renewed through execution and cleaned at a safe boundary.</p>
       <div id="mutation-lock" class="mutation-lock">mutation coordinator is idle</div>
+      <div class="bounded-actions">
+        <form id="mine-form" class="mini-action-form">
+          <h3>Mine blocks</h3>
+          <label>Node
+            <select id="mine-node"><option value="node2">node2</option><option value="node3">node3</option></select>
+          </label>
+          <label>Blocks
+            <input id="mine-blocks" type="number" min="1" value="1" required>
+          </label>
+          <button id="mine-start" type="submit">Mine</button>
+          <div id="mine-action-result" class="action-result"></div>
+        </form>
+        <form id="burst-form" class="mini-action-form">
+          <h3>Spam burst</h3>
+          <label>Node
+            <select id="burst-node"><option value="node2">node2</option><option value="node3">node3</option></select>
+          </label>
+          <label>Transactions
+            <input id="burst-txs" type="number" min="1" value="100" required>
+          </label>
+          <label>Outputs / tx
+            <input id="burst-outputs" type="number" min="0" value="25" required>
+          </label>
+          <button id="burst-start" type="submit">Create burst</button>
+          <div id="burst-action-result" class="action-result"></div>
+        </form>
+      </div>
+
+      <h3>Reorganization</h3>
       <form id="reorg-form" class="action-form">
         <label>Depth
           <input id="reorg-depth" type="number" min="1" max="100" value="3" required>
@@ -80,11 +108,33 @@
       </form>
       <div id="reorg-action-result" class="action-result"></div>
 
+      <h3>Scenario</h3>
+      <form id="scenario-form" class="scenario-form">
+        <label>Scenario YAML
+          <textarea id="scenario-yaml" rows="10" required>version: 1
+steps:
+  - type: checkpoint
+    name: inspect
+    timeout_secs: 600</textarea>
+        </label>
+        <div class="scenario-actions">
+          <label class="file-label">Load file
+            <input id="scenario-file" type="file" accept=".yml,.yaml,text/yaml,application/yaml">
+          </label>
+          <button id="scenario-start" type="submit">Start scenario</button>
+        </div>
+      </form>
+      <div id="scenario-action-result" class="action-result"></div>
+
       <div class="job-heading">
         <h3>Selected job</h3>
-        <button id="job-abort" class="danger" type="button" hidden>Request abort</button>
+        <div class="job-heading-actions">
+          <button id="job-download" class="secondary" type="button" hidden>Download result</button>
+          <button id="job-abort" class="danger" type="button" hidden>Request abort</button>
+        </div>
       </div>
       <div id="job-detail" class="job-detail muted">no jobs yet</div>
+      <div id="job-checkpoints" class="job-checkpoints"></div>
       <ol id="job-events" class="job-events"></ol>
 
       <h3>Recent jobs</h3>

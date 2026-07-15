@@ -19,7 +19,10 @@ let selectedJobEvents = [];
 let selectedJobEventAfter = 0;
 let jobsRefreshing = false;
 let startingJob = false;
+let startingScenario = false;
+const startingAction = { mine: false, burst: false };
 let abortingJob = false;
+const releasingCheckpoints = new Set();
 const changingComponentState = { mining: false, spam: false };
 
 const GROUP_TITLES = {
@@ -379,6 +382,17 @@ function renderJobs() {
   const start = $("#reorg-start");
   start.disabled = startingJob || active != null || !$("#reorg-form").checkValidity();
   start.textContent = startingJob ? "Starting…" : "Start reorg";
+  const scenarioStart = $("#scenario-start");
+  scenarioStart.disabled = startingScenario || active != null || !$("#scenario-form").checkValidity();
+  scenarioStart.textContent = startingScenario ? "Starting…" : "Start scenario";
+  for (const [action, formId, buttonId, label] of [
+    ["mine", "mine-form", "mine-start", "Mine"],
+    ["burst", "burst-form", "burst-start", "Create burst"],
+  ]) {
+    const button = $("#" + buttonId);
+    button.disabled = startingAction[action] || active != null || !$("#" + formId).checkValidity();
+    button.textContent = startingAction[action] ? "Starting…" : label;
+  }
 
   const tbody = $("#jobs tbody");
   tbody.replaceChildren();
@@ -420,10 +434,12 @@ function renderStatusControlsOnly() {
 function renderSelectedJob() {
   const detail = $("#job-detail");
   const abort = $("#job-abort");
+  const download = $("#job-download");
   if (!selectedJob) {
     detail.textContent = selectedJobId ? "loading job…" : "no jobs yet";
     detail.className = "job-detail muted";
     abort.hidden = true;
+    download.hidden = true;
   } else {
     const lines = [
       `${selectedJob.id} · ${selectedJob.kind} · ${selectedJob.state}`,
@@ -432,6 +448,10 @@ function renderSelectedJob() {
     if (selectedJob.started_at_ms != null) lines.push(`started ${formatJobTime(selectedJob.started_at_ms)}`);
     if (selectedJob.ended_at_ms != null) lines.push(`ended ${formatJobTime(selectedJob.ended_at_ms)}`);
     if (selectedJob.failure) lines.push(`failure ${selectedJob.failure.code}: ${selectedJob.failure.message}`);
+    if (selectedJob.current_step) {
+      const step = selectedJob.current_step;
+      lines.push(`step ${step.index}/${step.total} · ${step.kind} · ${step.state}`);
+    }
     lines.push(`cleanup ${selectedJob.cleanup.state}`);
     for (const error of selectedJob.cleanup.errors || []) lines.push(`cleanup error: ${error}`);
     detail.textContent = lines.join("\n");
@@ -440,7 +460,10 @@ function renderSelectedJob() {
     abort.disabled = abortingJob || selectedJob.state === "abort_requested";
     abort.textContent = abortingJob ? "Requesting…" :
       (selectedJob.state === "abort_requested" ? "Abort requested" : "Request abort");
+    download.hidden = !isTerminalJob(selectedJob.state);
   }
+
+  renderCheckpoints();
 
   const events = $("#job-events");
   events.replaceChildren();
@@ -459,6 +482,40 @@ function renderSelectedJob() {
     item.className = "muted";
     item.textContent = "waiting for progress events…";
     events.append(item);
+  }
+}
+
+function renderCheckpoints() {
+  const container = $("#job-checkpoints");
+  container.replaceChildren();
+  const checkpoints = (selectedJob && selectedJob.checkpoints) || [];
+  if (checkpoints.length === 0) return;
+  const heading = document.createElement("h3");
+  heading.textContent = "Checkpoints";
+  container.append(heading);
+  for (const checkpoint of checkpoints) {
+    const row = document.createElement("div");
+    row.className = `checkpoint checkpoint-${checkpoint.state}`;
+    const summary = document.createElement("span");
+    const arrival = checkpoint.arrived_at_ms == null
+      ? "" : ` · ${formatJobTime(checkpoint.arrived_at_ms)}`;
+    summary.textContent = `${checkpoint.name} · ${checkpoint.state} · generation ${checkpoint.generation}${arrival}`;
+    row.append(summary);
+    if (checkpoint.pause && checkpoint.state === "reached") {
+      const release = document.createElement("button");
+      release.type = "button";
+      release.className = "small";
+      release.textContent = releasingCheckpoints.has(checkpoint.name) ? "Releasing…" : "Release";
+      release.disabled = releasingCheckpoints.has(checkpoint.name);
+      release.addEventListener("click", () => releaseCheckpoint(checkpoint));
+      row.append(release);
+    }
+    if (checkpoint.live_summary) {
+      const live = document.createElement("pre");
+      live.textContent = JSON.stringify(checkpoint.live_summary, null, 2);
+      row.append(live);
+    }
+    container.append(row);
   }
 }
 
@@ -561,6 +618,117 @@ async function startReorg(event) {
   }
 }
 
+async function startScenario(event) {
+  event.preventDefault();
+  if (startingScenario || activeMutationId() != null || !event.currentTarget.checkValidity()) return;
+  startingScenario = true;
+  renderJobs();
+  const result = $("#scenario-action-result");
+  result.textContent = "Validating and submitting durable scenario job…";
+  result.className = "action-result";
+  try {
+    const { ok, body } = await api("/api/v1/jobs/scenario", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/yaml",
+        "Authorization": "Bearer " + TOKEN,
+        "Idempotency-Key": browserIdempotencyKey(),
+      },
+      body: $("#scenario-yaml").value,
+    });
+    if (!ok) throw new Error((body && body.error && body.error.message) || "scenario request failed");
+    result.textContent = `${body.reused ? "Reused" : "Started"} ${body.job_id}`;
+    await selectJob(body.job_id);
+  } catch (error) {
+    result.textContent = String(error);
+    result.className = "action-result err";
+  } finally {
+    startingScenario = false;
+    await refreshJobs();
+    await refreshStatus();
+  }
+}
+
+async function startBoundedAction(event, action) {
+  event.preventDefault();
+  if (startingAction[action] || activeMutationId() != null || !event.currentTarget.checkValidity()) return;
+  startingAction[action] = true;
+  renderJobs();
+  const isMine = action === "mine";
+  const result = $(isMine ? "#mine-action-result" : "#burst-action-result");
+  const path = isMine ? "mine" : "spam-burst";
+  const request = isMine ? {
+    node: $("#mine-node").value,
+    blocks: Number($("#mine-blocks").value),
+  } : {
+    node: $("#burst-node").value,
+    txs: Number($("#burst-txs").value),
+    outputs_per_tx: Number($("#burst-outputs").value),
+  };
+  result.textContent = `Submitting ${isMine ? "mine" : "spam burst"} job…`;
+  result.className = "action-result";
+  try {
+    const { ok, body } = await api(`/api/v1/jobs/${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + TOKEN,
+        "Idempotency-Key": browserIdempotencyKey(),
+      },
+      body: JSON.stringify(request),
+    });
+    if (!ok) throw new Error((body && body.error && body.error.message) || `${path} request failed`);
+    result.textContent = `${body.reused ? "Reused" : "Started"} ${body.job_id}`;
+    await selectJob(body.job_id);
+  } catch (error) {
+    result.textContent = String(error);
+    result.className = "action-result err";
+  } finally {
+    startingAction[action] = false;
+    await refreshJobs();
+    await refreshStatus();
+  }
+}
+
+async function releaseCheckpoint(checkpoint) {
+  if (!selectedJobId || releasingCheckpoints.has(checkpoint.name)) return;
+  releasingCheckpoints.add(checkpoint.name);
+  renderSelectedJob();
+  const result = $("#scenario-action-result");
+  try {
+    const { ok, body } = await api(
+      `/api/v1/jobs/${encodeURIComponent(selectedJobId)}/checkpoints/${encodeURIComponent(checkpoint.name)}/release`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + TOKEN,
+        },
+        body: JSON.stringify({ generation: checkpoint.generation }),
+      });
+    if (!ok) throw new Error((body && body.error && body.error.message) || "checkpoint release failed");
+    result.textContent = `Released ${checkpoint.name} at generation ${checkpoint.generation}`;
+    result.className = "action-result";
+  } catch (error) {
+    result.textContent = String(error);
+    result.className = "action-result err";
+  } finally {
+    releasingCheckpoints.delete(checkpoint.name);
+    await refreshJobs();
+  }
+}
+
+function downloadSelectedJob() {
+  if (!selectedJob) return;
+  const artifact = JSON.stringify({ job: selectedJob, events: selectedJobEvents }, null, 2) + "\n";
+  const url = URL.createObjectURL(new Blob([artifact], { type: "application/json" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${selectedJob.id}.json`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 async function abortSelectedJob() {
   if (!selectedJobId || abortingJob) return;
   abortingJob = true;
@@ -653,7 +821,20 @@ async function init() {
   $("#spam-resume").addEventListener("click", () => setComponentState("spam", "running"));
   $("#reorg-form").addEventListener("submit", startReorg);
   $("#reorg-form").addEventListener("input", renderJobs);
+  $("#scenario-form").addEventListener("submit", startScenario);
+  $("#scenario-form").addEventListener("input", renderJobs);
+  $("#scenario-file").addEventListener("change", async (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    $("#scenario-yaml").value = await file.text();
+    renderJobs();
+  });
   $("#job-abort").addEventListener("click", abortSelectedJob);
+  $("#job-download").addEventListener("click", downloadSelectedJob);
+  $("#mine-form").addEventListener("submit", (event) => startBoundedAction(event, "mine"));
+  $("#mine-form").addEventListener("input", renderJobs);
+  $("#burst-form").addEventListener("submit", (event) => startBoundedAction(event, "burst"));
+  $("#burst-form").addEventListener("input", renderJobs);
   setInterval(refreshStatus, 2000);
   setInterval(() => { if (!applying) refreshState(); }, 4000);
   setInterval(refreshJobs, 1000);

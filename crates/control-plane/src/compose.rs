@@ -47,6 +47,19 @@ impl ComposeBackend {
         scrub_managed_env(&mut command);
         self.run_raw(command)
     }
+
+    fn partition_command(&self, node: &str, main_blocks: u64, isolated_blocks: u64) -> Command {
+        let mut command = Command::new(self.repo_root.join("scripts/partition.sh"));
+        command
+            .arg("run")
+            .arg(node)
+            .arg("--main-blocks")
+            .arg(main_blocks.to_string())
+            .arg("--isolated-blocks")
+            .arg(isolated_blocks.to_string())
+            .current_dir(&self.repo_root);
+        command
+    }
 }
 
 impl ComposeBackend {
@@ -180,6 +193,20 @@ impl JobActions for ComposeBackend {
     fn wait(&self, duration: Duration) {
         std::thread::sleep(duration);
     }
+
+    fn run_partition(
+        &self,
+        node: &str,
+        main_blocks: u64,
+        isolated_blocks: u64,
+    ) -> anyhow::Result<()> {
+        let output = self.run(self.partition_command(node, main_blocks, isolated_blocks))?;
+        if output.success {
+            Ok(())
+        } else {
+            anyhow::bail!("partition command failed: {}", output.tail(30))
+        }
+    }
 }
 
 /// The panel's own environment must never leak managed values into child
@@ -275,6 +302,28 @@ mod tests {
             envs.iter()
                 .any(|(k, v)| *k == OsStr::new("DOCKER_HOST") && v.is_some()),
             "unrelated variables must survive"
+        );
+    }
+
+    #[test]
+    fn partition_adapter_builds_the_existing_operator_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = backend_with("simchain", dir.path());
+        let command = backend.partition_command("btc-simnet-node3", 3, 4);
+        assert!(command
+            .get_program()
+            .to_string_lossy()
+            .ends_with("scripts/partition.sh"));
+        assert_eq!(
+            args_of(&command),
+            [
+                "run",
+                "btc-simnet-node3",
+                "--main-blocks",
+                "3",
+                "--isolated-blocks",
+                "4"
+            ]
         );
     }
 }

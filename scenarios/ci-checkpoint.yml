@@ -1,0 +1,17 @@
+version: 1
+steps:
+  - type: wait_height
+    height: 204
+
+  - type: pause_mining
+
+  - type: spam_burst
+    node: btc-simnet-node2
+    txs: 100
+    outputs_per_tx: 25
+
+  - type: checkpoint
+    name: mempool_loaded
+    timeout_secs: 600
+
+  - type: resume_mining
