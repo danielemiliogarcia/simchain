@@ -1,5 +1,9 @@
 use serde::de::DeserializeOwned;
-use simchain_common::control_api::{ApiErrorEnvelope, ConfigResponse, StatusResponse, API_PREFIX};
+use simchain_common::control_api::{
+    ApiErrorEnvelope, ComponentControlResponse, ConfigResponse, SetComponentStateRequest,
+    StatusResponse, API_PREFIX,
+};
+use simchain_common::internal_api::DesiredState;
 use std::fmt;
 
 #[derive(Debug)]
@@ -46,6 +50,27 @@ impl ControlClient {
         self.get(&format!("{API_PREFIX}/config"))
     }
 
+    pub fn set_mining_state(
+        &self,
+        state: DesiredState,
+    ) -> Result<ComponentControlResponse, ClientError> {
+        let path = format!("{API_PREFIX}/mining/state");
+        let url = format!("{}{path}", self.base_url);
+        let body = serde_json::to_string(&SetComponentStateRequest { state })
+            .map_err(|error| ClientError::Output(error.to_string()))?;
+        let mut request = minreq::put(&url)
+            .with_timeout(35)
+            .with_header("Content-Type", "application/json")
+            .with_body(body);
+        if let Some(token) = self.token.as_deref() {
+            request = request.with_header("Authorization", format!("Bearer {token}"));
+        }
+        let response = request
+            .send()
+            .map_err(|error| ClientError::Unavailable(format!("cannot reach {url}: {error}")))?;
+        self.decode(&url, response)
+    }
+
     fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
         let url = format!("{}{path}", self.base_url);
         let mut request = minreq::get(&url).with_timeout(10);
@@ -55,6 +80,14 @@ impl ControlClient {
         let response = request
             .send()
             .map_err(|error| ClientError::Unavailable(format!("cannot reach {url}: {error}")))?;
+        self.decode(&url, response)
+    }
+
+    fn decode<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        response: minreq::Response,
+    ) -> Result<T, ClientError> {
         let body = response.as_str().map_err(|error| {
             ClientError::Decode(format!("invalid response from {url}: {error}"))
         })?;
@@ -108,6 +141,43 @@ mod tests {
         let client = ControlClient::new(format!("http://{address}"), None);
         let status = client.status().expect("status response");
         assert_eq!(status.height, Some(204));
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn mining_pause_uses_authenticated_versioned_put() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("PUT /api/v1/mining/state HTTP/1.1"));
+            assert!(request.contains("Authorization: Bearer secret"));
+            assert!(request.contains(r#"{"state":"paused"}"#));
+
+            let response_body = serde_json::to_string(&ComponentControlResponse {
+                component: "mining".to_string(),
+                desired_state: DesiredState::Paused,
+                effective_state: DesiredState::Paused,
+                phase: simchain_common::internal_api::WorkerPhase::Paused,
+                effective_generation: 2,
+            })
+            .expect("response JSON");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).expect("response");
+        });
+
+        let client = ControlClient::new(format!("http://{address}"), Some("secret".to_string()));
+        let response = client
+            .set_mining_state(DesiredState::Paused)
+            .expect("pause response");
+        assert_eq!(response.effective_state, DesiredState::Paused);
         server.join().expect("server");
     }
 }

@@ -4,7 +4,8 @@ mod output;
 
 use clap::Parser;
 use client::{ClientError, ControlClient};
-use commands::{Cli, Command, ConfigCommand};
+use commands::{Cli, Command, ConfigCommand, MiningCommand};
+use simchain_common::internal_api::DesiredState;
 use std::process::ExitCode;
 
 pub const EXIT_SUCCESS: u8 = 0;
@@ -39,6 +40,14 @@ fn run(cli: Cli) -> Result<(), ClientError> {
                 output::print_config(&config, args.json)?;
             }
         },
+        Command::Mining(mining) => {
+            let state = match mining.command {
+                MiningCommand::Pause => DesiredState::Paused,
+                MiningCommand::Resume => DesiredState::Running,
+            };
+            let response = client.set_mining_state(state)?;
+            output::print_component_control(&response)?;
+        }
     }
     Ok(())
 }

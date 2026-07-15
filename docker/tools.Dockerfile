@@ -44,8 +44,8 @@ COPY --from=builder /app/target/release/simchain-scenario-engine /usr/local/bin/
 ENTRYPOINT ["simchain-scenario-engine"]
 
 # ---- control-plane ---------------------------------------------------------
-# The transitional control-plane backend rewrites .env and recreates tool
-# services through the host Docker socket, so like the scenario engine its
+# The Phase-2 control plane uses a private API for mining but still rewrites
+# .env and recreates spam through the host Docker socket, so its
 # runtime includes the Docker CLI and Compose v2 (Debian base: the builder
 # links against glibc, so an Alpine/docker:cli base would not run it).
 FROM debian:trixie-slim AS control-plane

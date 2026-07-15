@@ -4,6 +4,7 @@
 use crate::{
     bootstrap,
     config::MiningConfig,
+    control::MiningControl,
     mining,
     rng::{entropy_seed, Rng},
     wallet::setup_wallet,
@@ -14,8 +15,14 @@ use std::time::Duration;
 
 pub fn run() -> anyhow::Result<()> {
     let config = MiningConfig::global();
-    let seed = config.configured_seed.unwrap_or_else(entropy_seed);
+    let seed = config.initial_policy.rng_seed.unwrap_or_else(entropy_seed);
     let rng = Rng::new(seed);
+    let control = MiningControl::new(config.initial_policy.clone(), seed);
+    let _control_server = crate::server::spawn(
+        config.control_listen_addr,
+        config.internal_token.clone(),
+        control.clone(),
+    )?;
 
     let node2 = create_client(&config.node2_url).context("build node2 client")?;
     let node3 = create_client(&config.node3_url).context("build node3 client")?;
@@ -27,7 +34,14 @@ pub fn run() -> anyhow::Result<()> {
     let (_wallet2, addr2) = setup_wallet(&config.node2_url, &node2, &config.wallet2_name)?;
     let (_wallet3, addr3) = setup_wallet(&config.node3_url, &node3, &config.wallet3_name)?;
 
-    bootstrap::run(&node2, &node3, &addr2, &addr3, &config.user_address)?;
+    bootstrap::run(
+        &node2,
+        &node3,
+        &addr2,
+        &addr3,
+        &config.user_address,
+        |height| control.bootstrap_safe_point(height),
+    )?;
 
-    mining::run(seed, rng, &node2, &node3, &addr2, &addr3)
+    mining::run(control, rng, &node2, &node3, &addr2, &addr3)
 }

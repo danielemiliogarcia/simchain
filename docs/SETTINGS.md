@@ -430,16 +430,22 @@ host access. Full schema and execution semantics: [SCENARIOS.md](SCENARIOS.md).
 
 The control plane is an opt-in localhost web UI + HTTP API + MCP endpoint for live retuning
 (see [RETUNING.md](RETUNING.md)). Like the scenario engine it mounts
-`/var/run/docker.sock`; treat access to this container as root-equivalent host access.
+`/var/run/docker.sock` only for the transitional spam adapter; mining control uses a
+private authenticated worker API. Treat access to this container as root-equivalent
+host access until the spam migration removes that mount.
 
 | Variable | Default | Description |
 |---|---|---|
 | `CONTROL_PLANE_PORT` | `8090` | Host port (bound to `127.0.0.1` only) for the browser UI, the `/api/v1` JSON API, and the `/mcp` MCP endpoint. |
 | `CONTROL_PLANE_API_TOKEN` | _(empty)_ | Bearer token required on `PATCH /api/v1/config` and the whole `/mcp` endpoint. Empty generates `.simchain-control/token` (mode 0600, gitignored), reused across restarts. |
 | `SIMCHAIN_CONTROL_STATE_DIR` | `.simchain-control` | Narrow directory for the token and atomically written, versioned control state. |
+| `MINING_CONTROL_URL` | `http://btc-simnet-mining-controller:9081` | Private Compose-network endpoint used by the control plane; never publish this port to the host. |
+| `MINING_CONTROL_LISTEN_ADDR` | `0.0.0.0:9081` | Mining worker's private control listener. Boot-only. |
+| `SIMCHAIN_INTERNAL_TOKEN` | `simchain-internal-dev-token` | Shared bearer token for control-plane-to-worker requests. Supply the same non-empty value to both services when overriding it. |
 
-Control-plane-managed settings in the transitional backend (it validates and rewrites exactly
-these keys in `.env`; everything else in the file is preserved verbatim):
+Control-plane-managed runtime settings (durable desired values live in
+`.simchain-control/state.json`; Phase 2 also mirrors these keys to `.env` for spam
+compatibility, preserving everything else verbatim):
 
 - Mining controller scope: `BLOCK_INTERVAL_MODE`, `BLOCK_INTERVAL_MEAN_SECS`,
   `BLOCK_INTERVAL_MIN_SECS`, `BLOCK_INTERVAL_MAX_SECS`, `MINER_WEIGHTS`,

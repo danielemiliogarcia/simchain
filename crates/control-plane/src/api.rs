@@ -2,7 +2,9 @@
 //! embedded browser UI, and the `/mcp` mount. Thin adapter over `service`.
 
 use crate::apply::{apply, ApplyRequest};
-use crate::service::{config, schema, settings_state, status, ErrorCode, ServiceError};
+use crate::service::{
+    config, schema, set_mining_state, settings_state, status, ErrorCode, ServiceError,
+};
 use crate::state::SharedState;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Request, State};
@@ -11,7 +13,7 @@ use axum::http::uri::Authority;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -38,6 +40,7 @@ pub fn router(app: SharedState) -> Router {
             get(config_handler).patch(config_patch_handler),
         )
         .route("/api/v1/config/schema", get(schema_handler))
+        .route("/api/v1/mining/state", put(mining_state_handler))
         // Phase-1 compatibility routes; removed with the Compose adapter.
         .route("/api/v1/state", get(state_handler))
         .route("/api/v1/status", get(status_handler))
@@ -266,6 +269,37 @@ async fn config_patch_handler(State(app): State<SharedState>, request: Request) 
     }
 }
 
+async fn mining_state_handler(State(app): State<SharedState>, request: Request) -> Response {
+    if !request_has_token(&app, &request) {
+        return error_response(&ServiceError::new(
+            ErrorCode::Unauthorized,
+            "missing or invalid bearer token (see .simchain-control/token)",
+        ));
+    }
+    let payload: Result<
+        Json<simchain_common::control_api::SetComponentStateRequest>,
+        JsonRejection,
+    > = Json::from_request(request, &()).await;
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return error_response(&ServiceError::new(
+                ErrorCode::ValidationFailed,
+                format!("invalid request body: {rejection}"),
+            ));
+        }
+    };
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || set_mining_state(&worker, payload.state)).await {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
 // Json::from_request needs the trait in scope.
 use axum::extract::FromRequest;
 
@@ -283,6 +317,7 @@ mod tests {
         _dir: tempfile::TempDir,
         router: Router,
         env_file: std::path::PathBuf,
+        mock: Arc<MockBackend>,
     }
 
     fn fixture(env_content: Option<&str>) -> Fixture {
@@ -293,11 +328,12 @@ mod tests {
         }
         let mock = Arc::new(MockBackend::new(env_file.clone()));
         mock.sync_containers();
-        let app = Arc::new(test_app(dir.path(), mock));
+        let app = Arc::new(test_app(dir.path(), mock.clone()));
         Fixture {
             _dir: dir,
             router: router(app),
             env_file,
+            mock,
         }
     }
 
@@ -342,6 +378,18 @@ mod tests {
         }
         builder
             .body(Body::from(payload.to_string()))
+            .expect("request")
+    }
+
+    fn put_mining_state(state: &str, token: Option<&str>) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::put("/api/v1/mining/state")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder
+            .body(Body::from(serde_json::json!({"state": state}).to_string()))
             .expect("request")
     }
 
@@ -396,7 +444,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["changed"], true);
         assert_eq!(
-            body["services_recreated"][0],
+            body["components_applied"][0],
             "btc-simnet-mining-controller"
         );
         let written = std::fs::read_to_string(&fx.env_file).expect("read");
@@ -441,6 +489,21 @@ mod tests {
         let (status, body) = send(&fx.router, patch_config(stale, Some("test-token"))).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"]["code"], "stale_revision");
+    }
+
+    #[tokio::test]
+    async fn mining_pause_uses_worker_api_and_never_compose() {
+        let fx = fixture(None);
+        let (status, body) = send(&fx.router, put_mining_state("paused", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = send(&fx.router, put_mining_state("paused", Some("test-token"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["component"], "mining");
+        assert_eq!(body["desired_state"], "paused");
+        assert_eq!(body["effective_state"], "paused");
+        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[tokio::test]
@@ -538,7 +601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_lists_exactly_the_four_tools() {
+    async fn mcp_lists_phase_two_tools() {
         let router = crate::mcp::ControlPlaneMcp::tool_router();
         let mut names: Vec<String> = router
             .list_all()
@@ -553,6 +616,7 @@ mod tests {
                 "get_config_schema",
                 "get_status",
                 "set_config",
+                "set_mining_state",
             ]
         );
     }

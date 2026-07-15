@@ -1,13 +1,13 @@
-//! The apply transaction: validate -> write -> recreate -> verify ->
-//! rollback. Everything here is blocking; callers run it in
+//! The apply transaction: validate -> persist legacy compatibility state ->
+//! apply through component backends -> verify -> rollback. Everything here is blocking; callers run it in
 //! `spawn_blocking`.
 
 use crate::backend::ComponentInfo;
 use crate::control_state;
 use crate::envfile::{self, EnvFileState};
 use crate::service::{
-    config_error_details, scope_needs_restart, staged_from_content, tuning_source, validate_input,
-    ErrorCode, ErrorDetail, RollbackReport, ServiceError,
+    config_error_details, scope_needs_restart, tuning_source, validate_input, ErrorCode,
+    ErrorDetail, RollbackReport, ServiceError,
 };
 use crate::state::AppState;
 use fs2::FileExt;
@@ -42,7 +42,14 @@ pub struct ApplyReport {
     /// False when neither the file nor any service needed changing.
     pub changed: bool,
     pub file_changed: bool,
-    pub services_recreated: Vec<String>,
+    /// Components whose runtime policy was changed. This is transport
+    /// neutral: mining applies in-process while the transitional spam adapter
+    /// still recreates its container.
+    pub components_applied: Vec<String>,
+    /// Explicitly identifies the remaining Phase-2 Compose compatibility
+    /// path so callers never infer that mining was recreated.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub legacy_services_recreated: Vec<String>,
     pub revision: String,
     pub generation: u64,
     pub logs: Vec<String>,
@@ -148,13 +155,9 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
         .with_details(input_errors));
     }
 
-    // Merge over the current staged overrides and validate the full set
-    // through the shared tool validators.
-    let staged = staged_from_content(&file.content);
-    // Keep this sparse so recognized legacy aliases remain visible to the
-    // shared parser until canonicalization. Proposed canonical keys naturally
-    // take precedence over aliases.
-    let mut merged_map = staged.overrides.clone();
+    // Durable control state is authoritative once initialized. The legacy
+    // env file is only mirrored while spam still uses the Compose adapter.
+    let mut merged_map = state_before.desired.clone();
     for (key, value) in &proposed {
         // Keep an explicit empty marker so reset-to-default cannot fall back
         // to a legacy alias during source expansion.
@@ -196,6 +199,12 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     // Two independent change sets (finding 6): the file diff decides the
     // write, the running-container diff decides the recreates.
     let canonical = tuning.canonical_values();
+    let desired: BTreeMap<String, String> = canonical
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), value.clone()))
+        .collect();
+    let state_changed = desired != state_before.desired;
+    let next_state = control_state::successful_apply(&state_before, desired.clone());
     let new_content = envfile::render_with_managed_block(&file.content, &canonical);
     let file_changed = !file.exists || new_content != file.content;
 
@@ -222,11 +231,29 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
         }
     }
 
-    if !file_changed && services.is_empty() {
+    if services
+        .iter()
+        .any(|service| service == ServiceScope::MiningController.service_name())
+        && inspected
+            .get(ServiceScope::MiningController.service_name())
+            .is_none_or(|component| !component.present)
+    {
+        let detail = inspected
+            .get(ServiceScope::MiningController.service_name())
+            .and_then(|component| component.last_error.as_deref())
+            .unwrap_or("worker status is unavailable");
+        return Err(ServiceError::new(
+            ErrorCode::ComponentUnavailable,
+            format!("mining worker is unavailable: {detail}"),
+        ));
+    }
+
+    if !file_changed && services.is_empty() && !state_changed {
         return Ok(ApplyReport {
             changed: false,
             file_changed: false,
-            services_recreated: Vec::new(),
+            components_applied: Vec::new(),
+            legacy_services_recreated: Vec::new(),
             revision: file.revision,
             generation: state_before.generation,
             logs: vec!["no-op: staged file and running services already match".to_string()],
@@ -268,20 +295,22 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     let written_revision = file_changed.then(|| envfile::revision_of(&new_content));
 
     if !services.is_empty() {
-        let recreate = app.configuration.apply_configuration(&services);
-        let compose_failed = match &recreate {
+        let applied =
+            app.configuration
+                .apply_configuration(&services, &desired, next_state.generation);
+        let apply_failed = match &applied {
             Ok(output) if output.success => {
-                logs.push(format!("recreated: {}", services.join(", ")));
+                logs.push(format!("applied: {}", services.join(", ")));
                 let tail = output.tail(5);
                 if !tail.is_empty() {
                     logs.push(tail);
                 }
                 None
             }
-            Ok(output) => Some(format!("compose exited non-zero: {}", output.tail(10))),
-            Err(error) => Some(format!("compose failed to launch: {error}")),
+            Ok(output) => Some(format!("component apply failed: {}", output.tail(10))),
+            Err(error) => Some(format!("component apply failed: {error}")),
         };
-        if let Some(reason) = compose_failed {
+        if let Some(reason) = apply_failed {
             let rollback = rollback(
                 app,
                 &file,
@@ -290,11 +319,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
                 &runtime_before,
                 &mut logs,
             );
-            let code = if rollback.env_restored && rollback.recreate_ok {
-                ErrorCode::ComposeFailed
-            } else {
-                ErrorCode::RollbackFailed
-            };
+            let code = failure_code(&services, &rollback);
             let mut error = ServiceError::new(code, reason);
             error.rollback = Some(rollback);
             return Err(error);
@@ -309,11 +334,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
                 &runtime_before,
                 &mut logs,
             );
-            let code = if rollback.env_restored && rollback.recreate_ok {
-                ErrorCode::ComposeFailed
-            } else {
-                ErrorCode::RollbackFailed
-            };
+            let code = failure_code(&services, &rollback);
             let mut error = ServiceError::new(code, format!("apply verification failed: {reason}"));
             error.rollback = Some(rollback);
             return Err(error);
@@ -359,11 +380,6 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
         );
     }
 
-    let desired = canonical
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value))
-        .collect();
-    let next_state = control_state::successful_apply(&state_before, desired);
     if let Err(error) = app.control_store.save(&next_state) {
         let rollback = rollback(
             app,
@@ -385,12 +401,29 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     Ok(ApplyReport {
         changed: true,
         file_changed,
-        services_recreated: services,
+        legacy_services_recreated: services
+            .iter()
+            .filter(|service| service.as_str() == ServiceScope::Spammer.service_name())
+            .cloned()
+            .collect(),
+        components_applied: services,
         revision,
         generation: next_state.generation,
         logs,
         warnings,
     })
+}
+
+fn failure_code(components: &[String], rollback: &RollbackReport) -> ErrorCode {
+    if !rollback.env_restored || !rollback.recreate_ok {
+        ErrorCode::RollbackFailed
+    } else if components.len() == 1
+        && components[0] == ServiceScope::MiningController.service_name()
+    {
+        ErrorCode::ComponentUnavailable
+    } else {
+        ErrorCode::ComposeFailed
+    }
 }
 
 /// The spammer exits before parsing any other spam setting when disabled.
@@ -619,6 +652,13 @@ fn rollback(
         .cloned()
         .collect();
     let mut restore_env = BTreeMap::new();
+    let restore_generations: BTreeMap<String, u64> = runtime_before
+        .iter()
+        .filter_map(|(component, info)| {
+            info.effective_generation
+                .map(|generation| (component.clone(), generation))
+        })
+        .collect();
     for service in &restore_services {
         let scope = service_scope(service);
         let info = &runtime_before[service];
@@ -635,10 +675,11 @@ fn rollback(
     let recreated = if restore_services.is_empty() {
         true
     } else {
-        match app
-            .configuration
-            .restore_configuration(&restore_services, &restore_env)
-        {
+        match app.configuration.restore_configuration(
+            &restore_services,
+            &restore_env,
+            &restore_generations,
+        ) {
             Ok(output) if output.success => {
                 logs.push(format!(
                     "rollback: recreated {} from the pre-apply runtime environment",
@@ -773,6 +814,7 @@ fn verify_runtime_restored(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::MiningControlBackend;
     use crate::state::{AppState, CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
     use crate::test_support::{test_app, MockBackend, RecreateOutcome};
     use std::sync::Arc;
@@ -811,19 +853,36 @@ mod tests {
     }
 
     #[test]
-    fn mining_only_change_recreates_only_the_controller() {
+    fn mining_only_change_applies_without_recreating_the_controller() {
         let fx = fixture(None);
         let report =
             apply(&fx.app, request(&[("BLOCK_INTERVAL_MEAN_SECS", "12")])).expect("apply succeeds");
         assert!(report.changed);
         assert!(report.file_changed);
-        assert_eq!(report.services_recreated, vec![CONTROLLER_CONTAINER]);
-        assert_eq!(
-            fx.mock.compose_calls(),
-            vec![vec![CONTROLLER_CONTAINER.to_string()]]
+        assert_eq!(report.components_applied, vec![CONTROLLER_CONTAINER]);
+        assert!(report.legacy_services_recreated.is_empty());
+        assert!(
+            fx.mock.compose_calls().is_empty(),
+            "mining policy must use the worker API"
         );
         let written = std::fs::read_to_string(&fx.app.config.env_file).expect("env written");
         assert!(written.contains("BLOCK_INTERVAL_MEAN_SECS=12"));
+    }
+
+    #[test]
+    fn mining_apply_fails_before_writing_when_worker_is_unavailable() {
+        let fx = fixture(None);
+        fx.mock
+            .world
+            .lock()
+            .expect("lock")
+            .containers
+            .remove(CONTROLLER_CONTAINER);
+        let error = apply(&fx.app, request(&[("BLOCK_INTERVAL_MEAN_SECS", "12")]))
+            .expect_err("worker must be reachable");
+        assert_eq!(error.code, ErrorCode::ComponentUnavailable);
+        assert!(!fx.app.config.env_file.exists());
+        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[test]
@@ -831,7 +890,8 @@ mod tests {
         let fx = fixture(None);
         let report =
             apply(&fx.app, request(&[("SPAM_FILL_BLOCK_RATIO", "0.5")])).expect("apply succeeds");
-        assert_eq!(report.services_recreated, vec![SPAMMER_CONTAINER]);
+        assert_eq!(report.components_applied, vec![SPAMMER_CONTAINER]);
+        assert_eq!(report.legacy_services_recreated, vec![SPAMMER_CONTAINER]);
     }
 
     #[test]
@@ -843,8 +903,42 @@ mod tests {
         )
         .expect("apply succeeds");
         assert_eq!(
-            report.services_recreated,
+            report.components_applied,
             vec![CONTROLLER_CONTAINER, SPAMMER_CONTAINER]
+        );
+        assert_eq!(
+            fx.mock.compose_calls(),
+            vec![vec![SPAMMER_CONTAINER.to_string()]]
+        );
+    }
+
+    #[test]
+    fn mixed_apply_failure_restores_the_previous_mining_generation() {
+        let fx = fixture(None);
+        fx.mock
+            .world
+            .lock()
+            .expect("lock")
+            .after_recreate
+            .insert(SPAMMER_CONTAINER.to_string(), RecreateOutcome::Crash);
+        let error = apply(
+            &fx.app,
+            request(&[
+                ("BLOCK_INTERVAL_MEAN_SECS", "12"),
+                ("ENABLE_SPAM_REPLACES", "true"),
+            ]),
+        )
+        .expect_err("spammer failure rolls back the transaction");
+        assert!(error.rollback.expect("rollback").recreate_ok);
+        let mining = fx.mock.status().expect("mining status");
+        assert_eq!(mining.effective_generation, 0);
+        assert_eq!(mining.policy.mean_secs, 15);
+        assert_eq!(
+            fx.mock.compose_calls(),
+            vec![
+                vec![SPAMMER_CONTAINER.to_string()],
+                vec![SPAMMER_CONTAINER.to_string()],
+            ]
         );
     }
 
@@ -852,7 +946,7 @@ mod tests {
     fn fallback_fee_maps_to_spammer_only() {
         let fx = fixture(None);
         let report = apply(&fx.app, request(&[("FALLBACK_FEE", "0.0002")])).expect("apply");
-        assert_eq!(report.services_recreated, vec![SPAMMER_CONTAINER]);
+        assert_eq!(report.components_applied, vec![SPAMMER_CONTAINER]);
         for call in fx.mock.compose_calls() {
             assert!(
                 !call.iter().any(|s| s.contains("node")),
@@ -872,7 +966,7 @@ mod tests {
         let report = apply(&fx.app, request(&[("FALLBACK_FEE", "0.0002")])).expect("noop");
         assert!(!report.changed);
         assert!(!report.file_changed);
-        assert!(report.services_recreated.is_empty());
+        assert!(report.components_applied.is_empty());
         assert_eq!(fx.mock.compose_calls().len(), calls_before);
         assert_eq!(
             std::fs::read_to_string(&fx.app.config.env_file).expect("read"),
@@ -889,7 +983,7 @@ mod tests {
         let report = apply(&fx.app, request(&[])).expect("apply");
         assert!(report.changed);
         assert!(report.file_changed, "file must be canonicalized");
-        assert!(report.services_recreated.is_empty());
+        assert!(report.components_applied.is_empty());
         assert!(fx.mock.compose_calls().is_empty());
     }
 
@@ -904,7 +998,7 @@ mod tests {
         let report = apply(&fx.app, request(&[])).expect("apply");
         assert!(report.changed);
         assert!(!report.file_changed);
-        assert_eq!(report.services_recreated, vec![SPAMMER_CONTAINER]);
+        assert_eq!(report.components_applied, vec![SPAMMER_CONTAINER]);
         assert_eq!(
             std::fs::read_to_string(&fx.app.config.env_file).expect("read"),
             content_before
@@ -1047,15 +1141,15 @@ mod tests {
     }
 
     #[test]
-    fn restart_loop_triggers_rollback() {
+    fn mining_apply_ignores_legacy_container_restart_state() {
         let fx = fixture(None);
         fx.mock.world.lock().expect("lock").after_recreate.insert(
             CONTROLLER_CONTAINER.to_string(),
             RecreateOutcome::RestartLoop,
         );
-        let error =
-            apply(&fx.app, request(&[("BLOCK_INTERVAL_MEAN_SECS", "12")])).expect_err("fail");
-        assert!(error.message.contains("restart-looping"));
+        let report = apply(&fx.app, request(&[("BLOCK_INTERVAL_MEAN_SECS", "12")])).expect("apply");
+        assert_eq!(report.components_applied, vec![CONTROLLER_CONTAINER]);
+        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[test]
@@ -1068,7 +1162,7 @@ mod tests {
             .after_recreate
             .insert(SPAMMER_CONTAINER.to_string(), RecreateOutcome::ExitedClean);
         let report = apply(&fx.app, request(&[("ENABLE_SPAM", "false")])).expect("apply");
-        assert_eq!(report.services_recreated, vec![SPAMMER_CONTAINER]);
+        assert_eq!(report.components_applied, vec![SPAMMER_CONTAINER]);
         assert!(report
             .warnings
             .iter()
@@ -1206,7 +1300,7 @@ mod tests {
             .after_recreate
             .insert(SPAMMER_CONTAINER.to_string(), RecreateOutcome::Running);
         let report = apply(&fx.app, request(&[("ENABLE_SPAM", "true")])).expect("enable");
-        assert_eq!(report.services_recreated, vec![SPAMMER_CONTAINER]);
+        assert_eq!(report.components_applied, vec![SPAMMER_CONTAINER]);
     }
 
     #[test]

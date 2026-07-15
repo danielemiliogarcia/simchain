@@ -11,6 +11,8 @@ let lastState = null;       // last /api/v1/config payload
 let dirty = new Map();      // key -> edited value (string)
 let fieldErrors = new Map(); // key -> latest client/server validation message
 let applying = false;
+let latestStatus = null;
+let changingMiningState = false;
 
 const GROUP_TITLES = {
   "mining": "Mining",
@@ -51,6 +53,7 @@ function tile(k, v) {
 }
 
 function renderStatus(s) {
+  latestStatus = s;
   const stale = !s.last_updated_ms || (Date.now() - s.last_updated_ms) > 8000;
   const conn = $("#conn");
   conn.textContent = stale ? (s.last_error ? `stale: ${s.last_error}` : "stale / RPC unavailable")
@@ -79,13 +82,36 @@ function renderStatus(s) {
     `<span class="n">${b.count}</span></div>`).join("") || "–";
 
   $("#services").innerHTML = Object.entries(s.components || {}).map(([name, svc]) => {
-    let cls = "off", text = svc.status;
+    let cls = "off", text = svc.phase || svc.status;
     if (svc.restarting) { cls = "err"; text = "restarting"; }
     else if (svc.running) { cls = "ok"; }
     else if (svc.status === "exited") { cls = svc.exit_code === 0 ? "warn" : "err"; text = `exited(${svc.exit_code})`; }
     else if (!svc.present) { text = "absent"; }
-    return `<div class="svc"><span class="dot ${cls}"></span>${name.replace("btc-simnet-", "")} · ${text}</div>`;
+    const details = [];
+    if (svc.effective_generation != null) details.push(`gen ${svc.effective_generation}`);
+    if (svc.uptime_secs != null) details.push(`up ${svc.uptime_secs}s`);
+    return `<div class="svc"><span class="dot ${cls}"></span>${name.replace("btc-simnet-", "")} · ${text}` +
+      `${details.length ? " · " + details.join(" · ") : ""}</div>`;
   }).join("");
+
+  const mining = (s.components || {})["btc-simnet-mining-controller"];
+  const miningState = $("#mining-state");
+  const pause = $("#mining-pause");
+  const resume = $("#mining-resume");
+  if (!mining || !mining.present) {
+    miningState.textContent = mining && mining.last_error
+      ? `mining worker unreachable: ${mining.last_error}` : "mining worker unavailable";
+    pause.disabled = true;
+    resume.disabled = true;
+  } else {
+    const desired = mining.desired_state || "unknown";
+    const effective = mining.effective_state || "unknown";
+    const next = mining.next_scheduled_attempt_ms == null
+      ? "" : ` · next attempt ${new Date(mining.next_scheduled_attempt_ms).toLocaleTimeString()}`;
+    miningState.textContent = `desired ${desired} · effective ${effective} · phase ${mining.phase || mining.status}${next}`;
+    pause.disabled = changingMiningState || desired === "paused";
+    resume.disabled = changingMiningState || desired === "running";
+  }
 }
 
 /* ---------------------------------------------------------------- settings */
@@ -195,10 +221,10 @@ function refreshForm() {
     const runningEl = field.querySelector(".running");
     const running = runningValueFor(spec);
     if (running == null) {
-      runningEl.textContent = "running: –";
+      runningEl.textContent = "effective: –";
       runningEl.className = "running";
     } else {
-      runningEl.textContent = "running: " + (running === "" ? "(unset)" : running);
+      runningEl.textContent = "effective: " + (running === "" ? "(unset)" : running);
       const differs = (lastState.desired[spec.key] ?? "") !== running;
       runningEl.className = "running" + (differs ? " differs" : "");
     }
@@ -210,8 +236,13 @@ function refreshForm() {
     const spec = schema.settings.find((s) => s.key === key);
     if (spec) impacted.add(spec.component);
   }
+  const impacts = [...impacted].map((component) => {
+    const edited = schema.settings.find((spec) => spec.component === component && dirty.has(spec.key));
+    const mode = edited ? edited.apply_mode.replaceAll("_", " ") : "pending reconciliation";
+    return `${component.replace("btc-simnet-", "")} (${mode})`;
+  });
   $("#impact").textContent = impacted.size
-    ? "pending apply: " + [...impacted].map((s) => s.replace("btc-simnet-", "")).join(", ")
+    ? "pending apply: " + impacts.join(", ")
     : "desired and effective configuration match";
   const invalid = [...document.querySelectorAll("#form input, #form select")]
     .some((input) => !input.checkValidity()) || fieldErrors.size > 0;
@@ -245,6 +276,36 @@ async function refreshState() {
 async function refreshStatus() {
   const { ok, body } = await api("/api/v1/status");
   if (ok && body) renderStatus(body);
+}
+
+async function setMiningState(state) {
+  if (changingMiningState) return;
+  changingMiningState = true;
+  renderStatus(latestStatus || { components: {} });
+  const result = $("#mining-action-result");
+  result.textContent = `${state === "paused" ? "Pausing" : "Resuming"}…`;
+  result.className = "action-result";
+  try {
+    const { ok, body } = await api("/api/v1/mining/state", {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + TOKEN,
+      },
+      body: JSON.stringify({ state }),
+    });
+    result.textContent = ok
+      ? `acknowledged at phase ${body.phase}`
+      : ((body && body.error && body.error.message) || "mining state change failed");
+    result.className = "action-result" + (ok ? "" : " err");
+  } catch (error) {
+    result.textContent = String(error);
+    result.className = "action-result err";
+  } finally {
+    changingMiningState = false;
+    await refreshStatus();
+    await refreshState();
+  }
 }
 
 /* ------------------------------------------------------------------- apply */
@@ -305,6 +366,8 @@ async function init() {
   await refreshStatus();
   $("#apply").addEventListener("click", doApply);
   $("#reset").addEventListener("click", () => { dirty.clear(); fieldErrors.clear(); refreshForm(); });
+  $("#mining-pause").addEventListener("click", () => setMiningState("paused"));
+  $("#mining-resume").addEventListener("click", () => setMiningState("running"));
   setInterval(refreshStatus, 2000);
   setInterval(() => { if (!applying) refreshState(); }, 4000);
 }

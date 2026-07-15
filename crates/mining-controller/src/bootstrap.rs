@@ -25,6 +25,7 @@ pub fn run(
     addr2: &Address,
     addr3: &Address,
     user_address: &Address,
+    mut safe_point: impl FnMut(u64),
 ) -> anyhow::Result<()> {
     // Each stage ends at a fixed height, so the sequence is resumable: on
     // restart a completed stage is skipped (height already >= its target)
@@ -50,6 +51,7 @@ pub fn run(
     );
 
     let mut height = rpc_retry("get pre-bootstrap block count", || node2.get_block_count());
+    safe_point(height);
     if height >= BOOTSTRAP_END {
         tracing::info!(
             "Chain already bootstrapped (height {height}), skipping the funding sequence"
@@ -104,6 +106,7 @@ pub fn run(
         // top, so blocks do not compete and stack on each other.
         wait_for_height(witness, height, Duration::from_millis(100));
         tracing::info!("New block height: {height}");
+        safe_point(height);
     }
 
     tracing::info!(

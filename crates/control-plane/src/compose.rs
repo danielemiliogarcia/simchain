@@ -82,7 +82,12 @@ impl ComposeBackend {
 }
 
 impl ConfigurationBackend for ComposeBackend {
-    fn apply_configuration(&self, services: &[String]) -> anyhow::Result<BackendOutput> {
+    fn apply_configuration(
+        &self,
+        services: &[String],
+        _desired: &BTreeMap<String, String>,
+        _generation: u64,
+    ) -> anyhow::Result<BackendOutput> {
         tracing::info!(services = services.join(","), "compose recreate");
         self.run(self.compose_command(services))
     }
@@ -91,6 +96,7 @@ impl ConfigurationBackend for ComposeBackend {
         &self,
         services: &[String],
         managed_env: &BTreeMap<String, String>,
+        _generations: &BTreeMap<String, u64>,
     ) -> anyhow::Result<BackendOutput> {
         tracing::info!(services = services.join(","), "compose rollback recreate");
         let mut command = self.compose_command(services);

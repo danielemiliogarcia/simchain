@@ -123,7 +123,8 @@ fn collect<T>(errors: &mut Vec<ConfigError>, result: Result<T, ConfigError>) -> 
 // Mining subset
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BlockIntervalMode {
     Fixed,
     Poisson,
@@ -142,14 +143,14 @@ impl BlockIntervalMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MinerWeights {
     pub node2: u64,
     pub node3: u64,
     pub total: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IntervalBounds {
     pub min: Option<f64>,
     pub max: Option<f64>,
@@ -172,7 +173,7 @@ impl IntervalBounds {
 }
 
 /// The live-retunable mining-controller subset, validated.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MiningTuning {
     pub interval_mode: BlockIntervalMode,
     pub mean_secs: u64,
@@ -441,7 +442,7 @@ fn parse_weight(part: &str, full_value: &str) -> Result<u64, ConfigError> {
 // ---------------------------------------------------------------------------
 
 /// The live-retunable spammer subset, validated.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct SpamTuning {
     pub enabled: bool,
     pub use_raw: bool,

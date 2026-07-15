@@ -7,7 +7,7 @@
 //! rewrites (see the plan's finding 1). `.env` is only ever parsed into
 //! in-memory maps.
 
-use crate::backend::{ComponentBackend, ConfigurationBackend, JobActions};
+use crate::backend::{ComponentBackend, ConfigurationBackend, JobActions, MiningControlBackend};
 use crate::control_state::{ControlState, ControlStateStore};
 use crate::status::StatusSnapshot;
 use std::net::SocketAddr;
@@ -30,6 +30,8 @@ pub struct ControlPlaneConfig {
     pub node2_url: String,
     pub node3_url: String,
     pub state_dir: PathBuf,
+    pub mining_control_url: String,
+    pub internal_token: String,
 }
 
 impl ControlPlaneConfig {
@@ -58,6 +60,13 @@ impl ControlPlaneConfig {
         let state_dir = std::env::var("SIMCHAIN_CONTROL_STATE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| repo_root.join(".simchain-control"));
+        let mining_control_url = std::env::var("MINING_CONTROL_URL")
+            .unwrap_or_else(|_| "http://btc-simnet-mining-controller:9081".to_string());
+        let internal_token = std::env::var("SIMCHAIN_INTERNAL_TOKEN")
+            .unwrap_or_else(|_| "simchain-internal-dev-token".to_string());
+        if internal_token.trim().is_empty() {
+            anyhow::bail!("SIMCHAIN_INTERNAL_TOKEN must not be empty");
+        }
         Ok(Self {
             listen_addr,
             repo_root,
@@ -67,6 +76,8 @@ impl ControlPlaneConfig {
             node2_url,
             node3_url,
             state_dir,
+            mining_control_url,
+            internal_token,
         })
     }
 }
@@ -77,6 +88,7 @@ pub struct AppState {
     pub components: Arc<dyn ComponentBackend>,
     pub configuration: Arc<dyn ConfigurationBackend>,
     pub job_actions: Arc<dyn JobActions>,
+    pub mining: Arc<dyn MiningControlBackend>,
     pub control_state: RwLock<ControlState>,
     pub control_store: ControlStateStore,
     pub status: RwLock<StatusSnapshot>,

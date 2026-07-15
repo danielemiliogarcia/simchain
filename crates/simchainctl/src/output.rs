@@ -1,5 +1,5 @@
 use crate::client::ClientError;
-use simchain_common::control_api::{ConfigResponse, StatusResponse};
+use simchain_common::control_api::{ComponentControlResponse, ConfigResponse, StatusResponse};
 use std::io::{self, Write};
 
 pub fn print_status(status: &StatusResponse, json: bool) -> Result<(), ClientError> {
@@ -43,6 +43,19 @@ pub fn print_config(config: &ConfigResponse, json: bool) -> Result<(), ClientErr
     if !config.pending_apply.is_empty() {
         writeln!(out, "pending apply: {}", config.pending_apply.join(", "))?;
     }
+    Ok(())
+}
+
+pub fn print_component_control(response: &ComponentControlResponse) -> Result<(), ClientError> {
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
+        "{}: desired={}, effective={}, phase={}",
+        response.component,
+        response.desired_state.as_str(),
+        response.effective_state.as_str(),
+        response.phase.as_str(),
+    )?;
     Ok(())
 }
 

@@ -233,9 +233,10 @@ With `mempool` or `all-tools`, browse the explorer at
 ## Simchain control plane
 
 The localhost control plane combines the dashboard, versioned API, and MCP endpoint
-(profile: `control-plane`; `panel` is a temporary alias). During Phase 1 it retains the
-existing Compose adapter and socket mount, so it remains opt-in and excluded from
-`all-tools`:
+(profile: `control-plane`; `panel` is a temporary alias). During Phase 2 it retains the
+existing Compose adapter only for spam, so it remains opt-in and excluded from
+`all-tools` while that migration is unfinished. Mining policy and pause/resume already
+use the mining worker's private API and never recreate its container:
 
 ```bash
 docker compose --profile control-plane up -d --build
@@ -243,9 +244,9 @@ docker compose --profile control-plane up -d --build
 
 Open [http://localhost:8090/](http://localhost:8090/) (port: `CONTROL_PLANE_PORT`) to watch
 chain height, block cadence, mempool depth and the fee histogram, and to change the
-live-retunable mining/spam settings. Apply rewrites `.env` and recreates only the
-affected tool containers — the nodes and the chain are never touched — with automatic
-rollback if the retuned tool fails to come back up. See
+live-retunable mining/spam settings. Mining cadence and weights apply at a scheduler
+safe point; spam still uses the transitional `.env`/Compose adapter. The nodes and the
+chain are never touched, and a mixed apply rolls back transactionally. See
 [RETUNING.md](./docs/RETUNING.md).
 
 Everything the UI shows comes from the versioned localhost HTTP API
@@ -258,6 +259,10 @@ curl -s -X PATCH localhost:8090/api/v1/config \
   -H "Authorization: Bearer $(cat .simchain-control/token)" \
   -H "Content-Type: application/json" \
   -d '{"settings": {"SPAM_FILL_BLOCK_RATIO": "0.5"}}'
+curl -s -X PUT localhost:8090/api/v1/mining/state \
+  -H "Authorization: Bearer $(cat .simchain-control/token)" \
+  -H "Content-Type: application/json" \
+  -d '{"state": "paused"}'
 ```
 
 The same operations are exposed over MCP (streamable HTTP) at
@@ -270,11 +275,13 @@ claude mcp add --transport http simchain-control-plane \
   --header "Authorization: Bearer $(cat .simchain-control/token)"
 ```
 
-The Phase-1 CLI supports the read-only paths through the same API DTOs:
+The CLI uses the same API and service operations:
 
 ```bash
 cargo run -p simchainctl -- status
 cargo run -p simchainctl -- config show --json
+cargo run -p simchainctl -- mining pause
+cargo run -p simchainctl -- mining resume
 ```
 
 ## Scenarios

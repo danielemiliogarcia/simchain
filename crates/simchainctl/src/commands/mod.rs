@@ -59,6 +59,8 @@ pub enum Command {
     Status(StatusArgs),
     /// Inspect runtime configuration.
     Config(ConfigArgs),
+    /// Pause or resume continuous mining at a worker safe point.
+    Mining(MiningArgs),
 }
 
 #[derive(Debug, Args)]
@@ -87,12 +89,26 @@ pub struct JsonArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct MiningArgs {
+    #[command(subcommand)]
+    pub command: MiningCommand,
+}
+
+#[derive(Clone, Copy, Debug, Subcommand)]
+pub enum MiningCommand {
+    /// Pause after any in-flight generate and propagation check completes.
+    Pause,
+    /// Resume continuous mining unless a job-owned pause lease remains.
+    Resume,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_phase_one_commands() {
+    fn parses_control_commands() {
         let status =
             Cli::try_parse_from(["simchainctl", "status", "--json"]).expect("status command");
         assert!(matches!(
@@ -106,6 +122,15 @@ mod tests {
             config.command,
             Command::Config(ConfigArgs {
                 command: ConfigCommand::Show(JsonArgs { json: false })
+            })
+        ));
+
+        let mining =
+            Cli::try_parse_from(["simchainctl", "mining", "pause"]).expect("mining command");
+        assert!(matches!(
+            mining.command,
+            Command::Mining(MiningArgs {
+                command: MiningCommand::Pause
             })
         ));
     }

@@ -28,8 +28,16 @@
         <div>
           <h3>Mempool fees (sat/vB)</h3>
           <div id="fees" class="fees"></div>
-          <h3>Services</h3>
+          <h3>Components</h3>
           <div id="services" class="services"></div>
+          <div class="component-control">
+            <div id="mining-state" class="component-state">mining control unavailable</div>
+            <div class="component-buttons">
+              <button id="mining-pause" type="button">Pause mining</button>
+              <button id="mining-resume" type="button">Resume mining</button>
+            </div>
+            <div id="mining-action-result" class="action-result"></div>
+          </div>
         </div>
       </div>
     </section>
@@ -37,7 +45,7 @@
     <section class="card" id="settings-card">
       <h2>Live retune</h2>
       <p class="hint">Desired configuration is managed by the control plane; effective values are
-        reported by each component. Phase 1 applies changes through the compatibility backend.</p>
+        reported by each component. Mining changes wake the scheduler and apply at its next safe point.</p>
       <div id="page-errors"></div>
       <div id="form"></div>
       <div class="applybar">

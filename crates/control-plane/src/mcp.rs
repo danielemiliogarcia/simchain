@@ -4,7 +4,9 @@
 //! including the error envelope.
 
 use crate::apply::{apply, ApplyRequest};
-use crate::service::{config, schema, status, ServiceError};
+use crate::service::{
+    config, schema, set_mining_state as set_mining_state_service, status, ServiceError,
+};
 use crate::state::SharedState;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
@@ -46,6 +48,12 @@ pub struct SetConfigParams {
     /// Optional generation from get_config. A stale generation is rejected.
     #[serde(default)]
     pub base_generation: Option<u64>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct SetMiningStateParams {
+    /// Desired manual state: `running` or `paused`.
+    pub state: String,
 }
 
 #[tool_router(vis = "pub(crate)")]
@@ -102,7 +110,7 @@ impl ControlPlaneMcp {
 
     #[tool(
         name = "set_config",
-        description = "Patch desired runtime configuration with optional generation compare-and-swap. Phase 1 applies through the transitional component backend.",
+        description = "Patch desired runtime configuration with optional generation compare-and-swap. Mining applies at a worker safe point; spam still uses the transitional component adapter.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -125,6 +133,40 @@ impl ControlPlaneMcp {
             .map_err(join_error)?
         {
             Ok(report) => success_json(&report),
+            Err(error) => error_json(error),
+        }
+    }
+
+    #[tool(
+        name = "set_mining_state",
+        description = "Set manual desired mining state to running or paused. Pause waits for the worker's next safe point and is idempotent.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn set_mining_state(
+        &self,
+        Parameters(params): Parameters<SetMiningStateParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let desired = match params.state.as_str() {
+            "running" => simchain_common::internal_api::DesiredState::Running,
+            "paused" => simchain_common::internal_api::DesiredState::Paused,
+            _ => {
+                return error_json(ServiceError::new(
+                    crate::service::ErrorCode::ValidationFailed,
+                    "mining state must be running or paused",
+                ));
+            }
+        };
+        let app = self.app.clone();
+        match tokio::task::spawn_blocking(move || set_mining_state_service(&app, desired))
+            .await
+            .map_err(join_error)?
+        {
+            Ok(response) => success_json(&response),
             Err(error) => error_json(error),
         }
     }
