@@ -1,20 +1,23 @@
-//! Single-mutation job coordinator, persistence, events, abort, worker leases,
-//! and restart recovery.
+//! Single-mutation job coordinator, persistence, events, abort, worker/network
+//! leases, and restart recovery.
 
-use crate::backend::{MiningControlBackend, SpamControlBackend};
+use crate::backend::{MiningControlBackend, NetworkControlBackend, SpamControlBackend};
 use crate::job_store::JobStore;
+use crate::network_job::NetworkActionBackend;
 use crate::reorg_job::{ReorgExecution, ReorgExecutor, ReorgRecoveryContext};
 use crate::scenario_job::ScenarioActionBackend;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use simchain_common::control_api::{
-    AbortJobResponse, CheckpointState, CleanupState, ErrorCode, JobCheckpoint,
+    AbortJobResponse, CheckpointState, CleanupState, DegradeJobRequest, ErrorCode, JobCheckpoint,
     JobCheckpointResponse, JobCleanup, JobCreatedResponse, JobDetail, JobEvent, JobEventsResponse,
     JobFailure, JobKind, JobLease, JobListResponse, JobState, JobSummary, MineJobRequest,
-    ReleaseCheckpointRequest, ReorgJobRequest, ScenarioStepStatus, SpamBurstJobRequest,
+    PartitionJobRequest, ReleaseCheckpointRequest, ReorgJobRequest, ScenarioStepStatus,
+    SpamBurstJobRequest,
 };
 use simchain_common::internal_api::{
-    LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest, PauseLease,
+    LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest, NetworkImpairment,
+    NetworkLeaseReleaseRequest, NetworkLeaseRequest, PauseLease,
 };
 use simchain_reorg::{ReorgObserver, ReorgPhase, ReorgProgress};
 use simchain_scenario_engine::{
@@ -108,6 +111,8 @@ pub struct JobManager {
     state: Mutex<ManagerState>,
     mining: Arc<dyn MiningControlBackend>,
     spam: Arc<dyn SpamControlBackend>,
+    network: Arc<dyn NetworkControlBackend>,
+    network_actions: Arc<dyn NetworkActionBackend>,
     reorg: Arc<dyn ReorgExecutor>,
     scenario: Arc<dyn ScenarioActionBackend>,
     checkpoint_cv: Condvar,
@@ -115,30 +120,26 @@ pub struct JobManager {
     lease_ttl_secs: u64,
 }
 
+pub struct JobDependencies {
+    pub mining: Arc<dyn MiningControlBackend>,
+    pub spam: Arc<dyn SpamControlBackend>,
+    pub network: Arc<dyn NetworkControlBackend>,
+    pub reorg: Arc<dyn ReorgExecutor>,
+    pub scenario: Arc<dyn ScenarioActionBackend>,
+    pub network_actions: Arc<dyn NetworkActionBackend>,
+}
+
 impl JobManager {
     pub fn open(
         state_dir: &std::path::Path,
-        mining: Arc<dyn MiningControlBackend>,
-        spam: Arc<dyn SpamControlBackend>,
-        reorg: Arc<dyn ReorgExecutor>,
-        scenario: Arc<dyn ScenarioActionBackend>,
+        dependencies: JobDependencies,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::open_with_ttl(
-            state_dir,
-            mining,
-            spam,
-            reorg,
-            scenario,
-            DEFAULT_LEASE_TTL_SECS,
-        )
+        Self::open_with_ttl(state_dir, dependencies, DEFAULT_LEASE_TTL_SECS)
     }
 
     fn open_with_ttl(
         state_dir: &std::path::Path,
-        mining: Arc<dyn MiningControlBackend>,
-        spam: Arc<dyn SpamControlBackend>,
-        reorg: Arc<dyn ReorgExecutor>,
-        scenario: Arc<dyn ScenarioActionBackend>,
+        dependencies: JobDependencies,
         lease_ttl_secs: u64,
     ) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!(lease_ttl_secs > 0, "job lease TTL must be positive");
@@ -174,7 +175,7 @@ impl JobManager {
             })?;
             if !job.detail.summary.state.is_terminal() {
                 job.detail.summary.state = JobState::Interrupted;
-                job.detail.summary.phase = "recovering_worker_leases".to_string();
+                job.detail.summary.phase = "recovering_owned_resources".to_string();
                 job.detail.summary.ended_at_ms = Some(now_ms());
                 job.detail.summary.cleanup.state = CleanupState::Running;
                 job.detail.failure = Some(JobFailure {
@@ -195,10 +196,12 @@ impl JobManager {
                 recovering: HashSet::new(),
                 recovery_errors: HashMap::new(),
             }),
-            mining,
-            spam,
-            reorg,
-            scenario,
+            mining: dependencies.mining,
+            spam: dependencies.spam,
+            network: dependencies.network,
+            reorg: dependencies.reorg,
+            scenario: dependencies.scenario,
+            network_actions: dependencies.network_actions,
             checkpoint_cv: Condvar::new(),
             id_sequence: AtomicU64::new(1),
             lease_ttl_secs,
@@ -207,7 +210,7 @@ impl JobManager {
             manager.emit_best_effort(
                 &job_id,
                 "restart_recovery",
-                "recovering_worker_leases",
+                "recovering_owned_resources",
                 "previous active job was marked interrupted; recovering owned leases",
                 None,
             );
@@ -581,6 +584,94 @@ impl JobManager {
         Ok(created)
     }
 
+    pub fn start_partition(
+        self: &Arc<Self>,
+        request: PartitionJobRequest,
+        idempotency_key: Option<String>,
+    ) -> Result<JobCreatedResponse, JobManagerError> {
+        let (request, node) = normalize_partition_request(request)?;
+        let request_value = serde_json::to_value(&request).map_err(internal_error)?;
+        let (created, abort) = self.reserve_action_job(
+            JobKind::Partition,
+            request_value,
+            idempotency_key,
+            "partition job accepted",
+        )?;
+        let Some(abort) = abort else {
+            return Ok(created);
+        };
+        let manager = self.clone();
+        let job_id = created.job_id.clone();
+        let thread_job_id = job_id.clone();
+        let spawn = thread::Builder::new()
+            .name(format!("partition-{job_id}"))
+            .spawn(move || {
+                let panic_manager = manager.clone();
+                let panic_job_id = thread_job_id.clone();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    manager.run_partition_job(
+                        thread_job_id,
+                        node,
+                        request.main_blocks,
+                        request.isolated_blocks,
+                        abort,
+                    )
+                }));
+                if outcome.is_err() {
+                    panic_manager.handle_executor_panic(&panic_job_id);
+                }
+            });
+        if let Err(error) = spawn {
+            self.fail_before_thread(&job_id, format!("failed to start job thread: {error}"));
+            return Err(JobManagerError::new(
+                ErrorCode::Internal,
+                format!("failed to start job thread: {error}"),
+            ));
+        }
+        Ok(created)
+    }
+
+    pub fn start_degrade(
+        self: &Arc<Self>,
+        request: DegradeJobRequest,
+        idempotency_key: Option<String>,
+    ) -> Result<JobCreatedResponse, JobManagerError> {
+        let (request, node) = normalize_degrade_request(request)?;
+        let request_value = serde_json::to_value(&request).map_err(internal_error)?;
+        let (created, abort) = self.reserve_action_job(
+            JobKind::Degrade,
+            request_value,
+            idempotency_key,
+            "network degradation job accepted",
+        )?;
+        let Some(abort) = abort else {
+            return Ok(created);
+        };
+        let manager = self.clone();
+        let job_id = created.job_id.clone();
+        let thread_job_id = job_id.clone();
+        let spawn = thread::Builder::new()
+            .name(format!("degrade-{job_id}"))
+            .spawn(move || {
+                let panic_manager = manager.clone();
+                let panic_job_id = thread_job_id.clone();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    manager.run_degrade_job(thread_job_id, node, request, abort)
+                }));
+                if outcome.is_err() {
+                    panic_manager.handle_executor_panic(&panic_job_id);
+                }
+            });
+        if let Err(error) = spawn {
+            self.fail_before_thread(&job_id, format!("failed to start job thread: {error}"));
+            return Err(JobManagerError::new(
+                ErrorCode::Internal,
+                format!("failed to start job thread: {error}"),
+            ));
+        }
+        Ok(created)
+    }
+
     fn reserve_action_job(
         self: &Arc<Self>,
         kind: JobKind,
@@ -701,7 +792,16 @@ impl JobManager {
     ) -> Result<JobEventsResponse, JobManagerError> {
         let limit = limit.clamp(1, MAX_EVENT_PAGE);
         let events = if let Some(job_id) = job_id {
-            self.get(job_id)?;
+            // Keep the manager lock while reading JSONL. Event writers hold
+            // the same lock across append+fsync, so readers can never observe
+            // a partially written line or race file rotation.
+            let state = self.state.lock().expect("job manager lock");
+            if find_stored(&state.persisted, job_id).is_none() {
+                return Err(JobManagerError::new(
+                    ErrorCode::JobNotFound,
+                    "job not found",
+                ));
+            }
             self.store.read_events(job_id).map_err(internal_error)?
         } else {
             self.state
@@ -1297,12 +1397,233 @@ impl JobManager {
         }
     }
 
+    fn run_partition_job(
+        self: Arc<Self>,
+        job_id: String,
+        node: MinerNode,
+        main_blocks: u64,
+        isolated_blocks: u64,
+        abort: Arc<AtomicBool>,
+    ) {
+        if abort.load(Ordering::Acquire) {
+            self.finish_job(
+                &job_id,
+                JobState::Aborted,
+                "aborted_before_start",
+                None,
+                None,
+                successful_cleanup(),
+            );
+            return;
+        }
+        self.set_running(&job_id, "validating_converged_start");
+        if let Err(error) = self.network_actions.validate_ready_and_converged() {
+            self.finish_failed_before_mutation(&job_id, error, Vec::new(), abort);
+            return;
+        }
+
+        self.set_phase(&job_id, "acquiring_spam_lease");
+        let spam = match self.acquire_scenario_lease(&job_id, "spam", "partition job", 1) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.finish_failed_before_mutation(&job_id, error, Vec::new(), abort);
+                return;
+            }
+        };
+        self.set_phase(&job_id, "acquiring_mining_lease");
+        let mining = match self.acquire_scenario_lease(&job_id, "mining", "partition job", 2) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.finish_failed_before_mutation(&job_id, error, vec![spam], abort);
+                return;
+            }
+        };
+        let mut leases = vec![spam, mining];
+        if abort.load(Ordering::Acquire) {
+            self.finish_aborted_with_cleanup(&job_id, leases, false, None);
+            return;
+        }
+
+        // Recheck after both workers reached their pause safe points so the
+        // fork base cannot race continuous mining or spam reconciliation.
+        if let Err(error) = self.network_actions.validate_ready_and_converged() {
+            self.finish_failed_before_mutation(&job_id, error, leases, abort);
+            return;
+        }
+        self.set_phase(&job_id, "applying_partition");
+        let network = match self.acquire_network_lease(
+            &job_id,
+            node.short_name(),
+            "deterministic partition job",
+            NetworkImpairment::Partition {
+                ingress_drop: true,
+                egress_drop: true,
+            },
+            3,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.finish_failed_before_mutation(&job_id, error, leases, abort);
+                return;
+            }
+        };
+        leases.push(network);
+        let renewer = match OwnedLeaseRenewer::start(
+            self.clone(),
+            job_id.clone(),
+            abort.clone(),
+            self.lease_ttl_secs,
+        ) {
+            Ok(renewer) => renewer,
+            Err(error) => {
+                self.finish_failed_before_mutation(&job_id, error, leases, abort);
+                return;
+            }
+        };
+        let chain_changed = AtomicBool::new(false);
+        let execution = self.execute_partition(
+            &job_id,
+            node,
+            main_blocks,
+            isolated_blocks,
+            &SimpleJobControl {
+                abort: abort.clone(),
+            },
+            &chain_changed,
+        );
+        let stop_error = renewer.stop().err().map(|error| error.to_string());
+        let cleanup = self.cleanup_leases(
+            &job_id,
+            &leases,
+            chain_changed.load(Ordering::Acquire),
+            stop_error,
+        );
+        match execution {
+            Ok(result) if abort.load(Ordering::Acquire) => self.finish_job(
+                &job_id,
+                JobState::Aborted,
+                "aborted_safely",
+                Some(result),
+                None,
+                cleanup,
+            ),
+            Ok(result) => self.finish_job(
+                &job_id,
+                JobState::Succeeded,
+                "succeeded",
+                Some(result),
+                None,
+                cleanup,
+            ),
+            Err(error) => self.finish_job(
+                &job_id,
+                if abort.load(Ordering::Acquire) {
+                    JobState::Aborted
+                } else {
+                    JobState::Failed
+                },
+                "failed",
+                None,
+                (!abort.load(Ordering::Acquire)).then(|| JobFailure {
+                    code: "partition_failed".to_string(),
+                    message: error.to_string(),
+                }),
+                cleanup,
+            ),
+        }
+    }
+
+    fn run_degrade_job(
+        self: Arc<Self>,
+        job_id: String,
+        node: String,
+        request: DegradeJobRequest,
+        abort: Arc<AtomicBool>,
+    ) {
+        if abort.load(Ordering::Acquire) {
+            self.finish_job(
+                &job_id,
+                JobState::Aborted,
+                "aborted_before_start",
+                None,
+                None,
+                successful_cleanup(),
+            );
+            return;
+        }
+        self.set_running(&job_id, "applying_network_degradation");
+        let lease = match self.acquire_network_lease(
+            &job_id,
+            &node,
+            "timed network degradation",
+            NetworkImpairment::Netem {
+                delay_ms: request.delay_ms,
+                loss_pct: request.loss_pct,
+            },
+            1,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.finish_failed_before_mutation(&job_id, error, Vec::new(), abort);
+                return;
+            }
+        };
+        let renewer = match OwnedLeaseRenewer::start(
+            self.clone(),
+            job_id.clone(),
+            abort.clone(),
+            self.lease_ttl_secs,
+        ) {
+            Ok(renewer) => renewer,
+            Err(error) => {
+                self.finish_failed_before_mutation(&job_id, error, vec![lease], abort);
+                return;
+            }
+        };
+        self.set_phase(&job_id, "observing_degraded_network");
+        let started = Instant::now();
+        let duration = Duration::from_secs(request.seconds);
+        while started.elapsed() < duration && !abort.load(Ordering::Acquire) {
+            thread::sleep(
+                Duration::from_millis(100).min(duration.saturating_sub(started.elapsed())),
+            );
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let stop_error = renewer.stop().err().map(|error| error.to_string());
+        let cleanup = self.cleanup_leases(&job_id, &[lease], false, stop_error);
+        let result = json!({
+            "node": node,
+            "delay_ms": request.delay_ms,
+            "loss_pct": request.loss_pct,
+            "requested_seconds": request.seconds,
+            "elapsed_ms": elapsed_ms,
+            "aborted": abort.load(Ordering::Acquire)
+        });
+        self.finish_job(
+            &job_id,
+            if abort.load(Ordering::Acquire) {
+                JobState::Aborted
+            } else {
+                JobState::Succeeded
+            },
+            if abort.load(Ordering::Acquire) {
+                "aborted_safely"
+            } else {
+                "succeeded"
+            },
+            Some(result),
+            None,
+            cleanup,
+        );
+    }
+
     fn acquire_spam_lease(&self, job_id: &str, leases: &mut Vec<JobLease>) -> anyhow::Result<()> {
         let lease = JobLease {
             component: "spam".to_string(),
             lease_id: format!("{job_id}-spam"),
             purpose: "reorg chain mutation".to_string(),
         };
+        self.persist_lease_intent(job_id, lease.clone())?;
         self.spam.acquire_lease(LeaseRequest {
             lease_id: lease.lease_id.clone(),
             owner_job_id: job_id.to_string(),
@@ -1311,7 +1632,7 @@ impl JobManager {
             request_id: format!("{job_id}-spam-acquire"),
         })?;
         leases.push(lease.clone());
-        self.record_lease(job_id, lease);
+        self.acknowledge_lease(job_id, &lease);
         Ok(())
     }
 
@@ -1321,6 +1642,7 @@ impl JobManager {
             lease_id: format!("{job_id}-mining"),
             purpose: "reorg chain mutation".to_string(),
         };
+        self.persist_lease_intent(job_id, lease.clone())?;
         self.mining.acquire_lease(LeaseRequest {
             lease_id: lease.lease_id.clone(),
             owner_job_id: job_id.to_string(),
@@ -1329,7 +1651,7 @@ impl JobManager {
             request_id: format!("{job_id}-mining-acquire"),
         })?;
         leases.push(lease.clone());
-        self.record_lease(job_id, lease);
+        self.acknowledge_lease(job_id, &lease);
         Ok(())
     }
 
@@ -1352,13 +1674,124 @@ impl JobManager {
             ttl_secs: self.lease_ttl_secs,
             request_id: format!("{}-acquire", lease.lease_id),
         };
+        self.persist_lease_intent(job_id, lease.clone())?;
         match component {
             "spam" => self.spam.acquire_lease(request)?,
             "mining" => self.mining.acquire_lease(request)?,
             other => anyhow::bail!("unknown lease component {other}"),
         };
-        self.record_lease(job_id, lease.clone());
+        self.acknowledge_lease(job_id, &lease);
         Ok(lease)
+    }
+
+    fn acquire_network_lease(
+        &self,
+        job_id: &str,
+        node: &str,
+        purpose: &str,
+        impairment: NetworkImpairment,
+        sequence: u64,
+    ) -> anyhow::Result<JobLease> {
+        let lease = JobLease {
+            component: format!("network:{node}"),
+            lease_id: format!("{job_id}-network-{node}-{sequence}"),
+            purpose: purpose.to_string(),
+        };
+        self.persist_lease_intent(job_id, lease.clone())?;
+        self.network.acquire_lease(
+            node,
+            NetworkLeaseRequest {
+                lease_id: lease.lease_id.clone(),
+                owner_job_id: job_id.to_string(),
+                purpose: purpose.to_string(),
+                ttl_secs: self.lease_ttl_secs,
+                request_id: format!("{}-acquire", lease.lease_id),
+                impairment,
+            },
+        )?;
+        self.acknowledge_lease(job_id, &lease);
+        Ok(lease)
+    }
+
+    fn release_network_lease(&self, job_id: &str, lease: &JobLease) -> anyhow::Result<()> {
+        let node = network_lease_node(lease)?;
+        self.network.release_lease(
+            node,
+            &lease.lease_id,
+            NetworkLeaseReleaseRequest {
+                request_id: format!("{}-release", lease.lease_id),
+            },
+        )?;
+        self.emit_best_effort(
+            job_id,
+            "lease_released",
+            "network_healed",
+            &format!("{node} network impairment lease released"),
+            Some(json!({"lease": lease})),
+        );
+        Ok(())
+    }
+
+    fn execute_partition(
+        &self,
+        job_id: &str,
+        node: MinerNode,
+        main_blocks: u64,
+        isolated_blocks: u64,
+        control: &dyn ScenarioControl,
+        chain_changed: &AtomicBool,
+    ) -> anyhow::Result<Value> {
+        let initial = self.network_actions.validate_ready_and_converged()?;
+        self.set_phase(job_id, "disconnecting_partition_peers");
+        self.network_actions.disconnect_target_peers(node)?;
+        self.set_phase(job_id, "verifying_partition");
+        let split = self.network_actions.wait_for_isolation(node, control)?;
+        anyhow::ensure!(
+            !control.abort_requested(),
+            "partition aborted before branch mining"
+        );
+
+        let main = other_miner(node);
+        self.set_phase(job_id, "mining_main_branch");
+        chain_changed.store(true, Ordering::Release);
+        let main_result = self.scenario.mine(main, main_blocks)?;
+        let main_tip = result_hash(&main_result)?;
+        self.set_phase(job_id, "mining_isolated_branch");
+        let isolated_result = self.scenario.mine(node, isolated_blocks)?;
+        let isolated_tip = result_hash(&isolated_result)?;
+        let expected_tip = if main_blocks > isolated_blocks {
+            main_tip.clone()
+        } else {
+            isolated_tip.clone()
+        };
+
+        self.set_phase(job_id, "healing_partition");
+        let network_lease = self
+            .get(job_id)
+            .map_err(|error| anyhow::anyhow!(error.message))?
+            .leases
+            .into_iter()
+            .rev()
+            .find(|lease| lease.component == format!("network:{}", node.short_name()))
+            .ok_or_else(|| anyhow::anyhow!("partition network lease disappeared"))?;
+        self.release_network_lease(job_id, &network_lease)?;
+        self.network_actions.reconnect_target(node)?;
+        self.set_phase(job_id, "verifying_winning_tip");
+        let final_snapshot = self
+            .network_actions
+            .wait_for_convergence(Some(&expected_tip), control)?;
+        Ok(json!({
+            "node": node.short_name(),
+            "main_node": main.short_name(),
+            "main_blocks": main_blocks,
+            "isolated_blocks": isolated_blocks,
+            "initial": initial,
+            "split": split,
+            "main_branch": main_result,
+            "isolated_branch": isolated_result,
+            "expected_tip": expected_tip,
+            "final": final_snapshot
+        }))
     }
 
     fn release_scenario_lease(
@@ -1386,28 +1819,38 @@ impl JobManager {
         Ok(())
     }
 
-    fn record_lease(&self, job_id: &str, lease: JobLease) {
+    fn persist_lease_intent(&self, job_id: &str, lease: JobLease) -> anyhow::Result<()> {
         let component = lease.component.clone();
         let mut state = self.state.lock().expect("job manager lock");
-        if let Some(job) = find_stored_mut(&mut state.persisted, job_id) {
-            if !job
-                .detail
-                .leases
-                .iter()
-                .any(|existing| existing.lease_id == lease.lease_id)
-            {
-                job.detail.leases.push(lease.clone());
-            }
-            if let Err(error) = self.store.save(&state.persisted) {
-                tracing::error!(job_id, "failed to persist acquired lease: {error}");
-            }
+        let job = find_stored_mut(&mut state.persisted, job_id)
+            .ok_or_else(|| anyhow::anyhow!("lease owner job {job_id} disappeared"))?;
+        if !job
+            .detail
+            .leases
+            .iter()
+            .any(|existing| existing.lease_id == lease.lease_id)
+        {
+            job.detail.leases.push(lease.clone());
         }
+        self.store.save(&state.persisted)?;
         drop(state);
         self.emit_best_effort(
             job_id,
+            "lease_intent_recorded",
+            "acquiring_lease",
+            &format!("durably recorded intent to acquire {component} lease"),
+            Some(json!({"lease": lease})),
+        );
+        Ok(())
+    }
+
+    fn acknowledge_lease(&self, job_id: &str, lease: &JobLease) {
+        let component = lease.component.clone();
+        self.emit_best_effort(
+            job_id,
             "lease_acquired",
-            &format!("{}_paused", component),
-            &format!("{component} worker acknowledged a pause lease"),
+            &format!("{}_leased", component.replace(':', "_")),
+            &format!("{component} acknowledged its owned lease"),
             Some(json!({"lease": lease})),
         );
     }
@@ -1421,6 +1864,76 @@ impl JobManager {
     ) -> JobCleanup {
         self.set_cleanup_running(job_id);
         let mut errors = stop_error.into_iter().collect::<Vec<_>>();
+        // Network healing is first and is witnessed before either worker can
+        // resume. Historical lease records are intentional: reconnect and
+        // convergence are harmless if the happy path already healed.
+        let network_leases: Vec<&JobLease> = leases
+            .iter()
+            .filter(|lease| lease.component.starts_with("network:"))
+            .collect();
+        for lease in &network_leases {
+            match network_lease_node(lease) {
+                Ok(node) => match self.network.status(node) {
+                    Ok(status)
+                        if status
+                            .active_lease
+                            .as_ref()
+                            .is_some_and(|active| active.lease_id == lease.lease_id) =>
+                    {
+                        if let Err(error) = self.network.release_lease(
+                            node,
+                            &lease.lease_id,
+                            NetworkLeaseReleaseRequest {
+                                request_id: format!("{job_id}-{}-cleanup-release", lease.lease_id),
+                            },
+                        ) {
+                            errors.push(format!(
+                                "failed to heal {node} impairment {}: {error}",
+                                lease.lease_id
+                            ));
+                        }
+                    }
+                    Ok(status) if status.active_lease.is_some() => errors.push(format!(
+                        "{node} has a different active network lease during cleanup"
+                    )),
+                    Ok(_) => {}
+                    Err(error) => errors.push(format!(
+                        "failed to inspect {node} network impairment during cleanup: {error}"
+                    )),
+                },
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        let mut healed_nodes = HashSet::new();
+        for lease in &network_leases {
+            let Ok(node_name) = network_lease_node(lease) else {
+                continue;
+            };
+            if !healed_nodes.insert(node_name.to_string()) {
+                continue;
+            }
+            if node_name == "node1" {
+                continue;
+            }
+            match parse_miner_node(node_name) {
+                Ok(node) => {
+                    if let Err(error) = self.network_actions.reconnect_target(node) {
+                        errors.push(format!("failed to reconnect {node_name}: {error}"));
+                    }
+                }
+                Err(error) => errors.push(error.message),
+            }
+        }
+        if !network_leases.is_empty() {
+            if let Err(error) = self
+                .network_actions
+                .wait_for_convergence(None, &NeverAbortControl)
+            {
+                errors.push(format!(
+                    "network healed but chain convergence failed: {error}"
+                ));
+            }
+        }
         // Spam is released first so its chain-derived pools reconcile while
         // continuous mining is still held.
         for component in ["spam", "mining"] {
@@ -1481,6 +1994,29 @@ impl JobManager {
                 },
             )?;
         }
+        let network_nodes: HashSet<String> = self
+            .get(job_id)
+            .map_err(|error| anyhow::anyhow!(error.message))?
+            .leases
+            .into_iter()
+            .filter_map(|lease| network_lease_node(&lease).ok().map(str::to_string))
+            .collect();
+        for node in network_nodes {
+            let status = self.network.status(&node)?;
+            if let Some(lease) = status
+                .active_lease
+                .filter(|lease| lease.owner_job_id == job_id)
+            {
+                self.network.renew_lease(
+                    &node,
+                    &lease.lease_id,
+                    LeaseRenewRequest {
+                        ttl_secs: self.lease_ttl_secs,
+                        request_id: format!("{}-renew-{sequence}", lease.lease_id),
+                    },
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1491,7 +2027,22 @@ impl JobManager {
         leases: Vec<JobLease>,
         abort: Arc<AtomicBool>,
     ) {
-        let cleanup = self.cleanup_leases(job_id, &leases, false, None);
+        // A lease intent is persisted before the remote acquire call. If that
+        // call took effect but its response was lost, the caller's local list
+        // will not contain the lease even though cleanup still owns it.
+        let mut cleanup_targets = self
+            .get(job_id)
+            .map(|detail| detail.leases)
+            .unwrap_or_default();
+        for lease in leases {
+            if !cleanup_targets
+                .iter()
+                .any(|existing| existing.lease_id == lease.lease_id)
+            {
+                cleanup_targets.push(lease);
+            }
+        }
+        let cleanup = self.cleanup_leases(job_id, &cleanup_targets, false, None);
         let state = if abort.load(Ordering::Acquire) {
             JobState::Aborted
         } else {
@@ -1680,8 +2231,9 @@ impl JobManager {
             None,
             Some(JobFailure {
                 code: "executor_panicked".to_string(),
-                message: "job executor panicked; worker leases are being recovered conservatively"
-                    .to_string(),
+                message:
+                    "job executor panicked; owned resources are being recovered conservatively"
+                        .to_string(),
             }),
             JobCleanup {
                 state: CleanupState::Failed,
@@ -1754,7 +2306,7 @@ impl JobManager {
                         &job_id,
                         "recovery_complete",
                         "recovery_complete",
-                        "interrupted job leases are clear",
+                        "interrupted job network and worker resources are clear",
                         None,
                     );
                     return;
@@ -1770,7 +2322,7 @@ impl JobManager {
                                 .insert(job_id.clone(), message.clone());
                             if let Some(job) = find_stored_mut(&mut state.persisted, &job_id) {
                                 job.detail.summary.cleanup.state = CleanupState::Running;
-                                job.detail.summary.phase = "recovering_worker_leases".to_string();
+                                job.detail.summary.phase = "recovering_owned_resources".to_string();
                                 if !job.detail.summary.cleanup.errors.contains(&message) {
                                     job.detail.summary.cleanup.errors.push(message.clone());
                                 }
@@ -1785,7 +2337,7 @@ impl JobManager {
                         self.emit_best_effort(
                             &job_id,
                             "recovery_pending",
-                            "recovering_worker_leases",
+                            "recovering_owned_resources",
                             &message,
                             None,
                         );
@@ -1836,6 +2388,7 @@ impl JobManager {
                 job.reorg_recovery.clone(),
             )
         };
+        self.recover_network_resources(job_id)?;
         if context.mutation_may_have_occurred {
             let request = match context.request.clone() {
                 Some(request) => request,
@@ -1856,12 +2409,59 @@ impl JobManager {
         self.recover_worker_leases(job_id)
     }
 
+    fn recover_network_resources(&self, job_id: &str) -> anyhow::Result<()> {
+        let recorded_nodes: HashSet<String> = self
+            .get(job_id)
+            .map_err(|error| anyhow::anyhow!(error.message))?
+            .leases
+            .into_iter()
+            .filter_map(|lease| network_lease_node(&lease).ok().map(str::to_string))
+            .collect();
+        let mut affected = recorded_nodes;
+        for node in ["node1", "node2", "node3"] {
+            let status = self.network.status(node)?;
+            if let Some(lease) = status
+                .active_lease
+                .filter(|lease| lease.owner_job_id == job_id)
+            {
+                self.network.release_lease(
+                    node,
+                    &lease.lease_id,
+                    NetworkLeaseReleaseRequest {
+                        request_id: format!("{}-recovery-release", lease.lease_id),
+                    },
+                )?;
+                affected.insert(node.to_string());
+            }
+        }
+        for node in &affected {
+            if node == "node1" {
+                continue;
+            }
+            self.network_actions
+                .reconnect_target(parse_miner_node(node).map_err(|error| {
+                    anyhow::anyhow!("invalid recovery network node: {}", error.message)
+                })?)?;
+        }
+        if !affected.is_empty() {
+            self.network_actions
+                .wait_for_convergence(None, &NeverAbortControl)?;
+        }
+        Ok(())
+    }
+
     fn ensure_recovery_leases(&self, job_id: &str) -> anyhow::Result<()> {
         let nonce = now_ms();
         let spam_status = self.spam.status()?;
         let spam_leases = owned_leases(&spam_status.active_leases, job_id);
         if spam_leases.is_empty() {
             let lease_id = format!("{job_id}-spam");
+            let lease = JobLease {
+                component: "spam".to_string(),
+                lease_id: lease_id.clone(),
+                purpose: "interrupted reorg recovery".to_string(),
+            };
+            self.persist_lease_intent(job_id, lease.clone())?;
             self.spam.acquire_lease(LeaseRequest {
                 lease_id: lease_id.clone(),
                 owner_job_id: job_id.to_string(),
@@ -1869,14 +2469,7 @@ impl JobManager {
                 ttl_secs: self.lease_ttl_secs,
                 request_id: format!("{job_id}-spam-recovery-acquire-{nonce}"),
             })?;
-            self.record_lease(
-                job_id,
-                JobLease {
-                    component: "spam".to_string(),
-                    lease_id,
-                    purpose: "interrupted reorg recovery".to_string(),
-                },
-            );
+            self.acknowledge_lease(job_id, &lease);
         } else {
             for lease in spam_leases {
                 self.spam.renew_lease(
@@ -1893,6 +2486,12 @@ impl JobManager {
         let mining_leases = owned_leases(&mining_status.active_leases, job_id);
         if mining_leases.is_empty() {
             let lease_id = format!("{job_id}-mining");
+            let lease = JobLease {
+                component: "mining".to_string(),
+                lease_id: lease_id.clone(),
+                purpose: "interrupted reorg recovery".to_string(),
+            };
+            self.persist_lease_intent(job_id, lease.clone())?;
             self.mining.acquire_lease(LeaseRequest {
                 lease_id: lease_id.clone(),
                 owner_job_id: job_id.to_string(),
@@ -1900,14 +2499,7 @@ impl JobManager {
                 ttl_secs: self.lease_ttl_secs,
                 request_id: format!("{job_id}-mining-recovery-acquire-{nonce}"),
             })?;
-            self.record_lease(
-                job_id,
-                JobLease {
-                    component: "mining".to_string(),
-                    lease_id,
-                    purpose: "interrupted reorg recovery".to_string(),
-                },
-            );
+            self.acknowledge_lease(job_id, &lease);
         } else {
             for lease in mining_leases {
                 self.mining.renew_lease(
@@ -2168,6 +2760,16 @@ struct SimpleJobControl {
     abort: Arc<AtomicBool>,
 }
 
+struct NeverAbortControl;
+
+impl ScenarioControl for NeverAbortControl {
+    fn observe(&self, _progress: ScenarioProgress) {}
+
+    fn abort_requested(&self) -> bool {
+        false
+    }
+}
+
 impl ScenarioControl for SimpleJobControl {
     fn observe(&self, _progress: ScenarioProgress) {}
 
@@ -2390,9 +2992,66 @@ impl ScenarioActions for JobScenarioActions {
         isolated_blocks: u64,
         control: &dyn ScenarioControl,
     ) -> anyhow::Result<Value> {
-        self.manager
-            .scenario
-            .run_partition(node, main_blocks, isolated_blocks, control)
+        let acquired_spam = self.ensure_spam_lease("scenario partition step")?;
+        let acquired_mining = self.ensure_mining_lease("scenario partition step")?;
+        let network = self.manager.acquire_network_lease(
+            &self.job_id,
+            node.short_name(),
+            "scenario partition step",
+            NetworkImpairment::Partition {
+                ingress_drop: true,
+                egress_drop: true,
+            },
+            {
+                let mut runtime = self.runtime.lock().expect("scenario runtime lock");
+                runtime.next_lease_sequence = runtime.next_lease_sequence.saturating_add(1);
+                runtime.next_lease_sequence
+            },
+        )?;
+        let chain_changed = AtomicBool::new(false);
+        let execution = self.manager.execute_partition(
+            &self.job_id,
+            node,
+            main_blocks,
+            isolated_blocks,
+            control,
+            &chain_changed,
+        );
+        self.runtime
+            .lock()
+            .expect("scenario runtime lock")
+            .chain_changed |= chain_changed.load(Ordering::Acquire);
+
+        let mut cleanup_errors = Vec::new();
+        if execution.is_ok() {
+            // execute_partition healed its owned network lease. Temporary
+            // worker leases can now be released in the required spam/mining
+            // order. On failure, retain all three for final cleanup, which
+            // heals the network before either worker resumes.
+            let _ = network;
+            if acquired_spam {
+                if let Err(error) = self.release_component("spam") {
+                    cleanup_errors.push(format!("spam lease: {error}"));
+                }
+            }
+            let mining_paused_by_step = self
+                .runtime
+                .lock()
+                .expect("scenario runtime lock")
+                .mining_paused_by_step;
+            if acquired_mining && !mining_paused_by_step {
+                if let Err(error) = self.release_component("mining") {
+                    cleanup_errors.push(format!("mining lease: {error}"));
+                }
+            }
+        }
+        let value = execution?;
+        anyhow::ensure!(
+            cleanup_errors.is_empty(),
+            "partition completed but worker lease cleanup failed: {}",
+            cleanup_errors.join("; ")
+        );
+        Ok(value)
     }
 
     fn reach_checkpoint(
@@ -2659,6 +3318,76 @@ fn normalize_spam_burst_request(
     Ok((request, node))
 }
 
+fn normalize_partition_request(
+    mut request: PartitionJobRequest,
+) -> Result<(PartitionJobRequest, MinerNode), JobManagerError> {
+    request.node = request.node.trim().to_ascii_lowercase();
+    let node = parse_miner_node(&request.node)?;
+    request.node = node.short_name().to_string();
+    if request.main_blocks == 0 || request.isolated_blocks == 0 {
+        return Err(JobManagerError::new(
+            ErrorCode::ValidationFailed,
+            "main_blocks and isolated_blocks must be positive",
+        ));
+    }
+    if request.main_blocks == request.isolated_blocks {
+        return Err(JobManagerError::new(
+            ErrorCode::ValidationFailed,
+            "main_blocks and isolated_blocks must differ to guarantee a deterministic winner",
+        ));
+    }
+    if request.main_blocks > 100 || request.isolated_blocks > 100 {
+        return Err(JobManagerError::new(
+            ErrorCode::ValidationFailed,
+            "partition branch lengths must not exceed 100 blocks",
+        ));
+    }
+    Ok((request, node))
+}
+
+fn normalize_degrade_request(
+    mut request: DegradeJobRequest,
+) -> Result<(DegradeJobRequest, String), JobManagerError> {
+    request.node = request.node.trim().to_ascii_lowercase();
+    let node = match request.node.as_str() {
+        "node1" | "btc-simnet-node1" => "node1",
+        "node2" | "btc-simnet-node2" => "node2",
+        "node3" | "btc-simnet-node3" => "node3",
+        _ => {
+            return Err(JobManagerError::new(
+                ErrorCode::ValidationFailed,
+                "degrade node must be node1, node2, or node3",
+            ))
+        }
+    };
+    request.node = node.to_string();
+    if request.delay_ms > 600_000 {
+        return Err(JobManagerError::new(
+            ErrorCode::ValidationFailed,
+            "delay_ms must not exceed 600000",
+        ));
+    }
+    if !request.loss_pct.is_finite() || !(0.0..=100.0).contains(&request.loss_pct) {
+        return Err(JobManagerError::new(
+            ErrorCode::ValidationFailed,
+            "loss_pct must be a finite number from 0 through 100",
+        ));
+    }
+    if request.delay_ms == 0 && request.loss_pct == 0.0 {
+        return Err(JobManagerError::new(
+            ErrorCode::ValidationFailed,
+            "degrade must specify a positive delay or loss percentage",
+        ));
+    }
+    if request.seconds == 0 || request.seconds > 86_400 {
+        return Err(JobManagerError::new(
+            ErrorCode::ValidationFailed,
+            "seconds must be between 1 and 86400",
+        ));
+    }
+    Ok((request, node.to_string()))
+}
+
 fn parse_miner_node(node: &str) -> Result<MinerNode, JobManagerError> {
     match node {
         "node2" | "btc-simnet-node2" => Ok(MinerNode::Node2),
@@ -2667,6 +3396,40 @@ fn parse_miner_node(node: &str) -> Result<MinerNode, JobManagerError> {
             ErrorCode::ValidationFailed,
             "node must be node2 or node3",
         )),
+    }
+}
+
+fn other_miner(node: MinerNode) -> MinerNode {
+    match node {
+        MinerNode::Node2 => MinerNode::Node3,
+        MinerNode::Node3 => MinerNode::Node2,
+    }
+}
+
+fn network_lease_node(lease: &JobLease) -> anyhow::Result<&str> {
+    let node = lease
+        .component
+        .strip_prefix("network:")
+        .ok_or_else(|| anyhow::anyhow!("lease {} is not a network lease", lease.lease_id))?;
+    anyhow::ensure!(
+        matches!(node, "node1" | "node2" | "node3"),
+        "invalid network lease node {node}"
+    );
+    Ok(node)
+}
+
+fn result_hash(value: &Value) -> anyhow::Result<String> {
+    value
+        .get("last_hash")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("mining result did not include last_hash"))
+}
+
+fn successful_cleanup() -> JobCleanup {
+    JobCleanup {
+        state: CleanupState::Succeeded,
+        errors: Vec::new(),
     }
 }
 
@@ -2811,10 +3574,14 @@ mod tests {
         backend.sync_containers();
         let manager = JobManager::open_with_ttl(
             dir,
-            backend.clone(),
-            backend.clone(),
-            executor,
-            backend.clone(),
+            JobDependencies {
+                mining: backend.clone(),
+                spam: backend.clone(),
+                network: backend.clone(),
+                reorg: executor,
+                scenario: backend.clone(),
+                network_actions: backend.clone(),
+            },
             60,
         )
         .expect("job manager");
@@ -2967,10 +3734,14 @@ mod tests {
 
         let manager = JobManager::open_with_ttl(
             dir.path(),
-            backend.clone(),
-            backend.clone(),
-            Arc::new(BlockingExecutor::new()),
-            backend,
+            JobDependencies {
+                mining: backend.clone(),
+                spam: backend.clone(),
+                network: backend.clone(),
+                reorg: Arc::new(BlockingExecutor::new()),
+                scenario: backend.clone(),
+                network_actions: backend,
+            },
             60,
         )
         .expect("reopen");
@@ -3055,10 +3826,14 @@ mod tests {
         });
         let manager = JobManager::open_with_ttl(
             dir.path(),
-            backend.clone(),
-            backend.clone(),
-            executor.clone(),
-            backend.clone(),
+            JobDependencies {
+                mining: backend.clone(),
+                spam: backend.clone(),
+                network: backend.clone(),
+                reorg: executor.clone(),
+                scenario: backend.clone(),
+                network_actions: backend.clone(),
+            },
             60,
         )
         .expect("reopen");
@@ -3160,10 +3935,14 @@ mod tests {
 
         let manager = JobManager::open_with_ttl(
             dir.path(),
-            backend.clone(),
-            backend.clone(),
-            Arc::new(BlockingExecutor::new()),
-            backend.clone(),
+            JobDependencies {
+                mining: backend.clone(),
+                spam: backend.clone(),
+                network: backend.clone(),
+                reorg: Arc::new(BlockingExecutor::new()),
+                scenario: backend.clone(),
+                network_actions: backend.clone(),
+            },
             60,
         )
         .expect("reopen");
@@ -3394,6 +4173,10 @@ steps:
     node: btc-simnet-node2
     txs: 2
     outputs_per_tx: 1
+  - type: partition
+    node: btc-simnet-node3
+    main_blocks: 1
+    isolated_blocks: 2
   - type: resume_mining
 "#
                 .to_string(),
@@ -3489,6 +4272,135 @@ steps:
             .active_leases
             .is_empty());
         assert!(backend.compose_calls().is_empty());
+    }
+
+    #[test]
+    fn partition_and_degrade_jobs_use_owned_network_leases_and_heal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(BlockingExecutor::new());
+        let (backend, manager) = manager(dir.path(), executor);
+        let partition = manager
+            .start_partition(
+                PartitionJobRequest {
+                    node: "btc-simnet-node3".to_string(),
+                    main_blocks: 2,
+                    isolated_blocks: 3,
+                },
+                Some("partition-retry".to_string()),
+            )
+            .expect("start partition");
+        wait_until(|| {
+            manager
+                .get(&partition.job_id)
+                .expect("partition")
+                .summary
+                .state
+                .is_terminal()
+        });
+        let detail = manager.get(&partition.job_id).expect("partition");
+        assert_eq!(detail.summary.kind, JobKind::Partition);
+        assert_eq!(detail.summary.state, JobState::Succeeded);
+        assert_eq!(detail.summary.cleanup.state, CleanupState::Succeeded);
+        assert_eq!(detail.request["node"], "node3");
+        assert_eq!(detail.result.expect("result")["expected_tip"], "node3-3");
+        assert!(NetworkControlBackend::status(backend.as_ref(), "node3")
+            .expect("network status")
+            .active_lease
+            .is_none());
+        assert!(MiningControlBackend::status(backend.as_ref())
+            .expect("mining")
+            .active_leases
+            .is_empty());
+        assert!(SpamControlBackend::status(backend.as_ref())
+            .expect("spam")
+            .active_leases
+            .is_empty());
+
+        let degrade = manager
+            .start_degrade(
+                DegradeJobRequest {
+                    node: "node1".to_string(),
+                    delay_ms: 100,
+                    loss_pct: 0.5,
+                    seconds: 30,
+                },
+                None,
+            )
+            .expect("start degrade");
+        wait_until(|| {
+            NetworkControlBackend::status(backend.as_ref(), "node1")
+                .expect("network status")
+                .active_lease
+                .is_some()
+        });
+        manager.abort(&degrade.job_id).expect("abort degrade");
+        wait_until(|| {
+            manager
+                .get(&degrade.job_id)
+                .expect("degrade")
+                .summary
+                .state
+                .is_terminal()
+        });
+        let detail = manager.get(&degrade.job_id).expect("degrade");
+        assert_eq!(detail.summary.state, JobState::Aborted);
+        assert_eq!(detail.summary.cleanup.state, CleanupState::Succeeded);
+        assert!(NetworkControlBackend::status(backend.as_ref(), "node1")
+            .expect("network status")
+            .active_lease
+            .is_none());
+        assert!(backend.compose_calls().is_empty());
+    }
+
+    #[test]
+    fn lost_network_acquire_response_still_heals_persisted_lease_intent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(BlockingExecutor::new());
+        let (backend, manager) = manager(dir.path(), executor);
+        backend
+            .world
+            .lock()
+            .expect("world lock")
+            .network_acquire_response_fail_times = 1;
+
+        let partition = manager
+            .start_partition(
+                PartitionJobRequest {
+                    node: "node3".to_string(),
+                    main_blocks: 2,
+                    isolated_blocks: 3,
+                },
+                None,
+            )
+            .expect("start partition");
+        wait_until(|| {
+            manager
+                .get(&partition.job_id)
+                .expect("partition")
+                .summary
+                .state
+                .is_terminal()
+        });
+
+        let detail = manager.get(&partition.job_id).expect("partition");
+        assert_eq!(detail.summary.state, JobState::Failed);
+        assert_eq!(detail.summary.cleanup.state, CleanupState::Succeeded);
+        assert!(detail
+            .leases
+            .iter()
+            .any(|lease| lease.component == "network:node3"));
+        assert!(NetworkControlBackend::status(backend.as_ref(), "node3")
+            .expect("network status")
+            .active_lease
+            .is_none());
+        assert!(MiningControlBackend::status(backend.as_ref())
+            .expect("mining")
+            .active_leases
+            .is_empty());
+        assert!(SpamControlBackend::status(backend.as_ref())
+            .expect("spam")
+            .active_leases
+            .is_empty());
     }
 
     #[test]

@@ -1,9 +1,10 @@
 use serde::de::DeserializeOwned;
 use simchain_common::control_api::{
     AbortJobResponse, ApiErrorEnvelope, ComponentControlResponse, ConfigResponse,
-    JobCheckpointResponse, JobCreatedResponse, JobDetail, JobEventsResponse, JobListResponse,
-    MineJobRequest, ReleaseCheckpointRequest, ReorgJobRequest, ScenarioJobRequest,
-    SetComponentStateRequest, SpamBurstJobRequest, StatusResponse, API_PREFIX,
+    DegradeJobRequest, JobCheckpointResponse, JobCreatedResponse, JobDetail, JobEventsResponse,
+    JobListResponse, MineJobRequest, PartitionJobRequest, ReleaseCheckpointRequest,
+    ReorgJobRequest, ScenarioJobRequest, SetComponentStateRequest, SpamBurstJobRequest,
+    StatusResponse, API_PREFIX,
 };
 use simchain_common::internal_api::DesiredState;
 use std::fmt;
@@ -111,6 +112,30 @@ impl ControlClient {
     ) -> Result<JobCreatedResponse, ClientError> {
         self.post_json(
             &format!("{API_PREFIX}/jobs/spam-burst"),
+            request,
+            idempotency_key,
+        )
+    }
+
+    pub fn start_partition(
+        &self,
+        request: &PartitionJobRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<JobCreatedResponse, ClientError> {
+        self.post_json(
+            &format!("{API_PREFIX}/jobs/partition"),
+            request,
+            idempotency_key,
+        )
+    }
+
+    pub fn start_degrade(
+        &self,
+        request: &DegradeJobRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<JobCreatedResponse, ClientError> {
+        self.post_json(
+            &format!("{API_PREFIX}/jobs/degrade"),
             request,
             idempotency_key,
         )

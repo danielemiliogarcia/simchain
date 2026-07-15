@@ -220,7 +220,7 @@ One compose file serves every combination via
 
 | Command | What comes up |
 |---|---|
-| `docker compose up` | basic simnet: 3 nodes + mining controller + spammer |
+| `docker compose up` | basic simnet: 3 nodes + mining controller + spammer + 3 private network agents |
 | `docker compose --profile basic up` | same as above (alias) |
 | `docker compose --profile electrs up` | basic + electrs (Electrum RPC on 60001, HTTP on 3000) |
 | `docker compose --profile mempool up` | basic + electrs + mempool.space explorer |
@@ -236,9 +236,10 @@ With `mempool` or `all-tools`, browse the explorer at
 The localhost control plane combines the dashboard, versioned API, and MCP endpoint
 (profile: `control-plane`; `panel` is a temporary alias). Mining and spam policy plus
 pause/resume use private worker APIs and never recreate their containers. Reorgs,
-manual mine/burst actions, and scenarios are durable server-side jobs under one mutation
-lock. Reorgs pause both workers with expiring leases and require node1 witness convergence;
-scenarios persist ordered steps, checkpoints, results, and owned cleanup. The service
+partitions, timed network degradation, manual mine/burst actions, and scenarios are
+durable server-side jobs under one mutation lock. Reorgs and partitions pause workers
+with expiring leases; namespace-local network agents also heal on TTL expiry. Scenarios
+persist ordered steps, checkpoints, results, and owned cleanup. The service
 remains opt-in and excluded from `all-tools` while boot-only lifecycle paths still use
 the transitional Compose adapter:
 
@@ -279,8 +280,9 @@ curl -s "localhost:8090/api/v1/jobs/$job_id/events?after=0" | jq .
 
 The same operations are exposed over MCP (streamable HTTP) at
 `http://localhost:8090/mcp`, so coding agents can inspect and retune the simnet
-directly. The Phase 4 tool set includes `start_reorg`, `get_job`, `list_jobs`, and
-`abort_job` over the same coordinator and validation as HTTP. Register it in Claude
+directly. Mutation tools include `start_reorg`, `start_partition`, `start_degrade`,
+`start_scenario`, `get_job`, `list_jobs`, and `abort_job` over the same coordinator and
+validation as HTTP. Register it in Claude
 Code with:
 
 ```bash
@@ -297,6 +299,8 @@ cargo run -p simchainctl -- config show --json
 cargo run -p simchainctl -- mining pause
 cargo run -p simchainctl -- mining resume
 cargo run -p simchainctl -- reorg --depth 3 --empty --wait
+cargo run -p simchainctl -- partition --node node3 --main-blocks 3 --isolated-blocks 4 --wait
+cargo run -p simchainctl -- degrade --node node3 --delay-ms 500 --loss-pct 1 --seconds 60 --wait
 cargo run -p simchainctl -- jobs list
 cargo run -p simchainctl -- jobs watch JOB_ID --timeout 900
 cargo run -p simchainctl -- jobs abort JOB_ID
@@ -309,7 +313,8 @@ automation exit codes are `1` for operation/job failure, `2` for CLI usage, `3` 
 API/authentication failure, `4` for wait timeout, and `5` for aborted/interrupted jobs
 or cleanup failure. Job metadata and the most recent 100 summaries are stored under
 `.simchain-control/jobs/`; a control-plane restart marks an unfinished job interrupted
-and keeps the coordinator locked until its worker leases are confirmed clear.
+and keeps the coordinator locked until its network impairment is healed, convergence is
+witnessed, and worker leases are confirmed clear.
 
 ## Scenarios
 
@@ -335,24 +340,23 @@ miner, mining both branches, healing the P2P network, and waiting for the longer
 to win everywhere:
 
 ```bash
-./scripts/partition.sh run btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
-./scripts/partition.sh disconnect btc-simnet-node3
-./scripts/partition.sh heal btc-simnet-node3
-./scripts/partition.sh status
+cargo run -p simchainctl -- partition \
+  --node node3 --main-blocks 3 --isolated-blocks 4 --wait
 ```
 
-The `run` command pauses and restores the mining controller and, unless
-`--keep-spammer` is passed, the spammer. Manual `disconnect` and `heal` do not manage
-either service. Add latency or loss to only a node's P2P interface with the one-shot
-netem helper:
+The coordinator owns expiring mining, spam, and network leases, verifies isolation,
+heals before workers resume, and witnesses the expected winner. Add bounded latency or
+loss to only a node's P2P interface with:
 
 ```bash
-./scripts/netem.sh apply btc-simnet-node3 --delay-ms 500 --loss-pct 1
-./scripts/netem.sh status btc-simnet-node3
-./scripts/netem.sh clear btc-simnet-node3
+cargo run -p simchainctl -- degrade \
+  --node node3 --delay-ms 500 --loss-pct 1 --seconds 60 --wait
 ```
 
-Netem state is ephemeral and clears when the target node is recreated or restarted.
+Each node has a private namespace-local agent with only `NET_ADMIN`, no host port or
+Docker socket. Agent TTL expiry clears abandoned nft/tc state if the control plane dies.
+The compatibility `partition.sh` and `degrade.sh` scripts submit these same jobs; raw
+manual detach and unbounded netem commands were removed.
 Operational recipes and guardrails are in [RUNBOOK.md](./docs/RUNBOOK.md).
 
 
@@ -369,9 +373,9 @@ For full details, commands, and modes, see [REORGS.md](./docs/REORGS.md).
 Isolates one miner from the P2P mesh (RPC stays up), mines competing branches on both
 sides, then heals so the longer branch wins everywhere: an organic reorg caused by the
 real mechanism (a partition), unlike the administrative reorg simulator below.
-`degrade.sh` makes a node slower and/or lossy for N seconds or blocks (auto-restored);
-`netem.sh` underneath gives fine control. P2P traffic only — block/tx propagation
-becomes observable, RPC stays clean.
+`degrade` makes a node slower and/or lossy for a bounded number of seconds. Both faults
+are lease-owned and target P2P traffic only — block/tx propagation becomes observable,
+RPC stays clean.
 
 For commands, manual walkthroughs, and caveats, see
 [PARTITIONS.md](./docs/PARTITIONS.md).
@@ -406,6 +410,7 @@ of a given commit ships identical dependency versions.
 |---|---|
 | [crates/simchain-common](crates/simchain-common) | Shared helpers and public/internal API DTOs |
 | [crates/mining-controller](crates/mining-controller) | Bootstraps the chain and drives configurable mining (`btc-simnet-mining-controller`) |
+| [crates/network-agent](crates/network-agent) | Private namespace-local P2P impairment agent with TTL healing |
 | [crates/spammer](crates/spammer) | Fills blocks with transactions (`btc-simnet-spammer`) |
 | [crates/reorg](crates/reorg) | Forces chain reorganizations on demand (`btc-simnet-reorg`) |
 | [crates/scenario-engine](crates/scenario-engine) | Pure scenario schema/executor library plus compatibility HTTP client |

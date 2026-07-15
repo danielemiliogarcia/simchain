@@ -12,10 +12,11 @@ pub use config::{
 };
 pub use error::{ApiError, ApiErrorEnvelope, ErrorCode, ErrorDetail, RollbackReport};
 pub use jobs::{
-    AbortJobResponse, CheckpointState, CleanupState, JobCheckpoint, JobCheckpointResponse,
-    JobCleanup, JobCreatedResponse, JobDetail, JobEvent, JobEventsResponse, JobFailure, JobKind,
-    JobLease, JobListResponse, JobState, JobSummary, MineJobRequest, ReleaseCheckpointRequest,
-    ReorgJobRequest, ScenarioJobRequest, ScenarioStepStatus, SpamBurstJobRequest,
+    AbortJobResponse, CheckpointState, CleanupState, DegradeJobRequest, JobCheckpoint,
+    JobCheckpointResponse, JobCleanup, JobCreatedResponse, JobDetail, JobEvent, JobEventsResponse,
+    JobFailure, JobKind, JobLease, JobListResponse, JobState, JobSummary, MineJobRequest,
+    PartitionJobRequest, ReleaseCheckpointRequest, ReorgJobRequest, ScenarioJobRequest,
+    ScenarioStepStatus, SpamBurstJobRequest,
 };
 pub use status::{
     BlockSummary, Cadence, ComponentControlResponse, ComponentState, ExplorerStatus, FeeBucket,

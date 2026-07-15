@@ -158,6 +158,73 @@ pub struct SpamWorkerStatus {
     pub last_error: Option<String>,
 }
 
+/// Network impairment applied only to a node's P2P interface.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NetworkImpairment {
+    Netem {
+        delay_ms: u64,
+        loss_pct: f64,
+    },
+    Partition {
+        ingress_drop: bool,
+        egress_drop: bool,
+    },
+}
+
+impl NetworkImpairment {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Netem { .. } => "netem",
+            Self::Partition { .. } => "partition",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct NetworkLeaseRequest {
+    pub lease_id: String,
+    pub owner_job_id: String,
+    pub purpose: String,
+    pub ttl_secs: u64,
+    pub request_id: String,
+    pub impairment: NetworkImpairment,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NetworkLeaseReleaseRequest {
+    pub request_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct NetworkImpairmentLease {
+    pub lease_id: String,
+    pub owner_job_id: String,
+    pub purpose: String,
+    pub expires_at_ms: u64,
+    pub impairment: NetworkImpairment,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NetworkCommandAck {
+    pub request_id: String,
+    pub effective_generation: u64,
+    pub impairment_active: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct NetworkAgentStatus {
+    pub component: String,
+    pub node: String,
+    pub p2p_interface: String,
+    pub effective_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_lease: Option<NetworkImpairmentLease>,
+    pub uptime_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +239,16 @@ mod tests {
             serde_json::from_str::<DesiredState>("\"running\"").expect("deserialize"),
             DesiredState::Running
         );
+    }
+
+    #[test]
+    fn network_impairment_json_is_tagged_and_stable() {
+        let value = serde_json::to_value(NetworkImpairment::Partition {
+            ingress_drop: true,
+            egress_drop: true,
+        })
+        .expect("serialize");
+        assert_eq!(value["kind"], "partition");
+        assert_eq!(value["ingress_drop"], true);
     }
 }

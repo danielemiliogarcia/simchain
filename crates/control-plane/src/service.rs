@@ -9,10 +9,10 @@ use crate::status::StatusSnapshot;
 use serde::Serialize;
 use simchain_common::config::ConfigError;
 use simchain_common::control_api::{
-    AbortJobResponse, ApplyMode, ComponentControlResponse, ConfigResponse,
+    AbortJobResponse, ApplyMode, ComponentControlResponse, ConfigResponse, DegradeJobRequest,
     EffectiveComponentConfig, JobCheckpointResponse, JobCreatedResponse, JobDetail,
-    JobEventsResponse, JobListResponse, MineJobRequest, OperationSummary, ReleaseCheckpointRequest,
-    ReorgJobRequest, SchemaResponse, SettingSchema, SpamBurstJobRequest,
+    JobEventsResponse, JobListResponse, MineJobRequest, OperationSummary, PartitionJobRequest,
+    ReleaseCheckpointRequest, ReorgJobRequest, SchemaResponse, SettingSchema, SpamBurstJobRequest,
 };
 pub use simchain_common::control_api::{
     ApiError as ServiceError, ErrorCode, ErrorDetail, RollbackReport,
@@ -483,6 +483,38 @@ pub fn start_spam_burst(
     };
     app.jobs
         .start_spam_burst(request, idempotency_key)
+        .map_err(job_manager_error)
+}
+
+pub fn start_partition(
+    app: &std::sync::Arc<AppState>,
+    request: PartitionJobRequest,
+    idempotency_key: Option<String>,
+) -> Result<JobCreatedResponse, ServiceError> {
+    let Ok(_guard) = app.apply_lock.try_lock() else {
+        return Err(ServiceError::new(
+            ErrorCode::ApplyInProgress,
+            "another desired-state mutation is already in progress",
+        ));
+    };
+    app.jobs
+        .start_partition(request, idempotency_key)
+        .map_err(job_manager_error)
+}
+
+pub fn start_degrade(
+    app: &std::sync::Arc<AppState>,
+    request: DegradeJobRequest,
+    idempotency_key: Option<String>,
+) -> Result<JobCreatedResponse, ServiceError> {
+    let Ok(_guard) = app.apply_lock.try_lock() else {
+        return Err(ServiceError::new(
+            ErrorCode::ApplyInProgress,
+            "another desired-state mutation is already in progress",
+        ));
+    };
+    app.jobs
+        .start_degrade(request, idempotency_key)
         .map_err(job_manager_error)
 }
 

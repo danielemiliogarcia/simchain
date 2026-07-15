@@ -8,7 +8,7 @@ use crate::state::{
 use bitcoincore_rpc::{Client, RpcApi};
 pub use simchain_common::control_api::StatusResponse as StatusSnapshot;
 use simchain_common::control_api::{
-    BlockSummary, Cadence, ComponentState, FeeBucket, MempoolSummary,
+    BlockSummary, Cadence, ComponentState, FeeBucket, ImpairmentSummary, MempoolSummary,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -137,6 +137,10 @@ fn fast_sample(app: &SharedState, client: Option<&Client>, init_error: Option<St
             })
             .collect::<BTreeMap<_, _>>()
     });
+    let network = ["node1", "node2", "node3"]
+        .into_iter()
+        .map(|node| app.network.status(node).map(|status| (node, status)))
+        .collect::<anyhow::Result<Vec<_>>>();
 
     let mut snapshot = app.status.write().expect("status lock");
     match rpc {
@@ -150,7 +154,53 @@ fn fast_sample(app: &SharedState, client: Option<&Client>, init_error: Option<St
         Err(error) => snapshot.rpc_error = Some(error.to_string()),
     }
     match components {
-        Ok(components) => {
+        Ok(mut components) => {
+            let network = match network {
+                Ok(network) => network,
+                Err(error) => {
+                    snapshot.component_error = Some(format!("network agents: {error}"));
+                    refresh_last_error(&mut snapshot);
+                    return;
+                }
+            };
+            snapshot.impairments = network
+                .iter()
+                .filter_map(|(node, status)| {
+                    status.active_lease.as_ref().map(|lease| ImpairmentSummary {
+                        node: (*node).to_string(),
+                        kind: lease.impairment.kind().to_string(),
+                        owner_job_id: lease.owner_job_id.clone(),
+                    })
+                })
+                .collect();
+            for (node, status) in network {
+                components.insert(
+                    format!("network-agent-{node}"),
+                    ComponentState {
+                        present: true,
+                        status: if status.active_lease.is_some() {
+                            "impaired"
+                        } else {
+                            "clear"
+                        }
+                        .to_string(),
+                        running: true,
+                        phase: Some(
+                            if status.active_lease.is_some() {
+                                "active"
+                            } else {
+                                "clear"
+                            }
+                            .to_string(),
+                        ),
+                        effective_generation: Some(status.effective_generation),
+                        uptime_secs: Some(status.uptime_secs),
+                        last_error: status.last_error,
+                        active_lease_count: Some(usize::from(status.active_lease.is_some())),
+                        ..ComponentState::default()
+                    },
+                );
+            }
             snapshot.effective_generations = components
                 .iter()
                 .filter_map(|(name, component)| {

@@ -20,7 +20,7 @@ let selectedJobEventAfter = 0;
 let jobsRefreshing = false;
 let startingJob = false;
 let startingScenario = false;
-const startingAction = { mine: false, burst: false };
+const startingAction = { mine: false, burst: false, partition: false, degrade: false };
 let abortingJob = false;
 const releasingCheckpoints = new Set();
 const changingComponentState = { mining: false, spam: false };
@@ -155,6 +155,10 @@ function renderStatus(s) {
     spamPause.disabled = changingComponentState.spam || desired === "paused" || activeMutationId() != null;
     spamResume.disabled = changingComponentState.spam || desired === "running" || activeMutationId() != null;
   }
+  const impairments = s.impairments || [];
+  $("#network-status").textContent = impairments.length === 0
+    ? "all P2P links clear"
+    : impairments.map((item) => `${item.node}: ${item.kind} · owner ${item.owner_job_id}`).join(" · ");
   refreshForm();
 }
 
@@ -388,6 +392,8 @@ function renderJobs() {
   for (const [action, formId, buttonId, label] of [
     ["mine", "mine-form", "mine-start", "Mine"],
     ["burst", "burst-form", "burst-start", "Create burst"],
+    ["partition", "partition-form", "partition-start", "Start partition"],
+    ["degrade", "degrade-form", "degrade-start", "Start degradation"],
   ]) {
     const button = $("#" + buttonId);
     button.disabled = startingAction[action] || active != null || !$("#" + formId).checkValidity();
@@ -690,6 +696,48 @@ async function startBoundedAction(event, action) {
   }
 }
 
+async function startNetworkAction(event, action) {
+  event.preventDefault();
+  if (startingAction[action] || activeMutationId() != null || !event.currentTarget.checkValidity()) return;
+  startingAction[action] = true;
+  renderJobs();
+  const partition = action === "partition";
+  const result = $(`#${action}-action-result`);
+  const request = partition ? {
+    node: $("#partition-node").value,
+    main_blocks: Number($("#partition-main-blocks").value),
+    isolated_blocks: Number($("#partition-isolated-blocks").value),
+  } : {
+    node: $("#degrade-node").value,
+    delay_ms: Number($("#degrade-delay").value),
+    loss_pct: Number($("#degrade-loss").value),
+    seconds: Number($("#degrade-seconds").value),
+  };
+  result.textContent = `Submitting ${partition ? "partition" : "degradation"} job…`;
+  result.className = "action-result";
+  try {
+    const { ok, body } = await api(`/api/v1/jobs/${action}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + TOKEN,
+        "Idempotency-Key": browserIdempotencyKey(),
+      },
+      body: JSON.stringify(request),
+    });
+    if (!ok) throw new Error((body && body.error && body.error.message) || `${action} request failed`);
+    result.textContent = `${body.reused ? "Reused" : "Started"} ${body.job_id}`;
+    await selectJob(body.job_id);
+  } catch (error) {
+    result.textContent = String(error);
+    result.className = "action-result err";
+  } finally {
+    startingAction[action] = false;
+    await refreshJobs();
+    await refreshStatus();
+  }
+}
+
 async function releaseCheckpoint(checkpoint) {
   if (!selectedJobId || releasingCheckpoints.has(checkpoint.name)) return;
   releasingCheckpoints.add(checkpoint.name);
@@ -835,6 +883,10 @@ async function init() {
   $("#mine-form").addEventListener("input", renderJobs);
   $("#burst-form").addEventListener("submit", (event) => startBoundedAction(event, "burst"));
   $("#burst-form").addEventListener("input", renderJobs);
+  $("#partition-form").addEventListener("submit", (event) => startNetworkAction(event, "partition"));
+  $("#partition-form").addEventListener("input", renderJobs);
+  $("#degrade-form").addEventListener("submit", (event) => startNetworkAction(event, "degrade"));
+  $("#degrade-form").addEventListener("input", renderJobs);
   setInterval(refreshStatus, 2000);
   setInterval(() => { if (!applying) refreshState(); }, 4000);
   setInterval(refreshJobs, 1000);

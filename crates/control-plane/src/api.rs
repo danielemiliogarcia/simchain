@@ -4,8 +4,8 @@
 use crate::apply::{apply, ApplyRequest};
 use crate::service::{
     abort_job, config, get_checkpoint, get_job, job_events, list_jobs, release_checkpoint, schema,
-    set_mining_state, set_spam_state, settings_state, start_mine, start_reorg, start_scenario,
-    start_spam_burst, status, ErrorCode, ServiceError,
+    set_mining_state, set_spam_state, settings_state, start_degrade, start_mine, start_partition,
+    start_reorg, start_scenario, start_spam_burst, status, ErrorCode, ServiceError,
 };
 use crate::state::SharedState;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -51,6 +51,8 @@ pub fn router(app: SharedState) -> Router {
         .route("/api/v1/jobs/scenario", post(scenario_job_handler))
         .route("/api/v1/jobs/mine", post(mine_job_handler))
         .route("/api/v1/jobs/spam-burst", post(spam_burst_job_handler))
+        .route("/api/v1/jobs/partition", post(partition_job_handler))
+        .route("/api/v1/jobs/degrade", post(degrade_job_handler))
         .route("/api/v1/jobs/{job_id}", get(job_handler))
         .route("/api/v1/jobs/{job_id}/events", get(job_events_handler))
         .route("/api/v1/jobs/{job_id}/abort", post(abort_job_handler))
@@ -608,6 +610,68 @@ async fn spam_burst_job_handler(State(app): State<SharedState>, request: Request
     match tokio::task::spawn_blocking(move || start_spam_burst(&worker, payload, idempotency_key))
         .await
     {
+        Ok(Ok(response)) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
+async fn partition_job_handler(State(app): State<SharedState>, request: Request) -> Response {
+    authenticated_job_request::<simchain_common::control_api::PartitionJobRequest, _>(
+        app,
+        request,
+        start_partition,
+    )
+    .await
+}
+
+async fn degrade_job_handler(State(app): State<SharedState>, request: Request) -> Response {
+    authenticated_job_request::<simchain_common::control_api::DegradeJobRequest, _>(
+        app,
+        request,
+        start_degrade,
+    )
+    .await
+}
+
+async fn authenticated_job_request<T, F>(app: SharedState, request: Request, start: F) -> Response
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(
+            &SharedState,
+            T,
+            Option<String>,
+        ) -> Result<simchain_common::control_api::JobCreatedResponse, ServiceError>
+        + Send
+        + Sync
+        + Copy
+        + 'static,
+{
+    if !request_has_token(&app, &request) {
+        return error_response(&ServiceError::new(
+            ErrorCode::Unauthorized,
+            "missing or invalid bearer token (see .simchain-control/token)",
+        ));
+    }
+    let idempotency_key = match request_idempotency_key(&request) {
+        Ok(key) => key,
+        Err(error) => return error_response(&error),
+    };
+    let payload: Result<Json<T>, JsonRejection> = Json::from_request(request, &()).await;
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return error_response(&ServiceError::new(
+                ErrorCode::ValidationFailed,
+                format!("invalid request body: {rejection}"),
+            ));
+        }
+    };
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || start(&worker, payload, idempotency_key)).await {
         Ok(Ok(response)) => (StatusCode::ACCEPTED, Json(response)).into_response(),
         Ok(Err(error)) => error_response(&error),
         Err(error) => error_response(&ServiceError::new(
@@ -1274,6 +1338,66 @@ steps:
     }
 
     #[tokio::test]
+    async fn partition_and_degrade_routes_share_the_job_contract() {
+        let fx = fixture(None);
+        let partition = serde_json::json!({
+            "node": "node3",
+            "main_blocks": 2,
+            "isolated_blocks": 3
+        });
+        let (status, body) = send(
+            &fx.router,
+            post_action("partition", partition.clone(), None, None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = send(
+            &fx.router,
+            post_action(
+                "partition",
+                partition,
+                Some("test-token"),
+                Some("partition-http"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job_id = body["job_id"].as_str().expect("job ID").to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let (_, job) = send(&fx.router, get(&format!("/api/v1/jobs/{job_id}"))).await;
+            if job["state"] == "succeeded" {
+                assert_eq!(job["kind"], "partition");
+                assert_eq!(job["result"]["expected_tip"], "node3-3");
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let (status, body) = send(
+            &fx.router,
+            post_action(
+                "degrade",
+                serde_json::json!({
+                    "node": "node1",
+                    "delay_ms": 0,
+                    "loss_pct": 0,
+                    "seconds": 10
+                }),
+                Some("test-token"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "validation_failed");
+        assert!(fx.mock.compose_calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn invalid_value_yields_validation_failed() {
         let fx = fixture(None);
         let payload = serde_json::json!({"settings": {"ENABLE_SPAM": "maybe"}});
@@ -1368,7 +1492,7 @@ steps:
     }
 
     #[tokio::test]
-    async fn mcp_lists_phase_five_tools() {
+    async fn mcp_lists_phase_six_tools() {
         let router = crate::mcp::ControlPlaneMcp::tool_router();
         let mut names: Vec<String> = router
             .list_all()
@@ -1389,6 +1513,8 @@ steps:
                 "set_config",
                 "set_mining_state",
                 "set_spam_state",
+                "start_degrade",
+                "start_partition",
                 "start_reorg",
                 "start_scenario",
             ]

@@ -102,6 +102,21 @@ pub struct SpamBurstJobRequest {
     pub outputs_per_tx: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PartitionJobRequest {
+    pub node: String,
+    pub main_blocks: u64,
+    pub isolated_blocks: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct DegradeJobRequest {
+    pub node: String,
+    pub delay_ms: u64,
+    pub loss_pct: f64,
+    pub seconds: u64,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointState {

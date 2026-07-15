@@ -1,12 +1,13 @@
 //! Synchronous clients for authenticated worker APIs. Control-plane handlers
 //! run these calls on blocking workers; status sampling is already blocking.
 
-use crate::backend::{MiningControlBackend, SpamControlBackend};
+use crate::backend::{MiningControlBackend, NetworkControlBackend, SpamControlBackend};
 use serde::de::DeserializeOwned;
 use simchain_common::control_api::ApiErrorEnvelope;
 use simchain_common::internal_api::{
     CommandAck, DesiredState, LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest,
-    MiningWorkerStatus, SetMiningPolicyRequest, SetSpamPolicyRequest, SetStateRequest,
+    MiningWorkerStatus, NetworkAgentStatus, NetworkCommandAck, NetworkLeaseReleaseRequest,
+    NetworkLeaseRequest, SetMiningPolicyRequest, SetSpamPolicyRequest, SetStateRequest,
     SpamWorkerStatus, INTERNAL_API_PREFIX,
 };
 use simchain_common::live_tuning::{MiningTuning, SpamTuning};
@@ -69,6 +70,117 @@ pub struct SpamClient {
     base_url: String,
     token: String,
     request_sequence: AtomicU64,
+}
+
+pub struct NetworkClients {
+    node1_url: String,
+    node2_url: String,
+    node3_url: String,
+    token: String,
+}
+
+impl NetworkClients {
+    pub fn new(node1_url: String, node2_url: String, node3_url: String, token: String) -> Self {
+        Self {
+            node1_url: normalize_url(node1_url),
+            node2_url: normalize_url(node2_url),
+            node3_url: normalize_url(node3_url),
+            token,
+        }
+    }
+
+    fn base_url(&self, node: &str) -> anyhow::Result<&str> {
+        match node {
+            "node1" | "btc-simnet-node1" => Ok(&self.node1_url),
+            "node2" | "btc-simnet-node2" => Ok(&self.node2_url),
+            "node3" | "btc-simnet-node3" => Ok(&self.node3_url),
+            _ => anyhow::bail!("network-agent node must be node1, node2, or node3"),
+        }
+    }
+
+    fn request<T: serde::Serialize, R: DeserializeOwned>(
+        &self,
+        node: &str,
+        method: Method,
+        path: &str,
+        body: Option<&T>,
+    ) -> anyhow::Result<R> {
+        let url = format!("{}{}", self.base_url(node)?, path);
+        let mut request = match method {
+            Method::Get => minreq::get(&url),
+            Method::Put => minreq::put(&url),
+            Method::Post => minreq::post(&url),
+            Method::Delete => minreq::delete(&url),
+        }
+        .with_timeout(35)
+        .with_header("Authorization", format!("Bearer {}", self.token));
+        if let Some(body) = body {
+            request = request
+                .with_header("Content-Type", "application/json")
+                .with_body(serde_json::to_string(body)?);
+        }
+        let response = request.send()?;
+        let text = response.as_str()?;
+        if !(200..300).contains(&response.status_code) {
+            let message = serde_json::from_str::<ApiErrorEnvelope>(text)
+                .map(|envelope| envelope.error.message)
+                .unwrap_or_else(|_| format!("HTTP {}: {text}", response.status_code));
+            anyhow::bail!("{node} network agent rejected request: {message}");
+        }
+        Ok(serde_json::from_str(text)?)
+    }
+}
+
+impl NetworkControlBackend for NetworkClients {
+    fn status(&self, node: &str) -> anyhow::Result<NetworkAgentStatus> {
+        self.request::<(), _>(
+            node,
+            Method::Get,
+            &format!("{INTERNAL_API_PREFIX}/status"),
+            None,
+        )
+    }
+
+    fn acquire_lease(
+        &self,
+        node: &str,
+        request: NetworkLeaseRequest,
+    ) -> anyhow::Result<NetworkCommandAck> {
+        self.request(
+            node,
+            Method::Post,
+            &format!("{INTERNAL_API_PREFIX}/leases"),
+            Some(&request),
+        )
+    }
+
+    fn renew_lease(
+        &self,
+        node: &str,
+        lease_id: &str,
+        request: LeaseRenewRequest,
+    ) -> anyhow::Result<NetworkCommandAck> {
+        self.request(
+            node,
+            Method::Post,
+            &format!("{INTERNAL_API_PREFIX}/leases/{lease_id}/renew"),
+            Some(&request),
+        )
+    }
+
+    fn release_lease(
+        &self,
+        node: &str,
+        lease_id: &str,
+        request: NetworkLeaseReleaseRequest,
+    ) -> anyhow::Result<NetworkCommandAck> {
+        self.request(
+            node,
+            Method::Delete,
+            &format!("{INTERNAL_API_PREFIX}/leases/{lease_id}"),
+            Some(&request),
+        )
+    }
 }
 
 impl SpamClient {
@@ -285,4 +397,8 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn normalize_url(url: String) -> String {
+    url.trim_end_matches('/').to_string()
 }

@@ -3,18 +3,20 @@
 
 use crate::backend::{
     BackendOutput, ComponentBackend, ComponentInfo, ConfigurationBackend, JobActions,
-    MiningControlBackend, SpamControlBackend,
+    MiningControlBackend, NetworkControlBackend, SpamControlBackend,
 };
 use crate::control_state::ControlStateStore;
 use crate::envfile;
-use crate::jobs::JobManager;
+use crate::jobs::{JobDependencies, JobManager};
+use crate::network_job::{ChainSnapshot, NetworkActionBackend};
 use crate::reorg_job::{ReorgExecution, ReorgExecutor, ReorgRecoveryContext};
 use crate::scenario_job::ScenarioActionBackend;
 use crate::state::{AppState, ControlPlaneConfig, CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
 use crate::status::StatusSnapshot;
 use simchain_common::internal_api::{
     CommandAck, DesiredState, LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest,
-    MiningWorkerStatus, PauseLease, SpamWorkerStatus, WorkerPhase,
+    MiningWorkerStatus, NetworkAgentStatus, NetworkCommandAck, NetworkImpairmentLease,
+    NetworkLeaseReleaseRequest, NetworkLeaseRequest, PauseLease, SpamWorkerStatus, WorkerPhase,
 };
 use simchain_common::live_tuning;
 use simchain_common::live_tuning::{MiningTuning, SpamTuning};
@@ -77,6 +79,10 @@ pub struct MockWorld {
     pub spam_state: DesiredState,
     pub spam_generation: u64,
     pub spam_leases: HashMap<String, PauseLease>,
+    pub network_leases: HashMap<String, NetworkImpairmentLease>,
+    pub network_generations: HashMap<String, u64>,
+    /// Apply the impairment, then fail the next N acquire responses.
+    pub network_acquire_response_fail_times: u32,
 }
 
 pub struct MockBackend {
@@ -103,6 +109,9 @@ impl MockBackend {
                 spam_state: DesiredState::Running,
                 spam_generation: 0,
                 spam_leases: HashMap::new(),
+                network_leases: HashMap::new(),
+                network_generations: HashMap::new(),
+                network_acquire_response_fail_times: 0,
             }),
         }
     }
@@ -345,25 +354,6 @@ impl JobActions for MockBackend {
     }
 
     fn wait(&self, _duration: Duration) {}
-
-    fn run_partition(
-        &self,
-        node: &str,
-        main_blocks: u64,
-        isolated_blocks: u64,
-    ) -> anyhow::Result<()> {
-        self.world
-            .lock()
-            .expect("world lock")
-            .compose_calls
-            .push(vec![
-                "partition".to_string(),
-                node.to_string(),
-                main_blocks.to_string(),
-                isolated_blocks.to_string(),
-            ]);
-        Ok(())
-    }
 }
 
 impl ScenarioActionBackend for MockBackend {
@@ -384,7 +374,11 @@ impl ScenarioActionBackend for MockBackend {
         node: simchain_scenario_engine::MinerNode,
         blocks: u64,
     ) -> anyhow::Result<serde_json::Value> {
-        Ok(serde_json::json!({"node": node.to_string(), "blocks": blocks}))
+        Ok(serde_json::json!({
+            "node": node.to_string(),
+            "blocks": blocks,
+            "last_hash": format!("{}-{blocks}", node.short_name())
+        }))
     }
 
     fn spam_burst(
@@ -399,21 +393,6 @@ impl ScenarioActionBackend for MockBackend {
             "accepted_transactions": txs,
             "outputs_per_transaction": outputs_per_tx,
             "aborted": control.abort_requested()
-        }))
-    }
-
-    fn run_partition(
-        &self,
-        node: simchain_scenario_engine::MinerNode,
-        main_blocks: u64,
-        isolated_blocks: u64,
-        _control: &dyn simchain_scenario_engine::ScenarioControl,
-    ) -> anyhow::Result<serde_json::Value> {
-        JobActions::run_partition(self, &node.to_string(), main_blocks, isolated_blocks)?;
-        Ok(serde_json::json!({
-            "node": node.to_string(),
-            "main_blocks": main_blocks,
-            "isolated_blocks": isolated_blocks
         }))
     }
 
@@ -724,6 +703,160 @@ impl SpamControlBackend for MockBackend {
     }
 }
 
+impl NetworkControlBackend for MockBackend {
+    fn status(&self, node: &str) -> anyhow::Result<NetworkAgentStatus> {
+        let node = normalize_mock_node(node)?;
+        let world = self.world.lock().expect("world lock");
+        Ok(NetworkAgentStatus {
+            component: "network-agent".to_string(),
+            node: node.to_string(),
+            p2p_interface: "eth1".to_string(),
+            effective_generation: world.network_generations.get(node).copied().unwrap_or(0),
+            active_lease: world.network_leases.get(node).cloned(),
+            uptime_secs: 1,
+            last_error: None,
+        })
+    }
+
+    fn acquire_lease(
+        &self,
+        node: &str,
+        request: NetworkLeaseRequest,
+    ) -> anyhow::Result<NetworkCommandAck> {
+        let node = normalize_mock_node(node)?;
+        let mut world = self.world.lock().expect("world lock");
+        if let Some(active) = world.network_leases.get(node) {
+            anyhow::ensure!(
+                active.lease_id == request.lease_id,
+                "another lease is active"
+            );
+        } else {
+            world.network_leases.insert(
+                node.to_string(),
+                NetworkImpairmentLease {
+                    lease_id: request.lease_id,
+                    owner_job_id: request.owner_job_id,
+                    purpose: request.purpose,
+                    expires_at_ms: u64::MAX,
+                    impairment: request.impairment,
+                },
+            );
+            *world
+                .network_generations
+                .entry(node.to_string())
+                .or_default() += 1;
+        }
+        if world.network_acquire_response_fail_times > 0 {
+            world.network_acquire_response_fail_times -= 1;
+            anyhow::bail!("simulated lost network lease acquisition response");
+        }
+        Ok(NetworkCommandAck {
+            request_id: request.request_id,
+            effective_generation: world.network_generations.get(node).copied().unwrap_or(0),
+            impairment_active: true,
+        })
+    }
+
+    fn renew_lease(
+        &self,
+        node: &str,
+        lease_id: &str,
+        request: LeaseRenewRequest,
+    ) -> anyhow::Result<NetworkCommandAck> {
+        let status = NetworkControlBackend::status(self, node)?;
+        anyhow::ensure!(
+            status
+                .active_lease
+                .as_ref()
+                .is_some_and(|lease| lease.lease_id == lease_id),
+            "lease not found"
+        );
+        Ok(NetworkCommandAck {
+            request_id: request.request_id,
+            effective_generation: status.effective_generation,
+            impairment_active: true,
+        })
+    }
+
+    fn release_lease(
+        &self,
+        node: &str,
+        lease_id: &str,
+        request: NetworkLeaseReleaseRequest,
+    ) -> anyhow::Result<NetworkCommandAck> {
+        let node = normalize_mock_node(node)?;
+        let mut world = self.world.lock().expect("world lock");
+        if let Some(active) = world.network_leases.get(node) {
+            anyhow::ensure!(active.lease_id == lease_id, "different lease is active");
+            world.network_leases.remove(node);
+            *world
+                .network_generations
+                .entry(node.to_string())
+                .or_default() += 1;
+        }
+        Ok(NetworkCommandAck {
+            request_id: request.request_id,
+            effective_generation: world.network_generations.get(node).copied().unwrap_or(0),
+            impairment_active: false,
+        })
+    }
+}
+
+impl NetworkActionBackend for MockBackend {
+    fn validate_ready_and_converged(&self) -> anyhow::Result<ChainSnapshot> {
+        Ok(mock_snapshot("mock"))
+    }
+
+    fn disconnect_target_peers(
+        &self,
+        _node: simchain_scenario_engine::MinerNode,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn wait_for_isolation(
+        &self,
+        node: simchain_scenario_engine::MinerNode,
+        control: &dyn simchain_scenario_engine::ScenarioControl,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(!control.abort_requested(), "aborted");
+        Ok(serde_json::json!({"isolated_node": node.short_name()}))
+    }
+
+    fn reconnect_target(&self, _node: simchain_scenario_engine::MinerNode) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn wait_for_convergence(
+        &self,
+        expected_hash: Option<&str>,
+        _control: &dyn simchain_scenario_engine::ScenarioControl,
+    ) -> anyhow::Result<ChainSnapshot> {
+        Ok(mock_snapshot(expected_hash.unwrap_or("mock")))
+    }
+}
+
+fn normalize_mock_node(node: &str) -> anyhow::Result<&str> {
+    match node {
+        "node1" | "btc-simnet-node1" => Ok("node1"),
+        "node2" | "btc-simnet-node2" => Ok("node2"),
+        "node3" | "btc-simnet-node3" => Ok("node3"),
+        _ => anyhow::bail!("invalid mock node"),
+    }
+}
+
+fn mock_snapshot(hash: &str) -> ChainSnapshot {
+    ChainSnapshot {
+        height: 204,
+        best_hash: hash.to_string(),
+        tips: BTreeMap::from([
+            ("node1".to_string(), hash.to_string()),
+            ("node2".to_string(), hash.to_string()),
+            ("node3".to_string(), hash.to_string()),
+        ]),
+    }
+}
+
 pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
     let state_dir = dir.join(".simchain-control");
     let store = ControlStateStore::open(state_dir.clone()).expect("control store");
@@ -732,10 +865,14 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
     let control_state = store.load_or_initialize(desired).expect("control state");
     let jobs = JobManager::open(
         &state_dir,
-        backend.clone(),
-        backend.clone(),
-        Arc::new(MockReorgExecutor),
-        backend.clone(),
+        JobDependencies {
+            mining: backend.clone(),
+            spam: backend.clone(),
+            network: backend.clone(),
+            reorg: Arc::new(MockReorgExecutor),
+            scenario: backend.clone(),
+            network_actions: backend.clone(),
+        },
     )
     .expect("job manager");
     AppState {
@@ -750,6 +887,9 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
             state_dir,
             mining_control_url: "http://mock-mining:9081".to_string(),
             spam_control_url: "http://mock-spam:9082".to_string(),
+            node1_network_agent_url: "http://mock-node1:9083".to_string(),
+            node2_network_agent_url: "http://mock-node2:9083".to_string(),
+            node3_network_agent_url: "http://mock-node3:9083".to_string(),
             internal_token: "test-internal-token".to_string(),
         },
         token: "test-token".to_string(),
@@ -758,6 +898,7 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
         job_actions: backend.clone(),
         mining: backend.clone(),
         spam: backend.clone(),
+        network: backend.clone(),
         jobs,
         control_state: RwLock::new(control_state),
         control_store: store,

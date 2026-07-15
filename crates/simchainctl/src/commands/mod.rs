@@ -67,6 +67,10 @@ pub enum Command {
     Mine(MineArgs),
     /// Start a bounded server-side chain reorganization job.
     Reorg(ReorgArgs),
+    /// Isolate one miner, mine deterministic competing branches, and heal.
+    Partition(PartitionArgs),
+    /// Apply timed P2P-only latency and packet loss.
+    Degrade(DegradeArgs),
     /// Submit, run, or coordinate durable server-side scenarios.
     Scenario(ScenarioArgs),
     /// Inspect, watch, or abort server-side jobs.
@@ -197,6 +201,53 @@ pub struct ReorgArgs {
     #[arg(long)]
     pub json: bool,
     /// Optional retry key; the server returns the original matching job.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PartitionArgs {
+    /// Miner to isolate: node2 or node3.
+    #[arg(long, default_value = "node3")]
+    pub node: String,
+    /// Blocks mined by the main-side miner.
+    #[arg(long, default_value_t = 3)]
+    pub main_blocks: u64,
+    /// Blocks mined by the isolated miner; must differ from main-blocks.
+    #[arg(long, default_value_t = 4)]
+    pub isolated_blocks: u64,
+    /// Wait for healing and terminal convergence.
+    #[arg(long)]
+    pub wait: bool,
+    #[arg(long, default_value_t = 900)]
+    pub timeout: u64,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct DegradeArgs {
+    /// Node to impair: node1, node2, or node3.
+    #[arg(long, default_value = "node3")]
+    pub node: String,
+    /// Added one-way egress delay in milliseconds.
+    #[arg(long, default_value_t = 0)]
+    pub delay_ms: u64,
+    /// Percentage of egress packets dropped.
+    #[arg(long, default_value_t = 0.0)]
+    pub loss_pct: f64,
+    /// Duration of the impairment in seconds.
+    #[arg(long)]
+    pub seconds: u64,
+    /// Wait until the impairment is healed and the job is terminal.
+    #[arg(long)]
+    pub wait: bool,
+    #[arg(long, default_value_t = 900)]
+    pub timeout: u64,
+    #[arg(long)]
+    pub json: bool,
     #[arg(long)]
     pub idempotency_key: Option<String>,
 }
@@ -436,6 +487,50 @@ mod tests {
                     outputs_per_tx: 4,
                     ..
                 })
+            })
+        ));
+
+        let partition = Cli::try_parse_from([
+            "simchainctl",
+            "partition",
+            "--node",
+            "node3",
+            "--main-blocks",
+            "3",
+            "--isolated-blocks",
+            "4",
+            "--wait",
+        ])
+        .expect("partition");
+        assert!(matches!(
+            partition.command,
+            Command::Partition(PartitionArgs {
+                main_blocks: 3,
+                isolated_blocks: 4,
+                wait: true,
+                ..
+            })
+        ));
+
+        let degrade = Cli::try_parse_from([
+            "simchainctl",
+            "degrade",
+            "--node",
+            "node1",
+            "--delay-ms",
+            "250",
+            "--loss-pct",
+            "1.5",
+            "--seconds",
+            "30",
+        ])
+        .expect("degrade");
+        assert!(matches!(
+            degrade.command,
+            Command::Degrade(DegradeArgs {
+                delay_ms: 250,
+                seconds: 30,
+                ..
             })
         ));
     }

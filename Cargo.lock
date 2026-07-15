@@ -1554,6 +1554,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "simchain-network-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "simchain-common",
+ "tiny_http",
+ "tracing",
+]
+
+[[package]]
 name = "simchain-reorg"
 version = "0.1.0"
 dependencies = [

@@ -53,6 +53,16 @@ RUN apt-get update \
 COPY --from=builder /app/target/release/simchain-control-plane /usr/local/bin/simchain-control-plane
 ENTRYPOINT ["simchain-control-plane"]
 
+# ---- network-agent ---------------------------------------------------------
+# Runs as root with Docker granting only CAP_NET_ADMIN. It shares a Bitcoin
+# node's network namespace and owns only P2P-interface nft/tc state.
+FROM debian:trixie-slim AS network-agent
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2 nftables \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/simchain-network-agent /usr/local/bin/simchain-network-agent
+ENTRYPOINT ["simchain-network-agent"]
+
 # ---- simchainctl -----------------------------------------------------------
 # Thin HTTP client; deliberately contains neither Docker CLI nor Bitcoin RPC
 # orchestration logic.

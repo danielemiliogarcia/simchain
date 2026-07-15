@@ -119,16 +119,17 @@ release the checkpoint, or the checkpoint timeout will fail the job and trigger 
 
 Height waits, manual mining, and wallet bursts use Bitcoin RPC directly. Mining pause and
 resume use an expiring job-owned worker lease. Reorg steps use both mining and spam leases,
-the reusable reorg executor, and strict node1 witness convergence. The partition step is
-temporarily routed through the control plane's existing transitional adapter; Phase 6
-replaces it with namespace-local leased network agents. There is only one public backend:
-the control plane.
+the reusable reorg executor, and strict node1 witness convergence. Partition steps lease
+the namespace-local target network agent, block P2P ingress and egress, mine both branches,
+heal, and witness the deterministic winner before worker leases can resume. There is only
+one public backend: the control plane.
 
 Execution stops at the first failed step. Cleanup releases only resources the scenario
 acquired, reports cleanup errors separately from the primary failure, and retains the
-mutation lock if safe recovery is still pending. A control-plane restart marks an active
-scenario interrupted and clears or safely recovers its owned worker leases before another
-mutation may begin.
+mutation lock if safe recovery is still pending. Cleanup heals network impairment and
+witnesses convergence before releasing spam and mining. A control-plane restart marks an
+active scenario interrupted and clears or safely recovers its owned network/worker leases
+before another mutation may begin.
 
 ## Shipped examples
 

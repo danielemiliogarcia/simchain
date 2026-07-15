@@ -8,8 +8,9 @@ use commands::{
     Cli, Command, ConfigCommand, JobsCommand, MiningCommand, ScenarioCommand, SpamCommand,
 };
 use simchain_common::control_api::{
-    CheckpointState, CleanupState, JobCheckpointResponse, JobDetail, JobEventsResponse, JobState,
-    MineJobRequest, ReorgJobRequest, SpamBurstJobRequest,
+    CheckpointState, CleanupState, DegradeJobRequest, JobCheckpointResponse, JobDetail,
+    JobEventsResponse, JobState, MineJobRequest, PartitionJobRequest, ReorgJobRequest,
+    SpamBurstJobRequest,
 };
 use simchain_common::internal_api::DesiredState;
 use std::process::ExitCode;
@@ -119,6 +120,39 @@ fn run(cli: Cli) -> Result<(), ClientError> {
                 terminal_result(&job)?;
             }
         }
+        Command::Partition(args) => {
+            let node = scenario_node(&args.node)?;
+            let response = client.start_partition(
+                &PartitionJobRequest {
+                    node: node.to_string(),
+                    main_blocks: args.main_blocks,
+                    isolated_blocks: args.isolated_blocks,
+                },
+                args.idempotency_key.as_deref(),
+            )?;
+            output::print_job_created(&response, args.json)?;
+            if args.wait {
+                let job = watch_job(&client, &response.job_id, args.json, args.timeout)?;
+                terminal_result(&job)?;
+            }
+        }
+        Command::Degrade(args) => {
+            let node = network_node(&args.node)?;
+            let response = client.start_degrade(
+                &DegradeJobRequest {
+                    node: node.to_string(),
+                    delay_ms: args.delay_ms,
+                    loss_pct: args.loss_pct,
+                    seconds: args.seconds,
+                },
+                args.idempotency_key.as_deref(),
+            )?;
+            output::print_job_created(&response, args.json)?;
+            if args.wait {
+                let job = watch_job(&client, &response.job_id, args.json, args.timeout)?;
+                terminal_result(&job)?;
+            }
+        }
         Command::Scenario(args) => match args.command {
             ScenarioCommand::Start(args) => {
                 let yaml = read_scenario(&args.file)?;
@@ -187,6 +221,17 @@ fn scenario_node(node: &str) -> Result<&'static str, ClientError> {
         "node3" | "btc-simnet-node3" => Ok("node3"),
         _ => Err(ClientError::Local(
             "--node must be node2 or node3".to_string(),
+        )),
+    }
+}
+
+fn network_node(node: &str) -> Result<&'static str, ClientError> {
+    match node {
+        "node1" | "btc-simnet-node1" => Ok("node1"),
+        "node2" | "btc-simnet-node2" => Ok("node2"),
+        "node3" | "btc-simnet-node3" => Ok("node3"),
+        _ => Err(ClientError::Local(
+            "--node must be node1, node2, or node3".to_string(),
         )),
     }
 }
