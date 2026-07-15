@@ -9,6 +9,7 @@ use crate::control_state::ControlStateStore;
 use crate::envfile;
 use crate::jobs::JobManager;
 use crate::reorg_job::{ReorgExecution, ReorgExecutor, ReorgRecoveryContext};
+use crate::scenario_job::ScenarioActionBackend;
 use crate::state::{AppState, ControlPlaneConfig, CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
 use crate::status::StatusSnapshot;
 use simchain_common::internal_api::{
@@ -344,6 +345,86 @@ impl JobActions for MockBackend {
     }
 
     fn wait(&self, _duration: Duration) {}
+
+    fn run_partition(
+        &self,
+        node: &str,
+        main_blocks: u64,
+        isolated_blocks: u64,
+    ) -> anyhow::Result<()> {
+        self.world
+            .lock()
+            .expect("world lock")
+            .compose_calls
+            .push(vec![
+                "partition".to_string(),
+                node.to_string(),
+                main_blocks.to_string(),
+                isolated_blocks.to_string(),
+            ]);
+        Ok(())
+    }
+}
+
+impl ScenarioActionBackend for MockBackend {
+    fn wait_height(
+        &self,
+        height: u64,
+        control: &dyn simchain_scenario_engine::ScenarioControl,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "target_height": height,
+            "final_height": height,
+            "aborted": control.abort_requested()
+        }))
+    }
+
+    fn mine(
+        &self,
+        node: simchain_scenario_engine::MinerNode,
+        blocks: u64,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({"node": node.to_string(), "blocks": blocks}))
+    }
+
+    fn spam_burst(
+        &self,
+        node: simchain_scenario_engine::MinerNode,
+        txs: u64,
+        outputs_per_tx: u64,
+        control: &dyn simchain_scenario_engine::ScenarioControl,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "node": node.to_string(),
+            "accepted_transactions": txs,
+            "outputs_per_transaction": outputs_per_tx,
+            "aborted": control.abort_requested()
+        }))
+    }
+
+    fn run_partition(
+        &self,
+        node: simchain_scenario_engine::MinerNode,
+        main_blocks: u64,
+        isolated_blocks: u64,
+        _control: &dyn simchain_scenario_engine::ScenarioControl,
+    ) -> anyhow::Result<serde_json::Value> {
+        JobActions::run_partition(self, &node.to_string(), main_blocks, isolated_blocks)?;
+        Ok(serde_json::json!({
+            "node": node.to_string(),
+            "main_blocks": main_blocks,
+            "isolated_blocks": isolated_blocks
+        }))
+    }
+
+    fn live_summary(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "height": 204,
+            "best_block_hash": "mock",
+            "mining": MiningControlBackend::status(self)?,
+            "spam": SpamControlBackend::status(self)?
+        }))
+    }
 }
 
 impl MiningControlBackend for MockBackend {
@@ -654,6 +735,7 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
         backend.clone(),
         backend.clone(),
         Arc::new(MockReorgExecutor),
+        backend.clone(),
     )
     .expect("job manager");
     AppState {

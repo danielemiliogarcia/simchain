@@ -34,14 +34,12 @@ COPY --from=builder /app/target/release/simchain-reorg /usr/local/bin/simchain-r
 ENTRYPOINT ["simchain-reorg"]
 
 # ---- scenario-engine -------------------------------------------------------
-# The opt-in orchestrator invokes compose and repo helper scripts through the
-# host Docker socket, so its runtime includes the Docker CLI and Compose v2.
-FROM debian:trixie-slim AS scenario-engine
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates docker-cli docker-compose \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/simchain-scenario-engine /usr/local/bin/simchain-scenario-engine
-ENTRYPOINT ["simchain-scenario-engine"]
+# Compatibility HTTP client only. Scenario execution belongs to the control
+# plane, so this image deliberately contains no Docker CLI or orchestration
+# backend.
+FROM gcr.io/distroless/cc-debian12 AS scenario-engine
+COPY --from=builder /app/target/release/simchain-scenario-engine /simchain-scenario-engine
+ENTRYPOINT ["/simchain-scenario-engine"]
 
 # ---- control-plane ---------------------------------------------------------
 # Mining, spam, and reorg paths use worker APIs/Bitcoin RPC. The transitional

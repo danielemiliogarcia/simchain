@@ -193,6 +193,16 @@ impl JobActions for HybridBackend {
     fn wait(&self, duration: Duration) {
         self.legacy.wait(duration);
     }
+
+    fn run_partition(
+        &self,
+        node: &str,
+        main_blocks: u64,
+        isolated_blocks: u64,
+    ) -> anyhow::Result<()> {
+        self.legacy
+            .run_partition(node, main_blocks, isolated_blocks)
+    }
 }
 
 fn is_worker(name: &str) -> bool {

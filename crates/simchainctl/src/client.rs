@@ -1,8 +1,9 @@
 use serde::de::DeserializeOwned;
 use simchain_common::control_api::{
     AbortJobResponse, ApiErrorEnvelope, ComponentControlResponse, ConfigResponse,
-    JobCreatedResponse, JobDetail, JobEventsResponse, JobListResponse, ReorgJobRequest,
-    SetComponentStateRequest, StatusResponse, API_PREFIX,
+    JobCheckpointResponse, JobCreatedResponse, JobDetail, JobEventsResponse, JobListResponse,
+    MineJobRequest, ReleaseCheckpointRequest, ReorgJobRequest, ScenarioJobRequest,
+    SetComponentStateRequest, SpamBurstJobRequest, StatusResponse, API_PREFIX,
 };
 use simchain_common::internal_api::DesiredState;
 use std::fmt;
@@ -14,6 +15,7 @@ pub enum ClientError {
     Api(String),
     Decode(String),
     Output(String),
+    Local(String),
     Timeout(String),
     Interrupted(String),
 }
@@ -26,6 +28,7 @@ impl fmt::Display for ClientError {
             | Self::Api(message)
             | Self::Decode(message)
             | Self::Output(message)
+            | Self::Local(message)
             | Self::Timeout(message)
             | Self::Interrupted(message) => formatter.write_str(message),
         }
@@ -78,6 +81,61 @@ impl ControlClient {
             &format!("{API_PREFIX}/jobs/reorg"),
             request,
             idempotency_key,
+        )
+    }
+
+    pub fn start_scenario(
+        &self,
+        yaml: String,
+        idempotency_key: Option<&str>,
+    ) -> Result<JobCreatedResponse, ClientError> {
+        self.post_json(
+            &format!("{API_PREFIX}/jobs/scenario"),
+            &ScenarioJobRequest { yaml },
+            idempotency_key,
+        )
+    }
+
+    pub fn start_mine(
+        &self,
+        request: &MineJobRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<JobCreatedResponse, ClientError> {
+        self.post_json(&format!("{API_PREFIX}/jobs/mine"), request, idempotency_key)
+    }
+
+    pub fn start_spam_burst(
+        &self,
+        request: &SpamBurstJobRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<JobCreatedResponse, ClientError> {
+        self.post_json(
+            &format!("{API_PREFIX}/jobs/spam-burst"),
+            request,
+            idempotency_key,
+        )
+    }
+
+    pub fn checkpoint(
+        &self,
+        job_id: &str,
+        checkpoint: &str,
+    ) -> Result<JobCheckpointResponse, ClientError> {
+        self.get(&format!(
+            "{API_PREFIX}/jobs/{job_id}/checkpoints/{checkpoint}"
+        ))
+    }
+
+    pub fn release_checkpoint(
+        &self,
+        job_id: &str,
+        checkpoint: &str,
+        generation: u64,
+    ) -> Result<JobCheckpointResponse, ClientError> {
+        self.post_json(
+            &format!("{API_PREFIX}/jobs/{job_id}/checkpoints/{checkpoint}/release"),
+            &ReleaseCheckpointRequest { generation },
+            None,
         )
     }
 
@@ -347,6 +405,91 @@ mod tests {
             )
             .expect("job response");
         assert_eq!(response.job_id, "job-4");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn scenario_start_uses_authenticated_json_envelope_and_retry_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 8192];
+            let read = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /api/v1/jobs/scenario HTTP/1.1"));
+            assert!(request.contains("Authorization: Bearer secret"));
+            assert!(request.contains("Idempotency-Key: scenario-retry"));
+            assert!(request.contains(r#""yaml":"version: 1\nsteps: []\n""#));
+
+            let response_body = serde_json::to_string(&JobCreatedResponse {
+                job_id: "job-scenario".to_string(),
+                state: simchain_common::control_api::JobState::Starting,
+                reused: false,
+            })
+            .expect("response JSON");
+            let response = format!(
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).expect("response");
+        });
+
+        let client = ControlClient::new(format!("http://{address}"), Some("secret".to_string()));
+        let response = client
+            .start_scenario(
+                "version: 1\nsteps: []\n".to_string(),
+                Some("scenario-retry"),
+            )
+            .expect("scenario response");
+        assert_eq!(response.job_id, "job-scenario");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn checkpoint_release_posts_the_pinned_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.starts_with("POST /api/v1/jobs/job-1/checkpoints/held/release HTTP/1.1")
+            );
+            assert!(request.contains("Authorization: Bearer secret"));
+            assert!(request.contains(r#"{"generation":42}"#));
+
+            let response_body = serde_json::to_string(&JobCheckpointResponse {
+                job_id: "job-1".to_string(),
+                checkpoint: simchain_common::control_api::JobCheckpoint {
+                    name: "held".to_string(),
+                    generation: 42,
+                    state: simchain_common::control_api::CheckpointState::Released,
+                    pause: true,
+                    timeout_secs: Some(60),
+                    step_index: 1,
+                    arrived_at_ms: Some(1),
+                    released_at_ms: Some(2),
+                    live_summary: None,
+                },
+            })
+            .expect("response JSON");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).expect("response");
+        });
+
+        let client = ControlClient::new(format!("http://{address}"), Some("secret".to_string()));
+        let response = client
+            .release_checkpoint("job-1", "held", 42)
+            .expect("release response");
+        assert_eq!(response.checkpoint.generation, 42);
         server.join().expect("server");
     }
 }

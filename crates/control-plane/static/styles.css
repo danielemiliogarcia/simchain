@@ -113,7 +113,39 @@ td:first-child, th:first-child { text-align: left; }
   color: var(--text);
 }
 .action-form button { min-height: 2rem; }
+.bounded-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 0.7rem; margin-bottom: 0.7rem; }
+.mini-action-form { border: 1px solid var(--line); border-radius: 5px; padding: 0.5rem; }
+.mini-action-form h3 { margin-top: 0; }
+.mini-action-form label { display: block; color: var(--dim); font-size: 0.72rem; margin-bottom: 0.35rem; }
+.mini-action-form input, .mini-action-form select {
+  display: block;
+  width: 100%;
+  margin-top: 0.15rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.25rem 0.4rem;
+  font: inherit;
+}
+.scenario-form textarea {
+  display: block;
+  width: 100%;
+  margin-top: 0.2rem;
+  resize: vertical;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.45rem;
+  font: inherit;
+}
+.scenario-form > label { color: var(--dim); font-size: 0.74rem; }
+.scenario-actions { display: flex; justify-content: space-between; align-items: center; margin-top: 0.5rem; gap: 0.6rem; }
+.file-label { color: var(--dim); font-size: 0.74rem; }
+.file-label input { display: block; margin-top: 0.2rem; max-width: 18rem; }
 .job-heading { display: flex; justify-content: space-between; align-items: center; }
+.job-heading-actions { display: flex; gap: 0.45rem; }
 .job-heading h3 { margin-top: 1rem; }
 .job-detail {
   background: var(--bg);
@@ -138,6 +170,30 @@ td:first-child, th:first-child { text-align: left; }
   padding: 0.35rem 0.55rem;
 }
 .job-events li { display: grid; grid-template-columns: 11rem 1fr; gap: 0.55rem; font-size: 0.72rem; padding: 0.15rem 0; }
+.job-checkpoints { margin-top: 0.55rem; }
+.checkpoint {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.4rem;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--dim);
+  border-radius: 5px;
+  margin-top: 0.35rem;
+  padding: 0.4rem 0.55rem;
+  font-size: 0.72rem;
+}
+.checkpoint-reached { border-left-color: var(--warn); }
+.checkpoint-released { border-left-color: var(--ok); }
+.checkpoint-timed_out { border-left-color: var(--err); }
+.checkpoint pre {
+  grid-column: 1 / -1;
+  max-height: 8rem;
+  overflow: auto;
+  margin: 0;
+  color: var(--dim);
+  white-space: pre-wrap;
+}
 .event-heading { color: var(--dim); }
 .table-scroll { overflow-x: auto; }
 #jobs tbody tr.selected { background: rgba(31, 111, 235, 0.12); }

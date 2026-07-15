@@ -1,236 +1,368 @@
-use crate::{
-    config::Config,
-    docker::Docker,
-    results::RunSummary,
-    rpc::{self, RpcClients},
-    schema::{MinerNode, Scenario, Step, BOOTSTRAP_HEIGHT},
-    steps,
-};
-use anyhow::Error;
-use bitcoincore_rpc::RpcApi;
-use std::time::Instant;
+use crate::{CheckpointStep, MinerNode, Scenario, ScenarioResult, ScenarioStepResult, Step};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::thread;
+use std::time::{Duration, Instant};
 
-#[derive(Default)]
-struct EngineState {
-    mining_paused: bool,
-    resume_failed: bool,
-    active_partition: Option<MinerNode>,
+pub trait ScenarioControl: Send + Sync {
+    fn observe(&self, progress: ScenarioProgress);
+    fn abort_requested(&self) -> bool;
 }
 
-impl EngineState {
-    #[cfg(test)]
-    fn cleanup_actions(&self) -> Vec<CleanupAction> {
-        let mut actions = Vec::new();
-        if let Some(node) = self.active_partition {
-            actions.push(CleanupAction::Heal(node));
+pub trait ScenarioActions: Send + Sync {
+    fn wait_height(&self, height: u64, control: &dyn ScenarioControl) -> anyhow::Result<Value>;
+    fn set_mining_paused(&self, paused: bool) -> anyhow::Result<Value>;
+    fn mine(&self, node: MinerNode, blocks: u64) -> anyhow::Result<Value>;
+    fn run_reorg(
+        &self,
+        depth: u64,
+        empty: bool,
+        control: &dyn ScenarioControl,
+    ) -> anyhow::Result<Value>;
+    fn spam_burst(
+        &self,
+        node: MinerNode,
+        txs: u64,
+        outputs_per_tx: u64,
+        control: &dyn ScenarioControl,
+    ) -> anyhow::Result<Value>;
+    fn run_partition(
+        &self,
+        node: MinerNode,
+        main_blocks: u64,
+        isolated_blocks: u64,
+        control: &dyn ScenarioControl,
+    ) -> anyhow::Result<Value>;
+    fn reach_checkpoint(
+        &self,
+        checkpoint: &CheckpointStep,
+        step_index: usize,
+        control: &dyn ScenarioControl,
+    ) -> anyhow::Result<Value>;
+    fn live_summary(&self) -> anyhow::Result<Value>;
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScenarioProgressPhase {
+    StepStarted,
+    StepCompleted,
+    StepFailed,
+    AbortObserved,
+}
+
+impl ScenarioProgressPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StepStarted => "step_started",
+            Self::StepCompleted => "step_completed",
+            Self::StepFailed => "step_failed",
+            Self::AbortObserved => "abort_observed",
         }
-        if self.mining_paused && !self.resume_failed {
-            actions.push(CleanupAction::ResumeMining);
-        }
-        actions
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, PartialEq, Eq)]
-enum CleanupAction {
-    Heal(MinerNode),
-    ResumeMining,
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ScenarioProgress {
+    pub phase: ScenarioProgressPhase,
+    pub step_index: usize,
+    pub total_steps: usize,
+    pub step_kind: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
-pub struct RunFailure {
-    pub summary: RunSummary,
-    pub source: Error,
-}
+pub fn run(
+    scenario: &Scenario,
+    actions: &dyn ScenarioActions,
+    control: &dyn ScenarioControl,
+) -> ScenarioResult {
+    let started = Instant::now();
+    let mut steps = Vec::new();
+    let mut error = None;
+    let mut aborted = false;
 
-pub struct Engine {
-    config: Config,
-    scenario: Scenario,
-    rpc: RpcClients,
-    docker: Docker,
-    state: EngineState,
-    started: Instant,
-    executed_steps: usize,
-}
+    for (zero_index, step) in scenario.steps.iter().enumerate() {
+        let step_index = zero_index + 1;
+        if control.abort_requested() {
+            aborted = true;
+            control.observe(progress(
+                ScenarioProgressPhase::AbortObserved,
+                step_index,
+                scenario.steps.len(),
+                step,
+                "scenario abort observed at a step boundary".to_string(),
+                None,
+            ));
+            break;
+        }
 
-impl Engine {
-    pub fn new(config: Config, scenario: Scenario) -> anyhow::Result<Self> {
-        let rpc = RpcClients::new(&config)?;
-        let docker = Docker::new(config.repo_root.clone());
-        Ok(Self {
-            config,
-            scenario,
-            rpc,
-            docker,
-            state: EngineState::default(),
-            started: Instant::now(),
-            executed_steps: 0,
-        })
-    }
-
-    pub fn run(mut self) -> Result<RunSummary, Box<RunFailure>> {
-        tracing::info!("Waiting for node1 RPC");
-        let initial_height = match rpc::wait_for_rpc(self.rpc.node1(), self.config.timeout) {
-            Ok(height) => height,
-            Err(error) => return Err(self.fail(error)),
-        };
-        tracing::info!(height = initial_height, "Node1 RPC is ready");
-        tracing::info!(target_height = BOOTSTRAP_HEIGHT, "Waiting for bootstrap");
-        let (_, height) =
-            match rpc::wait_for_height(self.rpc.node1(), BOOTSTRAP_HEIGHT, self.config.timeout) {
-                Ok(heights) => heights,
-                Err(error) => return Err(self.fail(error)),
-            };
-        tracing::info!(height, "Bootstrap complete");
-
-        for index in 0..self.scenario.steps.len() {
-            let step = self.scenario.steps[index].clone();
-            let step_number = index + 1;
-            let step_started = Instant::now();
-            let parameters =
-                serde_json::to_string(&step).unwrap_or_else(|_| step.kind().to_string());
-            tracing::info!(
-                step = step_number,
-                total = self.scenario.steps.len(),
-                step_type = step.kind(),
-                parameters,
-                "Starting scenario step"
-            );
-            self.before_step(&step);
-            if let Err(error) = steps::execute(&step, &self.rpc, &self.docker, self.config.timeout)
-            {
-                self.after_failed_step(&step);
-                let error = error.context(format!(
-                    "step {step_number}/{} ({}) failed",
-                    self.scenario.steps.len(),
-                    step.kind()
+        control.observe(progress(
+            ScenarioProgressPhase::StepStarted,
+            step_index,
+            scenario.steps.len(),
+            step,
+            format!(
+                "starting step {step_index}/{} ({})",
+                scenario.steps.len(),
+                step.kind()
+            ),
+            serde_json::to_value(step).ok(),
+        ));
+        let step_started = Instant::now();
+        let outcome = execute_step(step, step_index, actions, control);
+        let duration_ms = elapsed_ms(step_started);
+        match outcome {
+            Ok(data) => {
+                steps.push(ScenarioStepResult {
+                    index: step_index,
+                    kind: step.kind().to_string(),
+                    duration_ms,
+                    success: true,
+                    error: None,
+                });
+                control.observe(progress(
+                    ScenarioProgressPhase::StepCompleted,
+                    step_index,
+                    scenario.steps.len(),
+                    step,
+                    format!(
+                        "completed step {step_index}/{} ({})",
+                        scenario.steps.len(),
+                        step.kind()
+                    ),
+                    Some(data),
                 ));
-                self.cleanup();
-                return Err(self.fail(error));
+                if control.abort_requested() {
+                    aborted = true;
+                    control.observe(progress(
+                        ScenarioProgressPhase::AbortObserved,
+                        step_index,
+                        scenario.steps.len(),
+                        step,
+                        "scenario abort observed after the current safe action completed"
+                            .to_string(),
+                        None,
+                    ));
+                    break;
+                }
             }
-            self.after_successful_step(&step);
-            self.executed_steps += 1;
-            tracing::info!(
-                step = step_number,
-                step_type = step.kind(),
-                duration_ms = step_started.elapsed().as_millis(),
-                "Finished scenario step"
-            );
-        }
-
-        Ok(self.summary(true, None))
-    }
-
-    fn before_step(&mut self, step: &Step) {
-        if let Step::Partition { node, .. } = step {
-            self.state.active_partition = Some(*node);
-        }
-    }
-
-    fn after_successful_step(&mut self, step: &Step) {
-        match step {
-            Step::PauseMining => self.state.mining_paused = true,
-            Step::ResumeMining => {
-                self.state.mining_paused = false;
-                self.state.resume_failed = false;
-            }
-            Step::Partition { .. } => self.state.active_partition = None,
-            _ => {}
-        }
-    }
-
-    fn after_failed_step(&mut self, step: &Step) {
-        if matches!(step, Step::ResumeMining) {
-            self.state.resume_failed = true;
-        }
-    }
-
-    // Cleanup reverses ENGINE-owned state only: partitions this engine started
-    // and pauses this engine issued. Steps that shell out (reorg, partition)
-    // stop/restart the controller and spammer through those scripts' own EXIT
-    // traps -- e.g. a reorg failure that leaves the controller stopped is
-    // simulate-reorg.sh's cleanup responsibility and is deliberately not
-    // tracked here.
-    fn cleanup(&mut self) {
-        if let Some(node) = self.state.active_partition.take() {
-            tracing::warn!(%node, "Healing partition after scenario failure");
-            if let Err(error) = self.docker.heal_partition(&node.to_string()) {
-                tracing::error!(%error, "Failed to heal partition during cleanup");
+            Err(source) => {
+                let message = format!(
+                    "step {step_index}/{} ({}) failed: {source:#}",
+                    scenario.steps.len(),
+                    step.kind()
+                );
+                steps.push(ScenarioStepResult {
+                    index: step_index,
+                    kind: step.kind().to_string(),
+                    duration_ms,
+                    success: false,
+                    error: Some(message.clone()),
+                });
+                control.observe(progress(
+                    ScenarioProgressPhase::StepFailed,
+                    step_index,
+                    scenario.steps.len(),
+                    step,
+                    message.clone(),
+                    None,
+                ));
+                error = Some(message);
+                break;
             }
         }
-        if self.state.mining_paused && !self.state.resume_failed {
-            tracing::warn!("Resuming mining controller after scenario failure");
-            if let Err(error) = self.docker.resume_mining() {
-                tracing::error!(%error, "Failed to resume mining during cleanup");
+    }
+
+    let final_summary = match actions.live_summary() {
+        Ok(summary) => Some(summary),
+        Err(source) => {
+            if error.is_none() && !aborted {
+                error = Some(format!(
+                    "failed to collect final scenario summary: {source:#}"
+                ));
             }
-            self.state.mining_paused = false;
+            None
+        }
+    };
+    let success = error.is_none() && !aborted && steps.len() == scenario.steps.len();
+    ScenarioResult {
+        success,
+        aborted,
+        executed_steps: steps.iter().filter(|step| step.success).count(),
+        total_steps: scenario.steps.len(),
+        duration_ms: elapsed_ms(started),
+        steps,
+        final_summary,
+        error,
+    }
+}
+
+fn execute_step(
+    step: &Step,
+    step_index: usize,
+    actions: &dyn ScenarioActions,
+    control: &dyn ScenarioControl,
+) -> anyhow::Result<Value> {
+    match step {
+        Step::WaitHeight { height } => actions.wait_height(*height, control),
+        Step::Sleep { secs } => {
+            let deadline = Instant::now() + Duration::from_secs(*secs);
+            while Instant::now() < deadline {
+                if control.abort_requested() {
+                    return Ok(json!({"aborted_during_sleep": true}));
+                }
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(100)),
+                );
+            }
+            Ok(json!({"slept_secs": secs}))
+        }
+        Step::PauseMining => actions.set_mining_paused(true),
+        Step::ResumeMining => actions.set_mining_paused(false),
+        Step::Mine { node, blocks } => actions.mine(*node, *blocks),
+        Step::Reorg { depth, empty } => actions.run_reorg(*depth, *empty, control),
+        Step::SpamBurst {
+            node,
+            txs,
+            outputs_per_tx,
+        } => actions.spam_burst(*node, *txs, *outputs_per_tx, control),
+        Step::Partition {
+            node,
+            main_blocks,
+            isolated_blocks,
+        } => actions.run_partition(*node, *main_blocks, *isolated_blocks, control),
+        Step::Checkpoint { checkpoint } => {
+            actions.reach_checkpoint(checkpoint, step_index, control)
         }
     }
+}
 
-    fn fail(&self, source: Error) -> Box<RunFailure> {
-        Box::new(RunFailure {
-            summary: self.summary(false, Some(format!("{source:#}"))),
-            source,
-        })
+fn progress(
+    phase: ScenarioProgressPhase,
+    step_index: usize,
+    total_steps: usize,
+    step: &Step,
+    message: String,
+    data: Option<Value>,
+) -> ScenarioProgress {
+    ScenarioProgress {
+        phase,
+        step_index,
+        total_steps,
+        step_kind: step.kind().to_string(),
+        message,
+        data,
     }
+}
 
-    fn summary(&self, success: bool, error: Option<String>) -> RunSummary {
-        let final_height = self.rpc.node1().get_block_count().ok();
-        let best_block_hash = self
-            .rpc
-            .node1()
-            .get_best_block_hash()
-            .ok()
-            .map(|hash| hash.to_string());
-        RunSummary {
-            scenario_file: self.config.scenario_file.display().to_string(),
-            success,
-            executed_steps: self.executed_steps,
-            total_steps: self.scenario.steps.len(),
-            duration_ms: self.started.elapsed().as_millis(),
-            final_height,
-            best_block_hash,
-            error,
-        }
-    }
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
-    #[test]
-    fn cleanup_resumes_after_engine_pause() {
-        let state = EngineState {
-            mining_paused: true,
-            ..EngineState::default()
-        };
-        assert_eq!(state.cleanup_actions(), [CleanupAction::ResumeMining]);
+    #[derive(Default)]
+    struct Fake {
+        calls: Mutex<Vec<String>>,
+        abort: AtomicBool,
+    }
+
+    impl ScenarioControl for Fake {
+        fn observe(&self, progress: ScenarioProgress) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(progress.phase.as_str().to_string());
+        }
+
+        fn abort_requested(&self) -> bool {
+            self.abort.load(Ordering::Acquire)
+        }
+    }
+
+    impl ScenarioActions for Fake {
+        fn wait_height(&self, height: u64, _: &dyn ScenarioControl) -> anyhow::Result<Value> {
+            Ok(json!({"height": height}))
+        }
+        fn set_mining_paused(&self, paused: bool) -> anyhow::Result<Value> {
+            Ok(json!({"paused": paused}))
+        }
+        fn mine(&self, _: MinerNode, blocks: u64) -> anyhow::Result<Value> {
+            Ok(json!({"blocks": blocks}))
+        }
+        fn run_reorg(&self, depth: u64, _: bool, _: &dyn ScenarioControl) -> anyhow::Result<Value> {
+            Ok(json!({"depth": depth}))
+        }
+        fn spam_burst(
+            &self,
+            _: MinerNode,
+            txs: u64,
+            _: u64,
+            _: &dyn ScenarioControl,
+        ) -> anyhow::Result<Value> {
+            Ok(json!({"txs": txs}))
+        }
+        fn run_partition(
+            &self,
+            _: MinerNode,
+            main_blocks: u64,
+            isolated_blocks: u64,
+            _: &dyn ScenarioControl,
+        ) -> anyhow::Result<Value> {
+            Ok(json!({"main": main_blocks, "isolated": isolated_blocks}))
+        }
+        fn reach_checkpoint(
+            &self,
+            checkpoint: &CheckpointStep,
+            _: usize,
+            _: &dyn ScenarioControl,
+        ) -> anyhow::Result<Value> {
+            Ok(json!({"checkpoint": checkpoint.name}))
+        }
+        fn live_summary(&self) -> anyhow::Result<Value> {
+            Ok(json!({"height": 210}))
+        }
     }
 
     #[test]
-    fn cleanup_heals_failed_partition_before_resuming() {
-        let state = EngineState {
-            mining_paused: true,
-            active_partition: Some(MinerNode::Node3),
-            ..EngineState::default()
-        };
+    fn runs_steps_in_order_and_reports_structured_progress() {
+        let scenario = Scenario::parse(
+            "version: 1\nsteps:\n  - type: pause_mining\n  - type: mine\n    node: btc-simnet-node2\n    blocks: 2\n",
+        )
+        .unwrap();
+        let fake = Fake::default();
+        let result = run(&scenario, &fake, &fake);
+        assert!(result.success);
+        assert_eq!(result.executed_steps, 2);
         assert_eq!(
-            state.cleanup_actions(),
+            *fake.calls.lock().unwrap(),
             [
-                CleanupAction::Heal(MinerNode::Node3),
-                CleanupAction::ResumeMining
+                "step_started",
+                "step_completed",
+                "step_started",
+                "step_completed"
             ]
         );
     }
 
     #[test]
-    fn failed_resume_is_not_retried_during_cleanup() {
-        let state = EngineState {
-            mining_paused: true,
-            resume_failed: true,
-            active_partition: None,
-        };
-        assert!(state.cleanup_actions().is_empty());
+    fn abort_stops_at_the_next_step_boundary() {
+        let scenario = Scenario::parse(
+            "version: 1\nsteps:\n  - type: pause_mining\n  - type: resume_mining\n",
+        )
+        .unwrap();
+        let fake = Fake::default();
+        fake.abort.store(true, Ordering::Release);
+        let result = run(&scenario, &fake, &fake);
+        assert!(result.aborted);
+        assert_eq!(result.executed_steps, 0);
     }
 }

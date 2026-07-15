@@ -61,10 +61,14 @@ pub enum Command {
     Config(ConfigArgs),
     /// Pause or resume continuous mining at a worker safe point.
     Mining(MiningArgs),
-    /// Pause or resume spam at a cooperative worker safe point.
+    /// Pause/resume continuous spam or submit a bounded burst.
     Spam(SpamArgs),
+    /// Mine a bounded number of blocks through a server-side action job.
+    Mine(MineArgs),
     /// Start a bounded server-side chain reorganization job.
     Reorg(ReorgArgs),
+    /// Submit, run, or coordinate durable server-side scenarios.
+    Scenario(ScenarioArgs),
     /// Inspect, watch, or abort server-side jobs.
     Jobs(JobsArgs),
 }
@@ -115,12 +119,55 @@ pub struct SpamArgs {
     pub command: SpamCommand,
 }
 
-#[derive(Clone, Copy, Debug, Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum SpamCommand {
     /// Pause after already-submitted spam reaches a consistent boundary.
     Pause,
     /// Resume spam unless disabled by policy or held by a job-owned lease.
     Resume,
+    /// Submit a bounded wallet transaction burst.
+    Burst(SpamBurstArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct MineArgs {
+    /// Miner node: node2 or node3.
+    #[arg(long, default_value = "node2")]
+    pub node: String,
+    /// Positive number of blocks to mine.
+    #[arg(long)]
+    pub blocks: u64,
+    /// Wait for the server-side action to finish.
+    #[arg(long)]
+    pub wait: bool,
+    #[arg(long, default_value_t = 900)]
+    pub timeout: u64,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SpamBurstArgs {
+    /// Wallet node: node2 or node3.
+    #[arg(long, default_value = "node2")]
+    pub node: String,
+    /// Positive number of transactions to submit.
+    #[arg(long)]
+    pub txs: u64,
+    /// Outputs per transaction; zero selects sequential sendtoaddress.
+    #[arg(long, default_value_t = 0)]
+    pub outputs_per_tx: u64,
+    /// Wait for the server-side action to finish.
+    #[arg(long)]
+    pub wait: bool,
+    #[arg(long, default_value_t = 900)]
+    pub timeout: u64,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -184,6 +231,80 @@ pub struct JobIdArgs {
     pub job_id: String,
 }
 
+#[derive(Debug, Args)]
+pub struct ScenarioArgs {
+    #[command(subcommand)]
+    pub command: ScenarioCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScenarioCommand {
+    /// Upload a scenario and return immediately with its job ID.
+    Start(ScenarioStartArgs),
+    /// Upload a scenario and wait for its terminal result.
+    Run(ScenarioRunArgs),
+    /// Wait until one named checkpoint is durably reached.
+    Wait(ScenarioWaitArgs),
+    /// Release a reached pausing checkpoint using its current generation.
+    Release(ScenarioReleaseArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ScenarioStartArgs {
+    /// Scenario YAML file.
+    pub file: PathBuf,
+    /// Emit the stable job-created JSON response.
+    #[arg(long, conflicts_with = "id_only")]
+    pub json: bool,
+    /// Print only the server-assigned job ID for shell capture.
+    #[arg(long, conflicts_with = "json")]
+    pub id_only: bool,
+    /// Optional retry key; identical retries return the original job.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ScenarioRunArgs {
+    /// Scenario YAML file.
+    pub file: PathBuf,
+    /// Write the terminal job plus complete event/checkpoint summary as JSON.
+    #[arg(long)]
+    pub result: Option<PathBuf>,
+    /// Emit stable JSON event and terminal objects.
+    #[arg(long)]
+    pub json: bool,
+    /// Maximum terminal wait in seconds.
+    #[arg(long, default_value_t = 900)]
+    pub timeout: u64,
+    /// Optional retry key; identical retries return the original job.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ScenarioWaitArgs {
+    pub job_id: String,
+    /// Checkpoint name from the submitted scenario.
+    #[arg(long)]
+    pub checkpoint: String,
+    /// Maximum wait in seconds.
+    #[arg(long, default_value_t = 900)]
+    pub timeout: u64,
+    /// Emit the stable checkpoint response as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ScenarioReleaseArgs {
+    pub job_id: String,
+    pub checkpoint: String,
+    /// Emit the stable checkpoint response as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +363,79 @@ mod tests {
             jobs.command,
             Command::Jobs(JobsArgs {
                 command: JobsCommand::Watch(JobWatchArgs { json: true, .. })
+            })
+        ));
+
+        let scenario = Cli::try_parse_from([
+            "simchainctl",
+            "scenario",
+            "start",
+            "scenarios/ci.yml",
+            "--id-only",
+        ])
+        .expect("scenario start");
+        assert!(matches!(
+            scenario.command,
+            Command::Scenario(ScenarioArgs {
+                command: ScenarioCommand::Start(ScenarioStartArgs { id_only: true, .. })
+            })
+        ));
+
+        let wait = Cli::try_parse_from([
+            "simchainctl",
+            "scenario",
+            "wait",
+            "job-1",
+            "--checkpoint",
+            "mempool_loaded",
+            "--timeout",
+            "60",
+        ])
+        .expect("scenario wait");
+        assert!(matches!(
+            wait.command,
+            Command::Scenario(ScenarioArgs {
+                command: ScenarioCommand::Wait(ScenarioWaitArgs { timeout: 60, .. })
+            })
+        ));
+
+        let mine = Cli::try_parse_from([
+            "simchainctl",
+            "mine",
+            "--node",
+            "node3",
+            "--blocks",
+            "2",
+            "--wait",
+        ])
+        .expect("mine command");
+        assert!(matches!(
+            mine.command,
+            Command::Mine(MineArgs {
+                blocks: 2,
+                wait: true,
+                ..
+            })
+        ));
+
+        let burst = Cli::try_parse_from([
+            "simchainctl",
+            "spam",
+            "burst",
+            "--txs",
+            "10",
+            "--outputs-per-tx",
+            "4",
+        ])
+        .expect("spam burst");
+        assert!(matches!(
+            burst.command,
+            Command::Spam(SpamArgs {
+                command: SpamCommand::Burst(SpamBurstArgs {
+                    txs: 10,
+                    outputs_per_tx: 4,
+                    ..
+                })
             })
         ));
     }

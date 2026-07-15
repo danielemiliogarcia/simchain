@@ -10,8 +10,9 @@ use serde::Serialize;
 use simchain_common::config::ConfigError;
 use simchain_common::control_api::{
     AbortJobResponse, ApplyMode, ComponentControlResponse, ConfigResponse,
-    EffectiveComponentConfig, JobCreatedResponse, JobDetail, JobEventsResponse, JobListResponse,
-    OperationSummary, ReorgJobRequest, SchemaResponse, SettingSchema,
+    EffectiveComponentConfig, JobCheckpointResponse, JobCreatedResponse, JobDetail,
+    JobEventsResponse, JobListResponse, MineJobRequest, OperationSummary, ReleaseCheckpointRequest,
+    ReorgJobRequest, SchemaResponse, SettingSchema, SpamBurstJobRequest,
 };
 pub use simchain_common::control_api::{
     ApiError as ServiceError, ErrorCode, ErrorDetail, RollbackReport,
@@ -425,6 +426,66 @@ pub fn start_reorg(
         .map_err(job_manager_error)
 }
 
+pub fn start_scenario(
+    app: &std::sync::Arc<AppState>,
+    yaml: String,
+    idempotency_key: Option<String>,
+) -> Result<JobCreatedResponse, ServiceError> {
+    let Ok(_guard) = app.apply_lock.try_lock() else {
+        return Err(ServiceError::new(
+            ErrorCode::ApplyInProgress,
+            "another desired-state mutation is already in progress",
+        ));
+    };
+    let desired = app
+        .control_state
+        .read()
+        .expect("control state lock")
+        .desired
+        .clone();
+    let (tuning, _) = LiveTuning::from_source(&desired).map_err(|error| {
+        ServiceError::new(
+            ErrorCode::ValidationFailed,
+            format!("durable spam policy is invalid: {error}"),
+        )
+    })?;
+    app.jobs
+        .start_scenario(yaml, idempotency_key, tuning.spam.use_raw)
+        .map_err(job_manager_error)
+}
+
+pub fn start_mine(
+    app: &std::sync::Arc<AppState>,
+    request: MineJobRequest,
+    idempotency_key: Option<String>,
+) -> Result<JobCreatedResponse, ServiceError> {
+    let Ok(_guard) = app.apply_lock.try_lock() else {
+        return Err(ServiceError::new(
+            ErrorCode::ApplyInProgress,
+            "another desired-state mutation is already in progress",
+        ));
+    };
+    app.jobs
+        .start_mine(request, idempotency_key)
+        .map_err(job_manager_error)
+}
+
+pub fn start_spam_burst(
+    app: &std::sync::Arc<AppState>,
+    request: SpamBurstJobRequest,
+    idempotency_key: Option<String>,
+) -> Result<JobCreatedResponse, ServiceError> {
+    let Ok(_guard) = app.apply_lock.try_lock() else {
+        return Err(ServiceError::new(
+            ErrorCode::ApplyInProgress,
+            "another desired-state mutation is already in progress",
+        ));
+    };
+    app.jobs
+        .start_spam_burst(request, idempotency_key)
+        .map_err(job_manager_error)
+}
+
 pub fn list_jobs(app: &AppState) -> JobListResponse {
     app.jobs.list()
 }
@@ -446,6 +507,25 @@ pub fn job_events(
 
 pub fn abort_job(app: &AppState, job_id: &str) -> Result<AbortJobResponse, ServiceError> {
     app.jobs.abort(job_id).map_err(job_manager_error)
+}
+
+pub fn get_checkpoint(
+    app: &AppState,
+    job_id: &str,
+    name: &str,
+) -> Result<JobCheckpointResponse, ServiceError> {
+    app.jobs.checkpoint(job_id, name).map_err(job_manager_error)
+}
+
+pub fn release_checkpoint(
+    app: &AppState,
+    job_id: &str,
+    name: &str,
+    request: ReleaseCheckpointRequest,
+) -> Result<JobCheckpointResponse, ServiceError> {
+    app.jobs
+        .release_checkpoint(job_id, name, request)
+        .map_err(job_manager_error)
 }
 
 pub(crate) fn job_manager_error(error: JobManagerError) -> ServiceError {

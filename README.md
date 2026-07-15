@@ -257,7 +257,7 @@ One compose file serves every combination via
 | `docker compose --profile mempool up` | basic + electrs + mempool.space explorer |
 | `docker compose --profile all-tools up` | basic + all long-running tools above |
 | `docker compose --profile control-plane up` | basic + the control plane (browser UI, HTTP API, MCP) |
-| `SCENARIO_FILE=scenarios/reorg-during-sync.yml docker compose --profile scenario run --rm btc-simnet-scenario` | run one declarative scenario against the simnet, then exit |
+| `SCENARIO_FILE=scenarios/reorg-during-sync.yml docker compose --profile scenario run --rm btc-simnet-scenario` | compatibility client: submit one durable control-plane scenario job, wait, then exit |
 
 With `mempool` or `all-tools`, browse the explorer at
 [http://localhost:1080/](http://localhost:1080/) (port: `MEMPOOL_WEB_PORT`).
@@ -274,12 +274,12 @@ helper containers left by an earlier run, use
 
 The localhost control plane combines the dashboard, versioned API, and MCP endpoint
 (profile: `control-plane`; `panel` is a temporary alias). Mining and spam policy plus
-pause/resume use private worker APIs and never recreate their containers. Reorgs are
-durable server-side jobs: the control plane owns the mutation lock, pauses both workers
-with expiring leases, calls the reusable reorg library through Bitcoin RPC, and requires
-node1 to witness convergence before releasing the workers. The service remains opt-in
-and excluded from `all-tools` while boot-only lifecycle paths still use the transitional
-Compose adapter:
+pause/resume use private worker APIs and never recreate their containers. Reorgs,
+manual mine/burst actions, and scenarios are durable server-side jobs under one mutation
+lock. Reorgs pause both workers with expiring leases and require node1 witness convergence;
+scenarios persist ordered steps, checkpoints, results, and owned cleanup. The service
+remains opt-in and excluded from `all-tools` while boot-only lifecycle paths still use
+the transitional Compose adapter:
 
 ```bash
 docker compose --profile control-plane up -d --build
@@ -339,6 +339,8 @@ cargo run -p simchainctl -- reorg --depth 3 --empty --wait
 cargo run -p simchainctl -- jobs list
 cargo run -p simchainctl -- jobs watch JOB_ID --timeout 900
 cargo run -p simchainctl -- jobs abort JOB_ID
+cargo run -p simchainctl -- mine --node node2 --blocks 1 --wait
+cargo run -p simchainctl -- spam burst --node node2 --txs 100 --outputs-per-tx 25 --wait
 ```
 
 `reorg --wait` streams progress and exits `0` only after successful cleanup. Stable
@@ -353,17 +355,17 @@ and keeps the coordinator locked until its worker leases are confirmed clear.
 Reproduce an ordered chain history from YAML after the simnet has bootstrapped:
 
 ```bash
-docker compose up -d
-SCENARIO_FILE=scenarios/reorg-during-sync.yml \
-  docker compose --profile scenario run --rm --build btc-simnet-scenario
+docker compose --profile control-plane up -d --build
+cargo run -p simchainctl -- scenario run scenarios/reorg-during-sync.yml \
+  --result results/reorg.json
 ```
 
-The one-shot engine waits for height 204, runs each step in order, stops at the first
-failure, and exits with the scenario result. It supports height waits, sleeps, mining
-pause/resume, manual mining, reorgs, one-shot wallet bursts, and deterministic network
-partitions. The container mounts `docker.sock`, so the profile is intentionally opt-in
-and excluded from `all-tools`. Schema, cleanup behavior, and all shipped examples are in
-[SCENARIOS.md](./docs/SCENARIOS.md).
+The control plane validates the document before reserving its single mutation coordinator,
+waits for height 204, persists step events/results, and cleans only job-owned leases. Named
+checkpoints let CI hold an exact state, run external assertions, and release by generation;
+disconnecting the client does not cancel the job. The old `scenario` Compose profile is a
+thin HTTP client with no Docker CLI or socket. Schema, checkpoint workflow, cleanup, and
+examples are in [SCENARIOS.md](./docs/SCENARIOS.md).
 
 
 ## Simulating reorgs
@@ -408,17 +410,19 @@ print(topic, len(body), 'bytes')
 
 ## Repository structure
 
-The four Rust tools live in a single Cargo workspace at the repo root, sharing one
+The Rust tools live in a single Cargo workspace at the repo root, sharing one
 `target/` dir, one dependency resolution, and one committed `Cargo.lock` so every build
 of a given commit ships identical dependency versions.
 
 | Path | Purpose |
 |---|---|
-| [crates/simchain-common](crates/simchain-common) | Shared helpers: RPC clients, config parsing, logging, and burn addresses, used across the four tools |
+| [crates/simchain-common](crates/simchain-common) | Shared helpers and public/internal API DTOs |
 | [crates/mining-controller](crates/mining-controller) | Bootstraps the chain and drives configurable mining (`btc-simnet-mining-controller`) |
 | [crates/spammer](crates/spammer) | Fills blocks with transactions (`btc-simnet-spammer`) |
 | [crates/reorg](crates/reorg) | Forces chain reorganizations on demand (`btc-simnet-reorg`) |
-| [crates/scenario-engine](crates/scenario-engine) | Executes ordered YAML scenarios (`btc-simnet-scenario`) |
+| [crates/scenario-engine](crates/scenario-engine) | Pure scenario schema/executor library plus compatibility HTTP client |
+| [crates/control-plane](crates/control-plane) | Single dashboard/API/MCP backend and durable job coordinator |
+| [crates/simchainctl](crates/simchainctl) | Thin first-party HTTP client for humans and CI |
 
 `Cargo.lock` is committed on purpose: these are binaries for a reproducible test
 network, so the lockfile is tracked (unlike a library crate, which would leave it to

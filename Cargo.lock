@@ -1532,6 +1532,7 @@ dependencies = [
  "sha2",
  "simchain-common",
  "simchain-reorg",
+ "simchain-scenario-engine",
  "tempfile",
  "tokio",
  "tower",
@@ -1570,8 +1571,8 @@ name = "simchain-scenario-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bitcoincore-rpc",
  "dotenvy",
+ "minreq",
  "serde",
  "serde_json",
  "serde_yaml",
