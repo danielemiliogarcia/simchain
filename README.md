@@ -1,6 +1,6 @@
 # BTC Simchain
 
-[![CI](https://github.com/danielemiliogarcia/simchain/actions/workflows/ci.yml/badge.svg)](https://github.com/danielemiliogarcia/simchain/actions/workflows/ci.yml) [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](./LICENSE)
+[![CI](https://github.com/danielemiliogarcia/simchain/actions/workflows/ci.yml/badge.svg)](https://github.com/danielemiliogarcia/simchain/actions/workflows/ci.yml) [![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](./LICENSE)
 
 A regtest Bitcoin simulation network that tries to stay as close to mainnet reality as
 regtest allows: several P2P-connected nodes, rotating miners, a non-mining full node as
@@ -13,6 +13,36 @@ Blockchain regtest tool that helps write tests needing minimal changes to run on
 Three P2P-connected nodes, rotating miners, non-mining user endpoint, non-empty blocks, configurable reorgs.
 
 For detailed component descriptions, see [INTRO.md](./docs/INTRO.md).
+
+## Features
+
+- **Mainnet-like network shape.** Three Bitcoin Core nodes form a full P2P mesh;
+  two mine while a wallet-disabled, non-mining node gives applications a
+  production-like RPC endpoint.
+- **Configurable, reproducible mining.** Choose fixed or bounded-Poisson block
+  intervals, strict miner alternation or weighted selection, and an optional RNG
+  seed for repeatable runs.
+- **Realistic block and fee pressure.** Locally signed raw transactions fill blocks,
+  maintain configurable mempool depth and an economic fee floor, and can exercise
+  fee replacement without changing Bitcoin Core's mainnet relay or mempool policy.
+- **Programmatic reorgs (`invalidateblock`).** Deterministically run one-shot or
+  continuous reorgs with configurable depth, rebuild replacement blocks from the
+  live mempool, inject new transactions, leave transactions unconfirmed in chaos
+  mode, or permanently drop selected transactions through simulated double spends.
+- **Network splits and organic reorgs.** Partition the P2P mesh while keeping the RPC
+  control plane reachable, let both sides mine competing branches, then heal the
+  split and observe every node converge on the most-work chain.
+- **P2P link degradation.** Add latency and packet loss for a duration or number of
+  blocks, with automatic recovery, to exercise block and transaction propagation
+  without impairing RPC traffic.
+- **Reusable chain state.** Named volumes make bootstrap resumable; validated
+  snapshots preserve blocks, chainstate, miner wallets, the mempool, and the active
+  Compose profile for fast restoration.
+- **Application integration.** Use Bitcoin Core RPC and all five ZMQ topics, with
+  optional Electrum and mempool.space services enabled through Compose profiles.
+- **Configuration without patching code.** Every setting has a default, `.env`
+  controls the full stack, and mining and spam behavior can be retuned on a live
+  chain without restarting the nodes.
 
 ## Network topology
 
@@ -160,13 +190,14 @@ docker compose logs -ft btc-simnet-node1
 # Everything at once
 docker compose logs -ft
 
-# Tear down; the chain persists on named volumes and resumes on the next up.
+# Tear down every profile; the chain persists on named volumes and resumes on
+# the next up. The quoted wildcard also catches reorg/partition helper containers.
 # Let it finish on its own -- see "Chain snapshots" for why force-killing it
 # can cost you the chain.
-docker compose --profile all-tools down
+docker compose --profile "*" down
 
 # Tear down AND wipe the chain (fresh bootstrap on the next up)
-docker compose --profile all-tools down -v
+docker compose --profile "*" down -v
 
 # Or in one command: wipe + start a fresh chain (flags are passed to compose)
 ./scripts/fresh-chain.sh --profile all-tools
@@ -223,10 +254,17 @@ One compose file serves every combination via
 | `docker compose --profile basic up` | same as above (alias) |
 | `docker compose --profile electrs up` | basic + electrs (Electrum RPC on 60001, HTTP on 3000) |
 | `docker compose --profile mempool up` | basic + electrs + mempool.space explorer |
-| `docker compose --profile all-tools up` | basic + all the tools above |
+| `docker compose --profile all-tools up` | basic + all long-running tools above |
 
 With `mempool` or `all-tools`, browse the explorer at
 [http://localhost:1080/](http://localhost:1080/) (port: `MEMPOOL_WEB_PORT`).
+
+The core services have no `profiles` entry, so they are available both to plain
+`docker compose up` and whenever any profile is enabled. The `reorg` and `partition`
+profiles stay separate because they are disruptive, on-demand helpers; including them
+in `all-tools` would run them during an ordinary startup. To stop and remove containers
+from every profile, including helper containers left by an earlier run, use
+`docker compose --profile "*" down`.
 
 
 ## Simulating reorgs
@@ -309,8 +347,6 @@ exclude = ["path/to/simchain"]
 - [SETTINGS.md](./docs/SETTINGS.md), every setting, its default and what it does.
 - [SNAPSHOTS.md](./docs/SNAPSHOTS.md), chain snapshot/restore cookbook: concrete
   commands for the common situations.
-- [snapshot-restore-plan.md](./docs/snapshot-restore-plan.md), chain snapshot/restore
-  design, rationale and usage details.
 - [NICE-TO-HAVE.md](./docs/NICE-TO-HAVE.md), all limitations, future enhancements and
   proposed features with rationale and implementation plans.
 - [RUNBOOK.md](./docs/RUNBOOK.md), handy `bitcoin-cli` one-liners against the simnet.
@@ -320,11 +356,32 @@ exclude = ["path/to/simchain"]
 All known limitations, future enhancements and proposed features live in
 [NICE-TO-HAVE.md](./docs/NICE-TO-HAVE.md).
 
-### Local development
+## Contributing
+
+Bug reports, documentation, tests, reviews, and code contributions are welcome. For
+a new feature or broad behavioral change, please
+[open an issue](https://github.com/danielemiliogarcia/simchain/issues) first so the
+use case and its effect on mainnet fidelity can be agreed before implementation.
+Small, self-contained fixes can go directly to a pull request.
+
+Keep pull requests focused and explain both what changed and why. Preserve the
+project's intent: the tools should imitate mainnet behavior, so do not introduce
+relay, mempool, or capacity policy that diverges from Bitcoin Core's mainnet
+defaults. Put a helper in `crates/simchain-common` as soon as a second tool needs it,
+and update tests, `.env` examples, and documentation whenever behavior or settings
+change.
+
+### Development workflow
 
 All `cargo` commands run from the repo root. Project aliases live in
 [.cargo/config.toml](.cargo/config.toml) (Cargo discovers it by walking up from any
-crate directory):
+crate directory). Before opening a pull request, format the workspace and run the
+same checks as CI:
+
+```bash
+cargo fa
+cargo ba && cargo ca && cargo fac && cargo tt
+```
 
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs `cargo ba`, clippy
 (`-D warnings`), `cargo fmt --check`, and the test suite on every pull request, all
@@ -332,7 +389,13 @@ with `--locked` so a stale `Cargo.lock` fails the build. The three tool Docker i
 build from one shared [docker/tools.Dockerfile](docker/tools.Dockerfile) (one builder
 stage, three targets), also with `--locked`.
 
-# Trouble shotting
+If dependencies change, commit the updated `Cargo.lock`. For Compose, Dockerfile, or
+shell-script changes, also run `docker compose config --quiet` and exercise the
+affected profile or script. In the pull request, link any relevant issue and list the
+automated checks and manual scenarios you ran. By submitting a contribution, you
+agree that it may be distributed under the project's `GPL-3.0-or-later` license.
+
+## Troubleshooting
 
 Stopping the containers (`docker compose stop`) and starting them again used to crash
 the mining controller with:
@@ -346,5 +409,12 @@ the chain is already bootstrapped (height >= 204), so `stop`/`start` resumes cle
 where it left off.
 
 To reset the chain from scratch, remove the containers **and the chain volumes**:
-`docker compose --profile all-tools down -v` (a plain `down` keeps the named volumes,
+`docker compose --profile "*" down -v` (a plain `down` keeps the named volumes,
 so the chain resumes on the next `up`).
+
+## License
+
+BTC Simchain's source code is licensed under the
+[GNU General Public License version 3 or later](./LICENSE)
+(`GPL-3.0-or-later`). Third-party dependencies and optional container images remain
+under their respective licenses.

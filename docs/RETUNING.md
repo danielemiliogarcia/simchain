@@ -32,7 +32,7 @@ This is safe mid-run: `--force-recreate` only replaces the services named on the
 - Settings consumed by the **nodes** (`BTC_IMAGE`, host ports, `MIN_RELAY_TX_FEE`,
   ZMQ ports, ...) do require recreating the nodes, and node containers keep the chain
   in their filesystem, so that resets the chain: use a full
-  `docker compose --profile all-tools down` / `up`.
+  `docker compose --profile "*" down`, then bring up the profile you want.
 - `FALLBACK_FEE` is shared: the spammer prices its floor fills with it, and the nodes
   take it as `-fallbackfee` (wallet-side fallback). A spammer-only recreate moves the
   spam fee floor immediately; the nodes keep the old wallet fallback until a full

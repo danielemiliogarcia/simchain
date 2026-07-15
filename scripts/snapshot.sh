@@ -34,11 +34,11 @@ SNAP_DIR="${SNAPSHOT_DIR:-$REPO_ROOT/snapshots}"
 VOLUMES=(btc-simnet-node1-data btc-simnet-node2-data btc-simnet-node3-data)
 HELPER_IMAGE=alpine:3
 
-# All stop/start/down calls use the widest profile so optional tools
-# (electrs, mempool explorer) are cycled together with the nodes; services
-# without containers are simply ignored. `up` is NOT profile-forced: restore
-# starts the default stack unless the user passes profile flags.
-compose()    { docker compose -f "$REPO_ROOT/docker-compose.yml" --project-directory "$REPO_ROOT" --profile all-tools "$@"; }
+# All stop/start/down calls select every profile so optional and on-demand
+# containers are cycled together with the nodes; services without containers
+# are simply ignored. `up` is NOT profile-forced: restore starts the default
+# stack unless the user passes profile flags.
+compose()    { docker compose -f "$REPO_ROOT/docker-compose.yml" --project-directory "$REPO_ROOT" --profile "*" "$@"; }
 compose_up() { docker compose -f "$REPO_ROOT/docker-compose.yml" --project-directory "$REPO_ROOT" "$@"; }
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'

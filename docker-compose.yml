@@ -6,14 +6,16 @@
 #   electrs           -> basic + electrs
 #   mempool           -> basic + electrs + mempool.space explorer
 #                        (mempool-web/mempool-api/mempool-db)
-#   all-tools         -> basic + every tool above
+#   all-tools         -> basic + all long-running tools above
 #   reorg             -> reorg simulator (run on demand, see README)
 #   partition         -> one-shot P2P latency/loss helpers
+#                        (intentionally excluded from all-tools)
 #
 # Examples:
 #   docker compose up
 #   docker compose --profile mempool up
 #   docker compose run --rm btc-simnet-reorg 3
+#   docker compose --profile "*" down  # tear down every profile
 #
 # Each node is declared in full on purpose (no YAML anchors), so that in the
 # future different nodes can run different bitcoind versions/images and
