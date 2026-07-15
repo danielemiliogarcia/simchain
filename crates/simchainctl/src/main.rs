@@ -4,7 +4,7 @@ mod output;
 
 use clap::Parser;
 use client::{ClientError, ControlClient};
-use commands::{Cli, Command, ConfigCommand, MiningCommand};
+use commands::{Cli, Command, ConfigCommand, MiningCommand, SpamCommand};
 use simchain_common::internal_api::DesiredState;
 use std::process::ExitCode;
 
@@ -46,6 +46,14 @@ fn run(cli: Cli) -> Result<(), ClientError> {
                 MiningCommand::Resume => DesiredState::Running,
             };
             let response = client.set_mining_state(state)?;
+            output::print_component_control(&response)?;
+        }
+        Command::Spam(spam) => {
+            let state = match spam.command {
+                SpamCommand::Pause => DesiredState::Paused,
+                SpamCommand::Resume => DesiredState::Running,
+            };
+            let response = client.set_spam_state(state)?;
             output::print_component_control(&response)?;
         }
     }

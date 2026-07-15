@@ -1,13 +1,13 @@
-//! Phase-2 migration adapter: mining uses its internal worker API while spam
-//! and process telemetry still use the legacy Compose adapter.
+//! Worker-first migration adapter. Mining and spam use their private control
+//! APIs; the legacy backend remains only for node probes and later-phase jobs.
 
 use crate::backend::{
     BackendOutput, ComponentBackend, ComponentInfo, ConfigurationBackend, JobActions,
-    MiningControlBackend,
+    MiningControlBackend, SpamControlBackend,
 };
 use crate::compose::ComposeBackend;
-use crate::state::CONTROLLER_CONTAINER;
-use simchain_common::live_tuning::MiningTuning;
+use crate::state::{CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
+use simchain_common::live_tuning::{MiningTuning, SpamTuning};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,11 +15,20 @@ use std::time::Duration;
 pub struct HybridBackend {
     legacy: ComposeBackend,
     mining: Arc<dyn MiningControlBackend>,
+    spam: Arc<dyn SpamControlBackend>,
 }
 
 impl HybridBackend {
-    pub fn new(legacy: ComposeBackend, mining: Arc<dyn MiningControlBackend>) -> Self {
-        Self { legacy, mining }
+    pub fn new(
+        legacy: ComposeBackend,
+        mining: Arc<dyn MiningControlBackend>,
+        spam: Arc<dyn SpamControlBackend>,
+    ) -> Self {
+        Self {
+            legacy,
+            mining,
+            spam,
+        }
     }
 }
 
@@ -28,7 +37,7 @@ impl ComponentBackend for HybridBackend {
         let legacy_names: Vec<&str> = names
             .iter()
             .copied()
-            .filter(|name| *name != CONTROLLER_CONTAINER)
+            .filter(|name| !is_worker(name))
             .collect();
         let mut components = if legacy_names.is_empty() {
             HashMap::new()
@@ -60,28 +69,46 @@ impl ComponentBackend for HybridBackend {
                     next_scheduled_attempt_ms: status.next_scheduled_attempt_ms,
                     last_mined_block: status.last_mined_block,
                     active_lease_count: Some(status.active_leases.len()),
+                    cycle_phase: None,
+                    accepted_transactions: None,
+                    reconciliation_pending: None,
                 },
-                Err(error) => ComponentInfo {
-                    present: false,
-                    status: "unreachable".to_string(),
-                    running: false,
+                Err(error) => unreachable_component(error),
+            };
+            components.insert(CONTROLLER_CONTAINER.to_string(), component);
+        }
+        if names.contains(&SPAMMER_CONTAINER) {
+            let component = match self.spam.status() {
+                Ok(status) => ComponentInfo {
+                    present: true,
+                    status: status.phase.as_str().to_string(),
+                    running: true,
                     restarting: false,
                     exit_code: 0,
                     restart_count: 0,
-                    effective_config: HashMap::new(),
-                    phase: None,
-                    effective_generation: None,
-                    uptime_secs: None,
-                    last_error: Some(error.to_string()),
-                    desired_state: None,
-                    effective_state: None,
-                    observed_height: None,
+                    effective_config: status
+                        .policy
+                        .canonical_values()
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value))
+                        .collect(),
+                    phase: Some(status.phase.as_str().to_string()),
+                    effective_generation: Some(status.effective_generation),
+                    uptime_secs: Some(status.uptime_secs),
+                    last_error: status.last_error,
+                    desired_state: Some(status.desired_state),
+                    effective_state: Some(status.effective_state),
+                    observed_height: status.observed_height,
                     next_scheduled_attempt_ms: None,
                     last_mined_block: None,
-                    active_lease_count: None,
+                    active_lease_count: Some(status.active_leases.len()),
+                    cycle_phase: status.cycle_phase,
+                    accepted_transactions: Some(status.accepted_transactions),
+                    reconciliation_pending: Some(status.reconciliation_pending),
                 },
+                Err(error) => unreachable_component(error),
             };
-            components.insert(CONTROLLER_CONTAINER.to_string(), component);
+            components.insert(SPAMMER_CONTAINER.to_string(), component);
         }
         Ok(components)
     }
@@ -98,17 +125,14 @@ impl ConfigurationBackend for HybridBackend {
         if components.iter().any(|name| name == CONTROLLER_CONTAINER) {
             let policy = MiningTuning::from_source(desired)?;
             let ack = self.mining.set_policy(generation, policy)?;
-            outputs.push(BackendOutput {
-                success: true,
-                stdout: format!(
-                    "mining policy generation {} applied at {}",
-                    ack.effective_generation,
-                    ack.phase.as_str()
-                ),
-                stderr: String::new(),
-            });
+            outputs.push(worker_output("mining", &ack));
         }
-        let legacy_components = without_mining(components);
+        if components.iter().any(|name| name == SPAMMER_CONTAINER) {
+            let (policy, _) = SpamTuning::from_source(desired)?;
+            let ack = self.spam.set_policy(generation, policy)?;
+            outputs.push(worker_output("spam", &ack));
+        }
+        let legacy_components = without_workers(components);
         if !legacy_components.is_empty() {
             outputs.push(self.legacy.apply_configuration(
                 &legacy_components,
@@ -130,16 +154,15 @@ impl ConfigurationBackend for HybridBackend {
             let policy = MiningTuning::from_source(managed_values)?;
             let generation = generations.get(CONTROLLER_CONTAINER).copied().unwrap_or(0);
             let ack = self.mining.restore_policy(generation, policy)?;
-            outputs.push(BackendOutput {
-                success: true,
-                stdout: format!(
-                    "restored mining policy generation {}",
-                    ack.effective_generation
-                ),
-                stderr: String::new(),
-            });
+            outputs.push(worker_output("mining rollback", &ack));
         }
-        let legacy_components = without_mining(components);
+        if components.iter().any(|name| name == SPAMMER_CONTAINER) {
+            let (policy, _) = SpamTuning::from_source(managed_values)?;
+            let generation = generations.get(SPAMMER_CONTAINER).copied().unwrap_or(0);
+            let ack = self.spam.restore_policy(generation, policy)?;
+            outputs.push(worker_output("spam rollback", &ack));
+        }
+        let legacy_components = without_workers(components);
         if !legacy_components.is_empty() {
             outputs.push(self.legacy.restore_configuration(
                 &legacy_components,
@@ -151,10 +174,8 @@ impl ConfigurationBackend for HybridBackend {
     }
 
     fn remove_components(&self, names: &[String]) -> anyhow::Result<BackendOutput> {
-        if names.iter().any(|name| name == CONTROLLER_CONTAINER) {
-            anyhow::bail!(
-                "the mining worker is unavailable; it cannot be removed by configuration rollback"
-            );
+        if names.iter().any(|name| is_worker(name)) {
+            anyhow::bail!("resident workers cannot be removed by configuration rollback");
         }
         self.legacy.remove_components(names)
     }
@@ -174,12 +195,56 @@ impl JobActions for HybridBackend {
     }
 }
 
-fn without_mining(components: &[String]) -> Vec<String> {
+fn is_worker(name: &str) -> bool {
+    name == CONTROLLER_CONTAINER || name == SPAMMER_CONTAINER
+}
+
+fn without_workers(components: &[String]) -> Vec<String> {
     components
         .iter()
-        .filter(|name| name.as_str() != CONTROLLER_CONTAINER)
+        .filter(|name| !is_worker(name))
         .cloned()
         .collect()
+}
+
+fn worker_output(
+    component: &str,
+    ack: &simchain_common::internal_api::CommandAck,
+) -> BackendOutput {
+    BackendOutput {
+        success: true,
+        stdout: format!(
+            "{component} policy generation {} applied at {}",
+            ack.effective_generation,
+            ack.phase.as_str()
+        ),
+        stderr: String::new(),
+    }
+}
+
+fn unreachable_component(error: anyhow::Error) -> ComponentInfo {
+    ComponentInfo {
+        present: false,
+        status: "unreachable".to_string(),
+        running: false,
+        restarting: false,
+        exit_code: 0,
+        restart_count: 0,
+        effective_config: HashMap::new(),
+        phase: None,
+        effective_generation: None,
+        uptime_secs: None,
+        last_error: Some(error.to_string()),
+        desired_state: None,
+        effective_state: None,
+        observed_height: None,
+        next_scheduled_attempt_ms: None,
+        last_mined_block: None,
+        active_lease_count: None,
+        cycle_phase: None,
+        accepted_transactions: None,
+        reconciliation_pending: None,
+    }
 }
 
 fn combine(outputs: Vec<BackendOutput>) -> BackendOutput {

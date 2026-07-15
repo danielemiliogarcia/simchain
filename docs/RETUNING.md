@@ -1,15 +1,15 @@
 # Retuning a Live Chain
 
-Settings consumed by the mining controller and the spammer can be changed **without restarting the whole stack**. The control plane applies mining settings inside the resident worker at a scheduler safe point; the transitional spam path replaces only the spammer container. The nodes keep running and the chain is preserved.
+Settings consumed by the mining controller and the spammer can be changed **without restarting either worker**. The control plane applies mining settings at a scheduler safe point and spam settings at cooperative cycle boundaries. Structural spam changes build and reconcile a replacement engine before the old policy is replaced. The nodes keep running and the chain is preserved.
 
 Three equivalent paths perform the same operation:
 
 - **Manual** (below): edit `.env`, recreate the affected service(s).
 - **Control-plane UI**: `docker compose --profile control-plane up -d`, then
   [http://localhost:8090/](http://localhost:8090/) — edit, Apply. The control plane validates
-  first, stores durable desired state, mirrors the transitional `.env` settings (managed keys are canonicalized into one
-  `# Managed by simchain panel` block; your other lines are preserved), recreates only
-  the spammer when needed, and rolls back automatically if any component rejects the apply.
+  first, stores durable desired state, mirrors `.env` for compatibility (managed keys are canonicalized into one
+  `# Managed by simchain panel` block; your other lines are preserved), applies both
+  worker policies in place, and rolls back automatically if any component rejects the apply.
 - **Control-plane API / MCP**: `PATCH /api/v1/config` with the
   `.simchain-control/token` bearer token, or the `set_config` MCP tool at
   `http://localhost:8090/mcp` — same semantics, built for scripts and coding agents.
@@ -26,6 +26,18 @@ A pause acknowledgement means any in-flight `generate` RPC and propagation check
 completed. Changing cadence, weights, or `MINING_RNG_SEED` wakes an interruptible wait;
 the new generation takes effect at the next scheduler boundary. A seed change resets
 the worker RNG and miner-alternation toggle deterministically.
+
+Spam has matching controls through `PUT /api/v1/spam/state`, the `set_spam_state`
+MCP tool, the dashboard, or:
+
+```bash
+cargo run -p simchainctl -- spam pause
+cargo run -p simchainctl -- spam resume
+```
+
+A spam pause is acknowledged only after already-submitted work reaches a consistent
+boundary. `ENABLE_SPAM=false` keeps the worker resident in its `disabled` phase, so it
+can be inspected and re-enabled without a container restart.
 
 ## Steps
 
@@ -50,7 +62,7 @@ the worker RNG and miner-alternation toggle deterministically.
 
 ## Safety & Behavior
 
-The manual fallback is safe mid-run because `--force-recreate` replaces only the named services; the node dependencies remain running, so the chain, wallets, and mempool survive. The control-plane path is safer for mining because it does not replace the worker and can report desired/effective generations and its exact safe-point phase.
+The manual fallback is safe mid-run because `--force-recreate` replaces only the named services; the node dependencies remain running, so the chain, wallets, and mempool survive. The control-plane path does not replace either worker and reports desired/effective generations plus exact safe-point phases.
 
 ## Caveats
 
@@ -59,6 +71,6 @@ The manual fallback is safe mid-run because `--force-recreate` replaces only the
   in their filesystem, so that resets the chain: use a full
   `docker compose --profile all-tools down` / `up`.
 - `FALLBACK_FEE` is shared: the spammer prices its floor fills with it, and the nodes
-  take it as `-fallbackfee` (wallet-side fallback). A spammer-only recreate moves the
-  spam fee floor immediately; the nodes keep the old wallet fallback until a full
-  restart, which is usually irrelevant.
+  take it as `-fallbackfee` (wallet-side fallback). A spam engine rebuild moves the
+  spam fee floor immediately; wallet mode also sets wallet `paytxfee`. The nodes keep
+  their boot fallback until a full restart, which is usually irrelevant.

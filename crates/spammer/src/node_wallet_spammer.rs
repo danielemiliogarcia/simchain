@@ -47,9 +47,18 @@ fn spammable_utxos(wallet: &Client) -> u64 {
 // wallet's recent change, or when incoming dust is all that is left -- split
 // confirmed funds into `target` fresh UTXOs. A cheap no-op (one list_unspent)
 // when the pool is healthy, so it is safe to call every block.
-fn ensure_fanout(wallet: &Client, name: &str, need: u64, target: u64) {
+fn ensure_fanout(
+    wallet: &Client,
+    name: &str,
+    need: u64,
+    target: u64,
+    checkpoint: &impl Fn(&str) -> bool,
+) -> bool {
+    if !checkpoint("wallet_fanout_check") {
+        return false;
+    }
     if spammable_utxos(wallet) >= need {
-        return;
+        return true;
     }
 
     let trusted = rpc_retry("get wallet balance for fan-out", || wallet.get_balances())
@@ -63,36 +72,53 @@ fn ensure_fanout(wallet: &Client, name: &str, need: u64, target: u64) {
     if per_output <= 0.0 {
         // Funds are tied up in unconfirmed spam; a block will free them.
         tracing::warn!("Wallet '{name}' has no confirmed funds to fan out yet, deferring");
-        return;
+        return true;
     }
 
     tracing::info!("Wallet '{name}' low on spammable UTXOs, splitting funds into {target} UTXOs of {per_output} BTC each");
     let mut outputs = serde_json::Map::new();
     while outputs.len() < target as usize {
+        if !checkpoint("wallet_fanout_prepare") {
+            return false;
+        }
         let address = get_new_wallet_address(wallet);
         outputs.insert(address.to_string(), json!(per_output));
+    }
+    if !checkpoint("wallet_fanout_submit") {
+        return false;
     }
     match wallet.call::<String>("sendmany", &[json!(""), json!(outputs)]) {
         Ok(txid) => tracing::info!("Fan-out tx {txid} sent, waiting for it to confirm..."),
         Err(e) => {
             tracing::warn!("Wallet '{name}' fan-out failed ({e}), retrying next block");
-            return;
+            return true;
         }
-    }
+    };
+    let mut continue_work = checkpoint("wallet_fanout_submitted");
 
     loop {
         if spammable_utxos(wallet) >= need {
             break;
         }
+        if !checkpoint("wallet_fanout_confirmation") {
+            continue_work = false;
+        }
         thread::sleep(Duration::from_millis(500));
     }
     tracing::info!("Wallet '{name}' fan-out confirmed");
+    continue_work && checkpoint("wallet_fanout_confirmed")
 }
 
 // Send `count` txs and report how many actually made it, so empty blocks
 // are noticed (a silent wallet error would defeat the spammer's purpose).
 // Returns the accepted txids so a fraction of them can be fee-bumped.
-fn send_spam_tx(from: &Client, to_address: &Address, count: u64, replaceable: bool) -> Vec<Txid> {
+fn send_spam_tx(
+    from: &Client,
+    to_address: &Address,
+    count: u64,
+    replaceable: bool,
+    checkpoint: &impl Fn(&str) -> bool,
+) -> Vec<Txid> {
     // 546 sats is the dust limit for P2PKH outputs, the highest floor among
     // the common output types (bech32 is 294), so this amount is safely
     // above dust no matter what address type receives it.
@@ -101,6 +127,9 @@ fn send_spam_tx(from: &Client, to_address: &Address, count: u64, replaceable: bo
     let mut first_error: Option<String> = None;
     let replaceable = if replaceable { Some(true) } else { None };
     for _ in 0..count {
+        if !checkpoint("wallet_transaction_before_submit") {
+            break;
+        }
         match from.send_to_address(
             to_address,
             amount,
@@ -117,6 +146,9 @@ fn send_spam_tx(from: &Client, to_address: &Address, count: u64, replaceable: bo
                     first_error = Some(e.to_string());
                 }
             }
+        }
+        if !checkpoint("wallet_transaction_after_submit") {
+            break;
         }
     }
     if let Some(error) = first_error {
@@ -139,6 +171,7 @@ fn send_spam_batch(
     to_addresses: &[Address],
     count: u64,
     replaceable: bool,
+    checkpoint: &impl Fn(&str) -> bool,
 ) -> Vec<Txid> {
     let mut amounts = serde_json::Map::new();
     for address in to_addresses {
@@ -157,6 +190,9 @@ fn send_spam_batch(
     let mut txids = Vec::new();
     let mut first_error: Option<String> = None;
     for _ in 0..count {
+        if !checkpoint("wallet_batch_before_submit") {
+            break;
+        }
         match from.call::<String>("sendmany", &params) {
             Ok(txid) => txids.push(txid.parse().expect("bitcoind returned an invalid txid")),
             Err(e) => {
@@ -164,6 +200,9 @@ fn send_spam_batch(
                     first_error = Some(e.to_string());
                 }
             }
+        }
+        if !checkpoint("wallet_batch_after_submit") {
+            break;
         }
     }
     if let Some(error) = first_error {
@@ -179,11 +218,17 @@ fn send_spam_batch(
 // carries real BIP125 replacements for downstream code to handle. Bump
 // newest-first: the latest txs are the tips of the unconfirmed chains, and
 // a tx with in-wallet descendants cannot be bumped.
-fn bump_spam_txs(wallet: &Client, label: &str, txids: &[Txid], count: u64) {
+fn bump_spam_txs(
+    wallet: &Client,
+    label: &str,
+    txids: &[Txid],
+    count: u64,
+    checkpoint: &impl Fn(&str) -> bool,
+) {
     let mut bumped = 0;
     let mut first_error: Option<String> = None;
     for txid in txids.iter().rev() {
-        if bumped >= count {
+        if bumped >= count || !checkpoint("wallet_rbf_before_submit") {
             break;
         }
         match wallet.call::<serde_json::Value>("bumpfee", &[json!(txid.to_string())]) {
@@ -193,6 +238,9 @@ fn bump_spam_txs(wallet: &Client, label: &str, txids: &[Txid], count: u64) {
                     first_error = Some(e.to_string());
                 }
             }
+        }
+        if !checkpoint("wallet_rbf_after_submit") {
+            break;
         }
     }
     match first_error {
@@ -223,22 +271,25 @@ pub fn spam_round(
     batch_addrs: &[Address],
     replaceable: bool,
     replaces: u64,
+    checkpoint: &impl Fn(&str) -> bool,
 ) -> Vec<Txid> {
-    if fanout_utxos > 0 {
-        ensure_fanout(wallet, wallet_name, fanout_need, fanout_utxos);
+    if fanout_utxos > 0
+        && !ensure_fanout(wallet, wallet_name, fanout_need, fanout_utxos, checkpoint)
+    {
+        return Vec::new();
     }
     let txids = if !batch_addrs.is_empty() {
         tracing::info!(
             "{label} => Spamming {share} sendmany batches of {} outputs to burn addresses",
             batch_addrs.len()
         );
-        send_spam_batch(wallet, batch_addrs, share, replaceable)
+        send_spam_batch(wallet, batch_addrs, share, replaceable, checkpoint)
     } else {
         tracing::info!("{label} => Spamming {share} transactions to address {seq_addr}");
-        send_spam_tx(wallet, seq_addr, share, replaceable)
+        send_spam_tx(wallet, seq_addr, share, replaceable, checkpoint)
     };
     if replaceable {
-        bump_spam_txs(wallet, label, &txids, replaces);
+        bump_spam_txs(wallet, label, &txids, replaces, checkpoint);
     }
     txids
 }

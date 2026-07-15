@@ -38,6 +38,14 @@
             </div>
             <div id="mining-action-result" class="action-result"></div>
           </div>
+          <div class="component-control">
+            <div id="spam-state" class="component-state">spam control unavailable</div>
+            <div class="component-buttons">
+              <button id="spam-pause" type="button">Pause spam</button>
+              <button id="spam-resume" type="button">Resume spam</button>
+            </div>
+            <div id="spam-action-result" class="action-result"></div>
+          </div>
         </div>
       </div>
     </section>
@@ -45,7 +53,8 @@
     <section class="card" id="settings-card">
       <h2>Live retune</h2>
       <p class="hint">Desired configuration is managed by the control plane; effective values are
-        reported by each component. Mining changes wake the scheduler and apply at its next safe point.</p>
+        reported by each component. Both workers apply at safe points; structural spam changes
+        reconcile a replacement engine before becoming effective.</p>
       <div id="page-errors"></div>
       <div id="form"></div>
       <div class="applybar">

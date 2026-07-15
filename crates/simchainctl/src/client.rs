@@ -54,7 +54,22 @@ impl ControlClient {
         &self,
         state: DesiredState,
     ) -> Result<ComponentControlResponse, ClientError> {
-        let path = format!("{API_PREFIX}/mining/state");
+        self.set_component_state("mining", state)
+    }
+
+    pub fn set_spam_state(
+        &self,
+        state: DesiredState,
+    ) -> Result<ComponentControlResponse, ClientError> {
+        self.set_component_state("spam", state)
+    }
+
+    fn set_component_state(
+        &self,
+        component: &str,
+        state: DesiredState,
+    ) -> Result<ComponentControlResponse, ClientError> {
+        let path = format!("{API_PREFIX}/{component}/state");
         let url = format!("{}{path}", self.base_url);
         let body = serde_json::to_string(&SetComponentStateRequest { state })
             .map_err(|error| ClientError::Output(error.to_string()))?;
@@ -178,6 +193,42 @@ mod tests {
             .set_mining_state(DesiredState::Paused)
             .expect("pause response");
         assert_eq!(response.effective_state, DesiredState::Paused);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn spam_pause_uses_authenticated_versioned_put() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("PUT /api/v1/spam/state HTTP/1.1"));
+            assert!(request.contains("Authorization: Bearer secret"));
+
+            let response_body = serde_json::to_string(&ComponentControlResponse {
+                component: "spam".to_string(),
+                desired_state: DesiredState::Paused,
+                effective_state: DesiredState::Paused,
+                phase: simchain_common::internal_api::WorkerPhase::Paused,
+                effective_generation: 3,
+            })
+            .expect("response JSON");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).expect("response");
+        });
+
+        let client = ControlClient::new(format!("http://{address}"), Some("secret".to_string()));
+        let response = client
+            .set_spam_state(DesiredState::Paused)
+            .expect("pause response");
+        assert_eq!(response.component, "spam");
         server.join().expect("server");
     }
 }

@@ -62,6 +62,12 @@ pub struct ComponentState {
     pub last_mined_block: Option<LastMinedBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_lease_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_transactions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation_pending: Option<bool>,
     #[serde(default)]
     pub restarting: bool,
     #[serde(default)]

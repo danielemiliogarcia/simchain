@@ -5,7 +5,8 @@
 
 use crate::apply::{apply, ApplyRequest};
 use crate::service::{
-    config, schema, set_mining_state as set_mining_state_service, status, ServiceError,
+    config, schema, set_mining_state as set_mining_state_service,
+    set_spam_state as set_spam_state_service, status, ServiceError,
 };
 use crate::state::SharedState;
 use rmcp::handler::server::wrapper::Parameters;
@@ -52,6 +53,12 @@ pub struct SetConfigParams {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct SetMiningStateParams {
+    /// Desired manual state: `running` or `paused`.
+    pub state: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct SetSpamStateParams {
     /// Desired manual state: `running` or `paused`.
     pub state: String,
 }
@@ -110,7 +117,7 @@ impl ControlPlaneMcp {
 
     #[tool(
         name = "set_config",
-        description = "Patch desired runtime configuration with optional generation compare-and-swap. Mining applies at a worker safe point; spam still uses the transitional component adapter.",
+        description = "Patch desired runtime configuration with optional generation compare-and-swap. Both workers apply at safe points; structural spam changes reconcile a replacement engine before commit.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -163,6 +170,40 @@ impl ControlPlaneMcp {
         };
         let app = self.app.clone();
         match tokio::task::spawn_blocking(move || set_mining_state_service(&app, desired))
+            .await
+            .map_err(join_error)?
+        {
+            Ok(response) => success_json(&response),
+            Err(error) => error_json(error),
+        }
+    }
+
+    #[tool(
+        name = "set_spam_state",
+        description = "Set manual desired spam state to running or paused. Pause waits for a consistent cooperative safe point and is idempotent.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn set_spam_state(
+        &self,
+        Parameters(params): Parameters<SetSpamStateParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let desired = match params.state.as_str() {
+            "running" => simchain_common::internal_api::DesiredState::Running,
+            "paused" => simchain_common::internal_api::DesiredState::Paused,
+            _ => {
+                return error_json(ServiceError::new(
+                    crate::service::ErrorCode::ValidationFailed,
+                    "spam state must be running or paused",
+                ));
+            }
+        };
+        let app = self.app.clone();
+        match tokio::task::spawn_blocking(move || set_spam_state_service(&app, desired))
             .await
             .map_err(join_error)?
         {

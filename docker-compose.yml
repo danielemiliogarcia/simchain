@@ -298,6 +298,10 @@ services:
       - SPAM_FANOUT_UTXOS=${SPAM_FANOUT_UTXOS:-50}
       - ENABLE_SPAM_REPLACES=${ENABLE_SPAM_REPLACES:-false}
       - SPAM_REPLACES_PER_MINER_PER_BLOCK=${SPAM_REPLACES_PER_MINER_PER_BLOCK:-5}
+      # Private resident-worker API; the process remains available when spam
+      # is disabled and this port is never published to the host.
+      - SPAM_CONTROL_LISTEN_ADDR=0.0.0.0:9082
+      - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
       - NODE2_WALLET_NAME=${NODE2_WALLET_NAME:-node2}
@@ -405,11 +409,10 @@ services:
   # ---------------------------------------------------------------------------
   # Simchain control plane (profiles: control-plane, legacy alias panel).
   # Browser UI, versioned HTTP API and MCP endpoint on
-  # http://localhost:${CONTROL_PLANE_PORT:-8090}. During Phase 2, mining
-  # state and policy use the private worker API; spam remains on the
-  # transitional Compose adapter, so the service still mounts the Docker
-  # socket and is intentionally excluded from all-tools (the socket is
-  # root-equivalent host access). See docs/RETUNING.md.
+  # http://localhost:${CONTROL_PLANE_PORT:-8090}. Mining and spam state and
+  # policy use private worker APIs. Later reorg/scenario and node
+  # inspection paths still keep the transitional Docker socket, so this
+  # service remains excluded from all-tools until those phases migrate.
   # ---------------------------------------------------------------------------
   btc-simnet-control-plane:
     profiles: ["control-plane", "panel"]
@@ -436,6 +439,7 @@ services:
       - SIMCHAIN_CONTROL_STATE_DIR=/workspace/.simchain-control
       - CONTROL_PLANE_LISTEN_ADDR=0.0.0.0:8080
       - MINING_CONTROL_URL=http://btc-simnet-mining-controller:9081
+      - SPAM_CONTROL_URL=http://btc-simnet-spammer:9082
       - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
       # Optional pre-set API token; empty means generate one and persist it
       # to .simchain-control/token (bearer auth for API/MCP mutations)

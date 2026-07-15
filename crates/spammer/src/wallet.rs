@@ -3,17 +3,19 @@
 use bitcoincore_rpc::{bitcoin::Amount, Client, RpcApi};
 use std::{thread, time::Duration};
 
-// Wait until the wallet exists and has at least 1 BTC of trusted (confirmed,
-// mature) balance. Right after bootstrap each miner wallet has one mature
-// 50 BTC coinbase, so this returns quickly; it only really waits when the
-// spammer starts before the mining controller finishes funding.
-pub fn wait_for_funds(wallet: &Client, name: &str) {
+/// Wait until the wallet exists and has at least 1 BTC of trusted (confirmed,
+/// mature) balance, while remaining interruptible at cooperative boundaries.
+/// Returns false when the caller requested a safe stop.
+pub fn wait_for_funds_until(wallet: &Client, name: &str, checkpoint: impl Fn() -> bool) -> bool {
     tracing::info!("Waiting for wallet '{name}' funds to mature...");
     let minimum = Amount::from_btc(1.0).unwrap();
     let mut iterations = 0u64;
     loop {
+        if !checkpoint() {
+            return false;
+        }
         match wallet.get_balances() {
-            Ok(balances) if balances.mine.trusted >= minimum => return,
+            Ok(balances) if balances.mine.trusted >= minimum => return true,
             Ok(balances) => {
                 if iterations > 0 && iterations.is_multiple_of(60) {
                     tracing::info!(
