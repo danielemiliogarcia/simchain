@@ -1,5 +1,5 @@
-//! Helpers shared by the simchain tools (mining-controller, reorg, spammer,
-//! scenario engine):
+//! Helpers and protocol types shared by the simchain tools (control plane,
+//! CLI, mining-controller, reorg, spammer, and scenario engine):
 //! environment lookup, Bitcoin Core RPC client construction and the shared
 //! retry policy.
 //!
@@ -10,6 +10,7 @@
 mod address;
 mod burn;
 pub mod config;
+pub mod control_api;
 mod error;
 pub mod live_tuning;
 mod logging;

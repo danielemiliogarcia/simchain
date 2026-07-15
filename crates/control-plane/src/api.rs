@@ -2,7 +2,7 @@
 //! embedded browser UI, and the `/mcp` mount. Thin adapter over `service`.
 
 use crate::apply::{apply, ApplyRequest};
-use crate::service::{schema, settings_state, status, ErrorCode, ServiceError};
+use crate::service::{config, schema, settings_state, status, ErrorCode, ServiceError};
 use crate::state::SharedState;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Request, State};
@@ -31,6 +31,14 @@ pub fn router(app: SharedState) -> Router {
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/styles.css", get(styles_css))
+        .route("/health/live", get(live_handler))
+        .route("/health/ready", get(ready_handler))
+        .route(
+            "/api/v1/config",
+            get(config_handler).patch(config_patch_handler),
+        )
+        .route("/api/v1/config/schema", get(schema_handler))
+        // Phase-1 compatibility routes; removed with the Compose adapter.
         .route("/api/v1/state", get(state_handler))
         .route("/api/v1/status", get(status_handler))
         .route("/api/v1/schema", get(schema_handler))
@@ -67,7 +75,7 @@ async fn require_loopback_host(request: Request, next: Next) -> Response {
             Json(serde_json::json!({
                 "error": {
                     "code": "invalid_host",
-                    "message": "the panel accepts only loopback Host headers"
+                    "message": "the control plane accepts only loopback Host headers"
                 }
             })),
         )
@@ -111,7 +119,7 @@ async fn require_token(State(app): State<SharedState>, request: Request, next: N
     } else {
         error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .panel-token in the repo root)",
+            "missing or invalid bearer token (see .simchain-control/token)",
         ))
     }
 }
@@ -120,7 +128,7 @@ async fn index(State(app): State<SharedState>) -> Html<String> {
     // The token doubles as the CSRF guard: a cross-site request cannot read
     // this page to obtain it.
     Html(INDEX_HTML.replace(
-        "__PANEL_TOKEN_JSON__",
+        "__CONTROL_PLANE_TOKEN_JSON__",
         &javascript_string_literal(&app.token),
     ))
 }
@@ -151,8 +159,42 @@ async fn state_handler(State(app): State<SharedState>) -> Response {
         Ok(Err(error)) => error_response(&error),
         Err(error) => error_response(&ServiceError::new(
             ErrorCode::Internal,
-            format!("panel worker task failed: {error}"),
+            format!("control-plane worker task failed: {error}"),
         )),
+    }
+}
+
+async fn config_handler(State(app): State<SharedState>) -> Response {
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || config(&worker)).await {
+        Ok(Ok(view)) => Json(view).into_response(),
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
+async fn live_handler() -> Response {
+    Json(simchain_common::control_api::HealthResponse {
+        status: "live".to_string(),
+        ready: true,
+    })
+    .into_response()
+}
+
+async fn ready_handler(State(app): State<SharedState>) -> Response {
+    let status = status(&app);
+    let ready = status.last_updated_ms.is_some() && status.rpc_error.is_none();
+    let body = Json(simchain_common::control_api::HealthResponse {
+        status: if ready { "ready" } else { "not_ready" }.to_string(),
+        ready,
+    });
+    if ready {
+        body.into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
     }
 }
 
@@ -168,7 +210,7 @@ async fn apply_handler(State(app): State<SharedState>, request: Request) -> Resp
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .panel-token in the repo root)",
+            "missing or invalid bearer token (see .simchain-control/token)",
         ));
     }
     let payload: Result<Json<ApplyRequest>, JsonRejection> = Json::from_request(request, &()).await;
@@ -188,7 +230,38 @@ async fn apply_handler(State(app): State<SharedState>, request: Request) -> Resp
         Ok(Err(error)) => error_response(&error),
         Err(error) => error_response(&ServiceError::new(
             ErrorCode::Internal,
-            format!("panel worker task failed: {error}"),
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
+async fn config_patch_handler(State(app): State<SharedState>, request: Request) -> Response {
+    if !request_has_token(&app, &request) {
+        return error_response(&ServiceError::new(
+            ErrorCode::Unauthorized,
+            "missing or invalid bearer token (see .simchain-control/token)",
+        ));
+    }
+    let payload: Result<Json<ApplyRequest>, JsonRejection> = Json::from_request(request, &()).await;
+    let Json(mut apply_request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return error_response(&ServiceError::new(
+                ErrorCode::ValidationFailed,
+                format!("invalid request body: {rejection}"),
+            ));
+        }
+    };
+    // The public config contract uses generations. The env revision remains
+    // internal to the transitional adapter.
+    apply_request.base_revision = None;
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || apply(&worker, apply_request)).await {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
         )),
     }
 }
@@ -199,7 +272,7 @@ use axum::extract::FromRequest;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{test_app, MockExecutor};
+    use crate::test_support::{test_app, MockBackend};
     use axum::body::Body;
     use axum::http::{header, Request as HttpRequest, StatusCode};
     use http_body_util::BodyExt;
@@ -218,7 +291,7 @@ mod tests {
         if let Some(content) = env_content {
             std::fs::write(&env_file, content).expect("seed env");
         }
-        let mock = Arc::new(MockExecutor::new(env_file.clone()));
+        let mock = Arc::new(MockBackend::new(env_file.clone()));
         mock.sync_containers();
         let app = Arc::new(test_app(dir.path(), mock));
         Fixture {
@@ -260,17 +333,36 @@ mod tests {
             .expect("request")
     }
 
+    fn patch_config(payload: serde_json::Value, token: Option<&str>) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::patch("/api/v1/config")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder
+            .body(Body::from(payload.to_string()))
+            .expect("request")
+    }
+
     #[tokio::test]
     async fn versioned_read_routes_respond() {
         let fx = fixture(None);
-        let (status, body) = send(&fx.router, get("/api/v1/state")).await;
+        let (status, body) = send(&fx.router, get("/api/v1/config")).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["revision"], "absent");
-        assert_eq!(body["staged"]["BLOCK_INTERVAL_MEAN_SECS"], "15");
+        assert_eq!(body["generation"], 0);
+        assert_eq!(body["desired"]["BLOCK_INTERVAL_MEAN_SECS"], "15");
 
-        let (status, body) = send(&fx.router, get("/api/v1/schema")).await;
+        let (status, body) = send(&fx.router, get("/api/v1/config/schema")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["settings"].as_array().expect("settings").len() >= 20);
+
+        let (status, body) = send(&fx.router, get("/health/live")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "live");
+        let (status, body) = send(&fx.router, get("/health/ready")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
 
         let (status, _) = send(&fx.router, get("/api/v1/status")).await;
         assert_eq!(status, StatusCode::OK);
@@ -328,6 +420,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_patch_uses_token_and_generation_cas() {
+        let fx = fixture(None);
+        let payload = serde_json::json!({
+            "settings": {"BLOCK_INTERVAL_MEAN_SECS": "12"},
+            "base_generation": 0
+        });
+        let (status, body) = send(&fx.router, patch_config(payload.clone(), None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = send(&fx.router, patch_config(payload, Some("test-token"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["generation"], 1);
+
+        let stale = serde_json::json!({
+            "settings": {"BLOCK_INTERVAL_MEAN_SECS": "13"},
+            "base_generation": 0
+        });
+        let (status, body) = send(&fx.router, patch_config(stale, Some("test-token"))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "stale_revision");
+    }
+
+    #[tokio::test]
     async fn invalid_value_yields_validation_failed() {
         let fx = fixture(None);
         let payload = serde_json::json!({"settings": {"ENABLE_SPAM": "maybe"}});
@@ -364,7 +480,7 @@ mod tests {
             .to_bytes();
         let html = String::from_utf8_lossy(&bytes);
         assert!(html.contains("test-token"));
-        assert!(!html.contains("__PANEL_TOKEN_JSON__"));
+        assert!(!html.contains("__CONTROL_PLANE_TOKEN_JSON__"));
     }
 
     #[test]
@@ -423,7 +539,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_lists_exactly_the_four_tools() {
-        let router = crate::mcp::PanelMcp::tool_router();
+        let router = crate::mcp::ControlPlaneMcp::tool_router();
         let mut names: Vec<String> = router
             .list_all()
             .into_iter()
@@ -433,10 +549,10 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "apply_settings",
-                "get_setting_schema",
-                "get_settings",
-                "get_status"
+                "get_config",
+                "get_config_schema",
+                "get_status",
+                "set_config",
             ]
         );
     }
@@ -446,19 +562,19 @@ mod tests {
         use rmcp::handler::server::wrapper::Parameters;
         let dir = tempfile::tempdir().expect("tempdir");
         let env_file = dir.path().join(".env");
-        let mock = Arc::new(MockExecutor::new(env_file.clone()));
+        let mock = Arc::new(MockBackend::new(env_file.clone()));
         mock.sync_containers();
         let app = Arc::new(test_app(dir.path(), mock));
-        let mcp = crate::mcp::PanelMcp::new(app);
+        let mcp = crate::mcp::ControlPlaneMcp::new(app);
 
-        let params = crate::mcp::ApplySettingsParams {
+        let params = crate::mcp::SetConfigParams {
             settings: [("MINER_WEIGHTS".to_string(), "0,0".to_string())]
                 .into_iter()
                 .collect(),
-            base_revision: None,
+            base_generation: None,
         };
         let result = mcp
-            .apply_settings(Parameters(params))
+            .set_config(Parameters(params))
             .await
             .expect("tool call returns a result");
         assert_eq!(result.is_error, Some(true));
@@ -473,16 +589,16 @@ mod tests {
     #[tokio::test]
     async fn mcp_get_settings_matches_the_http_state_payload() {
         let fx = fixture(Some("FALLBACK_FEE=0.0002\n"));
-        let (_, http_body) = send(&fx.router, get("/api/v1/state")).await;
+        let (_, http_body) = send(&fx.router, get("/api/v1/config")).await;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let env_file = dir.path().join(".env");
         std::fs::write(&env_file, "FALLBACK_FEE=0.0002\n").expect("seed env");
-        let mock = Arc::new(MockExecutor::new(env_file));
+        let mock = Arc::new(MockBackend::new(env_file));
         mock.sync_containers();
         let app = Arc::new(test_app(dir.path(), mock));
-        let result = crate::mcp::PanelMcp::new(app)
-            .get_settings()
+        let result = crate::mcp::ControlPlaneMcp::new(app)
+            .get_config()
             .await
             .expect("tool result");
         let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
@@ -490,8 +606,8 @@ mod tests {
         };
         let mcp_body: serde_json::Value = serde_json::from_str(&text.text).expect("json");
         // Same shape and same staged values (revisions match too: same content).
-        assert_eq!(mcp_body["staged"], http_body["staged"]);
-        assert_eq!(mcp_body["revision"], http_body["revision"]);
-        assert_eq!(mcp_body["pending_restart"], http_body["pending_restart"]);
+        assert_eq!(mcp_body["desired"], http_body["desired"]);
+        assert_eq!(mcp_body["generation"], http_body["generation"]);
+        assert_eq!(mcp_body["pending_apply"], http_body["pending_apply"]);
     }
 }

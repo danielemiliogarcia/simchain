@@ -224,37 +224,38 @@ One compose file serves every combination via
 | `docker compose --profile electrs up` | basic + electrs (Electrum RPC on 60001, HTTP on 3000) |
 | `docker compose --profile mempool up` | basic + electrs + mempool.space explorer |
 | `docker compose --profile all-tools up` | basic + all the tools above |
-| `docker compose --profile panel up` | basic + the dashboard / control panel (browser UI, HTTP API, MCP) |
+| `docker compose --profile control-plane up` | basic + the control plane (browser UI, HTTP API, MCP) |
 | `SCENARIO_FILE=scenarios/reorg-during-sync.yml docker compose --profile scenario run --rm btc-simnet-scenario` | run one declarative scenario against the simnet, then exit |
 
 With `mempool` or `all-tools`, browse the explorer at
 [http://localhost:1080/](http://localhost:1080/) (port: `MEMPOOL_WEB_PORT`).
 
-## Dashboard / control panel
+## Simchain control plane
 
-An optional, localhost-only web UI for retuning the live simnet (profile: `panel`;
-like the scenario engine it mounts `docker.sock`, so it is intentionally opt-in and
-excluded from `all-tools`):
+The localhost control plane combines the dashboard, versioned API, and MCP endpoint
+(profile: `control-plane`; `panel` is a temporary alias). During Phase 1 it retains the
+existing Compose adapter and socket mount, so it remains opt-in and excluded from
+`all-tools`:
 
 ```bash
-docker compose --profile panel up -d --build
+docker compose --profile control-plane up -d --build
 ```
 
-Open [http://localhost:8090/](http://localhost:8090/) (port: `PANEL_WEB_PORT`) to watch
+Open [http://localhost:8090/](http://localhost:8090/) (port: `CONTROL_PLANE_PORT`) to watch
 chain height, block cadence, mempool depth and the fee histogram, and to change the
 live-retunable mining/spam settings. Apply rewrites `.env` and recreates only the
 affected tool containers — the nodes and the chain are never touched — with automatic
 rollback if the retuned tool fails to come back up. See
 [RETUNING.md](./docs/RETUNING.md).
 
-Everything the UI shows also comes from a versioned localhost HTTP API (`/api/v1/state`,
-`/api/v1/status`, `/api/v1/schema`, `POST /api/v1/apply`). Mutating calls need the bearer
-token the panel writes to `.panel-token` (gitignored, mode 0600) in the repo root:
+Everything the UI shows comes from the versioned localhost HTTP API
+(`/api/v1/status`, `/api/v1/config`, `/api/v1/config/schema`). Mutating calls need the
+bearer token stored at `.simchain-control/token` (gitignored, mode 0600):
 
 ```bash
 curl -s localhost:8090/api/v1/status | jq .height
-curl -s -X POST localhost:8090/api/v1/apply \
-  -H "Authorization: Bearer $(cat .panel-token)" \
+curl -s -X PATCH localhost:8090/api/v1/config \
+  -H "Authorization: Bearer $(cat .simchain-control/token)" \
   -H "Content-Type: application/json" \
   -d '{"settings": {"SPAM_FILL_BLOCK_RATIO": "0.5"}}'
 ```
@@ -264,9 +265,16 @@ The same operations are exposed over MCP (streamable HTTP) at
 directly. Register it in Claude Code with:
 
 ```bash
-claude mcp add --transport http simchain-panel \
+claude mcp add --transport http simchain-control-plane \
   "http://localhost:8090/mcp" \
-  --header "Authorization: Bearer $(cat .panel-token)"
+  --header "Authorization: Bearer $(cat .simchain-control/token)"
+```
+
+The Phase-1 CLI supports the read-only paths through the same API DTOs:
+
+```bash
+cargo run -p simchainctl -- status
+cargo run -p simchainctl -- config show --json
 ```
 
 ## Scenarios

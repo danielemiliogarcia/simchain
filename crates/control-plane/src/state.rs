@@ -1,4 +1,4 @@
-//! Panel configuration (from process env, never from `.env`) and the shared
+//! Control-plane bootstrap configuration and shared application state.
 //! application state.
 //!
 //! The panel deliberately does NOT load `.env` into its own process
@@ -7,7 +7,8 @@
 //! rewrites (see the plan's finding 1). `.env` is only ever parsed into
 //! in-memory maps.
 
-use crate::compose::Executor;
+use crate::backend::{ComponentBackend, ConfigurationBackend, JobActions};
+use crate::control_state::{ControlState, ControlStateStore};
 use crate::status::StatusSnapshot;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -20,7 +21,7 @@ pub const NODE2_CONTAINER: &str = "btc-simnet-node2";
 pub const NODE3_CONTAINER: &str = "btc-simnet-node3";
 
 #[derive(Clone, Debug)]
-pub struct PanelConfig {
+pub struct ControlPlaneConfig {
     pub listen_addr: SocketAddr,
     pub repo_root: PathBuf,
     pub env_file: PathBuf,
@@ -28,15 +29,17 @@ pub struct PanelConfig {
     pub node1_url: String,
     pub node2_url: String,
     pub node3_url: String,
+    pub state_dir: PathBuf,
 }
 
-impl PanelConfig {
-    /// Read the panel bootstrap settings from the process environment only.
+impl ControlPlaneConfig {
+    /// Read control-plane bootstrap settings from the process environment.
     pub fn from_process_env() -> anyhow::Result<Self> {
-        let listen_addr = std::env::var("PANEL_LISTEN_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
+        let listen_addr = std::env::var("CONTROL_PLANE_LISTEN_ADDR")
+            .or_else(|_| std::env::var("PANEL_LISTEN_ADDR"))
+            .unwrap_or_else(|_| "127.0.0.1:8090".to_string())
             .parse::<SocketAddr>()
-            .map_err(|error| anyhow::anyhow!("invalid PANEL_LISTEN_ADDR: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("invalid CONTROL_PLANE_LISTEN_ADDR: {error}"))?;
         let repo_root =
             PathBuf::from(std::env::var("SIMCHAIN_REPO_ROOT").unwrap_or_else(|_| ".".to_string()));
         let env_file = std::env::var("SIMCHAIN_ENV_FILE")
@@ -52,6 +55,9 @@ impl PanelConfig {
             .unwrap_or_else(|_| "http://btc-simnet-node2:18443".to_string());
         let node3_url = std::env::var("NODE3_RPC_URL")
             .unwrap_or_else(|_| "http://btc-simnet-node3:18443".to_string());
+        let state_dir = std::env::var("SIMCHAIN_CONTROL_STATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| repo_root.join(".simchain-control"));
         Ok(Self {
             listen_addr,
             repo_root,
@@ -60,14 +66,19 @@ impl PanelConfig {
             node1_url,
             node2_url,
             node3_url,
+            state_dir,
         })
     }
 }
 
 pub struct AppState {
-    pub config: PanelConfig,
+    pub config: ControlPlaneConfig,
     pub token: String,
-    pub executor: Arc<dyn Executor>,
+    pub components: Arc<dyn ComponentBackend>,
+    pub configuration: Arc<dyn ConfigurationBackend>,
+    pub job_actions: Arc<dyn JobActions>,
+    pub control_state: RwLock<ControlState>,
+    pub control_store: ControlStateStore,
     pub status: RwLock<StatusSnapshot>,
     /// Serializes applies within this process; the on-disk flock serializes
     /// across processes.

@@ -1,12 +1,15 @@
-//! Background status sampling: node1 RPC and container state land in one
-//! shared snapshot so HTTP handlers never touch RPC or Docker themselves.
+//! Background status sampling: node1 RPC and component state land in one
+//! shared snapshot so HTTP handlers never touch external backends directly.
 
 use crate::state::{
     SharedState, CONTROLLER_CONTAINER, NODE1_CONTAINER, NODE2_CONTAINER, NODE3_CONTAINER,
     SPAMMER_CONTAINER,
 };
 use bitcoincore_rpc::{Client, RpcApi};
-use serde::Serialize;
+pub use simchain_common::control_api::StatusResponse as StatusSnapshot;
+use simchain_common::control_api::{
+    BlockSummary, Cadence, ComponentState, FeeBucket, MempoolSummary,
+};
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,76 +18,6 @@ const FAST_TICK: Duration = Duration::from_secs(2);
 const SLOW_EVERY: u64 = 3;
 /// 11 blocks give 10 timestamp deltas while displaying 10 blocks.
 const CADENCE_BLOCKS: u64 = 11;
-
-#[derive(Clone, Debug, Serialize)]
-pub struct MempoolSummary {
-    pub tx_count: usize,
-    pub vbytes: usize,
-    pub usage_bytes: usize,
-    /// BTC/kvB, max(minrelaytxfee, mempool minimum).
-    pub min_fee: f64,
-    pub min_relay_fee: f64,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct BlockSummary {
-    pub height: u64,
-    pub hash: String,
-    pub time: u64,
-    /// Seconds since the previous block; None for the oldest fetched block.
-    pub delta_secs: Option<i64>,
-    pub tx_count: usize,
-    pub size_bytes: usize,
-    pub weight: usize,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct Cadence {
-    pub mean_secs: f64,
-    /// How many deltas the mean was computed from (10 when history allows).
-    pub samples: usize,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct FeeBucket {
-    pub label: &'static str,
-    pub count: usize,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ServiceState {
-    pub present: bool,
-    pub status: String,
-    pub running: bool,
-    pub restarting: bool,
-    pub exit_code: i64,
-    pub restart_count: i64,
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct StatusSnapshot {
-    pub height: Option<u64>,
-    pub best_hash: Option<String>,
-    pub mempool: Option<MempoolSummary>,
-    /// Newest first, at most 10 entries.
-    pub recent_blocks: Vec<BlockSummary>,
-    pub cadence: Option<Cadence>,
-    pub fee_histogram: Vec<FeeBucket>,
-    pub services: BTreeMap<String, ServiceState>,
-    /// Epoch millis of the last successful fast sample; consumers treat an
-    /// old value as "stale / RPC unavailable" instead of going blank.
-    pub last_updated_ms: Option<u64>,
-    /// Epoch millis of the last successful slow block/mempool sample.
-    pub slow_last_updated_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rpc_error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub docker_error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub slow_error: Option<String>,
-    /// Aggregate retained for compatibility with existing clients.
-    pub last_error: Option<String>,
-}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -108,7 +41,7 @@ fn sampler_loop(app: SharedState) {
                 Err(error) => init_error = Some(format!("RPC client init failed: {error}")),
             }
         }
-        // Docker sampling is independent and must continue even when the RPC
+        // Component sampling is independent and must continue even when the RPC
         // URL cannot currently be resolved or a client cannot be constructed.
         fast_sample(&app, client.as_ref(), init_error);
         if tick.is_multiple_of(SLOW_EVERY) {
@@ -164,26 +97,28 @@ fn fast_sample(app: &SharedState, client: Option<&Client>, init_error: Option<St
         NODE2_CONTAINER,
         NODE3_CONTAINER,
     ];
-    let docker = app.executor.inspect(&names).map(|inspected| {
+    let components = app.components.inspect_components(&names).map(|inspected| {
         names
             .iter()
             .map(|name| {
                 let state = match inspected.get(*name) {
-                    Some(info) => ServiceState {
+                    Some(info) => ComponentState {
                         present: true,
                         status: info.status.clone(),
                         running: info.running,
                         restarting: info.restarting,
                         exit_code: info.exit_code,
                         restart_count: info.restart_count,
+                        ..ComponentState::default()
                     },
-                    None => ServiceState {
+                    None => ComponentState {
                         present: false,
                         status: "absent".to_string(),
                         running: false,
                         restarting: false,
                         exit_code: 0,
                         restart_count: 0,
+                        ..ComponentState::default()
                     },
                 };
                 (name.to_string(), state)
@@ -202,12 +137,12 @@ fn fast_sample(app: &SharedState, client: Option<&Client>, init_error: Option<St
         }
         Err(error) => snapshot.rpc_error = Some(error.to_string()),
     }
-    match docker {
-        Ok(services) => {
-            snapshot.services = services;
-            snapshot.docker_error = None;
+    match components {
+        Ok(components) => {
+            snapshot.components = components;
+            snapshot.component_error = None;
         }
-        Err(error) => snapshot.docker_error = Some(error.to_string()),
+        Err(error) => snapshot.component_error = Some(error.to_string()),
     }
     refresh_last_error(&mut snapshot);
 }
@@ -215,7 +150,7 @@ fn fast_sample(app: &SharedState, client: Option<&Client>, init_error: Option<St
 fn refresh_last_error(snapshot: &mut StatusSnapshot) {
     let errors = [
         ("rpc", snapshot.rpc_error.as_deref()),
-        ("docker", snapshot.docker_error.as_deref()),
+        ("components", snapshot.component_error.as_deref()),
         ("slow sample", snapshot.slow_error.as_deref()),
     ]
     .into_iter()
@@ -300,7 +235,10 @@ fn fee_histogram(client: &Client) -> anyhow::Result<Vec<FeeBucket>> {
     Ok(BUCKETS
         .iter()
         .zip(counts)
-        .map(|((label, _, _), count)| FeeBucket { label, count })
+        .map(|((label, _, _), count)| FeeBucket {
+            label: (*label).to_string(),
+            count,
+        })
         .collect())
 }
 
@@ -311,13 +249,13 @@ mod tests {
     #[test]
     fn aggregate_error_keeps_independent_failures() {
         let mut snapshot = StatusSnapshot {
-            docker_error: Some("daemon down".to_string()),
+            component_error: Some("backend down".to_string()),
             slow_error: Some("verbose mempool failed".to_string()),
             ..StatusSnapshot::default()
         };
         refresh_last_error(&mut snapshot);
         let error = snapshot.last_error.as_ref().expect("aggregate error");
-        assert!(error.contains("daemon down"));
+        assert!(error.contains("backend down"));
         assert!(error.contains("verbose mempool failed"));
 
         snapshot.rpc_error = None;
@@ -325,6 +263,6 @@ mod tests {
         assert!(snapshot
             .last_error
             .expect("still present")
-            .contains("daemon down"));
+            .contains("backend down"));
     }
 }

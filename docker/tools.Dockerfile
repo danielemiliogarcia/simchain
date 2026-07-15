@@ -43,14 +43,21 @@ RUN apt-get update \
 COPY --from=builder /app/target/release/simchain-scenario-engine /usr/local/bin/simchain-scenario-engine
 ENTRYPOINT ["simchain-scenario-engine"]
 
-# ---- panel -----------------------------------------------------------------
-# The opt-in dashboard/control panel rewrites .env and recreates tool
+# ---- control-plane ---------------------------------------------------------
+# The transitional control-plane backend rewrites .env and recreates tool
 # services through the host Docker socket, so like the scenario engine its
 # runtime includes the Docker CLI and Compose v2 (Debian base: the builder
 # links against glibc, so an Alpine/docker:cli base would not run it).
-FROM debian:trixie-slim AS panel
+FROM debian:trixie-slim AS control-plane
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates docker-cli docker-compose \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/simchain-panel /usr/local/bin/simchain-panel
-ENTRYPOINT ["simchain-panel"]
+COPY --from=builder /app/target/release/simchain-control-plane /usr/local/bin/simchain-control-plane
+ENTRYPOINT ["simchain-control-plane"]
+
+# ---- simchainctl -----------------------------------------------------------
+# Thin HTTP client; deliberately contains neither Docker CLI nor Bitcoin RPC
+# orchestration logic.
+FROM gcr.io/distroless/cc-debian12:nonroot AS simchainctl
+COPY --from=builder /app/target/release/simchainctl /simchainctl
+ENTRYPOINT ["/simchainctl"]

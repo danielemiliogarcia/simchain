@@ -2,7 +2,8 @@
 //! rollback. Everything here is blocking; callers run it in
 //! `spawn_blocking`.
 
-use crate::docker_inspect::ContainerInfo;
+use crate::backend::ComponentInfo;
+use crate::control_state;
 use crate::envfile::{self, EnvFileState};
 use crate::service::{
     config_error_details, scope_needs_restart, staged_from_content, tuning_source, validate_input,
@@ -31,6 +32,9 @@ pub struct ApplyRequest {
     /// when absent the merge runs against whatever is current.
     #[serde(default)]
     pub base_revision: Option<String>,
+    /// Stable control-plane generation used by `PATCH /api/v1/config`.
+    #[serde(default)]
+    pub base_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -40,13 +44,14 @@ pub struct ApplyReport {
     pub file_changed: bool,
     pub services_recreated: Vec<String>,
     pub revision: String,
+    pub generation: u64,
     pub logs: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
 
 pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, ServiceError> {
-    // In-process serialization first, then a kernel flock so a second panel
+    // In-process serialization first, then a kernel flock so a second control-plane
     // process cannot race the same .env; the kernel releases the flock if
     // this process dies mid-apply.
     let Ok(_guard) = app.apply_lock.try_lock() else {
@@ -77,7 +82,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     if lock_file.try_lock_exclusive().is_err() {
         return Err(ServiceError::new(
             ErrorCode::ApplyInProgress,
-            "another panel process holds the apply lock",
+            "another control-plane process holds the apply lock",
         ));
     }
     // Keep the bind-mounted lock file owned by the host user, like .env.
@@ -103,6 +108,22 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
                 format!(
                     "the env file changed since this form was loaded (expected revision {base_revision}, current {})",
                     file.revision
+                ),
+            ));
+        }
+    }
+    let state_before = app
+        .control_state
+        .read()
+        .expect("control state lock")
+        .clone();
+    if let Some(base_generation) = request.base_generation {
+        if base_generation != state_before.generation {
+            return Err(ServiceError::new(
+                ErrorCode::StaleRevision,
+                format!(
+                    "the desired configuration changed since it was loaded (expected generation {base_generation}, current {})",
+                    state_before.generation
                 ),
             ));
         }
@@ -153,7 +174,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     // failing open here would accept a setting whose transactions are then
     // rejected after the recreate.
     if proposed.contains_key("FALLBACK_FEE") {
-        let required = app.executor.spam_min_fee().map_err(|error| {
+        let required = app.job_actions.spam_min_fee().map_err(|error| {
             ServiceError::new(
                 ErrorCode::RpcUnavailable,
                 format!("cannot validate FALLBACK_FEE against the running nodes: {error}"),
@@ -179,21 +200,23 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     let file_changed = !file.exists || new_content != file.content;
 
     let inspected = app
-        .executor
-        .inspect(&[
+        .components
+        .inspect_components(&[
             ServiceScope::MiningController.service_name(),
             ServiceScope::Spammer.service_name(),
         ])
         .map_err(|error| {
             ServiceError::new(
                 ErrorCode::Internal,
-                format!("docker inspect failed: {error}"),
+                format!("component inspection failed: {error}"),
             )
         })?;
     let runtime_before = inspected.clone();
     let mut services: Vec<String> = Vec::new();
     for scope in [ServiceScope::MiningController, ServiceScope::Spammer] {
-        let env = inspected.get(scope.service_name()).map(|info| &info.env);
+        let env = inspected
+            .get(scope.service_name())
+            .map(|info| &info.effective_config);
         if scope_needs_restart(&tuning, env, scope) {
             services.push(scope.service_name().to_string());
         }
@@ -205,12 +228,13 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
             file_changed: false,
             services_recreated: Vec::new(),
             revision: file.revision,
+            generation: state_before.generation,
             logs: vec!["no-op: staged file and running services already match".to_string()],
             warnings,
         });
     }
 
-    let node1_reachable_before = app.executor.node1_height().is_ok();
+    let node1_reachable_before = app.job_actions.node1_height().is_ok();
 
     if file_changed {
         let ownership = match file.ownership {
@@ -244,7 +268,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     let written_revision = file_changed.then(|| envfile::revision_of(&new_content));
 
     if !services.is_empty() {
-        let recreate = app.executor.compose_recreate(&services);
+        let recreate = app.configuration.apply_configuration(&services);
         let compose_failed = match &recreate {
             Ok(output) if output.success => {
                 logs.push(format!("recreated: {}", services.join(", ")));
@@ -297,7 +321,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
         logs.push("verification passed".to_string());
     }
 
-    // A manual writer does not honor our panel flock. Detect one after the
+    // A manual writer does not honor our control-plane flock. Detect one after the
     // slow recreate/verification window instead of returning a revision that
     // is already stale. Roll runtime back, but never overwrite that newer
     // external file in the rollback CAS.
@@ -319,7 +343,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
         );
         let mut error = ServiceError::new(
             ErrorCode::StaleRevision,
-            "the env file was edited outside the panel while apply was running; the newer file was preserved and runtime changes were rolled back",
+            "the env file was edited outside the control plane while apply was running; the newer file was preserved and runtime changes were rolled back",
         );
         error.rollback = Some(rollback);
         return Err(error);
@@ -335,11 +359,35 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
         );
     }
 
+    let desired = canonical
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect();
+    let next_state = control_state::successful_apply(&state_before, desired);
+    if let Err(error) = app.control_store.save(&next_state) {
+        let rollback = rollback(
+            app,
+            &file,
+            written_revision.as_deref(),
+            &services,
+            &runtime_before,
+            &mut logs,
+        );
+        let mut service_error = ServiceError::new(
+            ErrorCode::RollbackFailed,
+            format!("failed to persist control state: {error}"),
+        );
+        service_error.rollback = Some(rollback);
+        return Err(service_error);
+    }
+    *app.control_state.write().expect("control state lock") = next_state.clone();
+
     Ok(ApplyReport {
         changed: true,
         file_changed,
         services_recreated: services,
         revision,
+        generation: next_state.generation,
         logs,
         warnings,
     })
@@ -444,9 +492,9 @@ fn verify(
     for poll in 0..STABILIZE_POLLS {
         let last = poll == STABILIZE_POLLS - 1;
         let inspected = app
-            .executor
-            .inspect(&names)
-            .map_err(|error| format!("docker inspect failed during verification: {error}"))?;
+            .components
+            .inspect_components(&names)
+            .map_err(|error| format!("component inspection failed during verification: {error}"))?;
 
         for service in services {
             let scope = if service == ServiceScope::MiningController.service_name() {
@@ -465,7 +513,7 @@ fn verify(
             }
             // The container env is fixed at creation; a mismatch will not
             // heal, so fail immediately.
-            if scope_needs_restart(staged, Some(&info.env), scope) {
+            if scope_needs_restart(staged, Some(&info.effective_config), scope) {
                 return Err(format!(
                     "{service} started with an environment that does not match the applied settings"
                 ));
@@ -501,11 +549,11 @@ fn verify(
             }
         }
         if !last {
-            app.executor.sleep(POLL_INTERVAL);
+            app.job_actions.wait(POLL_INTERVAL);
         }
     }
 
-    if node1_reachable_before && app.executor.node1_height().is_err() {
+    if node1_reachable_before && app.job_actions.node1_height().is_err() {
         return Err("node1 RPC became unreachable after the apply".to_string());
     }
     Ok(())
@@ -516,7 +564,7 @@ fn rollback(
     original: &EnvFileState,
     written_revision: Option<&str>,
     services: &[String],
-    runtime_before: &HashMap<String, ContainerInfo>,
+    runtime_before: &HashMap<String, ComponentInfo>,
     logs: &mut Vec<String>,
 ) -> RollbackReport {
     let mut messages: Vec<String> = Vec::new();
@@ -578,7 +626,7 @@ fn rollback(
             .iter()
             .filter(|spec| spec.scope == scope)
         {
-            if let Some(value) = info.env.get(spec.key) {
+            if let Some(value) = info.effective_config.get(spec.key) {
                 restore_env.insert(spec.key.to_string(), value.clone());
             }
         }
@@ -588,8 +636,8 @@ fn rollback(
         true
     } else {
         match app
-            .executor
-            .compose_recreate_with_env(&restore_services, &restore_env)
+            .configuration
+            .restore_configuration(&restore_services, &restore_env)
         {
             Ok(output) if output.success => {
                 logs.push(format!(
@@ -614,7 +662,7 @@ fn rollback(
     let removed = if remove_services.is_empty() {
         true
     } else {
-        match app.executor.remove_containers(&remove_services) {
+        match app.configuration.remove_components(&remove_services) {
             Ok(output) if output.success => {
                 logs.push(format!(
                     "rollback: removed newly created {}",
@@ -667,14 +715,14 @@ fn service_scope(service: &str) -> ServiceScope {
 fn verify_runtime_restored(
     app: &AppState,
     services: &[String],
-    runtime_before: &HashMap<String, ContainerInfo>,
+    runtime_before: &HashMap<String, ComponentInfo>,
 ) -> Result<(), String> {
     let names: Vec<&str> = services.iter().map(String::as_str).collect();
     for poll in 0..STABILIZE_POLLS {
         let last = poll == STABILIZE_POLLS - 1;
         let inspected = app
-            .executor
-            .inspect(&names)
+            .components
+            .inspect_components(&names)
             .map_err(|error| format!("rollback inspect failed: {error}"))?;
         for service in services {
             let Some(original) = runtime_before.get(service) else {
@@ -690,7 +738,9 @@ fn verify_runtime_restored(
                 .iter()
                 .filter(|spec| spec.scope == service_scope(service))
             {
-                if restored.env.get(spec.key) != original.env.get(spec.key) {
+                if restored.effective_config.get(spec.key)
+                    != original.effective_config.get(spec.key)
+                {
                     return Err(format!(
                         "rollback restored the wrong {service} value for {}",
                         spec.key
@@ -714,7 +764,7 @@ fn verify_runtime_restored(
             }
         }
         if !last {
-            app.executor.sleep(POLL_INTERVAL);
+            app.job_actions.wait(POLL_INTERVAL);
         }
     }
     Ok(())
@@ -724,13 +774,13 @@ fn verify_runtime_restored(
 mod tests {
     use super::*;
     use crate::state::{AppState, CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
-    use crate::test_support::{test_app, MockExecutor, RecreateOutcome};
+    use crate::test_support::{test_app, MockBackend, RecreateOutcome};
     use std::sync::Arc;
 
     struct Fixture {
         _dir: tempfile::TempDir,
         app: AppState,
-        mock: Arc<MockExecutor>,
+        mock: Arc<MockBackend>,
     }
 
     fn fixture(env_content: Option<&str>) -> Fixture {
@@ -739,7 +789,7 @@ mod tests {
         if let Some(content) = env_content {
             std::fs::write(&env_file, content).expect("seed env");
         }
-        let mock = Arc::new(MockExecutor::new(env_file));
+        let mock = Arc::new(MockBackend::new(env_file));
         mock.sync_containers();
         let app = test_app(dir.path(), mock.clone());
         Fixture {
@@ -756,6 +806,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             base_revision: None,
+            base_generation: None,
         }
     }
 
@@ -1066,7 +1117,7 @@ mod tests {
         assert!(error.rollback.expect("rollback").recreate_ok);
         let world = fx.mock.world.lock().expect("lock");
         assert_eq!(
-            world.containers[SPAMMER_CONTAINER].env["FALLBACK_FEE"],
+            world.containers[SPAMMER_CONTAINER].effective_config["FALLBACK_FEE"],
             "0.00015"
         );
     }

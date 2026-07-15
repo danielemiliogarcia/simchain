@@ -4,7 +4,7 @@ Guidance for agents and contributors working in this repository.
 
 ## Repository structure
 
-The four Rust tools are members of a single Cargo workspace rooted at the repo top:
+The Rust tools are members of a single Cargo workspace rooted at the repo top:
 
 ```
 Cargo.toml                  # workspace root (members + resolver = "2")
@@ -12,7 +12,7 @@ Cargo.lock                  # committed — binaries want reproducible builds
 .cargo/config.toml          # project-wide cargo aliases
 docker/                     # docker build files and helper scripts
   bitcoin-node.Dockerfile   # local bitcoind image build
-  tools.Dockerfile          # one builder stage, four final targets
+  tools.Dockerfile          # one builder stage, per-tool final targets
   build-bitcoin-image.sh    # local bitcoind image build helper
   entrypoint.sh             # bitcoind container entrypoint
 scripts/                    # host-side helper scripts
@@ -24,6 +24,8 @@ crates/
   reorg/                    # on-demand chain reorganizations
   spammer/                  # block-filling transaction spam
   scenario-engine/          # ordered declarative scenario orchestration
+  control-plane/            # dashboard, versioned API, MCP, orchestration
+  simchainctl/              # first-party HTTP client for humans and CI
 ```
 
 `.dockerignore` intentionally remains at the repo root because Docker applies it
@@ -50,8 +52,12 @@ network). Do not add it to any `.gitignore`.
 - `crates/simchain-common` — the one home for helpers shared across tools (RPC client
   construction, config parsing/validation, logging). Put a helper here the moment a
   second tool needs it, rather than copy-pasting.
+- `crates/control-plane` — the single public Simchain backend. Keep HTTP, MCP, CLI, and
+  dashboard adapters over the same domain service layer; never add a second backend.
+- `crates/simchainctl` — a thin control-plane API client. It must not call Docker or
+  Bitcoin RPC directly.
 - `crates/mining-controller`, `crates/reorg`, `crates/spammer`,
-  `crates/scenario-engine` — the four binaries, each a thin RPC driver or orchestrator
+  `crates/scenario-engine` — worker/operation binaries, each a thin RPC driver or orchestrator
   over bitcoind. They must imitate mainnet **behavior**; do not add
   relay/mempool/capacity policy flags that diverge from mainnet.
 

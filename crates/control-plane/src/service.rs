@@ -7,95 +7,16 @@ use crate::state::{AppState, CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
 use crate::status::StatusSnapshot;
 use serde::Serialize;
 use simchain_common::config::ConfigError;
+pub use simchain_common::control_api::{
+    ApiError as ServiceError, ErrorCode, ErrorDetail, RollbackReport,
+};
+use simchain_common::control_api::{
+    ApplyMode, ConfigResponse, EffectiveComponentConfig, SchemaResponse, SettingSchema,
+};
 use simchain_common::live_tuning::{
     self, ControlKind, LiveTuning, MiningTuning, ServiceScope, SpamTuning,
 };
 use std::collections::{BTreeMap, HashMap};
-
-// ---------------------------------------------------------------------------
-// Error envelope
-// ---------------------------------------------------------------------------
-
-/// Closed error-code enum: agents branch on codes, not prose.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    ValidationFailed,
-    StaleRevision,
-    ApplyInProgress,
-    ComposeFailed,
-    RollbackFailed,
-    /// Reserved in the stable API contract for read paths that require RPC;
-    /// today every read serves the cached snapshot instead of failing.
-    #[allow(dead_code)]
-    RpcUnavailable,
-    Unauthorized,
-    Internal,
-}
-
-impl ErrorCode {
-    pub fn http_status(self) -> u16 {
-        match self {
-            ErrorCode::ValidationFailed => 422,
-            ErrorCode::StaleRevision => 409,
-            ErrorCode::ApplyInProgress => 409,
-            ErrorCode::ComposeFailed => 500,
-            ErrorCode::RollbackFailed => 500,
-            ErrorCode::RpcUnavailable => 503,
-            ErrorCode::Unauthorized => 401,
-            ErrorCode::Internal => 500,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ErrorDetail {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-    pub cause: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct RollbackReport {
-    /// Whether `.env` was restored to its pre-apply contents.
-    pub env_restored: bool,
-    /// Whether the rollback recreate of the touched services succeeded.
-    pub recreate_ok: bool,
-    pub message: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ServiceError {
-    pub code: ErrorCode,
-    pub message: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub details: Vec<ErrorDetail>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rollback: Option<RollbackReport>,
-}
-
-impl ServiceError {
-    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            details: Vec::new(),
-            rollback: None,
-        }
-    }
-
-    pub fn with_details(mut self, details: Vec<ErrorDetail>) -> Self {
-        self.details = details;
-        self
-    }
-
-    /// The JSON envelope shared by HTTP and MCP: `{"error": {...}}`.
-    pub fn envelope(&self) -> serde_json::Value {
-        serde_json::json!({ "error": self })
-    }
-}
 
 pub fn config_error_details(error: &ConfigError) -> Vec<ErrorDetail> {
     match error {
@@ -118,56 +39,34 @@ pub fn config_error_details(error: &ConfigError) -> Vec<ErrorDetail> {
 // Schema
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Serialize)]
-pub struct SettingSchema {
-    pub key: &'static str,
-    pub default: &'static str,
-    pub group: &'static str,
-    /// Compose service recreated when this key changes.
-    pub scope: &'static str,
-    pub control: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub options: Option<Vec<&'static str>>,
-    /// Empty input unsets optional settings and resets required settings to
-    /// their compose default.
-    pub optional: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub minimum: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub maximum: Option<f64>,
-    pub help: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warning: Option<&'static str>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct SchemaView {
-    pub settings: Vec<SettingSchema>,
-    pub legacy_aliases: Vec<&'static str>,
-}
-
-pub fn schema() -> SchemaView {
-    SchemaView {
+pub fn schema() -> SchemaResponse {
+    SchemaResponse {
         settings: live_tuning::MANAGED_SETTINGS
             .iter()
             .map(|spec| SettingSchema {
-                key: spec.key,
-                default: spec.default,
-                group: spec.group.as_str(),
-                scope: spec.scope.service_name(),
-                control: spec.control.as_str(),
+                key: spec.key.to_string(),
+                default: spec.default.to_string(),
+                group: spec.group.as_str().to_string(),
+                component: spec.scope.service_name().to_string(),
+                control: spec.control.as_str().to_string(),
                 options: match spec.control {
-                    ControlKind::Choice(options) => Some(options.to_vec()),
+                    ControlKind::Choice(options) => {
+                        Some(options.iter().map(|option| (*option).to_string()).collect())
+                    }
                     _ => None,
                 },
                 optional: spec.optional,
                 minimum: validation_bounds(spec.key).0,
                 maximum: validation_bounds(spec.key).1,
-                help: spec.help,
-                warning: spec.warning,
+                apply_mode: ApplyMode::LegacyRecreate,
+                help: spec.help.to_string(),
+                warning: spec.warning.map(str::to_string),
             })
             .collect(),
-        legacy_aliases: live_tuning::LEGACY_SPAM_ALIASES.to_vec(),
+        legacy_aliases: live_tuning::LEGACY_SPAM_ALIASES
+            .iter()
+            .map(|alias| (*alias).to_string())
+            .collect(),
     }
 }
 
@@ -213,7 +112,7 @@ pub struct SettingsStateView {
     /// Services whose running config differs from staged (what Apply would
     /// recreate right now).
     pub pending_restart: Vec<String>,
-    pub services: BTreeMap<String, crate::status::ServiceState>,
+    pub services: BTreeMap<String, simchain_common::control_api::ComponentState>,
 }
 
 /// Managed keys belonging to one service scope.
@@ -324,8 +223,8 @@ pub fn settings_state(app: &AppState) -> Result<SettingsStateView, ServiceError>
     };
 
     let (inspected, inspect_error) = match app
-        .executor
-        .inspect(&[CONTROLLER_CONTAINER, SPAMMER_CONTAINER])
+        .components
+        .inspect_components(&[CONTROLLER_CONTAINER, SPAMMER_CONTAINER])
     {
         Ok(inspected) => (inspected, None),
         Err(error) => {
@@ -346,7 +245,7 @@ pub fn settings_state(app: &AppState) -> Result<SettingsStateView, ServiceError>
                 .map(|key| {
                     (
                         key.to_string(),
-                        info.env.get(key).cloned().unwrap_or_default(),
+                        info.effective_config.get(key).cloned().unwrap_or_default(),
                     )
                 })
                 .collect::<BTreeMap<_, _>>()
@@ -361,14 +260,14 @@ pub fn settings_state(app: &AppState) -> Result<SettingsStateView, ServiceError>
         );
         if inspect_error.is_none() {
             if let Some(tuning) = &tuning {
-                if scope_needs_restart(tuning, info.map(|i| &i.env), scope) {
+                if scope_needs_restart(tuning, info.map(|i| &i.effective_config), scope) {
                     pending_restart.push(service.to_string());
                 }
             }
         }
     }
 
-    let services = app.status.read().expect("status lock").services.clone();
+    let services = app.status.read().expect("status lock").components.clone();
 
     Ok(SettingsStateView {
         revision: file.revision,
@@ -383,12 +282,57 @@ pub fn settings_state(app: &AppState) -> Result<SettingsStateView, ServiceError>
     })
 }
 
+/// Stable v1 configuration response. During Phase 1 `desired` is still
+/// sourced from the legacy env adapter and `effective` from component
+/// inspection; consumers do not need to know which backend supplied either.
+pub fn config(app: &AppState) -> Result<ConfigResponse, ServiceError> {
+    let legacy = settings_state(app)?;
+    let generation = app
+        .control_state
+        .read()
+        .expect("control state lock")
+        .generation;
+    let effective = legacy
+        .running
+        .into_iter()
+        .map(|(component, running)| {
+            (
+                component,
+                EffectiveComponentConfig {
+                    reachable: running.present && running.error.is_none(),
+                    generation: None,
+                    values: running.values,
+                    error: running.error,
+                },
+            )
+        })
+        .collect();
+    Ok(ConfigResponse {
+        generation,
+        desired: legacy.staged,
+        desired_valid: legacy.staged_valid,
+        desired_errors: legacy.staged_errors,
+        warnings: legacy.warnings,
+        effective,
+        pending_apply: legacy.pending_restart,
+        components: legacy.services,
+        legacy_revision: Some(legacy.revision),
+        legacy_env_file_exists: legacy.env_file_exists,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
 
 pub fn status(app: &AppState) -> StatusSnapshot {
-    app.status.read().expect("status lock").clone()
+    let mut status = app.status.read().expect("status lock").clone();
+    status.desired_generation = app
+        .control_state
+        .read()
+        .expect("control state lock")
+        .generation;
+    status
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +387,7 @@ pub fn validate_input(key: &str, value: &str) -> Result<(), ErrorDetail> {
 mod tests {
     use super::*;
     use crate::state::{CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
-    use crate::test_support::{test_app, MockExecutor};
+    use crate::test_support::{test_app, MockBackend};
     use std::sync::Arc;
 
     #[test]
@@ -472,7 +416,7 @@ mod tests {
             .find(|s| s.key == "FALLBACK_FEE")
             .expect("FALLBACK_FEE in schema");
         assert!(fee.warning.is_some(), "node-restart caveat must be visible");
-        assert_eq!(fee.scope, SPAMMER_CONTAINER);
+        assert_eq!(fee.component, SPAMMER_CONTAINER);
     }
 
     #[test]
@@ -481,7 +425,7 @@ mod tests {
         let env_file = dir.path().join(".env");
         std::fs::write(&env_file, "SPAM_TXS_PER_BLOCK=500\nFALLBACK_FEE=0.0002\n")
             .expect("seed env");
-        let mock = Arc::new(MockExecutor::new(env_file));
+        let mock = Arc::new(MockBackend::new(env_file));
         mock.sync_containers();
         // Make the spammer run with an older fee than staged.
         mock.set_container_env(SPAMMER_CONTAINER, "FALLBACK_FEE", "0.0001");
@@ -506,7 +450,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let env_file = dir.path().join(".env");
         std::fs::write(&env_file, "MINER_WEIGHTS=0,0\n").expect("seed env");
-        let mock = Arc::new(MockExecutor::new(env_file));
+        let mock = Arc::new(MockBackend::new(env_file));
         mock.sync_containers();
         let app = test_app(dir.path(), mock);
 
@@ -523,7 +467,7 @@ mod tests {
     #[test]
     fn missing_env_file_loads_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mock = Arc::new(MockExecutor::new(dir.path().join(".env")));
+        let mock = Arc::new(MockBackend::new(dir.path().join(".env")));
         mock.sync_containers();
         let app = test_app(dir.path(), mock);
 
