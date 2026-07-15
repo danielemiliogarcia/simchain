@@ -1,6 +1,6 @@
 //! Atomic job metadata plus bounded JSONL event artifacts.
 
-use crate::envfile;
+use crate::storage;
 use serde::{de::DeserializeOwned, Serialize};
 use simchain_common::control_api::JobEvent;
 use std::fs::{self, OpenOptions};
@@ -22,7 +22,7 @@ impl JobStore {
         let dir = state_dir.join("jobs");
         fs::create_dir_all(&dir)?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-        if let Ok(ownership) = envfile::dir_ownership(state_dir, 0o700) {
+        if let Ok(ownership) = storage::dir_ownership(state_dir, 0o700) {
             let _ = std::os::unix::fs::chown(&dir, Some(ownership.uid), Some(ownership.gid));
         }
         Ok(Self {
@@ -47,8 +47,8 @@ impl JobStore {
     pub fn save<T: Serialize>(&self, value: &T) -> anyhow::Result<()> {
         let mut content = serde_json::to_string_pretty(value)?;
         content.push('\n');
-        let ownership = envfile::dir_ownership(&self.dir, 0o600)?;
-        envfile::write_atomic(&self.index_path, &content, ownership)?;
+        let ownership = storage::dir_ownership(&self.dir, 0o600)?;
+        storage::write_atomic(&self.index_path, &content, ownership)?;
         Ok(())
     }
 
@@ -71,7 +71,7 @@ impl JobStore {
         file.write_all(b"\n")?;
         file.sync_data()?;
         if !existed {
-            let ownership = envfile::dir_ownership(&self.dir, 0o600)?;
+            let ownership = storage::dir_ownership(&self.dir, 0o600)?;
             fs::set_permissions(&path, fs::Permissions::from_mode(ownership.mode))?;
             let _ = std::os::unix::fs::chown(&path, Some(ownership.uid), Some(ownership.gid));
         }

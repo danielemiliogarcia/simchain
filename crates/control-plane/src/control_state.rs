@@ -1,18 +1,19 @@
-//! Narrow, atomic control-plane state storage. Phase 1 persists the API token
-//! and configuration generation here while the legacy Compose adapter still
-//! mirrors desired values into `.env`.
+//! Narrow, atomic control-plane desired-state storage and mutation lock.
 
-use crate::envfile;
+use crate::storage;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use simchain_common::internal_api::DesiredState;
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const STATE_FILE: &str = "state.json";
+const APPLY_LOCK_FILE: &str = "apply.lock";
+const INSTANCE_LOCK_FILE: &str = "instance.lock";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ApplyOutcome {
@@ -37,7 +38,14 @@ pub struct ControlState {
 
 impl Default for ControlState {
     fn default() -> Self {
-        let desired = simchain_common::live_tuning::staged_map(&BTreeMap::new());
+        let source = simchain_common::live_tuning::staged_map(&BTreeMap::new());
+        let (tuning, _) = simchain_common::live_tuning::LiveTuning::from_source(&source)
+            .expect("built-in live-tuning defaults must remain valid");
+        let desired = tuning
+            .canonical_values()
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
         Self {
             schema_version: STATE_SCHEMA_VERSION,
             generation: 0,
@@ -57,17 +65,9 @@ pub struct ControlStateStore {
 
 impl ControlStateStore {
     pub fn open(dir: PathBuf) -> anyhow::Result<Self> {
-        let parent_ownership = dir
-            .parent()
-            .and_then(|parent| envfile::dir_ownership(parent, 0o700).ok());
         fs::create_dir_all(&dir)?;
-        if let Some(ownership) = parent_ownership {
-            if let Err(error) =
-                std::os::unix::fs::chown(&dir, Some(ownership.uid), Some(ownership.gid))
-            {
-                tracing::debug!("could not align control-state ownership: {error}");
-            }
-        }
+        // Preserve ownership of the narrow host bind mount so its private
+        // token remains readable to the host user.
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         Ok(Self {
             path: dir.join(STATE_FILE),
@@ -79,20 +79,11 @@ impl ControlStateStore {
         &self,
         initial_desired: BTreeMap<String, String>,
     ) -> anyhow::Result<ControlState> {
-        match fs::read_to_string(&self.path) {
-            Ok(content) => {
-                let state: ControlState = serde_json::from_str(&content).map_err(|error| {
-                    anyhow::anyhow!("control state {} is corrupt: {error}", self.path.display())
-                })?;
-                if state.schema_version != STATE_SCHEMA_VERSION {
-                    anyhow::bail!(
-                        "unsupported control-state schema {} (expected {})",
-                        state.schema_version,
-                        STATE_SCHEMA_VERSION
-                    );
-                }
-                Ok(state)
-            }
+        let _guard = self.try_apply_lock()?.ok_or_else(|| {
+            anyhow::anyhow!("another control-plane process is initializing state")
+        })?;
+        match self.load() {
+            Ok(state) => Ok(state),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let state = ControlState {
                     desired: initial_desired,
@@ -105,28 +96,90 @@ impl ControlStateStore {
         }
     }
 
+    /// Reload the authoritative atomic state snapshot. Mutation callers hold
+    /// the durable lock before using this value for a generation check.
+    pub fn load_current(&self) -> anyhow::Result<ControlState> {
+        Ok(self.load()?)
+    }
+
+    fn load(&self) -> std::io::Result<ControlState> {
+        let content = fs::read_to_string(&self.path)?;
+        let state: ControlState = serde_json::from_str(&content).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("control state {} is corrupt: {error}", self.path.display()),
+            )
+        })?;
+        if state.schema_version != STATE_SCHEMA_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported control-state schema {} (expected {STATE_SCHEMA_VERSION})",
+                    state.schema_version
+                ),
+            ));
+        }
+        Ok(state)
+    }
+
     pub fn save(&self, state: &ControlState) -> anyhow::Result<()> {
         let mut content = serde_json::to_string_pretty(state)?;
         content.push('\n');
-        let ownership = envfile::dir_ownership(&self.dir, 0o600)?;
-        envfile::write_atomic(&self.path, &content, ownership)?;
+        let ownership = storage::dir_ownership(&self.dir, 0o600)?;
+        storage::write_atomic(&self.path, &content, ownership)?;
         Ok(())
+    }
+
+    pub fn try_apply_lock(&self) -> anyhow::Result<Option<File>> {
+        self.try_named_lock(APPLY_LOCK_FILE)
+    }
+
+    pub fn try_instance_lock(&self) -> anyhow::Result<Option<File>> {
+        self.try_named_lock(INSTANCE_LOCK_FILE)
+    }
+
+    fn try_named_lock(&self, name: &str) -> anyhow::Result<Option<File>> {
+        let path = self.dir.join(name);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let ownership = storage::dir_ownership(&self.dir, 0o600)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(ownership.mode))?;
+        if let Err(error) =
+            std::os::unix::fs::chown(&path, Some(ownership.uid), Some(ownership.gid))
+        {
+            tracing::debug!(path = %path.display(), "could not align lock ownership: {error}");
+        }
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
-/// Snapshot the transitional env-backed desired configuration for a first
-/// state-file initialization. Once state.json exists it always wins here.
-pub fn desired_from_legacy_env(path: &Path) -> anyhow::Result<BTreeMap<String, String>> {
-    let file = envfile::read_env_file(path)?;
-    let staged = crate::service::staged_from_content(&file.content);
-    Ok(match staged.tuning {
-        Ok((tuning, _)) => tuning
-            .canonical_values()
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value))
-            .collect(),
-        Err(_) => crate::service::tuning_source(&staged.overrides),
-    })
+/// Initial desired values are the boot policy passed to the workers and
+/// control plane. Once state.json exists it is authoritative.
+pub fn desired_from_process_env() -> anyhow::Result<BTreeMap<String, String>> {
+    let overrides: BTreeMap<String, String> = std::env::vars()
+        .filter(|(key, _)| simchain_common::live_tuning::is_managed_key(key))
+        .collect();
+    desired_from_source(&overrides)
+}
+
+fn desired_from_source(
+    overrides: &BTreeMap<String, String>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let source = simchain_common::live_tuning::staged_map(overrides);
+    let (tuning, _) = simchain_common::live_tuning::LiveTuning::from_source(&source)?;
+    Ok(tuning
+        .canonical_values()
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect())
 }
 
 pub fn successful_apply(
@@ -201,5 +254,47 @@ mod tests {
             .load_or_initialize(BTreeMap::new())
             .expect_err("corrupt state");
         assert!(error.to_string().contains("is corrupt"));
+    }
+
+    #[test]
+    fn initial_desired_values_are_canonicalized_from_boot_policy() {
+        let desired = desired_from_source(&BTreeMap::from([
+            ("BLOCK_INTERVAL_MEAN_SECS".to_string(), "12".to_string()),
+            ("MINER_WEIGHTS".to_string(), "70, 30".to_string()),
+        ]))
+        .expect("desired");
+        assert_eq!(desired["BLOCK_INTERVAL_MEAN_SECS"], "12");
+        assert_eq!(desired["MINER_WEIGHTS"], "70,30");
+    }
+
+    #[test]
+    fn apply_lock_is_exclusive_and_lives_in_the_state_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ControlStateStore::open(dir.path().join("state")).expect("store");
+        let first = store.try_apply_lock().expect("lock").expect("first lock");
+        assert!(store.try_apply_lock().expect("second attempt").is_none());
+        assert_eq!(
+            fs::metadata(store.dir.join(APPLY_LOCK_FILE))
+                .expect("lock metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(first);
+        assert!(store.try_apply_lock().expect("third attempt").is_some());
+    }
+
+    #[test]
+    fn instance_lock_enforces_the_single_control_plane_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ControlStateStore::open(dir.path().join("state")).expect("store");
+        let first = store
+            .try_instance_lock()
+            .expect("lock")
+            .expect("first instance");
+        assert!(store.try_instance_lock().expect("second attempt").is_none());
+        drop(first);
+        assert!(store.try_instance_lock().expect("third attempt").is_some());
     }
 }

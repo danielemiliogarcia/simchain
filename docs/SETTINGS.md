@@ -1,7 +1,9 @@
 # Simchain Settings Reference
 
-Every setting is read from `.env` by `docker-compose.yml`, and **every one has a
-default**, so a missing variable (or no `.env` file at all) still works.- `.env.example`, short template with the most used settings.
+Compose boot settings may be supplied through `.env`, and **every one has a default**,
+so a missing variable (or no `.env` file at all) still works.
+
+- `.env.example`, short template with the most used settings.
 - `.env.full.example`, complete template with everything below.
 
 ```bash
@@ -9,10 +11,10 @@ cp .env.example .env        # everyday version
 cp .env.full.example .env   # everything tweakable
 ```
 
-Settings consumed by the mining controller or the spammer (block cadence, fee floor,
-block fill, spam mode) can be applied to a **running** chain without resetting it:
-edit `.env`, then `docker compose up -d --force-recreate` only those services. See
-"Retuning a live chain" in the README.
+Mining/spam values from `.env` initialize the durable control state on first boot.
+Thereafter, change those values on a **running** chain through the dashboard,
+`simchainctl config set`, HTTP, or MCP. The control plane never rewrites `.env`; see
+[RETUNING.md](RETUNING.md).
 
 ## Bitcoin node image
 
@@ -204,9 +206,9 @@ long fixed interval while `.env` keeps the default bounds.
 |---|---|---|
 | `ENABLE_SPAM` | `true` | Spam transactions after each block so blocks are not empty. |
 | `USE_RAW_TX_SPAM` | `true` | Selects the spam engine. `true`: **raw engine** — the spammer holds its own keys, tracks its own UTXO set in memory, signs every tx locally and submits with `sendrawtransaction`. The node wallets are bypassed, so the send rate stays flat forever (no wallet fatigue). Floor-fill txs pay exactly `FALLBACK_FEE`; DATA/HYBRID bulk spam pays a tiny premium so miners drain bulk first and keep floor fills for residual gaps; rare refill fan-outs pay above the floor so they confirm under saturation. `false`: **node-wallet engine** — spam is sent with `sendtoaddress`/`sendmany` on the miner wallets, so bitcoind does coin selection and signing (wallet-realistic traffic, the original behavior); throughput is bound by the wallet lock and degrades as wallet history grows (see [Full blocks](#full-blocks)). All other spam knobs apply to both engines. |
-| `SPAM_FIXED_TXS_PER_BLOCK` | `100` | Fixed tx count for the **OUTPUT** spam modes (sequential/batch) and the wallet engine — the number a block explorer shows per block (plus coinbase) until blocks are full; excess waits in the mempool. Split across the miner nodes for you. **Ignored in DATA/HYBRID mode**, where the fill is driven by `SPAM_FILL_BLOCK_RATIO`. Renamed from `SPAM_TXS_PER_BLOCK` (still honored); replaces the older `SPAM_PER_MINER_PER_BLOCK` (× 2). |
+| `SPAM_FIXED_TXS_PER_BLOCK` | `100` | Fixed tx count for the **OUTPUT** spam modes (sequential/batch) and the wallet engine — the number a block explorer shows per block (plus coinbase) until blocks are full; excess waits in the mempool. Split across the miner nodes for you. **Ignored in DATA/HYBRID mode**, where the fill is driven by `SPAM_FILL_BLOCK_RATIO`. The standalone spammer still accepts the deprecated boot aliases `SPAM_TXS_PER_BLOCK` and `SPAM_PER_MINER_PER_BLOCK` (× 2); they are not runtime-managed keys. |
 | `SPAM_SENDMANY_OUTPUTS` | `0` | OUTPUT-mode fatness. `0`: sequential — one tx with a single burn output at a time, p2p-like arrival. `N > 0`: batch — each spam tx carries N burn outputs (exchange-payout-shaped). Ignored in DATA/HYBRID mode. |
-| `SPAM_TX_DATA_MAX_BYTES` | `90000` | Raw engine only. `N > 0` (the default): **DATA/HYBRID mode** — the fill comes from OP_RETURN data txs (biggest payload = N). An OP_RETURN is provably unspendable, so it never enters the UTXO set: pure block weight at near-zero node cost (a handful of fat txs fill a 4M WU block vs ~1130 in output mode; measured node CPU ~100% → ~2%). Capped just under the 100k-vB standard-tx limit; needs Core 30+ (the default image). `0`: legacy OUTPUT mode (fatness from burn outputs, UTXO-heavy). Renamed from `SPAM_TX_DATA_BYTES` (still honored). See [Hybrid: varied sizes and mempool depth](#hybrid-varied-sizes-and-mempool-depth). |
+| `SPAM_TX_DATA_MAX_BYTES` | `90000` | Raw engine only. `N > 0` (the default): **DATA/HYBRID mode** — the fill comes from OP_RETURN data txs (biggest payload = N). An OP_RETURN is provably unspendable, so it never enters the UTXO set: pure block weight at near-zero node cost (a handful of fat txs fill a 4M WU block vs ~1130 in output mode; measured node CPU ~100% → ~2%). Capped just under the 100k-vB standard-tx limit; needs Core 30+ (the default image). `0`: legacy OUTPUT mode (fatness from burn outputs, UTXO-heavy). The standalone spammer still accepts `SPAM_TX_DATA_BYTES` as a deprecated boot alias; it is not runtime-managed. See [Hybrid: varied sizes and mempool depth](#hybrid-varied-sizes-and-mempool-depth). |
 | `SPAM_TX_DATA_MIN_BYTES` | `250` | Smallest data payload. Below MAX (the default): each tx's size is drawn **log-uniformly** in `[MIN, MAX]` — a realistic spread, most small and a few large. `0` (or ≥ MAX): every data tx is exactly MAX (uniform). |
 | `SPAM_SMALL_TXS_PER_BLOCK` | `0` | HYBRID: this many extra minimum-size (~140 vB) floor-priced txs per block, on top of the data fill. Cosmetic — they add a stream of small realistic-looking payment-shaped txs. This is **not** the fee floor; the airtight floor is `SPAM_FLOOR_POOL_TXS`. `0`: none. |
 | `SPAM_FLOOR_POOL_TXS` | `4000` | **Airtight fee floor** (DATA/HYBRID mode). Keep this many standalone floor-priced ~110-vB fill txs *standing* in the mempool at all times, split across the miners and direct-relayed to the other miner. Each fill spends a **confirmed** UTXO from a dedicated second key (never unconfirmed spam change), so its ancestor package is itself and a below-floor tx must **outbid** the floor to confirm. Mined fills recycle their change into fresh ammo (zero net UTXO-set growth). `0`: off — the floor is then **soft** (see [The fee floor](#the-fee-floor)). Ignored in OUTPUT/wallet modes. |
@@ -405,41 +407,22 @@ bounded job request fields. It affects only the interface routed to the fixed
 `btc-simnet-p2p` subnet (`172.30.0.0/24`), never the RPC/control interface, and shapes
 egress only. The agent clears its qdisc on lease expiry or restart.
 
-## Scenario compatibility client (profile `scenario`)
+## Simchain control plane
 
-The compatibility container is a one-shot HTTP client for the control plane's durable
-scenario jobs. Relative paths resolve from `/workspace`. Normal host and CI use should
-prefer `simchainctl scenario`; the profile exists for old invocations.
-
-| Variable | Default | Description |
-|---|---|---|
-| `SCENARIO_FILE` | `/workspace/scenarios/pause-then-burst.yml` | YAML scenario to validate and execute. On the host, paths such as `scenarios/reorg-during-sync.yml` are accepted. |
-| `SCENARIO_TIMEOUT_SECS` | `1800` | Positive client wait timeout. Server-side checkpoint timeouts are declared in YAML and continue if this client disconnects. |
-| `SCENARIO_RESULT_FILE` | _(empty)_ | Optional terminal job JSON path. Relative paths resolve under `/workspace`. |
-| `SIMCHAIN_REPO_ROOT` | `/workspace` | Base path used only to resolve compatibility-client files. |
-| `SIMCHAIN_CONTROL_URL` | `http://127.0.0.1:8090` | Control-plane base URL; Compose sets the private service URL. |
-| `SIMCHAIN_CONTROL_TOKEN` | _(empty)_ | Optional bearer token override. Otherwise the client reads the shared control-state token. |
-
-The image contains no Docker CLI and the service mounts no Docker socket. Bitcoin RPC,
-worker/network leases, mutation safety, progress, and cleanup are owned by the control plane. Full
-schema and CI checkpoint semantics: [SCENARIOS.md](SCENARIOS.md).
-
-## Simchain control plane (profile `control-plane`; alias `panel`)
-
-The control plane is an opt-in localhost web UI + HTTP API + MCP endpoint for live retuning
-(see [RETUNING.md](RETUNING.md)). Mining and spam control use private authenticated
-worker APIs; reorg, scenario, partition, and degradation jobs use worker/network leases
-plus Bitcoin RPC directly. The
-service still mounts `/var/run/docker.sock` only for transitional boot/lifecycle
-compatibility scheduled for removal in Phase 7; runtime worker, job, and network control
-do not use it. Treat access to this container as root-equivalent host access until that
-migration removes the mount.
+The control plane is part of ordinary Compose startup. It is the single localhost web
+UI + HTTP API + MCP backend for live retuning and jobs (see
+[RETUNING.md](RETUNING.md)). Mining and spam control use private authenticated worker
+APIs; reorg, scenario, partition, and degradation jobs use worker/network leases plus
+Bitcoin RPC directly. Its image has no Docker CLI, and its only bind mount is the narrow
+`.simchain-control` state directory; the rest of its filesystem is read-only and all
+Linux capabilities are dropped. A lock in that directory enforces one control-plane
+process per durable state store.
 
 | Variable | Default | Description |
 |---|---|---|
 | `CONTROL_PLANE_PORT` | `8090` | Host port (bound to `127.0.0.1` only) for the browser UI, the `/api/v1` JSON API, and the `/mcp` MCP endpoint. |
 | `CONTROL_PLANE_API_TOKEN` | _(empty)_ | Bearer token required on every mutation and the whole `/mcp` endpoint. Empty generates `.simchain-control/token` (mode 0600, gitignored), reused across restarts. |
-| `SIMCHAIN_CONTROL_STATE_DIR` | `.simchain-control` | Narrow directory for the token, atomically written desired state, and bounded job metadata/JSONL events. |
+| `SIMCHAIN_CONTROL_STATE_DIR` | `/var/lib/simchain-control` in Compose | Narrow directory for the token, atomically written desired state, and bounded job metadata/JSONL events. The host bind is `.simchain-control`. |
 | `MINING_CONTROL_URL` | `http://btc-simnet-mining-controller:9081` | Private Compose-network endpoint used by the control plane; never publish this port to the host. |
 | `MINING_CONTROL_LISTEN_ADDR` | `0.0.0.0:9081` | Mining worker's private control listener. Boot-only. |
 | `SPAM_CONTROL_URL` | `http://btc-simnet-spammer:9082` | Private Compose-network spam endpoint; never publish this port to the host. |
@@ -450,10 +433,11 @@ migration removes the mount.
 | `NETWORK_AGENT_LISTEN_ADDR` | `0.0.0.0:9083` | Agent listener inside its shared node namespace; never published to the host. |
 | `P2P_PROBE_IP` | `172.30.0.254` | Unused address in the fixed P2P subnet used with `ip route get` to select only the P2P interface. |
 | `SIMCHAIN_INTERNAL_TOKEN` | `simchain-internal-dev-token` | Shared bearer token for control-plane-to-worker/agent requests. Supply the same non-empty value to the control plane, both workers, and all three agents when overriding it. |
+| `MEMPOOL_WEB_URL` | `http://127.0.0.1:$MEMPOOL_WEB_PORT` | Browser-facing explorer URL shown by the dashboard. |
+| `MEMPOOL_WEB_INTERNAL_URL` | `http://mempool-web:8080` | Private health-probe URL used by the control plane. |
 
-Control-plane-managed runtime settings (durable desired values live in
-`.simchain-control/state.json`; Phase 3 still mirrors these keys to `.env` for manual
-compatibility, preserving everything else verbatim):
+Control-plane-managed runtime settings (durable desired values live only in
+`.simchain-control/state.json` after initialization):
 
 - Mining controller scope: `BLOCK_INTERVAL_MODE`, `BLOCK_INTERVAL_MEAN_SECS`,
   `BLOCK_INTERVAL_MIN_SECS`, `BLOCK_INTERVAL_MAX_SECS`, `MINER_WEIGHTS`,

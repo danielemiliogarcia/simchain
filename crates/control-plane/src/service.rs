@@ -2,11 +2,9 @@
 //! are both thin adapters over these functions, so the two surfaces cannot
 //! drift. Shared response and error types live here too.
 
-use crate::envfile;
 use crate::jobs::JobManagerError;
-use crate::state::{AppState, CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
+use crate::state::{AppState, MINING_COMPONENT, SPAM_COMPONENT};
 use crate::status::StatusSnapshot;
-use serde::Serialize;
 use simchain_common::config::ConfigError;
 use simchain_common::control_api::{
     AbortJobResponse, ApplyMode, ComponentControlResponse, ConfigResponse, DegradeJobRequest,
@@ -18,10 +16,8 @@ pub use simchain_common::control_api::{
     ApiError as ServiceError, ErrorCode, ErrorDetail, RollbackReport,
 };
 use simchain_common::internal_api::DesiredState;
-use simchain_common::live_tuning::{
-    self, ControlKind, LiveTuning, MiningTuning, ServiceScope, SpamTuning,
-};
-use std::collections::{BTreeMap, HashMap};
+use simchain_common::live_tuning::{self, ControlKind, LiveTuning, ServiceScope};
+use std::collections::BTreeMap;
 
 pub fn config_error_details(error: &ConfigError) -> Vec<ErrorDetail> {
     match error {
@@ -52,7 +48,7 @@ pub fn schema() -> SchemaResponse {
                 key: spec.key.to_string(),
                 default: spec.default.to_string(),
                 group: spec.group.as_str().to_string(),
-                component: spec.scope.service_name().to_string(),
+                component: spec.scope.component_name().to_string(),
                 control: spec.control.as_str().to_string(),
                 options: match spec.control {
                     ControlKind::Choice(options) => {
@@ -70,10 +66,6 @@ pub fn schema() -> SchemaResponse {
                 help: spec.help.to_string(),
                 warning: spec.warning.map(str::to_string),
             })
-            .collect(),
-        legacy_aliases: live_tuning::LEGACY_SPAM_ALIASES
-            .iter()
-            .map(|alias| (*alias).to_string())
             .collect(),
     }
 }
@@ -104,259 +96,78 @@ fn validation_bounds(key: &str) -> (Option<f64>, Option<f64>) {
 }
 
 // ---------------------------------------------------------------------------
-// Settings state (staged vs running)
+// Desired/effective configuration
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Serialize)]
-pub struct RunningService {
-    pub present: bool,
-    /// Managed values (this service's scope) from the running container env.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub values: Option<BTreeMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub generation: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct SettingsStateView {
-    pub revision: String,
-    pub env_file_exists: bool,
-    /// Full managed set: canonical when valid, raw staged values otherwise.
-    pub staged: BTreeMap<String, String>,
-    pub staged_valid: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub staged_errors: Vec<ErrorDetail>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<String>,
-    pub running: BTreeMap<String, RunningService>,
-    /// Services whose running config differs from staged (what Apply would
-    /// recreate right now).
-    pub pending_restart: Vec<String>,
-    pub services: BTreeMap<String, simchain_common::control_api::ComponentState>,
-}
-
-/// Managed keys belonging to one service scope.
-fn scope_keys(scope: ServiceScope) -> Vec<&'static str> {
-    live_tuning::MANAGED_SETTINGS
-        .iter()
-        .filter(|spec| spec.scope == scope)
-        .map(|spec| spec.key)
-        .collect()
-}
-
-/// Does the staged tuning differ from what the container is running with?
-/// Absent or unparsable containers count as "differs" (recreate fixes both).
-pub fn scope_needs_restart(
-    staged: &LiveTuning,
-    running_env: Option<&HashMap<String, String>>,
-    scope: ServiceScope,
-) -> bool {
-    let Some(env) = running_env else {
-        return true;
-    };
-    match scope {
-        ServiceScope::MiningController => match MiningTuning::from_source(env) {
-            Ok(running) => running != staged.mining,
-            Err(_) => true,
-        },
-        ServiceScope::Spammer => match SpamTuning::from_source(env) {
-            Ok((running, _)) => running != staged.spam,
-            Err(_) => true,
-        },
-    }
-}
-
-/// Parse the staged view out of the env-file contents.
-pub struct Staged {
-    pub overrides: BTreeMap<String, String>,
-    pub tuning: Result<(LiveTuning, Vec<String>), ConfigError>,
-}
-
-pub fn tuning_source(overrides: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let mut source = live_tuning::staged_map(overrides);
-    // Catalog defaults model compose, but must not shadow a recognized alias
-    // when the canonical key was genuinely absent from the file.
-    if !overrides.contains_key("SPAM_FIXED_TXS_PER_BLOCK")
-        && ["SPAM_TXS_PER_BLOCK", "SPAM_PER_MINER_PER_BLOCK"]
-            .iter()
-            .any(|key| overrides.contains_key(*key))
-    {
-        source.remove("SPAM_FIXED_TXS_PER_BLOCK");
-    }
-    if !overrides.contains_key("SPAM_TX_DATA_MAX_BYTES")
-        && overrides.contains_key("SPAM_TX_DATA_BYTES")
-    {
-        source.remove("SPAM_TX_DATA_MAX_BYTES");
-    }
-    for alias in live_tuning::LEGACY_SPAM_ALIASES {
-        if let Some(value) = overrides.get(*alias) {
-            source.insert((*alias).to_string(), value.clone());
-        }
-    }
-    source
-}
-
-pub fn staged_from_content(content: &str) -> Staged {
-    let overrides = envfile::managed_overrides(content);
-    let tuning = LiveTuning::from_source(&tuning_source(&overrides));
-    Staged { overrides, tuning }
-}
-
-pub fn settings_state(app: &AppState) -> Result<SettingsStateView, ServiceError> {
-    let file = envfile::read_env_file(&app.config.env_file).map_err(|error| {
-        ServiceError::new(
-            ErrorCode::Internal,
-            format!("failed to read env file: {error}"),
-        )
-    })?;
-
-    let staged = staged_from_content(&file.content);
-    let mut warnings: Vec<String> = envfile::legacy_aliases_present(&file.content)
-        .into_iter()
-        .map(|key| {
-            format!(
-                "{key} is a deprecated migration alias; its effective value is shown and the next successful apply will replace it with the canonical setting."
-            )
-        })
-        .collect();
-
-    let (staged_values, staged_valid, staged_errors, tuning) = match &staged.tuning {
-        Ok((tuning, tuning_warnings)) => {
-            warnings.extend(tuning_warnings.iter().cloned());
-            (
-                tuning
-                    .canonical_values()
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), v))
-                    .collect(),
-                true,
-                Vec::new(),
-                Some(tuning.clone()),
-            )
-        }
-        Err(error) => (
-            live_tuning::staged_map(&staged.overrides),
-            false,
-            config_error_details(error),
-            None,
-        ),
-    };
-
-    let (inspected, inspect_error) = match app
-        .components
-        .inspect_components(&[CONTROLLER_CONTAINER, SPAMMER_CONTAINER])
-    {
-        Ok(inspected) => (inspected, None),
-        Err(error) => {
-            let message = format!("component inspection failed: {error}");
-            warnings.push(message.clone());
-            (HashMap::new(), Some(message))
-        }
-    };
-
-    let mut running = BTreeMap::new();
-    let mut pending_restart = Vec::new();
-    for scope in [ServiceScope::MiningController, ServiceScope::Spammer] {
-        let service = scope.service_name();
-        let info = inspected.get(service);
-        let values = info.map(|info| {
-            scope_keys(scope)
-                .into_iter()
-                .map(|key| {
-                    (
-                        key.to_string(),
-                        info.effective_config.get(key).cloned().unwrap_or_default(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>()
-        });
-        running.insert(
-            service.to_string(),
-            RunningService {
-                present: info.is_some_and(|component| component.present),
-                values,
-                generation: info.and_then(|component| component.effective_generation),
-                error: inspect_error
-                    .clone()
-                    .or_else(|| info.and_then(|component| component.last_error.clone())),
-            },
-        );
-        if inspect_error.is_none() {
-            if let Some(tuning) = &tuning {
-                if scope_needs_restart(tuning, info.map(|i| &i.effective_config), scope) {
-                    pending_restart.push(service.to_string());
-                }
-            }
-        }
-    }
-
-    let services = app.status.read().expect("status lock").components.clone();
-
-    Ok(SettingsStateView {
-        revision: file.revision,
-        env_file_exists: file.exists,
-        staged: staged_values,
-        staged_valid,
-        staged_errors,
-        warnings,
-        running,
-        pending_restart,
-        services,
-    })
-}
-
-/// Stable desired/effective configuration response. Both runtime workers
-/// report their own effective generation and canonical policy.
 pub fn config(app: &AppState) -> Result<ConfigResponse, ServiceError> {
-    let legacy = settings_state(app)?;
-    let control = app
-        .control_state
-        .read()
-        .expect("control state lock")
-        .clone();
-    let (desired_valid, desired_errors, mut warnings, tuning) =
+    let control = load_durable_control_state(app)?;
+    let (desired_valid, desired_errors, warnings, tuning) =
         match LiveTuning::from_source(&control.desired) {
             Ok((tuning, warnings)) => (true, Vec::new(), warnings, Some(tuning)),
             Err(error) => (false, config_error_details(&error), Vec::new(), None),
         };
-    warnings.extend(legacy.warnings);
     let mut pending_apply = Vec::new();
-    if let Some(tuning) = &tuning {
-        for scope in [ServiceScope::MiningController, ServiceScope::Spammer] {
-            let component = scope.service_name();
-            let running = legacy.running.get(component);
-            let values = running
-                .and_then(|running| running.values.as_ref())
-                .map(|values| {
-                    values
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect::<HashMap<_, _>>()
-                });
-            if running.is_none_or(|running| !running.present || running.error.is_some())
-                || scope_needs_restart(tuning, values.as_ref(), scope)
-            {
-                pending_apply.push(component.to_string());
+    let mut effective = BTreeMap::new();
+    match app.mining.status() {
+        Ok(status) => {
+            if tuning.as_ref().is_none_or(|desired| {
+                status.effective_generation != control.generation || status.policy != desired.mining
+            }) {
+                pending_apply.push(MINING_COMPONENT.to_string());
             }
+            effective.insert(
+                MINING_COMPONENT.to_string(),
+                EffectiveComponentConfig {
+                    reachable: true,
+                    generation: Some(status.effective_generation),
+                    values: Some(canonical_map(status.policy.canonical_values())),
+                    error: status.last_error,
+                },
+            );
+        }
+        Err(error) => {
+            pending_apply.push(MINING_COMPONENT.to_string());
+            effective.insert(
+                MINING_COMPONENT.to_string(),
+                EffectiveComponentConfig {
+                    reachable: false,
+                    generation: None,
+                    values: None,
+                    error: Some(error.to_string()),
+                },
+            );
         }
     }
-    let effective = legacy
-        .running
-        .into_iter()
-        .map(|(component, running)| {
-            (
-                component,
+    match app.spam.status() {
+        Ok(status) => {
+            if tuning.as_ref().is_none_or(|desired| {
+                status.effective_generation != control.generation || status.policy != desired.spam
+            }) {
+                pending_apply.push(SPAM_COMPONENT.to_string());
+            }
+            effective.insert(
+                SPAM_COMPONENT.to_string(),
                 EffectiveComponentConfig {
-                    reachable: running.present && running.error.is_none(),
-                    generation: running.generation,
-                    values: running.values,
-                    error: running.error,
+                    reachable: true,
+                    generation: Some(status.effective_generation),
+                    values: Some(canonical_map(status.policy.canonical_values())),
+                    error: status.last_error,
                 },
-            )
-        })
-        .collect();
+            );
+        }
+        Err(error) => {
+            pending_apply.push(SPAM_COMPONENT.to_string());
+            effective.insert(
+                SPAM_COMPONENT.to_string(),
+                EffectiveComponentConfig {
+                    reachable: false,
+                    generation: None,
+                    values: None,
+                    error: Some(error.to_string()),
+                },
+            );
+        }
+    }
     Ok(ConfigResponse {
         generation: control.generation,
         desired: control.desired,
@@ -365,10 +176,15 @@ pub fn config(app: &AppState) -> Result<ConfigResponse, ServiceError> {
         warnings,
         effective,
         pending_apply,
-        components: legacy.services,
-        legacy_revision: Some(legacy.revision),
-        legacy_env_file_exists: legacy.env_file_exists,
+        components: app.status.read().expect("status lock").components.clone(),
     })
+}
+
+fn canonical_map(values: BTreeMap<&'static str, String>) -> BTreeMap<String, String> {
+    values
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -383,10 +199,10 @@ pub fn status(app: &AppState) -> StatusSnapshot {
         .expect("control state lock")
         .clone();
     status.desired_generation = control.generation;
-    if let Some(mining) = status.components.get_mut(CONTROLLER_CONTAINER) {
+    if let Some(mining) = status.components.get_mut(MINING_COMPONENT) {
         mining.desired_state = Some(control.mining_state);
     }
-    if let Some(spam) = status.components.get_mut(SPAMMER_CONTAINER) {
+    if let Some(spam) = status.components.get_mut(SPAM_COMPONENT) {
         spam.desired_state = Some(control.spam_state);
     }
     status.active_operation = app.jobs.active_summary().map(|job| OperationSummary {
@@ -409,12 +225,7 @@ pub fn start_reorg(
             "another desired-state mutation is already in progress",
         ));
     };
-    let desired = app
-        .control_state
-        .read()
-        .expect("control state lock")
-        .desired
-        .clone();
+    let desired = load_durable_control_state(app)?.desired;
     let (tuning, _) = LiveTuning::from_source(&desired).map_err(|error| {
         ServiceError::new(
             ErrorCode::ValidationFailed,
@@ -437,12 +248,7 @@ pub fn start_scenario(
             "another desired-state mutation is already in progress",
         ));
     };
-    let desired = app
-        .control_state
-        .read()
-        .expect("control state lock")
-        .desired
-        .clone();
+    let desired = load_durable_control_state(app)?.desired;
     let (tuning, _) = LiveTuning::from_source(&desired).map_err(|error| {
         ServiceError::new(
             ErrorCode::ValidationFailed,
@@ -583,11 +389,8 @@ pub fn set_mining_state(
         ));
     };
     app.jobs.ensure_idle().map_err(job_manager_error)?;
-    let mut next = app
-        .control_state
-        .read()
-        .expect("control state lock")
-        .clone();
+    let _file_guard = durable_mutation_lock(app)?;
+    let mut next = load_durable_control_state(app)?;
     next.mining_state = desired_state;
     app.control_store.save(&next).map_err(|error| {
         ServiceError::new(
@@ -629,11 +432,8 @@ pub fn set_spam_state(
         ));
     };
     app.jobs.ensure_idle().map_err(job_manager_error)?;
-    let mut next = app
-        .control_state
-        .read()
-        .expect("control state lock")
-        .clone();
+    let _file_guard = durable_mutation_lock(app)?;
+    let mut next = load_durable_control_state(app)?;
     next.spam_state = desired_state;
     app.control_store.save(&next).map_err(|error| {
         ServiceError::new(
@@ -664,6 +464,36 @@ pub fn set_spam_state(
     })
 }
 
+fn durable_mutation_lock(app: &AppState) -> Result<std::fs::File, ServiceError> {
+    app.control_store
+        .try_apply_lock()
+        .map_err(|error| {
+            ServiceError::new(
+                ErrorCode::Internal,
+                format!("cannot acquire the durable mutation lock: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            ServiceError::new(
+                ErrorCode::ApplyInProgress,
+                "another control-plane process holds the mutation lock",
+            )
+        })
+}
+
+fn load_durable_control_state(
+    app: &AppState,
+) -> Result<crate::control_state::ControlState, ServiceError> {
+    let state = app.control_store.load_current().map_err(|error| {
+        ServiceError::new(
+            ErrorCode::Internal,
+            format!("cannot reload durable desired state: {error}"),
+        )
+    })?;
+    *app.control_state.write().expect("control state lock") = state.clone();
+    Ok(state)
+}
+
 // ---------------------------------------------------------------------------
 // Apply-input validation (strict, per key)
 // ---------------------------------------------------------------------------
@@ -681,7 +511,7 @@ pub fn validate_input(key: &str, value: &str) -> Result<(), ErrorDetail> {
         cause,
     };
     let Some(spec) = live_tuning::spec(key) else {
-        return Err(detail("not a panel-managed setting".to_string()));
+        return Err(detail("not a runtime-managed setting".to_string()));
     };
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -715,9 +545,6 @@ pub fn validate_input(key: &str, value: &str) -> Result<(), ErrorDetail> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
-    use crate::test_support::{test_app, MockBackend};
-    use std::sync::Arc;
 
     #[test]
     fn validate_input_enforces_control_kinds() {
@@ -744,8 +571,11 @@ mod tests {
             .iter()
             .find(|s| s.key == "FALLBACK_FEE")
             .expect("FALLBACK_FEE in schema");
-        assert!(fee.warning.is_some(), "node-restart caveat must be visible");
-        assert_eq!(fee.component, SPAMMER_CONTAINER);
+        assert!(
+            fee.warning.is_some(),
+            "boot fallback caveat must be visible"
+        );
+        assert_eq!(fee.component, SPAM_COMPONENT);
         let cadence = view
             .settings
             .iter()
@@ -759,83 +589,32 @@ mod tests {
             .expect("spam fill ratio in schema");
         assert_eq!(fill.apply_mode, ApplyMode::NextSafePoint);
         assert_eq!(fee.apply_mode, ApplyMode::EngineRebuild);
-        assert!(view
-            .settings
-            .iter()
-            .all(|setting| setting.apply_mode != ApplyMode::LegacyRecreate));
     }
 
     #[test]
-    fn settings_state_reports_drift_and_legacy_aliases() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let env_file = dir.path().join(".env");
-        std::fs::write(&env_file, "SPAM_TXS_PER_BLOCK=500\nFALLBACK_FEE=0.0002\n")
-            .expect("seed env");
-        let mock = Arc::new(MockBackend::new(env_file));
-        mock.sync_containers();
-        // Make the spammer run with an older fee than staged.
-        mock.set_container_env(SPAMMER_CONTAINER, "FALLBACK_FEE", "0.0001");
-        let app = test_app(dir.path(), mock);
-
-        let view = settings_state(&app).expect("state");
-        assert!(view.staged_valid);
-        assert_eq!(view.staged["FALLBACK_FEE"], "0.0002");
-        // Legacy alias participates in the effective staged configuration and
-        // is surfaced as a migration warning.
-        assert_eq!(view.staged["SPAM_FIXED_TXS_PER_BLOCK"], "500");
-        assert!(view
-            .warnings
-            .iter()
-            .any(|w| w.contains("SPAM_TXS_PER_BLOCK")));
-        assert_eq!(view.pending_restart, vec![SPAMMER_CONTAINER]);
-        assert!(view.running[CONTROLLER_CONTAINER].present);
-    }
-
-    #[test]
-    fn settings_state_surfaces_invalid_staged_values() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let env_file = dir.path().join(".env");
-        std::fs::write(&env_file, "MINER_WEIGHTS=0,0\n").expect("seed env");
-        let mock = Arc::new(MockBackend::new(env_file));
-        mock.sync_containers();
-        let app = test_app(dir.path(), mock);
-
-        let view = settings_state(&app).expect("state");
-        assert!(!view.staged_valid);
-        assert!(view
-            .staged_errors
-            .iter()
-            .any(|d| d.key.as_deref() == Some("MINER_WEIGHTS")));
-        // Raw staged values are still shown so the user can fix them.
-        assert_eq!(view.staged["MINER_WEIGHTS"], "0,0");
-    }
-
-    #[test]
-    fn missing_env_file_loads_defaults() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mock = Arc::new(MockBackend::new(dir.path().join(".env")));
-        mock.sync_containers();
-        let app = test_app(dir.path(), mock);
-
-        let view = settings_state(&app).expect("state");
-        assert!(!view.env_file_exists);
-        assert_eq!(view.revision, crate::envfile::ABSENT_REVISION);
-        assert!(view.staged_valid);
-        assert_eq!(view.staged["BLOCK_INTERVAL_MEAN_SECS"], "15");
-        assert!(view.pending_restart.is_empty());
-    }
-
-    #[test]
-    fn public_config_uses_durable_desired_state_after_initialization() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let env_file = dir.path().join(".env");
-        let mock = Arc::new(MockBackend::new(env_file.clone()));
-        mock.sync_containers();
-        let app = test_app(dir.path(), mock);
-
-        std::fs::write(&env_file, "BLOCK_INTERVAL_MEAN_SECS=99\n").expect("external legacy edit");
-        let view = config(&app).expect("config");
-        assert_eq!(view.desired["BLOCK_INTERVAL_MEAN_SECS"], "15");
-        assert_eq!(view.effective[CONTROLLER_CONTAINER].generation, Some(0));
+    fn schema_classifies_every_runtime_setting() {
+        let view = schema();
+        let engine_rebuild = [
+            "ENABLE_SPAM",
+            "FALLBACK_FEE",
+            "SPAM_SENDMANY_OUTPUTS",
+            "SPAM_TX_DATA_MAX_BYTES",
+            "SPAM_TX_DATA_MIN_BYTES",
+            "USE_RAW_TX_SPAM",
+        ];
+        for spec in live_tuning::MANAGED_SETTINGS {
+            let setting = view
+                .settings
+                .iter()
+                .find(|setting| setting.key == spec.key)
+                .unwrap_or_else(|| panic!("{} missing from schema", spec.key));
+            assert_eq!(setting.component, spec.scope.component_name());
+            let expected_mode = if engine_rebuild.contains(&spec.key) {
+                ApplyMode::EngineRebuild
+            } else {
+                ApplyMode::NextSafePoint
+            };
+            assert_eq!(setting.apply_mode, expected_mode, "{}", spec.key);
+        }
     }
 }

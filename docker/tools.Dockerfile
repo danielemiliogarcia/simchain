@@ -34,7 +34,7 @@ COPY --from=builder /app/target/release/simchain-reorg /usr/local/bin/simchain-r
 ENTRYPOINT ["simchain-reorg"]
 
 # ---- scenario-engine -------------------------------------------------------
-# Compatibility HTTP client only. Scenario execution belongs to the control
+# Thin file-based HTTP client only. Scenario execution belongs to the control
 # plane, so this image deliberately contains no Docker CLI or orchestration
 # backend.
 FROM gcr.io/distroless/cc-debian12 AS scenario-engine
@@ -42,16 +42,13 @@ COPY --from=builder /app/target/release/simchain-scenario-engine /simchain-scena
 ENTRYPOINT ["/simchain-scenario-engine"]
 
 # ---- control-plane ---------------------------------------------------------
-# Mining, spam, and reorg paths use worker APIs/Bitcoin RPC. The transitional
-# boot/lifecycle adapter still needs Compose until Phase 7 removes it and this
-# image's Docker CLI/socket access. Debian is required because the builder
-# links against glibc.
-FROM debian:trixie-slim AS control-plane
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates docker-cli docker-compose \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/simchain-control-plane /usr/local/bin/simchain-control-plane
-ENTRYPOINT ["simchain-control-plane"]
+# Domain APIs and Bitcoin RPC are the only orchestration boundary. The image
+# deliberately has no shell, package manager, Docker CLI, or Compose binary.
+FROM gcr.io/distroless/cc-debian12 AS control-plane
+COPY --from=builder /app/target/release/simchain-control-plane /simchain-control-plane
+COPY --from=builder /app/target/release/simchainctl /simchainctl
+HEALTHCHECK --interval=5s --timeout=3s --retries=12 CMD ["/simchainctl", "--url", "http://127.0.0.1:8080", "status"]
+ENTRYPOINT ["/simchain-control-plane"]
 
 # ---- network-agent ---------------------------------------------------------
 # Runs as root with Docker granting only CAP_NET_ADMIN. It shares a Bitcoin

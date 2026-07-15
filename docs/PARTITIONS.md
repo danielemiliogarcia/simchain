@@ -11,11 +11,11 @@ and cleanup reporting.
 
 ## Start the services
 
-The three namespace-local network agents are part of the ordinary stack. Start the
-control plane to use the browser, API, MCP, or `simchainctl`:
+The three namespace-local network agents and control plane are part of the ordinary
+stack, exposing the browser, API, MCP, and `simchainctl` contract:
 
 ```bash
-docker compose --profile control-plane up -d --build
+docker compose up -d --build
 ```
 
 Each agent shares exactly one node's network namespace with
@@ -31,7 +31,7 @@ cargo run -p simchainctl -- partition \
   --node node3 --main-blocks 3 --isolated-blocks 4 --wait
 ```
 
-The compatibility script submits the same job:
+The convenience script submits the same job:
 
 ```bash
 ./scripts/partition.sh run btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
@@ -65,7 +65,7 @@ cargo run -p simchainctl -- degrade \
 
 All three nodes are valid degradation targets. Delay is one-way egress delay; loss is a
 percentage from 0 through 100. At least one must be nonzero, and the bounded observation
-window is 1–86400 seconds. The compatibility wrapper is:
+window is 1–86400 seconds. The convenience wrapper is:
 
 ```bash
 ./scripts/degrade.sh btc-simnet-node3 500 1 60s

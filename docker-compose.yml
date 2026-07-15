@@ -2,18 +2,12 @@
 # has a working default, so it runs with no .env at all).
 #
 # Profiles:
-#   (none) / "basic"  -> 3 nodes + mining controller + spammer
+#   (none) / "basic"  -> nodes + workers + network agents + control plane
 #   electrs           -> basic + electrs
 #   mempool           -> basic + electrs + mempool.space explorer
 #                        (mempool-web/mempool-api/mempool-db)
 #   all-tools         -> basic + all long-running tools above
 #   reorg             -> reorg simulator (run on demand, see README)
-#   scenario          -> one-shot declarative scenario orchestrator
-#                        (intentionally excluded from all-tools)
-#   control-plane     -> control plane (browser UI + API + MCP)
-#                        (intentionally excluded from all-tools)
-#   panel             -> temporary alias for the control-plane profile
-#                        (intentionally excluded from all-tools)
 #
 # Examples:
 #   docker compose up
@@ -432,54 +426,24 @@ services:
       - REORG_WITNESS_NODE=${REORG_WITNESS_NODE:-btc-simnet-node1}
 
   # ---------------------------------------------------------------------------
-  # Declarative scenario compatibility client (profile: scenario), one-shot.
-  # Execution is a durable control-plane job; this client has no Docker API.
-  # ---------------------------------------------------------------------------
-  btc-simnet-scenario:
-    profiles: ["scenario"]
-    build:
-      context: .
-      dockerfile: docker/tools.Dockerfile
-      target: scenario-engine
-    container_name: btc-simnet-scenario
-    restart: "no"
-    working_dir: /workspace
-    volumes:
-      - .:/workspace
-    depends_on:
-      btc-simnet-control-plane:
-        condition: service_started
-    networks:
-      - btc-simnet-control
-    environment:
-      - SIMCHAIN_REPO_ROOT=/workspace
-      - SIMCHAIN_CONTROL_URL=http://btc-simnet-control-plane:8080
-      - SIMCHAIN_CONTROL_STATE_DIR=/workspace/.simchain-control
-      - SCENARIO_FILE=${SCENARIO_FILE:-/workspace/scenarios/pause-then-burst.yml}
-      - SCENARIO_RESULT_FILE=${SCENARIO_RESULT_FILE:-}
-      - SCENARIO_TIMEOUT_SECS=${SCENARIO_TIMEOUT_SECS:-1800}
-
-  # ---------------------------------------------------------------------------
-  # Simchain control plane (profiles: control-plane, legacy alias panel).
+  # Simchain control plane (part of ordinary startup).
   # Browser UI, versioned HTTP API and MCP endpoint on
   # http://localhost:${CONTROL_PLANE_PORT:-8090}. Mining and spam state and
   # policy use private worker APIs; mutation jobs use worker/network leases
-  # plus Bitcoin RPC. Network agents have no host ports.
-  # Transitional boot/lifecycle inspection still keeps the Docker socket,
-  # so this service remains excluded from all-tools until Phase 7.
+  # plus Bitcoin RPC. It has no Docker API and sees only its narrow state dir.
   # ---------------------------------------------------------------------------
   btc-simnet-control-plane:
-    profiles: ["control-plane", "panel", "scenario"]
     build:
       context: .
       dockerfile: docker/tools.Dockerfile
       target: control-plane
     container_name: btc-simnet-control-plane
     restart: on-failure
-    working_dir: /workspace
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     volumes:
-      - .:/workspace
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ./.simchain-control:/var/lib/simchain-control
     ports:
       - "127.0.0.1:${CONTROL_PLANE_PORT:-8090}:8080"
     depends_on:
@@ -491,12 +455,14 @@ services:
         condition: service_started
       btc-simnet-network-agent-node3:
         condition: service_started
+      btc-simnet-mining-controller:
+        condition: service_started
+      btc-simnet-spammer:
+        condition: service_started
     networks:
       - btc-simnet-control
     environment:
-      - SIMCHAIN_REPO_ROOT=/workspace
-      - SIMCHAIN_ENV_FILE=/workspace/.env
-      - SIMCHAIN_CONTROL_STATE_DIR=/workspace/.simchain-control
+      - SIMCHAIN_CONTROL_STATE_DIR=/var/lib/simchain-control
       - CONTROL_PLANE_LISTEN_ADDR=0.0.0.0:8080
       - MINING_CONTROL_URL=http://btc-simnet-mining-controller:9081
       - SPAM_CONTROL_URL=http://btc-simnet-spammer:9082
@@ -507,14 +473,36 @@ services:
       # Optional pre-set API token; empty means generate one and persist it
       # to .simchain-control/token (bearer auth for API/MCP mutations)
       - CONTROL_PLANE_API_TOKEN=${CONTROL_PLANE_API_TOKEN:-}
-      # Preserve the host compose project across the /workspace bind path, so
-      # nested compose commands operate on the existing tool containers.
-      - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-simchain}
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
       - NODE1_RPC_URL=${NODE1_RPC_URL:-http://btc-simnet-node1:18443}
       - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
       - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
+      # Initial runtime policy. After state.json is created, durable desired
+      # state in the narrow mount is authoritative across restarts.
+      - BLOCK_INTERVAL_MEAN_SECS=${BLOCK_INTERVAL_MEAN_SECS:-15}
+      - BLOCK_INTERVAL_MODE=${BLOCK_INTERVAL_MODE:-poisson}
+      - BLOCK_INTERVAL_MIN_SECS=${BLOCK_INTERVAL_MIN_SECS-10}
+      - BLOCK_INTERVAL_MAX_SECS=${BLOCK_INTERVAL_MAX_SECS-20}
+      - MINER_WEIGHTS=${MINER_WEIGHTS:-}
+      - MINING_RNG_SEED=${MINING_RNG_SEED:-}
+      - ENABLE_SPAM=${ENABLE_SPAM:-true}
+      - USE_RAW_TX_SPAM=${USE_RAW_TX_SPAM:-true}
+      - FALLBACK_FEE=${FALLBACK_FEE:-0.0001}
+      - SPAM_FIXED_TXS_PER_BLOCK=${SPAM_FIXED_TXS_PER_BLOCK:-100}
+      - SPAM_SENDMANY_OUTPUTS=${SPAM_SENDMANY_OUTPUTS:-0}
+      - SPAM_TX_DATA_MAX_BYTES=${SPAM_TX_DATA_MAX_BYTES:-90000}
+      - SPAM_TX_DATA_MIN_BYTES=${SPAM_TX_DATA_MIN_BYTES:-250}
+      - SPAM_SMALL_TXS_PER_BLOCK=${SPAM_SMALL_TXS_PER_BLOCK:-0}
+      - SPAM_FLOOR_POOL_TXS=${SPAM_FLOOR_POOL_TXS:-4000}
+      - SPAM_FILL_BLOCK_RATIO=${SPAM_FILL_BLOCK_RATIO:-2.0}
+      - SPAM_FANOUT_AUTO=${SPAM_FANOUT_AUTO:-true}
+      - SPAM_FANOUT_UTXOS=${SPAM_FANOUT_UTXOS:-50}
+      - ENABLE_SPAM_REPLACES=${ENABLE_SPAM_REPLACES:-false}
+      - SPAM_REPLACES_PER_MINER_PER_BLOCK=${SPAM_REPLACES_PER_MINER_PER_BLOCK:-5}
+      - MEMPOOL_WEB_PORT=${MEMPOOL_WEB_PORT:-1080}
+      - MEMPOOL_WEB_URL=${MEMPOOL_WEB_URL:-}
+      - MEMPOOL_WEB_INTERNAL_URL=http://mempool-web:8080
 
   # ---------------------------------------------------------------------------
   # Tools: electrs (profiles: electrs, mempool, all-tools)

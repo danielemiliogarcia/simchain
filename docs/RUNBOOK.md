@@ -12,7 +12,7 @@ Start the simnet plus its single control plane, then upload a scenario. The serv
 for bootstrap height 204 before executing any declared steps:
 
 ```bash
-docker compose --profile control-plane up -d --build
+docker compose up -d --build
 cargo run -p simchainctl -- scenario run scenarios/pause-then-burst.yml
 ```
 
@@ -89,7 +89,7 @@ cargo run -p simchainctl -- degrade \
   --node node3 --delay-ms 500 --loss-pct 1 --seconds 60 --wait
 ```
 
-The compatibility wrappers submit the same durable jobs:
+The convenience wrappers submit the same durable jobs:
 
 ```bash
 ./scripts/partition.sh run btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
@@ -105,28 +105,21 @@ receives. `--delay-ms 500` adds 500ms one way (RTT +500ms, not +1000ms); apply i
 both endpoints for symmetric latency. It also affects only the Docker P2P interface —
 host-side P2P traffic through the published ports bypasses it.
 
-## Manual mining
+## Bounded manual mining
 
-Mine manually (e.g. after stopping the mining controller):
+Mine through the same leased job path as the dashboard, API, and MCP:
 
 ```bash
-while true; do
-  docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword generatetoaddress 1 bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr
-  sleep 5
-done
+cargo run -p simchainctl -- mine --node node3 --blocks 1 --wait
 ```
 
-## Manual spam
+## Bounded spam burst
 
-Spam manually:
+Submit wallet transactions through a server-side action job:
 
 ```bash
-while true; do
-    for i in $(seq 0 10); do
-      docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword sendtoaddress "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr" 0.0000050$i "spam$i"
-    done
-  sleep 5
-done
+cargo run -p simchainctl -- spam burst \
+  --node node3 --txs 10 --outputs-per-tx 0 --wait
 ```
 
 ## UTXOs & balance
@@ -156,19 +149,19 @@ skipping bootstrap and funding (recipes: [SNAPSHOTS.md](SNAPSHOTS.md)):
 
 ## Reorgs
 
-One-shot reorg of the last 3 blocks:
+Run a durable three-block reorg and wait for convergence and cleanup:
 
 ```bash
-./scripts/simulate-reorg.sh 3
+cargo run -p simchainctl -- reorg --depth 3 --wait
 ```
 
-Chaos reorg: replace them with empty blocks (orphaned txs stay unconfirmed):
+Chaos reorg: replace them with empty blocks so orphaned transactions stay unconfirmed:
 
 ```bash
-./scripts/simulate-reorg.sh 3 empty
+cargo run -p simchainctl -- reorg --depth 3 --empty --wait
 ```
 
-Continuous reorgs: every `AUTO_REORG_EVERY_BLOCKS` blocks, reorg `REORG_DEPTH` blocks:
+The standalone direct-RPC profile remains available for continuous low-level testing:
 
 ```bash
 REORG_MODE=auto docker compose --profile reorg up btc-simnet-reorg

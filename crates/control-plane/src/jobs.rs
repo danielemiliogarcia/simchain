@@ -3570,8 +3570,8 @@ mod tests {
         dir: &std::path::Path,
         executor: Arc<BlockingExecutor>,
     ) -> (Arc<MockBackend>, Arc<JobManager>) {
-        let backend = Arc::new(MockBackend::new(dir.join(".env")));
-        backend.sync_containers();
+        let backend = Arc::new(MockBackend::new());
+        backend.sync_workers();
         let manager = JobManager::open_with_ttl(
             dir,
             JobDependencies {
@@ -3600,7 +3600,7 @@ mod tests {
     fn one_mutation_idempotency_and_event_cursors_are_pinned() {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = Arc::new(BlockingExecutor::new());
-        let (backend, manager) = manager(dir.path(), executor.clone());
+        let (_backend, manager) = manager(dir.path(), executor.clone());
         let request = ReorgJobRequest::default();
         let created = manager
             .start_reorg(request.clone(), Some("retry-key".to_string()), true)
@@ -3658,7 +3658,6 @@ mod tests {
             .events
             .iter()
             .all(|event| event.sequence > events.events[0].sequence));
-        assert!(backend.compose_calls().is_empty());
     }
 
     #[test]
@@ -3688,8 +3687,8 @@ mod tests {
     #[test]
     fn restart_marks_active_job_interrupted_and_recovers_before_unlocking() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let backend = Arc::new(MockBackend::new(dir.path().join(".env")));
-        backend.sync_containers();
+        let backend = Arc::new(MockBackend::new());
+        backend.sync_workers();
         let store = JobStore::open(dir.path()).expect("store");
         let job_id = "job-restarted".to_string();
         store
@@ -3758,8 +3757,8 @@ mod tests {
     #[test]
     fn restart_keeps_leases_and_mutation_lock_until_chain_recovery_is_safe() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let backend = Arc::new(MockBackend::new(dir.path().join(".env")));
-        backend.sync_containers();
+        let backend = Arc::new(MockBackend::new());
+        backend.sync_workers();
         let job_id = "job-recovery-gated".to_string();
         MiningControlBackend::acquire_lease(
             backend.as_ref(),
@@ -3866,8 +3865,8 @@ mod tests {
     #[test]
     fn restart_interrupts_a_held_scenario_and_recovers_its_owned_lease() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let backend = Arc::new(MockBackend::new(dir.path().join(".env")));
-        backend.sync_containers();
+        let backend = Arc::new(MockBackend::new());
+        backend.sync_workers();
         let job_id = "job-held-scenario".to_string();
         let lease_id = format!("{job_id}-mining-1");
         MiningControlBackend::acquire_lease(
@@ -4154,10 +4153,10 @@ steps:
     }
 
     #[test]
-    fn existing_v1_scenarios_run_without_compose_actions() {
+    fn existing_v1_scenarios_run_through_domain_actions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = Arc::new(BlockingExecutor::new());
-        let (backend, manager) = manager(dir.path(), executor);
+        let (_backend, manager) = manager(dir.path(), executor);
         let created = manager
             .start_scenario(
                 r#"
@@ -4196,7 +4195,6 @@ steps:
             manager.get(&created.job_id).expect("job").summary.state,
             JobState::Succeeded
         );
-        assert!(backend.compose_calls().is_empty());
     }
 
     #[test]
@@ -4271,7 +4269,6 @@ steps:
             .expect("spam status")
             .active_leases
             .is_empty());
-        assert!(backend.compose_calls().is_empty());
     }
 
     #[test]
@@ -4349,7 +4346,6 @@ steps:
             .expect("network status")
             .active_lease
             .is_none());
-        assert!(backend.compose_calls().is_empty());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Compatibility wrapper for the durable control-plane degradation job.
+# Convenience wrapper for the durable control-plane degradation job.
 # Usage: ./scripts/degrade.sh <node> <delay-ms> <loss-pct> <seconds>
 
 set -euo pipefail

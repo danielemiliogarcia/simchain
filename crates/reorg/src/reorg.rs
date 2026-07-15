@@ -42,7 +42,7 @@ pub struct WitnessTarget {
     pub name: String,
     pub rpc_url: RpcUrl,
     /// Control-plane jobs require a positive convergence witness. The legacy
-    /// compatibility binary keeps its historical best-effort behavior.
+    /// standalone binary keeps its historical best-effort behavior.
     pub required: bool,
 }
 

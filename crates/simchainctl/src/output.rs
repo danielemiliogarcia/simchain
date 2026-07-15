@@ -1,6 +1,6 @@
 use crate::client::ClientError;
 use simchain_common::control_api::{
-    AbortJobResponse, ComponentControlResponse, ConfigResponse, JobCheckpointResponse,
+    AbortJobResponse, ApplyReport, ComponentControlResponse, ConfigResponse, JobCheckpointResponse,
     JobCreatedResponse, JobDetail, JobEvent, JobListResponse, StatusResponse,
 };
 use std::io::{self, Write};
@@ -26,10 +26,51 @@ pub fn print_status(status: &StatusResponse, json: bool) -> Result<(), ClientErr
         )?;
     }
     for (name, component) in &status.components {
-        writeln!(out, "{}: {}", short_component(name), component.status)?;
+        let reachability = if component.reachable {
+            ""
+        } else {
+            " (unreachable)"
+        };
+        writeln!(out, "{name}: {}{reachability}", component.status)?;
+    }
+    if let Some(explorer) = &status.explorer {
+        writeln!(
+            out,
+            "explorer: {} ({})",
+            explorer.url,
+            if explorer.reachable {
+                "reachable"
+            } else {
+                "unreachable"
+            }
+        )?;
     }
     if let Some(error) = status.last_error.as_deref() {
         writeln!(out, "warning: {error}")?;
+    }
+    Ok(())
+}
+
+pub fn print_apply_report(report: &ApplyReport, json: bool) -> Result<(), ClientError> {
+    if json {
+        return print_json(report);
+    }
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
+        "generation {}: {}",
+        report.generation,
+        if report.changed {
+            "applied"
+        } else {
+            "unchanged"
+        }
+    )?;
+    if !report.components_applied.is_empty() {
+        writeln!(out, "components: {}", report.components_applied.join(", "))?;
+    }
+    for warning in &report.warnings {
+        writeln!(out, "warning: {warning}")?;
     }
     Ok(())
 }
@@ -183,10 +224,6 @@ fn optional(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "unavailable".to_string())
-}
-
-fn short_component(name: &str) -> &str {
-    name.strip_prefix("btc-simnet-").unwrap_or(name)
 }
 
 impl From<io::Error> for ClientError {

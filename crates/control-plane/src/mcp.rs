@@ -171,7 +171,7 @@ impl ControlPlaneMcp {
 
     #[tool(
         name = "get_status",
-        description = "Live simnet status from node1: chain height, best block hash, recent blocks with cadence, mempool depth and fee histogram, plus tool-container states.",
+        description = "Live simnet status from node1: chain height, best block hash, recent blocks with cadence, mempool depth and fee histogram, plus worker, node, network-agent, job, and explorer state.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -232,7 +232,6 @@ impl ControlPlaneMcp {
         let app = self.app.clone();
         let request = ApplyRequest {
             settings: params.settings,
-            base_revision: None,
             base_generation: params.base_generation,
         };
         match tokio::task::spawn_blocking(move || apply(&app, request))
@@ -531,8 +530,8 @@ impl ServerHandler for ControlPlaneMcp {
     }
 }
 
-/// The `/mcp` tower service, mounted into the panel's axum router. Sessions
-/// are in-memory; the panel is single-instance and localhost-only.
+/// The `/mcp` tower service, mounted into the control plane's axum router.
+/// Sessions are in-memory; the control plane is single-instance and localhost-only.
 pub fn mcp_service(
     app: SharedState,
 ) -> StreamableHttpService<ControlPlaneMcp, LocalSessionManager> {

@@ -11,7 +11,7 @@ Start the simnet and control plane, then submit a version-1 YAML file with the f
 client:
 
 ```bash
-docker compose --profile control-plane up -d --build
+docker compose up -d --build
 cargo run -p simchainctl -- scenario run scenarios/reorg-during-sync.yml \
   --result results/reorg.json
 ```
@@ -19,14 +19,6 @@ cargo run -p simchainctl -- scenario run scenarios/reorg-during-sync.yml \
 `scenario run` uploads the file, streams new events, waits for the terminal state, and
 uses stable automation exit codes. The optional result artifact contains the complete
 terminal job, checkpoint summaries, and persisted event history.
-
-The historical one-shot Compose command remains a thin compatibility client. Its image
-has no Docker CLI or Docker socket; it submits the same server-side job:
-
-```bash
-SCENARIO_FILE=scenarios/reorg-during-sync.yml \
-  docker compose --profile scenario run --rm --build btc-simnet-scenario
-```
 
 Every scenario waits for node1 to reach bootstrap height 204 before step 1. Pre-bootstrap
 history mutation remains unsupported because bootstrap funding stages use fixed heights.

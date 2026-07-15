@@ -1,18 +1,15 @@
-//! Shared live-retune settings: the catalog, parsing and validation for every
-//! variable that can be changed on a running simnet by recreating only the
-//! tool containers (see docs/RETUNING.md).
+//! Shared live-retune settings: the catalog, parsing, and validation used by
+//! the resident workers and control plane.
 //!
-//! The mining controller and the spammer validate their env through this
-//! module, and the panel validates proposed settings through it too, so a
-//! configuration the panel accepts is exactly a configuration the tool
-//! containers will accept on restart. Parsing is source-agnostic (an
-//! in-memory map or the process environment) because the panel works on
-//! `.env` contents, not on its own process env.
+//! The mining controller and the spammer validate their boot environment
+//! through this module, and the control plane validates proposed settings
+//! through it too, so a configuration the control plane accepts is exactly a configuration the
+//! workers accept through their policy API. Parsing is source-agnostic so the
+//! same rules apply at boot and during a live transaction.
 //!
-//! Value semantics follow docker-compose interpolation. Most settings use
-//! `${VAR:-default}`, where unset or empty means the default. Optional mining
-//! bounds use `${VAR-default}` so an explicit empty value remains "unbounded"
-//! while an unset variable still receives the catalog default.
+//! For required settings, unset and empty both select the catalog default.
+//! Optional mining bounds preserve an explicit empty value as "unbounded"
+//! while an unset value still receives the catalog default.
 
 use crate::config::ConfigError;
 use std::collections::BTreeMap;
@@ -31,7 +28,7 @@ pub const MAX_DATA_BYTES: u64 = 98_000;
 // ---------------------------------------------------------------------------
 
 /// Key/value lookup the parsers read from: the process environment for the
-/// tool binaries, an in-memory map for the panel.
+/// workers, or an in-memory desired-state map for the control plane.
 pub trait TuningSource {
     fn get(&self, key: &str) -> Option<String>;
 }
@@ -57,7 +54,7 @@ impl TuningSource for std::collections::HashMap<String, String> {
     }
 }
 
-/// Compose-style lookup: unset and empty are both "use the default".
+/// Required-value lookup: unset and empty both mean "use the default".
 fn value_or(source: &dyn TuningSource, key: &str, default: &str) -> String {
     match source.get(key) {
         Some(value) if !value.trim().is_empty() => value,
@@ -464,7 +461,7 @@ pub struct SpamTuning {
 
 impl SpamTuning {
     /// Parse and validate from `source`, enforcing exactly the rules the
-    /// spammer enforces at startup (including the legacy aliases
+    /// spammer enforces at startup (including the deprecated boot aliases
     /// `SPAM_TXS_PER_BLOCK`, `SPAM_PER_MINER_PER_BLOCK` and
     /// `SPAM_TX_DATA_BYTES`). Returns the tuning plus human-readable
     /// warnings (deprecations, clamps) for the caller to log or display.
@@ -804,7 +801,7 @@ impl SettingGroup {
     }
 }
 
-/// Which tool service a key's change requires recreating.
+/// Resident worker that owns a setting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceScope {
     MiningController,
@@ -812,11 +809,10 @@ pub enum ServiceScope {
 }
 
 impl ServiceScope {
-    /// Compose service name (equals the pinned container name).
-    pub fn service_name(self) -> &'static str {
+    pub fn component_name(self) -> &'static str {
         match self {
-            ServiceScope::MiningController => "btc-simnet-mining-controller",
-            ServiceScope::Spammer => "btc-simnet-spammer",
+            ServiceScope::MiningController => "mining",
+            ServiceScope::Spammer => "spam",
         }
     }
 }
@@ -843,9 +839,7 @@ impl ControlKind {
     }
 }
 
-/// One panel-managed variable: metadata for schema/UI plus the default that
-/// matches docker-compose.yml (the value the container gets when the key is
-/// absent from `.env`).
+/// One runtime-managed variable: metadata for schema/UI plus its boot default.
 pub struct SettingSpec {
     pub key: &'static str,
     pub default: &'static str,
@@ -860,7 +854,7 @@ pub struct SettingSpec {
 
 pub const FALLBACK_FEE_WARNING: &str = "FALLBACK_FEE changes the resident spam engine at a safe rebuild boundary. The nodes' boot-time -fallbackfee remains unchanged; wallet-mode spam uses an explicit wallet paytxfee.";
 
-/// The panel-managed catalog, in display order.
+/// The runtime-managed catalog, in display order.
 pub const MANAGED_SETTINGS: &[SettingSpec] = &[
     SettingSpec {
         key: "BLOCK_INTERVAL_MODE",
@@ -1064,16 +1058,6 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
     },
 ];
 
-/// Legacy variables the spammer still honors when run standalone. Under
-/// compose they are inert (docker-compose.yml does not pass them through),
-/// so the panel treats them as unmanaged file content and only surfaces a
-/// warning when they are present.
-pub const LEGACY_SPAM_ALIASES: &[&str] = &[
-    "SPAM_TXS_PER_BLOCK",
-    "SPAM_PER_MINER_PER_BLOCK",
-    "SPAM_TX_DATA_BYTES",
-];
-
 pub fn spec(key: &str) -> Option<&'static SettingSpec> {
     MANAGED_SETTINGS.iter().find(|spec| spec.key == key)
 }
@@ -1082,13 +1066,9 @@ pub fn is_managed_key(key: &str) -> bool {
     spec(key).is_some()
 }
 
-pub fn is_legacy_alias(key: &str) -> bool {
-    LEGACY_SPAM_ALIASES.contains(&key)
-}
-
 /// The full staged map: catalog defaults overlaid with managed entries.
 /// Explicit empty values survive for optional settings; for required settings
-/// empty means the compose default.
+/// empty means the catalog default.
 pub fn staged_map(overrides: &dyn TuningSource) -> BTreeMap<String, String> {
     MANAGED_SETTINGS
         .iter()

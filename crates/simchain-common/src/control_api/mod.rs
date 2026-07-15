@@ -8,7 +8,8 @@ mod jobs;
 mod status;
 
 pub use config::{
-    ApplyMode, ConfigResponse, EffectiveComponentConfig, SchemaResponse, SettingSchema,
+    ApplyMode, ApplyReport, ConfigPatchRequest, ConfigResponse, EffectiveComponentConfig,
+    SchemaResponse, SettingSchema,
 };
 pub use error::{ApiError, ApiErrorEnvelope, ErrorCode, ErrorDetail, RollbackReport};
 pub use jobs::{

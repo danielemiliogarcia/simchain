@@ -59,11 +59,11 @@ pub fn reconcile_once(app: &AppState) -> anyhow::Result<ReconcileOutcome> {
     if app.jobs.active_summary().is_some() {
         return Ok(ReconcileOutcome::default());
     }
-    let desired = app
-        .control_state
-        .read()
-        .expect("control state lock")
-        .clone();
+    let Some(_file_guard) = app.control_store.try_apply_lock()? else {
+        return Ok(ReconcileOutcome::default());
+    };
+    let desired = app.control_store.load_current()?;
+    *app.control_state.write().expect("control state lock") = desired.clone();
     let (desired_tuning, _) = LiveTuning::from_source(&desired.desired)?;
     let mut outcome = ReconcileOutcome::default();
     let mut errors = Vec::new();
@@ -149,20 +149,23 @@ fn apply_spam_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
+    use crate::state::{MINING_COMPONENT, SPAM_COMPONENT};
     use crate::test_support::{test_app, MockBackend};
     use simchain_common::internal_api::DesiredState;
     use std::sync::Arc;
 
     #[test]
-    fn reapplies_both_policies_and_manual_states_without_compose() {
+    fn reapplies_both_policies_and_manual_states() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mock = Arc::new(MockBackend::new(dir.path().join(".env")));
-        mock.sync_containers();
+        let mock = Arc::new(MockBackend::new());
+        mock.sync_workers();
         let app = test_app(dir.path(), mock.clone());
 
         {
-            let mut state = app.control_state.write().expect("control state");
+            let mut state = app
+                .control_store
+                .load_current()
+                .expect("durable control state");
             state.generation = 4;
             state
                 .desired
@@ -172,9 +175,10 @@ mod tests {
                 .insert("SPAM_FILL_BLOCK_RATIO".to_string(), "3".to_string());
             state.mining_state = DesiredState::Paused;
             state.spam_state = DesiredState::Paused;
+            app.control_store.save(&state).expect("save desired state");
         }
-        mock.set_container_env(CONTROLLER_CONTAINER, "BLOCK_INTERVAL_MEAN_SECS", "15");
-        mock.set_container_env(SPAMMER_CONTAINER, "SPAM_FILL_BLOCK_RATIO", "2");
+        mock.set_worker_policy_value(MINING_COMPONENT, "BLOCK_INTERVAL_MEAN_SECS", "15");
+        mock.set_worker_policy_value(SPAM_COMPONENT, "SPAM_FILL_BLOCK_RATIO", "2");
 
         let outcome = reconcile_once(&app).expect("reconcile");
         assert_eq!(
@@ -192,14 +196,13 @@ mod tests {
             app.spam.status().expect("spam").desired_state,
             DesiredState::Paused
         );
-        assert!(mock.compose_calls().is_empty());
     }
 
     #[test]
     fn matching_workers_are_a_noop() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mock = Arc::new(MockBackend::new(dir.path().join(".env")));
-        mock.sync_containers();
+        let mock = Arc::new(MockBackend::new());
+        mock.sync_workers();
         let app = test_app(dir.path(), mock);
         assert_eq!(
             reconcile_once(&app).expect("reconcile"),
@@ -210,27 +213,26 @@ mod tests {
     #[test]
     fn one_unavailable_worker_does_not_block_the_other() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mock = Arc::new(MockBackend::new(dir.path().join(".env")));
-        mock.sync_containers();
+        let mock = Arc::new(MockBackend::new());
+        mock.sync_workers();
         let app = test_app(dir.path(), mock.clone());
         {
-            let mut state = app.control_state.write().expect("control state");
+            let mut state = app
+                .control_store
+                .load_current()
+                .expect("durable control state");
             state.generation = 2;
             state
                 .desired
                 .insert("SPAM_FILL_BLOCK_RATIO".to_string(), "3".to_string());
+            app.control_store.save(&state).expect("save desired state");
         }
-        mock.world
-            .lock()
-            .expect("world")
-            .containers
-            .remove(CONTROLLER_CONTAINER);
+        mock.set_worker_available(MINING_COMPONENT, false);
 
         let error = reconcile_once(&app).expect_err("mining stays unavailable");
         assert!(error.to_string().contains("mining"));
         let spam = app.spam.status().expect("spam still reconciled");
         assert_eq!(spam.effective_generation, 2);
         assert_eq!(spam.policy.fill_block_ratio, 3.0);
-        assert!(mock.compose_calls().is_empty());
     }
 }

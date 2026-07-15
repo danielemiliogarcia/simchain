@@ -82,6 +82,12 @@ pub struct StatusArgs {
     /// Emit the stable JSON response.
     #[arg(long)]
     pub json: bool,
+    /// Continuously poll until interrupted.
+    #[arg(long)]
+    pub watch: bool,
+    /// Poll interval used with --watch.
+    #[arg(long, default_value_t = 2, requires = "watch")]
+    pub interval_secs: u64,
 }
 
 #[derive(Debug, Args)]
@@ -94,6 +100,21 @@ pub struct ConfigArgs {
 pub enum ConfigCommand {
     /// Show desired and effective runtime configuration.
     Show(JsonArgs),
+    /// Patch one or more runtime settings (KEY=VALUE).
+    Set(ConfigSetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigSetArgs {
+    /// Runtime setting assignments. Use KEY= to reset to its default.
+    #[arg(required = true, value_name = "KEY=VALUE")]
+    pub assignments: Vec<String>,
+    /// Reject the patch unless this desired generation is still current.
+    #[arg(long)]
+    pub base_generation: Option<u64>,
+    /// Emit the stable JSON response.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -366,7 +387,19 @@ mod tests {
             Cli::try_parse_from(["simchainctl", "status", "--json"]).expect("status command");
         assert!(matches!(
             status.command,
-            Command::Status(StatusArgs { json: true })
+            Command::Status(StatusArgs { json: true, .. })
+        ));
+
+        let watch =
+            Cli::try_parse_from(["simchainctl", "status", "--watch", "--interval-secs", "5"])
+                .expect("status watch");
+        assert!(matches!(
+            watch.command,
+            Command::Status(StatusArgs {
+                watch: true,
+                interval_secs: 5,
+                ..
+            })
         ));
 
         let spam = Cli::try_parse_from(["simchainctl", "spam", "resume"]).expect("spam command");
@@ -383,6 +416,26 @@ mod tests {
             config.command,
             Command::Config(ConfigArgs {
                 command: ConfigCommand::Show(JsonArgs { json: false })
+            })
+        ));
+
+        let config_set = Cli::try_parse_from([
+            "simchainctl",
+            "config",
+            "set",
+            "BLOCK_INTERVAL_MEAN_SECS=12",
+            "MINING_RNG_SEED=",
+            "--base-generation",
+            "4",
+        ])
+        .expect("config set");
+        assert!(matches!(
+            config_set.command,
+            Command::Config(ConfigArgs {
+                command: ConfigCommand::Set(ConfigSetArgs {
+                    base_generation: Some(4),
+                    ..
+                })
             })
         ));
 

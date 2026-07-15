@@ -13,19 +13,12 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let repo_root = PathBuf::from(env_or("SIMCHAIN_REPO_ROOT", "/workspace"));
-        let scenario_file = resolve_path(
-            &repo_root,
-            PathBuf::from(env_or(
-                "SCENARIO_FILE",
-                "/workspace/scenarios/pause-then-burst.yml",
-            )),
-        );
+        let scenario_file =
+            PathBuf::from(env_or("SCENARIO_FILE", "scenarios/pause-then-burst.yml"));
         let result_file = env::var("SCENARIO_RESULT_FILE")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
-            .map(|path| resolve_path(&repo_root, path));
+            .map(PathBuf::from);
         let timeout_secs = env_or("SCENARIO_TIMEOUT_SECS", "1800")
             .parse::<u64>()
             .context("SCENARIO_TIMEOUT_SECS must be a positive integer")?;
@@ -34,7 +27,7 @@ impl Config {
         }
         let state_dir = env::var("SIMCHAIN_CONTROL_STATE_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| repo_root.join(".simchain-control"));
+            .unwrap_or_else(|_| PathBuf::from(".simchain-control"));
         let configured_token = env::var("SIMCHAIN_CONTROL_TOKEN")
             .ok()
             .filter(|token| !token.trim().is_empty())
@@ -71,14 +64,6 @@ fn wait_for_token(path: &std::path::Path) -> Result<String> {
             bail!("control-plane token is unavailable at {}", path.display());
         }
         std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
-fn resolve_path(root: &std::path::Path, path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
-        path
-    } else {
-        root.join(path)
     }
 }
 

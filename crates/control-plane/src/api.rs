@@ -4,8 +4,8 @@
 use crate::apply::{apply, ApplyRequest};
 use crate::service::{
     abort_job, config, get_checkpoint, get_job, job_events, list_jobs, release_checkpoint, schema,
-    set_mining_state, set_spam_state, settings_state, start_degrade, start_mine, start_partition,
-    start_reorg, start_scenario, start_spam_burst, status, ErrorCode, ServiceError,
+    set_mining_state, set_spam_state, start_degrade, start_mine, start_partition, start_reorg,
+    start_scenario, start_spam_burst, status, ErrorCode, ServiceError,
 };
 use crate::state::SharedState;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -64,11 +64,7 @@ pub fn router(app: SharedState) -> Router {
             "/api/v1/jobs/{job_id}/checkpoints/{name}/release",
             post(release_checkpoint_handler),
         )
-        // Phase-1 compatibility routes; removed with the Compose adapter.
-        .route("/api/v1/state", get(state_handler))
         .route("/api/v1/status", get(status_handler))
-        .route("/api/v1/schema", get(schema_handler))
-        .route("/api/v1/apply", post(apply_handler))
         .nest("/mcp", mcp)
         // Binding to loopback is not sufficient against DNS rebinding: a
         // hostile page can resolve its own hostname to 127.0.0.1. Reject any
@@ -178,18 +174,6 @@ async fn styles_css() -> impl IntoResponse {
     ([(CONTENT_TYPE, "text/css; charset=utf-8")], STYLES_CSS)
 }
 
-async fn state_handler(State(app): State<SharedState>) -> Response {
-    let worker = app.clone();
-    match tokio::task::spawn_blocking(move || settings_state(&worker)).await {
-        Ok(Ok(view)) => Json(view).into_response(),
-        Ok(Err(error)) => error_response(&error),
-        Err(error) => error_response(&ServiceError::new(
-            ErrorCode::Internal,
-            format!("control-plane worker task failed: {error}"),
-        )),
-    }
-}
-
 async fn config_handler(State(app): State<SharedState>) -> Response {
     let worker = app.clone();
     match tokio::task::spawn_blocking(move || config(&worker)).await {
@@ -232,7 +216,7 @@ async fn schema_handler() -> Response {
     Json(schema()).into_response()
 }
 
-async fn apply_handler(State(app): State<SharedState>, request: Request) -> Response {
+async fn config_patch_handler(State(app): State<SharedState>, request: Request) -> Response {
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
@@ -249,38 +233,6 @@ async fn apply_handler(State(app): State<SharedState>, request: Request) -> Resp
             ));
         }
     };
-
-    let worker = app.clone();
-    match tokio::task::spawn_blocking(move || apply(&worker, apply_request)).await {
-        Ok(Ok(report)) => Json(report).into_response(),
-        Ok(Err(error)) => error_response(&error),
-        Err(error) => error_response(&ServiceError::new(
-            ErrorCode::Internal,
-            format!("control-plane worker task failed: {error}"),
-        )),
-    }
-}
-
-async fn config_patch_handler(State(app): State<SharedState>, request: Request) -> Response {
-    if !request_has_token(&app, &request) {
-        return error_response(&ServiceError::new(
-            ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .simchain-control/token)",
-        ));
-    }
-    let payload: Result<Json<ApplyRequest>, JsonRejection> = Json::from_request(request, &()).await;
-    let Json(mut apply_request) = match payload {
-        Ok(payload) => payload,
-        Err(rejection) => {
-            return error_response(&ServiceError::new(
-                ErrorCode::ValidationFailed,
-                format!("invalid request body: {rejection}"),
-            ));
-        }
-    };
-    // The public config contract uses generations. The env revision remains
-    // internal to the transitional adapter.
-    apply_request.base_revision = None;
     let worker = app.clone();
     match tokio::task::spawn_blocking(move || apply(&worker, apply_request)).await {
         Ok(Ok(report)) => Json(report).into_response(),
@@ -769,24 +721,16 @@ mod tests {
     struct Fixture {
         _dir: tempfile::TempDir,
         router: Router,
-        env_file: std::path::PathBuf,
-        mock: Arc<MockBackend>,
     }
 
-    fn fixture(env_content: Option<&str>) -> Fixture {
+    fn fixture(_boot_policy: Option<&str>) -> Fixture {
         let dir = tempfile::tempdir().expect("tempdir");
-        let env_file = dir.path().join(".env");
-        if let Some(content) = env_content {
-            std::fs::write(&env_file, content).expect("seed env");
-        }
-        let mock = Arc::new(MockBackend::new(env_file.clone()));
-        mock.sync_containers();
+        let mock = Arc::new(MockBackend::new());
+        mock.sync_workers();
         let app = Arc::new(test_app(dir.path(), mock.clone()));
         Fixture {
             _dir: dir,
             router: router(app),
-            env_file,
-            mock,
         }
     }
 
@@ -807,18 +751,6 @@ mod tests {
         HttpRequest::get(path)
             .header(header::HOST, "localhost")
             .body(Body::empty())
-            .expect("request")
-    }
-
-    fn post_apply(payload: serde_json::Value, token: Option<&str>) -> HttpRequest<Body> {
-        let mut builder = HttpRequest::post("/api/v1/apply")
-            .header(header::HOST, "localhost")
-            .header(header::CONTENT_TYPE, "application/json");
-        if let Some(token) = token {
-            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
-        }
-        builder
-            .body(Body::from(payload.to_string()))
             .expect("request")
     }
 
@@ -975,45 +907,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_without_token_is_unauthorized() {
+    async fn removed_transitional_config_routes_stay_absent() {
         let fx = fixture(None);
-        let payload = serde_json::json!({"settings": {"FALLBACK_FEE": "0.0002"}});
-        let (status, body) = send(&fx.router, post_apply(payload.clone(), None)).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body["error"]["code"], "unauthorized");
-        let (status, body) = send(&fx.router, post_apply(payload, Some("wrong"))).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body["error"]["code"], "unauthorized");
-        assert!(!fx.env_file.exists(), "no side effects without the token");
+        for request in [
+            get("/api/v1/state"),
+            get("/api/v1/schema"),
+            HttpRequest::post("/api/v1/apply")
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .expect("request"),
+        ] {
+            let (status, _) = send(&fx.router, request).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]
-    async fn apply_with_token_merges_partially() {
-        let fx = fixture(Some("FALLBACK_FEE=0.0002\n"));
+    async fn config_patch_without_token_is_unauthorized() {
+        let fx = fixture(None);
+        let payload = serde_json::json!({"settings": {"FALLBACK_FEE": "0.0002"}});
+        let (status, body) = send(&fx.router, patch_config(payload.clone(), None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+        let (status, body) = send(&fx.router, patch_config(payload, Some("wrong"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+        let (_, config) = send(&fx.router, get("/api/v1/config")).await;
+        assert_eq!(config["generation"], 0);
+    }
+
+    #[tokio::test]
+    async fn config_patch_merges_partially_into_durable_state() {
+        let fx = fixture(None);
         let payload = serde_json::json!({"settings": {"MINER_WEIGHTS": "70,30"}});
-        let (status, body) = send(&fx.router, post_apply(payload, Some("test-token"))).await;
+        let (status, body) = send(&fx.router, patch_config(payload, Some("test-token"))).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["changed"], true);
         assert_eq!(
-            body["components_applied"][0],
-            "btc-simnet-mining-controller"
+            body["components_applied"],
+            serde_json::json!(["mining", "spam"])
         );
-        let written = std::fs::read_to_string(&fx.env_file).expect("read");
-        assert!(
-            written.contains("FALLBACK_FEE=0.0002"),
-            "omitted keys untouched"
-        );
-        assert!(written.contains("MINER_WEIGHTS=70,30"));
+        let (_, config) = send(&fx.router, get("/api/v1/config")).await;
+        assert_eq!(config["desired"]["MINER_WEIGHTS"], "70,30");
+        assert_eq!(config["desired"]["FALLBACK_FEE"], "0.0001");
     }
 
     #[tokio::test]
-    async fn stale_revision_yields_409_with_code() {
-        let fx = fixture(Some("FALLBACK_FEE=0.0002\n"));
+    async fn stale_generation_yields_409_with_code() {
+        let fx = fixture(None);
         let payload = serde_json::json!({
             "settings": {"FALLBACK_FEE": "0.0003"},
-            "base_revision": "deadbeef"
+            "base_generation": 99
         });
-        let (status, body) = send(&fx.router, post_apply(payload, Some("test-token"))).await;
+        let (status, body) = send(&fx.router, patch_config(payload, Some("test-token"))).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"]["code"], "stale_revision");
     }
@@ -1043,7 +989,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mining_pause_uses_worker_api_and_never_compose() {
+    async fn mining_pause_uses_the_worker_api() {
         let fx = fixture(None);
         let (status, body) = send(&fx.router, put_mining_state("paused", None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1054,11 +1000,10 @@ mod tests {
         assert_eq!(body["component"], "mining");
         assert_eq!(body["desired_state"], "paused");
         assert_eq!(body["effective_state"], "paused");
-        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[tokio::test]
-    async fn spam_pause_uses_worker_api_and_never_compose() {
+    async fn spam_pause_uses_the_worker_api() {
         let fx = fixture(None);
         let (status, body) = send(&fx.router, put_spam_state("paused", None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1069,7 +1014,6 @@ mod tests {
         assert_eq!(body["component"], "spam");
         assert_eq!(body["desired_state"], "paused");
         assert_eq!(body["effective_state"], "paused");
-        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[tokio::test]
@@ -1142,7 +1086,6 @@ mod tests {
         let (status, body) = send(&fx.router, get("/api/v1/jobs/missing")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "job_not_found");
-        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[tokio::test]
@@ -1251,7 +1194,6 @@ steps:
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[tokio::test]
@@ -1334,7 +1276,6 @@ steps:
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[tokio::test]
@@ -1394,14 +1335,13 @@ steps:
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["error"]["code"], "validation_failed");
-        assert!(fx.mock.compose_calls().is_empty());
     }
 
     #[tokio::test]
     async fn invalid_value_yields_validation_failed() {
         let fx = fixture(None);
         let payload = serde_json::json!({"settings": {"ENABLE_SPAM": "maybe"}});
-        let (status, body) = send(&fx.router, post_apply(payload, Some("test-token"))).await;
+        let (status, body) = send(&fx.router, patch_config(payload, Some("test-token"))).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["error"]["code"], "validation_failed");
         assert_eq!(body["error"]["details"][0]["key"], "ENABLE_SPAM");
@@ -1410,7 +1350,7 @@ steps:
     #[tokio::test]
     async fn malformed_body_uses_the_error_envelope() {
         let fx = fixture(None);
-        let request = HttpRequest::post("/api/v1/apply")
+        let request = HttpRequest::patch("/api/v1/config")
             .header(header::HOST, "localhost")
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::AUTHORIZATION, "Bearer test-token")
@@ -1492,7 +1432,7 @@ steps:
     }
 
     #[tokio::test]
-    async fn mcp_lists_phase_six_tools() {
+    async fn mcp_lists_control_plane_tools() {
         let router = crate::mcp::ControlPlaneMcp::tool_router();
         let mut names: Vec<String> = router
             .list_all()
@@ -1525,9 +1465,8 @@ steps:
     async fn mcp_reorg_uses_the_same_job_service_contract() {
         use rmcp::handler::server::wrapper::Parameters;
         let dir = tempfile::tempdir().expect("tempdir");
-        let env_file = dir.path().join(".env");
-        let mock = Arc::new(MockBackend::new(env_file));
-        mock.sync_containers();
+        let mock = Arc::new(MockBackend::new());
+        mock.sync_workers();
         let app = Arc::new(test_app(dir.path(), mock));
         let mcp = crate::mcp::ControlPlaneMcp::new(app);
 
@@ -1566,8 +1505,8 @@ steps:
     async fn mcp_scenario_and_checkpoint_use_the_shared_job_contract() {
         use rmcp::handler::server::wrapper::Parameters;
         let dir = tempfile::tempdir().expect("tempdir");
-        let mock = Arc::new(MockBackend::new(dir.path().join(".env")));
-        mock.sync_containers();
+        let mock = Arc::new(MockBackend::new());
+        mock.sync_workers();
         let app = Arc::new(test_app(dir.path(), mock));
         let mcp = crate::mcp::ControlPlaneMcp::new(app.clone());
         let result = mcp
@@ -1631,9 +1570,8 @@ steps:
     async fn mcp_apply_settings_rejects_invalid_values_without_side_effects() {
         use rmcp::handler::server::wrapper::Parameters;
         let dir = tempfile::tempdir().expect("tempdir");
-        let env_file = dir.path().join(".env");
-        let mock = Arc::new(MockBackend::new(env_file.clone()));
-        mock.sync_containers();
+        let mock = Arc::new(MockBackend::new());
+        mock.sync_workers();
         let app = Arc::new(test_app(dir.path(), mock));
         let mcp = crate::mcp::ControlPlaneMcp::new(app);
 
@@ -1653,19 +1591,16 @@ steps:
         };
         let body: serde_json::Value = serde_json::from_str(&text.text).expect("json envelope");
         assert_eq!(body["error"]["code"], "validation_failed");
-        assert!(!env_file.exists(), ".env must be untouched");
     }
 
     #[tokio::test]
     async fn mcp_get_settings_matches_the_http_state_payload() {
-        let fx = fixture(Some("FALLBACK_FEE=0.0002\n"));
+        let fx = fixture(None);
         let (_, http_body) = send(&fx.router, get("/api/v1/config")).await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let env_file = dir.path().join(".env");
-        std::fs::write(&env_file, "FALLBACK_FEE=0.0002\n").expect("seed env");
-        let mock = Arc::new(MockBackend::new(env_file));
-        mock.sync_containers();
+        let mock = Arc::new(MockBackend::new());
+        mock.sync_workers();
         let app = Arc::new(test_app(dir.path(), mock));
         let result = crate::mcp::ControlPlaneMcp::new(app)
             .get_config()
@@ -1675,7 +1610,7 @@ steps:
             panic!("expected text content");
         };
         let mcp_body: serde_json::Value = serde_json::from_str(&text.text).expect("json");
-        // Same shape and same staged values (revisions match too: same content).
+        // HTTP and MCP are thin adapters over the same desired/effective service.
         assert_eq!(mcp_body["desired"], http_body["desired"]);
         assert_eq!(mcp_body["generation"], http_body["generation"]);
         assert_eq!(mcp_body["pending_apply"], http_body["pending_apply"]);

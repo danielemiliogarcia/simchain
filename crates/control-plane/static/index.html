@@ -15,13 +15,20 @@
 
   <main>
     <section class="card" id="chain-card">
-      <h2>Chain</h2>
+      <div class="section-heading">
+        <h2>Chain</h2>
+        <div id="explorer-status" class="explorer-status">
+          <span class="dot off"></span>
+          <span>mempool.space unavailable</span>
+          <a id="explorer-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Open mempool.space ↗</a>
+        </div>
+      </div>
       <div class="tiles" id="tiles"></div>
       <div class="split">
         <div>
           <h3>Recent blocks</h3>
           <table id="blocks">
-            <thead><tr><th>height</th><th>Δt</th><th>txs</th><th>size</th><th>weight</th></tr></thead>
+            <thead><tr><th>height</th><th>hash</th><th>Δt</th><th>txs</th><th>size</th><th>weight</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>

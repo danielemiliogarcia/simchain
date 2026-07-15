@@ -1,6 +1,15 @@
 # Simulating Reorgs
 
-The reorg simulator (a Rust container using only bitcoind RPC calls) invalidates the last *N* blocks on a miner node and mines *N+1* replacements, so the new chain is strictly longer and **the whole network reorgs to it**. Transactions from the orphaned blocks fall back to the mempool; each replacement block is filled by re-reading the mempool live and mining a slice of it with `generateblock`, like the winning chain of a real reorg, so reorged blocks are not empty. Reading the mempool fresh for each block means an RBF replacement that evicts an orphaned tx mid-reorg (e.g. with `ENABLE_SPAM_REPLACES=true`) is picked up automatically. On top of the returned txs it seeds `REORG_ADDS_NEW_TXS` fresh wallet transactions into the mempool first, modelling a node that received transactions its peers have not yet seen. It prints each block's hash and tx count before/after plus a replaced-blocks summary.
+The reorg engine uses only Bitcoin RPC. It invalidates the last *N* blocks on a miner
+node and mines *N+1* replacements, so the new chain is strictly longer and **the whole
+network reorgs to it**. Transactions from the orphaned blocks fall back to the mempool;
+each replacement block is filled by re-reading the mempool live and mining a slice of
+it with `generateblock`, like the winning chain of a real reorg, so reorged blocks are
+not empty. Reading the mempool fresh for each block means an RBF replacement that evicts
+an orphaned tx mid-reorg (for example, with `ENABLE_SPAM_REPLACES=true`) is picked up
+automatically. On top of the returned txs it can seed fresh wallet transactions,
+modelling a node that received transactions its peers have not yet seen. Results include
+each block's hash and transaction count plus a replaced-blocks summary.
 
 When fresh transactions are injected, the log includes the number created and one
 sample txid. Search that txid in the explorer (or with Bitcoin Core RPC) to verify
@@ -12,14 +21,16 @@ hash when you want to inspect a replaced block directly.
 
 ## Control-plane reorg job
 
-The primary operator path is a durable control-plane job. Start the `control-plane`
-profile, then use the dashboard or the thin HTTP CLI:
+The primary operator path is a durable control-plane job. Start the ordinary stack,
+then use the dashboard or the thin HTTP CLI:
 
 ```bash
-docker compose --profile control-plane up -d --build
+docker compose up -d --build
 cargo run -p simchainctl -- reorg --depth 3 --wait
 cargo run -p simchainctl -- reorg --depth 3 --empty --wait
 cargo run -p simchainctl -- jobs list --json
+# Convenience wrapper over the same job API:
+./scripts/simulate-reorg.sh 3 empty
 ```
 
 The server permits one chain-mutating job at a time. Before invalidating history it
@@ -35,18 +46,16 @@ For retry-safe automation, HTTP callers can send `Idempotency-Key`; reusing a ke
 the same normalized request returns the original job. A different request with the same
 key is rejected.
 
-## Legacy one-shot compatibility
+## Standalone one-shot tool
 
-The compatibility binary/profile remains during the migration. Pass `empty` to mine
-**empty** replacement blocks instead (a chaos reorg that leaves the orphaned txs
+The standalone direct-RPC binary/profile is useful for one-off low-level testing. Pass
+`empty` to mine **empty** replacement blocks instead (a chaos reorg that leaves the orphaned txs
 unconfirmed). Unlike the control-plane job, this path does not own worker leases and its
 witness remains best-effort, so normal interactive and CI use should prefer the job API.
 
 ```bash
-./scripts/simulate-reorg.sh 3
-# equivalent to:
 docker compose run --rm btc-simnet-reorg 3     # depth defaults to REORG_DEPTH (3)
-./scripts/simulate-reorg.sh 3 empty            # chaos: mine empty replacement blocks
+docker compose run --rm btc-simnet-reorg 3 empty  # chaos: mine empty replacements
 ```
 
 ## Permanent Drop (double-spend)
@@ -56,7 +65,7 @@ By default a reorg re-mines the orphaned transactions with the **same txids**, s
 ```bash
 REORG_DOUBLE_SPEND_PCT=100 ./scripts/simulate-reorg.sh 3        # drop all eligible
 REORG_DOUBLE_SPEND_PCT=50  ./scripts/simulate-reorg.sh 3        # drop half, re-mine the rest
-# Control-plane equivalent:
+# Direct CLI equivalent:
 cargo run -p simchainctl -- reorg --depth 3 --double-spend-pct 100 --wait
 ```
 

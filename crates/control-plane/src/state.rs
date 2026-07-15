@@ -1,34 +1,28 @@
 //! Control-plane bootstrap configuration and shared application state.
 //!
-//! The panel deliberately does NOT load `.env` into its own process
-//! environment: compose gives shell variables precedence over the project
-//! `.env`, so leaked managed values would override the very file the panel
-//! rewrites (see the plan's finding 1). `.env` is only ever parsed into
-//! in-memory maps.
+//! Boot-only infrastructure stays in the process environment. Runtime mining
+//! and spam intent is loaded from the narrow control-state directory.
 
 use crate::backend::{
-    ComponentBackend, ConfigurationBackend, JobActions, MiningControlBackend,
-    NetworkControlBackend, SpamControlBackend,
+    ChainBackend, MiningControlBackend, NetworkControlBackend, SpamControlBackend,
 };
 use crate::control_state::{ControlState, ControlStateStore};
 use crate::jobs::JobManager;
 use crate::status::StatusSnapshot;
+use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-pub const CONTROLLER_CONTAINER: &str = "btc-simnet-mining-controller";
-pub const SPAMMER_CONTAINER: &str = "btc-simnet-spammer";
-pub const NODE1_CONTAINER: &str = "btc-simnet-node1";
-pub const NODE2_CONTAINER: &str = "btc-simnet-node2";
-pub const NODE3_CONTAINER: &str = "btc-simnet-node3";
+pub const MINING_COMPONENT: &str = "mining";
+pub const SPAM_COMPONENT: &str = "spam";
+pub const NODE1_COMPONENT: &str = "node1";
+pub const NODE2_COMPONENT: &str = "node2";
+pub const NODE3_COMPONENT: &str = "node3";
 
 #[derive(Clone, Debug)]
 pub struct ControlPlaneConfig {
     pub listen_addr: SocketAddr,
-    pub repo_root: PathBuf,
-    pub env_file: PathBuf,
-    pub compose_project: String,
     pub node1_url: String,
     pub node2_url: String,
     pub node3_url: String,
@@ -39,25 +33,17 @@ pub struct ControlPlaneConfig {
     pub node2_network_agent_url: String,
     pub node3_network_agent_url: String,
     pub internal_token: String,
+    pub explorer_url: String,
+    pub explorer_probe_url: String,
 }
 
 impl ControlPlaneConfig {
     /// Read control-plane bootstrap settings from the process environment.
     pub fn from_process_env() -> anyhow::Result<Self> {
         let listen_addr = std::env::var("CONTROL_PLANE_LISTEN_ADDR")
-            .or_else(|_| std::env::var("PANEL_LISTEN_ADDR"))
             .unwrap_or_else(|_| "127.0.0.1:8090".to_string())
             .parse::<SocketAddr>()
             .map_err(|error| anyhow::anyhow!("invalid CONTROL_PLANE_LISTEN_ADDR: {error}"))?;
-        let repo_root =
-            PathBuf::from(std::env::var("SIMCHAIN_REPO_ROOT").unwrap_or_else(|_| ".".to_string()));
-        let env_file = std::env::var("SIMCHAIN_ENV_FILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| repo_root.join(".env"));
-        let compose_project = match std::env::var("COMPOSE_PROJECT_NAME") {
-            Ok(value) if !value.trim().is_empty() => value,
-            _ => "simchain".to_string(),
-        };
         let node1_url = std::env::var("NODE1_RPC_URL")
             .unwrap_or_else(|_| "http://btc-simnet-node1:18443".to_string());
         let node2_url = std::env::var("NODE2_RPC_URL")
@@ -66,7 +52,7 @@ impl ControlPlaneConfig {
             .unwrap_or_else(|_| "http://btc-simnet-node3:18443".to_string());
         let state_dir = std::env::var("SIMCHAIN_CONTROL_STATE_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| repo_root.join(".simchain-control"));
+            .unwrap_or_else(|_| PathBuf::from(".simchain-control"));
         let mining_control_url = std::env::var("MINING_CONTROL_URL")
             .unwrap_or_else(|_| "http://btc-simnet-mining-controller:9081".to_string());
         let spam_control_url = std::env::var("SPAM_CONTROL_URL")
@@ -82,11 +68,26 @@ impl ControlPlaneConfig {
         if internal_token.trim().is_empty() {
             anyhow::bail!("SIMCHAIN_INTERNAL_TOKEN must not be empty");
         }
+        let explorer_url = match std::env::var("MEMPOOL_WEB_URL") {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => {
+                let port = std::env::var("MEMPOOL_WEB_PORT")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "1080".to_string())
+                    .parse::<u16>()
+                    .map_err(|error| anyhow::anyhow!("invalid MEMPOOL_WEB_PORT: {error}"))?;
+                format!("http://127.0.0.1:{port}")
+            }
+        };
+        ensure_http_url("MEMPOOL_WEB_URL", &explorer_url)?;
+        let explorer_probe_url = std::env::var("MEMPOOL_WEB_INTERNAL_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| explorer_url.clone());
+        ensure_http_url("MEMPOOL_WEB_INTERNAL_URL", &explorer_probe_url)?;
         Ok(Self {
             listen_addr,
-            repo_root,
-            env_file,
-            compose_project,
             node1_url,
             node2_url,
             node3_url,
@@ -97,16 +98,24 @@ impl ControlPlaneConfig {
             node2_network_agent_url,
             node3_network_agent_url,
             internal_token,
+            explorer_url,
+            explorer_probe_url,
         })
     }
+}
+
+fn ensure_http_url(key: &str, value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.starts_with("http://") || value.starts_with("https://"),
+        "{key} must use http:// or https://"
+    );
+    Ok(())
 }
 
 pub struct AppState {
     pub config: ControlPlaneConfig,
     pub token: String,
-    pub components: Arc<dyn ComponentBackend>,
-    pub configuration: Arc<dyn ConfigurationBackend>,
-    pub job_actions: Arc<dyn JobActions>,
+    pub chain: Arc<dyn ChainBackend>,
     pub mining: Arc<dyn MiningControlBackend>,
     pub spam: Arc<dyn SpamControlBackend>,
     pub network: Arc<dyn NetworkControlBackend>,
@@ -114,6 +123,9 @@ pub struct AppState {
     pub control_state: RwLock<ControlState>,
     pub control_store: ControlStateStore,
     pub status: RwLock<StatusSnapshot>,
+    /// Held for the process lifetime: job coordination is deliberately
+    /// single-instance even though desired-state writes also use a short lock.
+    pub _instance_guard: File,
     /// Serializes applies within this process; the on-disk flock serializes
     /// across processes.
     pub apply_lock: Mutex<()>,
