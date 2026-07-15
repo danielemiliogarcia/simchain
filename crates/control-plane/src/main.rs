@@ -15,8 +15,11 @@ mod docker_inspect;
 mod envfile;
 mod hybrid_backend;
 mod internal_client;
+mod job_store;
+mod jobs;
 mod mcp;
 mod reconcile;
+mod reorg_job;
 mod service;
 mod state;
 mod status;
@@ -113,6 +116,15 @@ async fn main() -> anyhow::Result<()> {
         mining.clone(),
         spam.clone(),
     ));
+    let control_state =
+        store.load_or_initialize(control_state::desired_from_legacy_env(&config.env_file)?)?;
+    let reorg_executor = Arc::new(reorg_job::RpcReorgExecutor::from_config(&config)?);
+    let jobs = jobs::JobManager::open(
+        &config.state_dir,
+        mining.clone(),
+        spam.clone(),
+        reorg_executor,
+    )?;
     let app = Arc::new(AppState {
         config: config.clone(),
         token,
@@ -121,9 +133,8 @@ async fn main() -> anyhow::Result<()> {
         job_actions: backend,
         mining,
         spam,
-        control_state: RwLock::new(
-            store.load_or_initialize(control_state::desired_from_legacy_env(&config.env_file)?)?,
-        ),
+        jobs,
+        control_state: RwLock::new(control_state),
         control_store: store,
         status: RwLock::new(status::StatusSnapshot::default()),
         apply_lock: Mutex::new(()),

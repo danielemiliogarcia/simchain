@@ -10,9 +10,37 @@ queryable by their old hash (unless the node is pruned or its volumes are delete
 The explorer's height timeline shows only the active chain, so retain the logged old
 hash when you want to inspect a replaced block directly.
 
-## One-Shot Reorg
+## Control-plane reorg job
 
-Pass `empty` to mine **empty** replacement blocks instead (a chaos reorg that leaves the orphaned txs unconfirmed): `./scripts/simulate-reorg.sh 3 empty`. It is a per-run argument, not a setting, so a real reorg and an empty one can be issued against the same running chain.
+The primary operator path is a durable control-plane job. Start the `control-plane`
+profile, then use the dashboard or the thin HTTP CLI:
+
+```bash
+docker compose --profile control-plane up -d --build
+cargo run -p simchainctl -- reorg --depth 3 --wait
+cargo run -p simchainctl -- reorg --depth 3 --empty --wait
+cargo run -p simchainctl -- jobs list --json
+```
+
+The server permits one chain-mutating job at a time. Before invalidating history it
+acquires acknowledged pause leases from spam and mining; those leases preserve each
+worker's manual desired state. It holds them through a required node1 convergence
+witness and releases spam first so chain-derived pools reconcile while mining is still
+paused. Job metadata, progress events, primary result/failure, and cleanup outcome are
+reported separately. Closing a client does not cancel the job. `jobs abort` is
+cooperative: before invalidation it stops cleanly, while after invalidation it completes
+the minimum safe rewrite and convergence before cleanup.
+
+For retry-safe automation, HTTP callers can send `Idempotency-Key`; reusing a key with
+the same normalized request returns the original job. A different request with the same
+key is rejected.
+
+## Legacy one-shot compatibility
+
+The compatibility binary/profile remains during the migration. Pass `empty` to mine
+**empty** replacement blocks instead (a chaos reorg that leaves the orphaned txs
+unconfirmed). Unlike the control-plane job, this path does not own worker leases and its
+witness remains best-effort, so normal interactive and CI use should prefer the job API.
 
 ```bash
 ./scripts/simulate-reorg.sh 3
@@ -28,6 +56,8 @@ By default a reorg re-mines the orphaned transactions with the **same txids**, s
 ```bash
 REORG_DOUBLE_SPEND_PCT=100 ./scripts/simulate-reorg.sh 3        # drop all eligible
 REORG_DOUBLE_SPEND_PCT=50  ./scripts/simulate-reorg.sh 3        # drop half, re-mine the rest
+# Control-plane equivalent:
+cargo run -p simchainctl -- reorg --depth 3 --double-spend-pct 100 --wait
 ```
 
 It logs the configured percentage, the eligible/selected counts, and every `old_txid -> new_txid` pair (with how many descendants each replacement pruned), so the drop is auditable.

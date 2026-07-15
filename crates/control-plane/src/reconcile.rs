@@ -56,6 +56,9 @@ pub fn reconcile_once(app: &AppState) -> anyhow::Result<ReconcileOutcome> {
     let Ok(_guard) = app.apply_lock.try_lock() else {
         return Ok(ReconcileOutcome::default());
     };
+    if app.jobs.active_summary().is_some() {
+        return Ok(ReconcileOutcome::default());
+    }
     let desired = app
         .control_state
         .read()

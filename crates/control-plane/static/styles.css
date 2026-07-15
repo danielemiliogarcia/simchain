@@ -39,6 +39,8 @@ main {
   align-items: start;
 }
 @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+#settings-card { grid-column: 1 / -1; }
+@media (max-width: 1100px) { #settings-card { grid-column: auto; } }
 .card {
   background: var(--card);
   border: 1px solid var(--line);
@@ -76,6 +78,73 @@ td:first-child, th:first-child { text-align: left; }
 #mining-resume, #spam-resume { background: var(--ok); }
 .action-result { color: var(--dim); font-size: 0.72rem; min-height: 1rem; margin-top: 0.35rem; }
 .action-result.err { color: var(--err); }
+.mutation-lock {
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--ok);
+  font-size: 0.76rem;
+  margin-bottom: 0.8rem;
+  padding: 0.4rem 0.55rem;
+}
+.mutation-lock.busy { color: var(--warn); border-color: var(--warn); }
+.action-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(9rem, 1fr));
+  gap: 0.55rem 0.8rem;
+  align-items: end;
+}
+.action-form label { color: var(--dim); font-size: 0.74rem; }
+.action-form input[type="number"], .action-form select {
+  display: block;
+  width: 100%;
+  margin-top: 0.2rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.3rem 0.45rem;
+  font: inherit;
+}
+.action-form .check-field {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 2rem;
+  color: var(--text);
+}
+.action-form button { min-height: 2rem; }
+.job-heading { display: flex; justify-content: space-between; align-items: center; }
+.job-heading h3 { margin-top: 1rem; }
+.job-detail {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 5px;
+  padding: 0.5rem 0.65rem;
+  font-size: 0.76rem;
+  white-space: pre-wrap;
+}
+.job-detail.state-succeeded { border-left-color: var(--ok); }
+.job-detail.state-failed, .job-detail.state-interrupted { border-left-color: var(--err); }
+.job-detail.state-aborted, .job-detail.state-abort_requested { border-left-color: var(--warn); }
+.job-events {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  list-style: none;
+  margin: 0.55rem 0 0;
+  max-height: 13rem;
+  overflow: auto;
+  padding: 0.35rem 0.55rem;
+}
+.job-events li { display: grid; grid-template-columns: 11rem 1fr; gap: 0.55rem; font-size: 0.72rem; padding: 0.15rem 0; }
+.event-heading { color: var(--dim); }
+.table-scroll { overflow-x: auto; }
+#jobs tbody tr.selected { background: rgba(31, 111, 235, 0.12); }
+.muted { color: var(--dim); }
+button.secondary { background: transparent; border: 1px solid var(--line); color: var(--text); }
+button.danger { background: var(--err); color: white; }
+button.small { padding: 0.15rem 0.45rem; font-size: 0.7rem; }
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .dot.ok { background: var(--ok); }
 .dot.warn { background: var(--warn); }

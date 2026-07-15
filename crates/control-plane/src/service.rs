@@ -3,16 +3,18 @@
 //! drift. Shared response and error types live here too.
 
 use crate::envfile;
+use crate::jobs::JobManagerError;
 use crate::state::{AppState, CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
 use crate::status::StatusSnapshot;
 use serde::Serialize;
 use simchain_common::config::ConfigError;
+use simchain_common::control_api::{
+    AbortJobResponse, ApplyMode, ComponentControlResponse, ConfigResponse,
+    EffectiveComponentConfig, JobCreatedResponse, JobDetail, JobEventsResponse, JobListResponse,
+    OperationSummary, ReorgJobRequest, SchemaResponse, SettingSchema,
+};
 pub use simchain_common::control_api::{
     ApiError as ServiceError, ErrorCode, ErrorDetail, RollbackReport,
-};
-use simchain_common::control_api::{
-    ApplyMode, ComponentControlResponse, ConfigResponse, EffectiveComponentConfig, SchemaResponse,
-    SettingSchema,
 };
 use simchain_common::internal_api::DesiredState;
 use simchain_common::live_tuning::{
@@ -386,7 +388,76 @@ pub fn status(app: &AppState) -> StatusSnapshot {
     if let Some(spam) = status.components.get_mut(SPAMMER_CONTAINER) {
         spam.desired_state = Some(control.spam_state);
     }
+    status.active_operation = app.jobs.active_summary().map(|job| OperationSummary {
+        job_id: job.id,
+        kind: job.kind.as_str().to_string(),
+        state: job.state.as_str().to_string(),
+        phase: job.phase,
+    });
     status
+}
+
+pub fn start_reorg(
+    app: &std::sync::Arc<AppState>,
+    request: ReorgJobRequest,
+    idempotency_key: Option<String>,
+) -> Result<JobCreatedResponse, ServiceError> {
+    let Ok(_guard) = app.apply_lock.try_lock() else {
+        return Err(ServiceError::new(
+            ErrorCode::ApplyInProgress,
+            "another desired-state mutation is already in progress",
+        ));
+    };
+    let desired = app
+        .control_state
+        .read()
+        .expect("control state lock")
+        .desired
+        .clone();
+    let (tuning, _) = LiveTuning::from_source(&desired).map_err(|error| {
+        ServiceError::new(
+            ErrorCode::ValidationFailed,
+            format!("durable spam policy is invalid: {error}"),
+        )
+    })?;
+    app.jobs
+        .start_reorg(request, idempotency_key, tuning.spam.use_raw)
+        .map_err(job_manager_error)
+}
+
+pub fn list_jobs(app: &AppState) -> JobListResponse {
+    app.jobs.list()
+}
+
+pub fn get_job(app: &AppState, job_id: &str) -> Result<JobDetail, ServiceError> {
+    app.jobs.get(job_id).map_err(job_manager_error)
+}
+
+pub fn job_events(
+    app: &AppState,
+    job_id: Option<&str>,
+    after: u64,
+    limit: usize,
+) -> Result<JobEventsResponse, ServiceError> {
+    app.jobs
+        .events(job_id, after, limit)
+        .map_err(job_manager_error)
+}
+
+pub fn abort_job(app: &AppState, job_id: &str) -> Result<AbortJobResponse, ServiceError> {
+    app.jobs.abort(job_id).map_err(job_manager_error)
+}
+
+pub(crate) fn job_manager_error(error: JobManagerError) -> ServiceError {
+    let mut service = ServiceError::new(error.code, error.message);
+    if let Some(job_id) = error.active_job_id {
+        service.details.push(ErrorDetail {
+            key: Some("active_job_id".to_string()),
+            value: Some(job_id),
+            cause: "another chain-mutating job owns the coordinator".to_string(),
+        });
+    }
+    service
 }
 
 pub fn set_mining_state(
@@ -399,6 +470,7 @@ pub fn set_mining_state(
             "another desired-state mutation is already in progress",
         ));
     };
+    app.jobs.ensure_idle().map_err(job_manager_error)?;
     let mut next = app
         .control_state
         .read()
@@ -444,6 +516,7 @@ pub fn set_spam_state(
             "another desired-state mutation is already in progress",
         ));
     };
+    app.jobs.ensure_idle().map_err(job_manager_error)?;
     let mut next = app
         .control_state
         .read()

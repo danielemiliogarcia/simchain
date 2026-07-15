@@ -410,9 +410,9 @@ services:
   # Simchain control plane (profiles: control-plane, legacy alias panel).
   # Browser UI, versioned HTTP API and MCP endpoint on
   # http://localhost:${CONTROL_PLANE_PORT:-8090}. Mining and spam state and
-  # policy use private worker APIs. Later reorg/scenario and node
-  # inspection paths still keep the transitional Docker socket, so this
-  # service remains excluded from all-tools until those phases migrate.
+  # policy use private worker APIs; reorg jobs use leases plus Bitcoin RPC.
+  # Transitional boot/lifecycle inspection still keeps the Docker socket,
+  # so this service remains excluded from all-tools until Phase 7.
   # ---------------------------------------------------------------------------
   btc-simnet-control-plane:
     profiles: ["control-plane", "panel"]

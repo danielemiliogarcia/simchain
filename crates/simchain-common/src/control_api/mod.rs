@@ -4,12 +4,18 @@
 
 mod config;
 mod error;
+mod jobs;
 mod status;
 
 pub use config::{
     ApplyMode, ConfigResponse, EffectiveComponentConfig, SchemaResponse, SettingSchema,
 };
 pub use error::{ApiError, ApiErrorEnvelope, ErrorCode, ErrorDetail, RollbackReport};
+pub use jobs::{
+    AbortJobResponse, CleanupState, JobCleanup, JobCreatedResponse, JobDetail, JobEvent,
+    JobEventsResponse, JobFailure, JobKind, JobLease, JobListResponse, JobState, JobSummary,
+    ReorgJobRequest,
+};
 pub use status::{
     BlockSummary, Cadence, ComponentControlResponse, ComponentState, ExplorerStatus, FeeBucket,
     HealthResponse, ImpairmentSummary, MempoolSummary, OperationSummary, SetComponentStateRequest,

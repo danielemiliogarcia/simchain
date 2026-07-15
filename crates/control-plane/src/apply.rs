@@ -66,6 +66,9 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
             "another apply is already in progress",
         ));
     };
+    app.jobs
+        .ensure_idle()
+        .map_err(crate::service::job_manager_error)?;
     let lock_path = app.config.env_file.with_file_name(format!(
         "{}.panel.lock",
         app.config

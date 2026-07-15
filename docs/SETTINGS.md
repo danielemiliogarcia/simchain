@@ -430,15 +430,17 @@ host access. Full schema and execution semantics: [SCENARIOS.md](SCENARIOS.md).
 
 The control plane is an opt-in localhost web UI + HTTP API + MCP endpoint for live retuning
 (see [RETUNING.md](RETUNING.md)). Mining and spam control use private authenticated
-worker APIs. The service still mounts `/var/run/docker.sock` for transitional node/job
-paths scheduled for later phases; neither worker policy path uses it. Treat access to
-this container as root-equivalent host access until that migration removes the mount.
+worker APIs, and reorg jobs use those worker leases plus Bitcoin RPC directly. The
+service still mounts `/var/run/docker.sock` only for transitional boot/lifecycle
+compatibility scheduled for removal in Phase 7; runtime worker control and reorg jobs
+do not use it. Treat access to this container as root-equivalent host access until that
+migration removes the mount.
 
 | Variable | Default | Description |
 |---|---|---|
 | `CONTROL_PLANE_PORT` | `8090` | Host port (bound to `127.0.0.1` only) for the browser UI, the `/api/v1` JSON API, and the `/mcp` MCP endpoint. |
-| `CONTROL_PLANE_API_TOKEN` | _(empty)_ | Bearer token required on `PATCH /api/v1/config` and the whole `/mcp` endpoint. Empty generates `.simchain-control/token` (mode 0600, gitignored), reused across restarts. |
-| `SIMCHAIN_CONTROL_STATE_DIR` | `.simchain-control` | Narrow directory for the token and atomically written, versioned control state. |
+| `CONTROL_PLANE_API_TOKEN` | _(empty)_ | Bearer token required on every mutation and the whole `/mcp` endpoint. Empty generates `.simchain-control/token` (mode 0600, gitignored), reused across restarts. |
+| `SIMCHAIN_CONTROL_STATE_DIR` | `.simchain-control` | Narrow directory for the token, atomically written desired state, and bounded job metadata/JSONL events. |
 | `MINING_CONTROL_URL` | `http://btc-simnet-mining-controller:9081` | Private Compose-network endpoint used by the control plane; never publish this port to the host. |
 | `MINING_CONTROL_LISTEN_ADDR` | `0.0.0.0:9081` | Mining worker's private control listener. Boot-only. |
 | `SPAM_CONTROL_URL` | `http://btc-simnet-spammer:9082` | Private Compose-network spam endpoint; never publish this port to the host. |

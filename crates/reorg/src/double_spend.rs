@@ -21,6 +21,7 @@ use bitcoincore_rpc::{
     Client, RpcApi,
 };
 use serde_json::json;
+use simchain_common::config::RpcUrl;
 use std::collections::{HashMap, HashSet};
 
 /// Below this the replacement's single output would be an unspendable dust
@@ -198,12 +199,18 @@ pub fn exclusion_set(replacements: &[ReplacementTx]) -> HashSet<Txid> {
 /// the reorg: a tx that cannot be resolved, is not the wallet's, is not a root,
 /// or cannot be re-signed is simply skipped. Returns an empty plan (with a
 /// loggable reason) when `pct == 0` or nothing is eligible.
-pub fn build_plan(node: &Client, branch: &[BranchBlock], pct: u8) -> DoubleSpendPlan {
+pub fn build_plan(
+    node: &Client,
+    branch: &[BranchBlock],
+    pct: u8,
+    rpc_url: &RpcUrl,
+    preferred_wallet: &str,
+) -> DoubleSpendPlan {
     if pct == 0 {
         return DoubleSpendPlan::empty(pct, true, 0, 0);
     }
 
-    let Some((wallet_name, wallet)) = resolve_wallet(node) else {
+    let Some((wallet_name, wallet)) = resolve_wallet(node, rpc_url, preferred_wallet) else {
         return DoubleSpendPlan::empty(pct, false, 0, 0);
     };
 

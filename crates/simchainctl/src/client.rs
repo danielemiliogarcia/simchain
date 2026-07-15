@@ -1,7 +1,8 @@
 use serde::de::DeserializeOwned;
 use simchain_common::control_api::{
-    ApiErrorEnvelope, ComponentControlResponse, ConfigResponse, SetComponentStateRequest,
-    StatusResponse, API_PREFIX,
+    AbortJobResponse, ApiErrorEnvelope, ComponentControlResponse, ConfigResponse,
+    JobCreatedResponse, JobDetail, JobEventsResponse, JobListResponse, ReorgJobRequest,
+    SetComponentStateRequest, StatusResponse, API_PREFIX,
 };
 use simchain_common::internal_api::DesiredState;
 use std::fmt;
@@ -13,6 +14,8 @@ pub enum ClientError {
     Api(String),
     Decode(String),
     Output(String),
+    Timeout(String),
+    Interrupted(String),
 }
 
 impl fmt::Display for ClientError {
@@ -22,7 +25,9 @@ impl fmt::Display for ClientError {
             | Self::Authentication(message)
             | Self::Api(message)
             | Self::Decode(message)
-            | Self::Output(message) => formatter.write_str(message),
+            | Self::Output(message)
+            | Self::Timeout(message)
+            | Self::Interrupted(message) => formatter.write_str(message),
         }
     }
 }
@@ -64,6 +69,50 @@ impl ControlClient {
         self.set_component_state("spam", state)
     }
 
+    pub fn start_reorg(
+        &self,
+        request: &ReorgJobRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<JobCreatedResponse, ClientError> {
+        self.post_json(
+            &format!("{API_PREFIX}/jobs/reorg"),
+            request,
+            idempotency_key,
+        )
+    }
+
+    pub fn jobs(&self) -> Result<JobListResponse, ClientError> {
+        self.get(&format!("{API_PREFIX}/jobs"))
+    }
+
+    pub fn job(&self, job_id: &str) -> Result<JobDetail, ClientError> {
+        self.get(&format!("{API_PREFIX}/jobs/{job_id}"))
+    }
+
+    pub fn job_events(
+        &self,
+        job_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<JobEventsResponse, ClientError> {
+        self.get(&format!(
+            "{API_PREFIX}/jobs/{job_id}/events?after={after}&limit={limit}"
+        ))
+    }
+
+    pub fn abort_job(&self, job_id: &str) -> Result<AbortJobResponse, ClientError> {
+        let path = format!("{API_PREFIX}/jobs/{job_id}/abort");
+        let url = format!("{}{path}", self.base_url);
+        let mut request = minreq::post(&url).with_timeout(10);
+        if let Some(token) = self.token.as_deref() {
+            request = request.with_header("Authorization", format!("Bearer {token}"));
+        }
+        let response = request
+            .send()
+            .map_err(|error| ClientError::Unavailable(format!("cannot reach {url}: {error}")))?;
+        self.decode(&url, response)
+    }
+
     fn set_component_state(
         &self,
         component: &str,
@@ -91,6 +140,31 @@ impl ControlClient {
         let mut request = minreq::get(&url).with_timeout(10);
         if let Some(token) = self.token.as_deref() {
             request = request.with_header("Authorization", format!("Bearer {token}"));
+        }
+        let response = request
+            .send()
+            .map_err(|error| ClientError::Unavailable(format!("cannot reach {url}: {error}")))?;
+        self.decode(&url, response)
+    }
+
+    fn post_json<B: serde::Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        idempotency_key: Option<&str>,
+    ) -> Result<R, ClientError> {
+        let url = format!("{}{path}", self.base_url);
+        let body =
+            serde_json::to_string(body).map_err(|error| ClientError::Output(error.to_string()))?;
+        let mut request = minreq::post(&url)
+            .with_timeout(35)
+            .with_header("Content-Type", "application/json")
+            .with_body(body);
+        if let Some(token) = self.token.as_deref() {
+            request = request.with_header("Authorization", format!("Bearer {token}"));
+        }
+        if let Some(key) = idempotency_key {
+            request = request.with_header("Idempotency-Key", key);
         }
         let response = request
             .send()
@@ -229,6 +303,50 @@ mod tests {
             .set_spam_state(DesiredState::Paused)
             .expect("pause response");
         assert_eq!(response.component, "spam");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn reorg_start_uses_auth_and_idempotency_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /api/v1/jobs/reorg HTTP/1.1"));
+            assert!(request.contains("Authorization: Bearer secret"));
+            assert!(request.contains("Idempotency-Key: retry-1"));
+            assert!(request.contains(r#""depth":4"#));
+            assert!(request.contains(r#""empty":true"#));
+
+            let response_body = serde_json::to_string(&JobCreatedResponse {
+                job_id: "job-4".to_string(),
+                state: simchain_common::control_api::JobState::Starting,
+                reused: false,
+            })
+            .expect("response JSON");
+            let response = format!(
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).expect("response");
+        });
+
+        let client = ControlClient::new(format!("http://{address}"), Some("secret".to_string()));
+        let response = client
+            .start_reorg(
+                &ReorgJobRequest {
+                    depth: 4,
+                    empty: true,
+                    ..ReorgJobRequest::default()
+                },
+                Some("retry-1"),
+            )
+            .expect("job response");
+        assert_eq!(response.job_id, "job-4");
         server.join().expect("server");
     }
 }

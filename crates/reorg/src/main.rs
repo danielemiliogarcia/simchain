@@ -1,11 +1,7 @@
 //! Simchain reorg simulator entry point.
 
-mod chain;
 mod config;
-mod double_spend;
-mod reorg;
 mod runner;
-mod wallet;
 
 use config::ReorgConfig;
 use simchain_common::init_tracing;

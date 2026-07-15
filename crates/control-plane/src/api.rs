@@ -3,12 +3,12 @@
 
 use crate::apply::{apply, ApplyRequest};
 use crate::service::{
-    config, schema, set_mining_state, set_spam_state, settings_state, status, ErrorCode,
-    ServiceError,
+    abort_job, config, get_job, job_events, list_jobs, schema, set_mining_state, set_spam_state,
+    settings_state, start_reorg, status, ErrorCode, ServiceError,
 };
 use crate::state::SharedState;
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{Request, State};
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HOST};
 use axum::http::uri::Authority;
 use axum::http::StatusCode;
@@ -16,6 +16,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use serde::Deserialize;
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -43,6 +44,12 @@ pub fn router(app: SharedState) -> Router {
         .route("/api/v1/config/schema", get(schema_handler))
         .route("/api/v1/mining/state", put(mining_state_handler))
         .route("/api/v1/spam/state", put(spam_state_handler))
+        .route("/api/v1/events", get(global_events_handler))
+        .route("/api/v1/jobs", get(jobs_handler))
+        .route("/api/v1/jobs/reorg", post(reorg_job_handler))
+        .route("/api/v1/jobs/{job_id}", get(job_handler))
+        .route("/api/v1/jobs/{job_id}/events", get(job_events_handler))
+        .route("/api/v1/jobs/{job_id}/abort", post(abort_job_handler))
         // Phase-1 compatibility routes; removed with the Compose adapter.
         .route("/api/v1/state", get(state_handler))
         .route("/api/v1/status", get(status_handler))
@@ -333,6 +340,147 @@ async fn spam_state_handler(State(app): State<SharedState>, request: Request) ->
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+struct EventsQuery {
+    #[serde(default)]
+    after: u64,
+    #[serde(default = "default_event_limit")]
+    limit: usize,
+}
+
+fn default_event_limit() -> usize {
+    100
+}
+
+async fn global_events_handler(
+    State(app): State<SharedState>,
+    query: Result<Query<EventsQuery>, QueryRejection>,
+) -> Response {
+    let query = match events_query(query) {
+        Ok(query) => query,
+        Err(error) => return error_response(&error),
+    };
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || job_events(&worker, None, query.after, query.limit))
+        .await
+    {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
+async fn jobs_handler(State(app): State<SharedState>) -> Response {
+    Json(list_jobs(&app)).into_response()
+}
+
+async fn job_handler(
+    State(app): State<SharedState>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    match get_job(&app, &job_id) {
+        Ok(job) => Json(job).into_response(),
+        Err(error) => error_response(&error),
+    }
+}
+
+async fn job_events_handler(
+    State(app): State<SharedState>,
+    AxumPath(job_id): AxumPath<String>,
+    query: Result<Query<EventsQuery>, QueryRejection>,
+) -> Response {
+    let query = match events_query(query) {
+        Ok(query) => query,
+        Err(error) => return error_response(&error),
+    };
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || {
+        job_events(&worker, Some(&job_id), query.after, query.limit)
+    })
+    .await
+    {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
+fn events_query(
+    query: Result<Query<EventsQuery>, QueryRejection>,
+) -> Result<EventsQuery, ServiceError> {
+    query.map(|Query(query)| query).map_err(|rejection| {
+        ServiceError::new(
+            ErrorCode::ValidationFailed,
+            format!("invalid event cursor query: {rejection}"),
+        )
+    })
+}
+
+async fn reorg_job_handler(State(app): State<SharedState>, request: Request) -> Response {
+    if !request_has_token(&app, &request) {
+        return error_response(&ServiceError::new(
+            ErrorCode::Unauthorized,
+            "missing or invalid bearer token (see .simchain-control/token)",
+        ));
+    }
+    let idempotency_key = match request.headers().get("idempotency-key") {
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value.to_string()),
+            Err(_) => {
+                return error_response(&ServiceError::new(
+                    ErrorCode::ValidationFailed,
+                    "Idempotency-Key must be valid UTF-8",
+                ));
+            }
+        },
+        None => None,
+    };
+    let payload: Result<Json<simchain_common::control_api::ReorgJobRequest>, JsonRejection> =
+        Json::from_request(request, &()).await;
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return error_response(&ServiceError::new(
+                ErrorCode::ValidationFailed,
+                format!("invalid request body: {rejection}"),
+            ));
+        }
+    };
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || start_reorg(&worker, payload, idempotency_key)).await
+    {
+        Ok(Ok(response)) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
+async fn abort_job_handler(
+    State(app): State<SharedState>,
+    AxumPath(job_id): AxumPath<String>,
+    request: Request,
+) -> Response {
+    if !request_has_token(&app, &request) {
+        return error_response(&ServiceError::new(
+            ErrorCode::Unauthorized,
+            "missing or invalid bearer token (see .simchain-control/token)",
+        ));
+    }
+    match abort_job(&app, &job_id) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error_response(&error),
+    }
+}
+
 // Json::from_request needs the trait in scope.
 use axum::extract::FromRequest;
 
@@ -436,6 +584,34 @@ mod tests {
         builder
             .body(Body::from(serde_json::json!({"state": state}).to_string()))
             .expect("request")
+    }
+
+    fn post_reorg(
+        payload: serde_json::Value,
+        token: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::post("/api/v1/jobs/reorg")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if let Some(key) = idempotency_key {
+            builder = builder.header("Idempotency-Key", key);
+        }
+        builder
+            .body(Body::from(payload.to_string()))
+            .expect("request")
+    }
+
+    fn post_abort(job_id: &str, token: Option<&str>) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::post(format!("/api/v1/jobs/{job_id}/abort"))
+            .header(header::HOST, "localhost");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).expect("request")
     }
 
     #[tokio::test]
@@ -567,6 +743,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reorg_jobs_are_authenticated_idempotent_and_queryable() {
+        let fx = fixture(None);
+        let request = serde_json::json!({
+            "depth": 3,
+            "empty": true,
+            "node": "node3",
+            "adds_new_txs": 0,
+            "double_spend_pct": 0
+        });
+        let (status, body) = send(&fx.router, post_reorg(request.clone(), None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = send(
+            &fx.router,
+            post_reorg(request.clone(), Some("test-token"), Some("reorg-retry")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job_id = body["job_id"].as_str().expect("job ID").to_string();
+        assert_eq!(body["reused"], serde_json::Value::Null);
+
+        let (status, body) = send(
+            &fx.router,
+            post_reorg(request, Some("test-token"), Some("reorg-retry")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["job_id"], job_id);
+        assert_eq!(body["reused"], true);
+
+        let (status, body) = send(&fx.router, get("/api/v1/jobs")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["jobs"][0]["id"], job_id);
+
+        let (status, body) = send(&fx.router, get(&format!("/api/v1/jobs/{job_id}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], job_id);
+        assert_eq!(body["request"]["empty"], true);
+
+        let (status, body) = send(
+            &fx.router,
+            get(&format!("/api/v1/jobs/{job_id}/events?after=0&limit=20")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body["events"].as_array().expect("events").is_empty());
+
+        let (status, body) = send(&fx.router, get("/api/v1/events?after=0&limit=20")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["events"]
+            .as_array()
+            .expect("global events")
+            .iter()
+            .all(|event| event["job_id"] == job_id));
+        let (status, body) = send(&fx.router, get("/api/v1/events?after=not-a-number")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "validation_failed");
+
+        let (status, body) = send(&fx.router, post_abort(&job_id, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+        let (status, body) = send(&fx.router, post_abort(&job_id, Some("test-token"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["job_id"], job_id);
+
+        let (status, body) = send(&fx.router, get("/api/v1/jobs/missing")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "job_not_found");
+        assert!(fx.mock.compose_calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn invalid_value_yields_validation_failed() {
         let fx = fixture(None);
         let payload = serde_json::json!({"settings": {"ENABLE_SPAM": "maybe"}});
@@ -661,7 +910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_lists_phase_three_tools() {
+    async fn mcp_lists_phase_four_tools() {
         let router = crate::mcp::ControlPlaneMcp::tool_router();
         let mut names: Vec<String> = router
             .list_all()
@@ -672,14 +921,59 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "abort_job",
                 "get_config",
                 "get_config_schema",
+                "get_job",
                 "get_status",
+                "list_jobs",
                 "set_config",
                 "set_mining_state",
                 "set_spam_state",
+                "start_reorg",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_reorg_uses_the_same_job_service_contract() {
+        use rmcp::handler::server::wrapper::Parameters;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env_file = dir.path().join(".env");
+        let mock = Arc::new(MockBackend::new(env_file));
+        mock.sync_containers();
+        let app = Arc::new(test_app(dir.path(), mock));
+        let mcp = crate::mcp::ControlPlaneMcp::new(app);
+
+        let result = mcp
+            .start_reorg(Parameters(crate::mcp::StartReorgParams {
+                depth: 2,
+                empty: true,
+                node: "node3".to_string(),
+                adds_new_txs: 0,
+                double_spend_pct: 0,
+                idempotency_key: Some("mcp-reorg".to_string()),
+            }))
+            .await
+            .expect("tool result");
+        assert_ne!(result.is_error, Some(true));
+        let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let created: serde_json::Value = serde_json::from_str(&text.text).expect("job JSON");
+        let job_id = created["job_id"].as_str().expect("job ID").to_string();
+
+        let result = mcp
+            .get_job(Parameters(crate::mcp::JobIdParams { job_id }))
+            .await
+            .expect("tool result");
+        assert_ne!(result.is_error, Some(true));
+        let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let job: serde_json::Value = serde_json::from_str(&text.text).expect("job JSON");
+        assert_eq!(job["kind"], "reorg");
+        assert_eq!(job["request"]["depth"], 2);
     }
 
     #[tokio::test]
