@@ -1,7 +1,10 @@
-//! Process execution behind a trait so apply/verify logic is testable
-//! without Docker, plus the real Docker/compose/RPC implementation.
+//! Transitional Docker/Compose adapter behind the domain-facing backend
+//! traits. No control-plane service code depends directly on this module.
 
-use crate::docker_inspect::{parse_inspect_output, ContainerInfo};
+use crate::backend::{
+    BackendOutput, ComponentBackend, ComponentInfo, ConfigurationBackend, JobActions,
+};
+use crate::docker_inspect::parse_inspect_output;
 use bitcoincore_rpc::RpcApi;
 use simchain_common::live_tuning;
 use std::collections::{BTreeMap, HashMap};
@@ -9,57 +12,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-#[derive(Clone, Debug)]
-pub struct CommandOutput {
-    pub success: bool,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-impl CommandOutput {
-    /// A short tail of the combined output for API/MCP result logs.
-    pub fn tail(&self, lines: usize) -> String {
-        let combined = format!("{}\n{}", self.stdout.trim(), self.stderr.trim());
-        let all: Vec<&str> = combined.lines().filter(|l| !l.trim().is_empty()).collect();
-        let start = all.len().saturating_sub(lines);
-        all[start..].join("\n")
-    }
-}
-
-/// Everything the apply transaction and the status sampler need from the
-/// outside world. Mocked in tests.
-pub trait Executor: Send + Sync {
-    /// `docker compose ... up -d --no-deps --force-recreate <services>`.
-    fn compose_recreate(&self, services: &[String]) -> anyhow::Result<CommandOutput>;
-    /// Recreate with explicit managed values. Used only for rollback, where
-    /// the pre-apply running environment—not the possibly dirty `.env`—is the
-    /// state that must be restored.
-    fn compose_recreate_with_env(
-        &self,
-        services: &[String],
-        managed_env: &BTreeMap<String, String>,
-    ) -> anyhow::Result<CommandOutput>;
-    /// Remove containers that did not exist before a failed apply.
-    fn remove_containers(&self, names: &[String]) -> anyhow::Result<CommandOutput>;
-    /// `docker inspect` on pinned container names; missing names are absent.
-    fn inspect(&self, names: &[&str]) -> anyhow::Result<HashMap<String, ContainerInfo>>;
-    /// Cheap node1 RPC liveness probe; the current height on success.
-    fn node1_height(&self) -> anyhow::Result<u64>;
-    /// Highest currently enforced relay/mempool minimum across the three
-    /// nodes, in BTC/kvB.
-    fn spam_min_fee(&self) -> anyhow::Result<f64>;
-    /// Stabilization-window sleep, instant in tests.
-    fn sleep(&self, duration: Duration);
-}
-
-pub struct SystemExecutor {
+pub struct ComposeBackend {
     repo_root: PathBuf,
     env_file: PathBuf,
     project: String,
     node_urls: Vec<String>,
 }
 
-impl SystemExecutor {
+impl ComposeBackend {
     pub fn new(
         repo_root: PathBuf,
         env_file: PathBuf,
@@ -74,22 +34,22 @@ impl SystemExecutor {
         }
     }
 
-    fn run_raw(&self, mut command: Command) -> anyhow::Result<CommandOutput> {
+    fn run_raw(&self, mut command: Command) -> anyhow::Result<BackendOutput> {
         let output = command.output()?;
-        Ok(CommandOutput {
+        Ok(BackendOutput {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
 
-    fn run(&self, mut command: Command) -> anyhow::Result<CommandOutput> {
+    fn run(&self, mut command: Command) -> anyhow::Result<BackendOutput> {
         scrub_managed_env(&mut command);
         self.run_raw(command)
     }
 }
 
-impl SystemExecutor {
+impl ComposeBackend {
     /// The full compose invocation, exposed for tests.
     fn compose_command(&self, services: &[String]) -> Command {
         let mut command = Command::new("docker");
@@ -121,17 +81,17 @@ impl SystemExecutor {
     }
 }
 
-impl Executor for SystemExecutor {
-    fn compose_recreate(&self, services: &[String]) -> anyhow::Result<CommandOutput> {
+impl ConfigurationBackend for ComposeBackend {
+    fn apply_configuration(&self, services: &[String]) -> anyhow::Result<BackendOutput> {
         tracing::info!(services = services.join(","), "compose recreate");
         self.run(self.compose_command(services))
     }
 
-    fn compose_recreate_with_env(
+    fn restore_configuration(
         &self,
         services: &[String],
         managed_env: &BTreeMap<String, String>,
-    ) -> anyhow::Result<CommandOutput> {
+    ) -> anyhow::Result<BackendOutput> {
         tracing::info!(services = services.join(","), "compose rollback recreate");
         let mut command = self.compose_command(services);
         scrub_managed_env(&mut command);
@@ -139,15 +99,15 @@ impl Executor for SystemExecutor {
         self.run_raw(command)
     }
 
-    fn remove_containers(&self, names: &[String]) -> anyhow::Result<CommandOutput> {
+    fn remove_components(&self, names: &[String]) -> anyhow::Result<BackendOutput> {
         if names.is_empty() {
-            return Ok(CommandOutput {
+            return Ok(BackendOutput {
                 success: true,
                 stdout: String::new(),
                 stderr: String::new(),
             });
         }
-        let mut combined = CommandOutput {
+        let mut combined = BackendOutput {
             success: true,
             stdout: String::new(),
             stderr: String::new(),
@@ -170,8 +130,10 @@ impl Executor for SystemExecutor {
         }
         Ok(combined)
     }
+}
 
-    fn inspect(&self, names: &[&str]) -> anyhow::Result<HashMap<String, ContainerInfo>> {
+impl ComponentBackend for ComposeBackend {
+    fn inspect_components(&self, names: &[&str]) -> anyhow::Result<HashMap<String, ComponentInfo>> {
         let mut command = Command::new("docker");
         command
             .arg("inspect")
@@ -189,7 +151,9 @@ impl Executor for SystemExecutor {
         }
         parse_inspect_output(&output.stdout)
     }
+}
 
+impl JobActions for ComposeBackend {
     fn node1_height(&self) -> anyhow::Result<u64> {
         let client = simchain_common::create_client(&self.node_urls[0])?;
         Ok(client.get_block_count()?)
@@ -207,7 +171,7 @@ impl Executor for SystemExecutor {
         Ok(required)
     }
 
-    fn sleep(&self, duration: Duration) {
+    fn wait(&self, duration: Duration) {
         std::thread::sleep(duration);
     }
 }
@@ -230,8 +194,8 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
-    fn executor_with(project: &str, dir: &std::path::Path) -> SystemExecutor {
-        SystemExecutor::new(
+    fn backend_with(project: &str, dir: &std::path::Path) -> ComposeBackend {
+        ComposeBackend::new(
             dir.to_path_buf(),
             dir.join(".env"),
             project.to_string(),
@@ -254,8 +218,8 @@ mod tests {
     fn compose_command_pins_project_and_never_touches_deps() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".env"), "FALLBACK_FEE=0.0002\n").expect("write env");
-        let executor = executor_with("customproj", dir.path());
-        let command = executor.compose_command(&["btc-simnet-spammer".to_string()]);
+        let backend = backend_with("customproj", dir.path());
+        let command = backend.compose_command(&["btc-simnet-spammer".to_string()]);
         let args = args_of(&command);
 
         let p_index = args.iter().position(|a| a == "-p").expect("-p present");
@@ -274,8 +238,8 @@ mod tests {
     #[test]
     fn compose_command_skips_env_file_flag_when_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let executor = executor_with("simchain", dir.path());
-        let command = executor.compose_command(&[]);
+        let backend = backend_with("simchain", dir.path());
+        let command = backend.compose_command(&[]);
         assert!(!args_of(&command).contains(&"--env-file".to_string()));
     }
 
@@ -284,8 +248,8 @@ mod tests {
         // Simulate a stale managed value in the panel's own environment: the
         // child must resolve the value from the file, not the process env.
         let dir = tempfile::tempdir().expect("tempdir");
-        let executor = executor_with("simchain", dir.path());
-        let mut command = executor.compose_command(&[]);
+        let backend = backend_with("simchain", dir.path());
+        let mut command = backend.compose_command(&[]);
         command.env("FALLBACK_FEE", "0.999");
         command.env("SPAM_TXS_PER_BLOCK", "7");
         command.env("DOCKER_HOST", "unix:///var/run/docker.sock");

@@ -1,10 +1,12 @@
-//! Shared test fixtures: a mock executor simulating docker/compose/RPC and
-//! an `AppState` builder, so apply/service tests never require Docker.
+//! Shared test fixtures: a mock implementation of the domain backend ports
+//! and an `AppState` builder. API/service tests never import Compose.
 
-use crate::compose::{CommandOutput, Executor};
-use crate::docker_inspect::ContainerInfo;
+use crate::backend::{
+    BackendOutput, ComponentBackend, ComponentInfo, ConfigurationBackend, JobActions,
+};
+use crate::control_state::ControlStateStore;
 use crate::envfile;
-use crate::state::{AppState, PanelConfig, CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
+use crate::state::{AppState, ControlPlaneConfig, CONTROLLER_CONTAINER, SPAMMER_CONTAINER};
 use crate::status::StatusSnapshot;
 use simchain_common::live_tuning;
 use std::collections::{BTreeMap, HashMap};
@@ -22,7 +24,7 @@ pub enum RecreateOutcome {
 }
 
 pub struct MockWorld {
-    pub containers: HashMap<String, ContainerInfo>,
+    pub containers: HashMap<String, ComponentInfo>,
     pub compose_calls: Vec<Vec<String>>,
     /// Fail the next N compose invocations (exit non-zero).
     pub compose_fail_times: u32,
@@ -32,13 +34,13 @@ pub struct MockWorld {
     pub kill_node1_on_recreate: bool,
 }
 
-pub struct MockExecutor {
+pub struct MockBackend {
     pub env_file: PathBuf,
     pub min_relay: f64,
     pub world: Mutex<MockWorld>,
 }
 
-impl MockExecutor {
+impl MockBackend {
     pub fn new(env_file: PathBuf) -> Self {
         Self {
             env_file,
@@ -62,20 +64,20 @@ impl MockExecutor {
         live_tuning::staged_map(&overrides).into_iter().collect()
     }
 
-    fn container_for(outcome: RecreateOutcome, env: HashMap<String, String>) -> ContainerInfo {
+    fn container_for(outcome: RecreateOutcome, env: HashMap<String, String>) -> ComponentInfo {
         let (status, running, restarting, exit_code, restart_count) = match outcome {
             RecreateOutcome::Running => ("running", true, false, 0, 0),
             RecreateOutcome::ExitedClean => ("exited", false, false, 0, 0),
             RecreateOutcome::Crash => ("exited", false, false, 1, 0),
             RecreateOutcome::RestartLoop => ("restarting", false, true, 1, 2),
         };
-        ContainerInfo {
+        ComponentInfo {
             status: status.to_string(),
             running,
             restarting,
             exit_code,
             restart_count,
-            env,
+            effective_config: env,
         }
     }
 
@@ -95,7 +97,9 @@ impl MockExecutor {
     pub fn set_container_env(&self, name: &str, key: &str, value: &str) {
         let mut world = self.world.lock().expect("world lock");
         let container = world.containers.get_mut(name).expect("container exists");
-        container.env.insert(key.to_string(), value.to_string());
+        container
+            .effective_config
+            .insert(key.to_string(), value.to_string());
     }
 
     pub fn compose_calls(&self) -> Vec<Vec<String>> {
@@ -106,7 +110,7 @@ impl MockExecutor {
         &self,
         services: &[String],
         env: HashMap<String, String>,
-    ) -> anyhow::Result<CommandOutput> {
+    ) -> anyhow::Result<BackendOutput> {
         let mut world = self.world.lock().expect("world lock");
         world.compose_calls.push(services.to_vec());
         if world.kill_node1_on_recreate {
@@ -114,7 +118,7 @@ impl MockExecutor {
         }
         if world.compose_fail_times > 0 {
             world.compose_fail_times -= 1;
-            return Ok(CommandOutput {
+            return Ok(BackendOutput {
                 success: false,
                 stdout: String::new(),
                 stderr: "simulated compose failure".to_string(),
@@ -129,7 +133,7 @@ impl MockExecutor {
                 .containers
                 .insert(service.clone(), Self::container_for(outcome, env.clone()));
         }
-        Ok(CommandOutput {
+        Ok(BackendOutput {
             success: true,
             stdout: format!("recreated {}", services.join(",")),
             stderr: String::new(),
@@ -137,8 +141,8 @@ impl MockExecutor {
     }
 }
 
-impl Executor for MockExecutor {
-    fn compose_recreate(&self, services: &[String]) -> anyhow::Result<CommandOutput> {
+impl ConfigurationBackend for MockBackend {
+    fn apply_configuration(&self, services: &[String]) -> anyhow::Result<BackendOutput> {
         let env = {
             // Read the file the apply just wrote, exactly like compose would.
             let content = std::fs::read_to_string(&self.env_file).unwrap_or_default();
@@ -150,27 +154,29 @@ impl Executor for MockExecutor {
         self.recreate_with_env(services, env)
     }
 
-    fn compose_recreate_with_env(
+    fn restore_configuration(
         &self,
         services: &[String],
         managed_env: &BTreeMap<String, String>,
-    ) -> anyhow::Result<CommandOutput> {
+    ) -> anyhow::Result<BackendOutput> {
         self.recreate_with_env(services, managed_env.clone().into_iter().collect())
     }
 
-    fn remove_containers(&self, names: &[String]) -> anyhow::Result<CommandOutput> {
+    fn remove_components(&self, names: &[String]) -> anyhow::Result<BackendOutput> {
         let mut world = self.world.lock().expect("world lock");
         for name in names {
             world.containers.remove(name);
         }
-        Ok(CommandOutput {
+        Ok(BackendOutput {
             success: true,
             stdout: names.join("\n"),
             stderr: String::new(),
         })
     }
+}
 
-    fn inspect(&self, names: &[&str]) -> anyhow::Result<HashMap<String, ContainerInfo>> {
+impl ComponentBackend for MockBackend {
+    fn inspect_components(&self, names: &[&str]) -> anyhow::Result<HashMap<String, ComponentInfo>> {
         let world = self.world.lock().expect("world lock");
         Ok(names
             .iter()
@@ -182,7 +188,9 @@ impl Executor for MockExecutor {
             })
             .collect())
     }
+}
 
+impl JobActions for MockBackend {
     fn node1_height(&self) -> anyhow::Result<u64> {
         if self.world.lock().expect("world lock").node1_ok {
             Ok(100)
@@ -199,12 +207,17 @@ impl Executor for MockExecutor {
         }
     }
 
-    fn sleep(&self, _duration: Duration) {}
+    fn wait(&self, _duration: Duration) {}
 }
 
-pub fn test_app(dir: &Path, executor: Arc<MockExecutor>) -> AppState {
+pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
+    let state_dir = dir.join(".simchain-control");
+    let store = ControlStateStore::open(state_dir.clone()).expect("control store");
+    let desired =
+        crate::control_state::desired_from_legacy_env(&dir.join(".env")).expect("initial desired");
+    let control_state = store.load_or_initialize(desired).expect("control state");
     AppState {
-        config: PanelConfig {
+        config: ControlPlaneConfig {
             listen_addr: "127.0.0.1:0".parse().expect("addr"),
             repo_root: dir.to_path_buf(),
             env_file: dir.join(".env"),
@@ -212,9 +225,14 @@ pub fn test_app(dir: &Path, executor: Arc<MockExecutor>) -> AppState {
             node1_url: "http://mock-node1:18443".to_string(),
             node2_url: "http://mock-node2:18443".to_string(),
             node3_url: "http://mock-node3:18443".to_string(),
+            state_dir,
         },
         token: "test-token".to_string(),
-        executor,
+        components: backend.clone(),
+        configuration: backend.clone(),
+        job_actions: backend,
+        control_state: RwLock::new(control_state),
+        control_store: store,
         status: RwLock::new(StatusSnapshot::default()),
         apply_lock: Mutex::new(()),
     }

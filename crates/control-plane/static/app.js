@@ -1,13 +1,13 @@
-/* Schema-driven control panel: the form is rendered from /api/v1/schema and
- * populated from /api/v1/state; nothing here hard-codes individual settings
+/* Schema-driven control plane: the form comes from /api/v1/config/schema and
+ * is populated from /api/v1/config; nothing here hard-codes individual settings
  * beyond the UI-only ignore rules below. */
 "use strict";
 
-const TOKEN = window.PANEL_TOKEN;
+const TOKEN = window.CONTROL_PLANE_TOKEN;
 const $ = (sel) => document.querySelector(sel);
 
 let schema = null;          // [{key, default, group, scope, control, options, optional, help, warning}]
-let lastState = null;       // last /api/v1/state payload
+let lastState = null;       // last /api/v1/config payload
 let dirty = new Map();      // key -> edited value (string)
 let fieldErrors = new Map(); // key -> latest client/server validation message
 let applying = false;
@@ -78,7 +78,7 @@ function renderStatus(s) {
     `<div class="bar" style="width:${(100 * b.count / max).toFixed(1)}%"></div>` +
     `<span class="n">${b.count}</span></div>`).join("") || "–";
 
-  $("#services").innerHTML = Object.entries(s.services || {}).map(([name, svc]) => {
+  $("#services").innerHTML = Object.entries(s.components || {}).map(([name, svc]) => {
     let cls = "off", text = svc.status;
     if (svc.restarting) { cls = "err"; text = "restarting"; }
     else if (svc.running) { cls = "ok"; }
@@ -91,15 +91,15 @@ function renderStatus(s) {
 /* ---------------------------------------------------------------- settings */
 
 function stagedValues() {
-  const values = new Map(Object.entries(lastState ? lastState.staged : {}));
+  const values = new Map(Object.entries(lastState ? lastState.desired : {}));
   for (const [k, v] of dirty) values.set(k, v);
   return values;
 }
 
 function runningValueFor(spec) {
   if (!lastState) return null;
-  const svc = lastState.running[spec.scope];
-  if (!svc || !svc.present || !svc.values) return null;
+  const svc = lastState.effective[spec.component];
+  if (!svc || !svc.reachable || !svc.values) return null;
   return svc.values[spec.key] ?? "";
 }
 
@@ -162,7 +162,7 @@ function buildForm() {
 }
 
 function onEdit(key, value) {
-  const staged = lastState ? (lastState.staged[key] ?? "") : "";
+  const staged = lastState ? (lastState.desired[key] ?? "") : "";
   if (value === staged) dirty.delete(key); else dirty.set(key, value);
   fieldErrors.delete(key);
   refreshForm();
@@ -177,7 +177,7 @@ function refreshForm() {
     const input = field.querySelector("input, select");
     const isDirty = dirty.has(spec.key);
     if (document.activeElement !== input) {
-      input.value = isDirty ? dirty.get(spec.key) : (lastState.staged[spec.key] ?? "");
+      input.value = isDirty ? dirty.get(spec.key) : (lastState.desired[spec.key] ?? "");
     }
     field.classList.toggle("dirty", isDirty);
 
@@ -199,29 +199,29 @@ function refreshForm() {
       runningEl.className = "running";
     } else {
       runningEl.textContent = "running: " + (running === "" ? "(unset)" : running);
-      const differs = (lastState.staged[spec.key] ?? "") !== running;
+      const differs = (lastState.desired[spec.key] ?? "") !== running;
       runningEl.className = "running" + (differs ? " differs" : "");
     }
   }
 
-  // Impact preview: server-computed pending restarts plus local dirty scopes.
-  const impacted = new Set(lastState.pending_restart || []);
+  // Impact preview: server-computed drift plus locally edited components.
+  const impacted = new Set(lastState.pending_apply || []);
   for (const key of dirty.keys()) {
     const spec = schema.settings.find((s) => s.key === key);
-    if (spec) impacted.add(spec.scope);
+    if (spec) impacted.add(spec.component);
   }
   $("#impact").textContent = impacted.size
-    ? "apply recreates: " + [...impacted].map((s) => s.replace("btc-simnet-", "")).join(", ")
-    : "no service changes pending";
+    ? "pending apply: " + [...impacted].map((s) => s.replace("btc-simnet-", "")).join(", ")
+    : "desired and effective configuration match";
   const invalid = [...document.querySelectorAll("#form input, #form select")]
     .some((input) => !input.checkValidity()) || fieldErrors.size > 0;
   $("#apply").disabled = applying || invalid || (dirty.size === 0 && impacted.size === 0);
 
   const errors = [];
-  if (!lastState.staged_valid) {
-    const details = (lastState.staged_errors || [])
+  if (!lastState.desired_valid) {
+    const details = (lastState.desired_errors || [])
       .map((d) => `${d.key ?? ""}${d.value != null ? "=" + d.value : ""}: ${d.cause}`).join("\n");
-    errors.push({ className: "pageerr", text: `.env contains invalid managed values:\n${details}` });
+    errors.push({ className: "pageerr", text: `desired configuration is invalid:\n${details}` });
   }
   for (const warning of lastState.warnings || []) {
     errors.push({ className: "pagewarn", text: warning });
@@ -236,7 +236,7 @@ function refreshForm() {
 }
 
 async function refreshState() {
-  const { ok, body } = await api("/api/v1/state");
+  const { ok, body } = await api("/api/v1/config");
   if (!ok || !body) return;
   lastState = body;
   refreshForm();
@@ -264,20 +264,20 @@ async function doApply() {
   button.textContent = "Applying…";
   try {
     const settings = Object.fromEntries(dirty);
-    const { ok, status, body } = await api("/api/v1/apply", {
-      method: "POST",
+    const { ok, status, body } = await api("/api/v1/config", {
+      method: "PATCH",
       headers: {
         "Content-Type": "application/json",
         "Authorization": "Bearer " + TOKEN,
       },
-      body: JSON.stringify({ settings, base_revision: lastState ? lastState.revision : null }),
+      body: JSON.stringify({ settings, base_generation: lastState ? lastState.generation : null }),
     });
     if (ok) {
       dirty.clear();
       fieldErrors.clear();
       showResult(JSON.stringify(body, null, 2), false);
     } else if (status === 409 && body && body.error && body.error.code === "stale_revision") {
-      showResult("Conflict: .env changed since this page loaded (another tab or a manual edit).\n" +
+      showResult("Conflict: desired configuration changed since this page loaded.\n" +
         "The form has been refreshed — review and apply again.\n\n" + JSON.stringify(body, null, 2), true);
     } else {
       fieldErrors.clear();
@@ -298,7 +298,7 @@ async function doApply() {
 /* -------------------------------------------------------------------- init */
 
 async function init() {
-  const { body } = await api("/api/v1/schema");
+  const { body } = await api("/api/v1/config/schema");
   schema = body;
   buildForm();
   await refreshState();

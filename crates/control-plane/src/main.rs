@@ -8,7 +8,9 @@
 
 mod api;
 mod apply;
+mod backend;
 mod compose;
+mod control_state;
 mod docker_inspect;
 mod envfile;
 mod mcp;
@@ -20,19 +22,21 @@ mod test_support;
 
 use rand::RngCore;
 use simchain_common::config::CommonConfig;
-use state::{AppState, PanelConfig};
+use state::{AppState, ControlPlaneConfig};
 use std::sync::{Arc, Mutex, RwLock};
 
-fn load_or_create_token(config: &PanelConfig) -> anyhow::Result<String> {
-    let configured = std::env::var("PANEL_API_TOKEN").ok();
+fn load_or_create_token(config: &ControlPlaneConfig) -> anyhow::Result<String> {
+    let configured = std::env::var("CONTROL_PLANE_API_TOKEN")
+        .or_else(|_| std::env::var("PANEL_API_TOKEN"))
+        .ok();
     load_or_create_token_from(config, configured.as_deref())
 }
 
 fn load_or_create_token_from(
-    config: &PanelConfig,
+    config: &ControlPlaneConfig,
     configured: Option<&str>,
 ) -> anyhow::Result<String> {
-    let path = config.repo_root.join(".panel-token");
+    let path = config.state_dir.join("token");
     let configured = configured
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty());
@@ -41,10 +45,15 @@ fn load_or_create_token_from(
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty());
 
-    let (token, generated) = match (configured, existing) {
-        (Some(token), _) => (token, false),
-        (None, Some(token)) => (token, false),
-        (None, None) => {
+    let legacy = std::fs::read_to_string(config.repo_root.join(".panel-token"))
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
+
+    let (token, generated) = match (configured, existing, legacy) {
+        (Some(token), _, _) => (token, false),
+        (None, Some(token), _) | (None, None, Some(token)) => (token, false),
+        (None, None, None) => {
             let mut bytes = [0u8; 32];
             rand::rng().fill_bytes(&mut bytes);
             (
@@ -55,26 +64,30 @@ fn load_or_create_token_from(
     };
 
     // Always synchronize the effective token to the documented host-visible
-    // file. This also repairs a stale file after PANEL_API_TOKEN is changed
+    // file. This also repairs a stale file after the configured token changes
     // and reasserts host ownership plus mode 0600 on every startup.
-    let ownership = envfile::dir_ownership(&config.repo_root, 0o600)?;
+    let ownership = envfile::dir_ownership(&config.state_dir, 0o600)?;
     envfile::write_atomic(&path, &token, ownership)?;
     if generated {
-        tracing::info!("generated a new panel API token at {}", path.display());
+        tracing::info!(
+            "generated a new control-plane API token at {}",
+            path.display()
+        );
     } else {
-        tracing::info!("synchronized panel API token file at {}", path.display());
+        tracing::info!("synchronized control-plane API token at {}", path.display());
     }
     Ok(token)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    simchain_common::init_tracing("simchain_panel=info,info");
+    simchain_common::init_tracing("simchain_control_plane=info,info");
     CommonConfig::init()?;
-    let config = PanelConfig::from_process_env()?;
+    let config = ControlPlaneConfig::from_process_env()?;
+    let store = control_state::ControlStateStore::open(config.state_dir.clone())?;
     let token = load_or_create_token(&config)?;
 
-    let executor = Arc::new(compose::SystemExecutor::new(
+    let backend = Arc::new(compose::ComposeBackend::new(
         config.repo_root.clone(),
         config.env_file.clone(),
         config.compose_project.clone(),
@@ -87,7 +100,13 @@ async fn main() -> anyhow::Result<()> {
     let app = Arc::new(AppState {
         config: config.clone(),
         token,
-        executor,
+        components: backend.clone(),
+        configuration: backend.clone(),
+        job_actions: backend,
+        control_state: RwLock::new(
+            store.load_or_initialize(control_state::desired_from_legacy_env(&config.env_file)?)?,
+        ),
+        control_store: store,
         status: RwLock::new(status::StatusSnapshot::default()),
         apply_lock: Mutex::new(()),
     });
@@ -97,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
     let router = api::router(app);
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     tracing::info!(
-        "panel listening on {} (compose project {}, env file {})",
+        "control plane listening on {} (compose project {}, env file {})",
         config.listen_addr,
         config.compose_project,
         config.env_file.display()
@@ -111,8 +130,9 @@ mod token_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn config(dir: &std::path::Path) -> PanelConfig {
-        PanelConfig {
+    fn config(dir: &std::path::Path) -> ControlPlaneConfig {
+        std::fs::create_dir_all(dir.join(".simchain-control")).expect("state dir");
+        ControlPlaneConfig {
             listen_addr: "127.0.0.1:0".parse().expect("address"),
             repo_root: dir.to_path_buf(),
             env_file: dir.join(".env"),
@@ -120,13 +140,15 @@ mod token_tests {
             node1_url: "http://node1:18443".to_string(),
             node2_url: "http://node2:18443".to_string(),
             node3_url: "http://node3:18443".to_string(),
+            state_dir: dir.join(".simchain-control"),
         }
     }
 
     #[test]
     fn configured_token_replaces_stale_file_and_keeps_it_private() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join(".panel-token");
+        let path = dir.path().join(".simchain-control/token");
+        std::fs::create_dir_all(dir.path().join(".simchain-control")).expect("state dir");
         std::fs::write(&path, "stale").expect("seed token");
         let token =
             load_or_create_token_from(&config(dir.path()), Some("configured")).expect("load token");
@@ -148,7 +170,9 @@ mod token_tests {
     #[test]
     fn existing_generated_token_is_reused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join(".panel-token"), "existing\n").expect("seed token");
+        std::fs::create_dir_all(dir.path().join(".simchain-control")).expect("state dir");
+        std::fs::write(dir.path().join(".simchain-control/token"), "existing\n")
+            .expect("seed token");
         let token = load_or_create_token_from(&config(dir.path()), None).expect("load token");
         assert_eq!(token, "existing");
     }

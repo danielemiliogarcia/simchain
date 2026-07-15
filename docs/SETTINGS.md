@@ -426,18 +426,19 @@ profile mounts `/var/run/docker.sock` because pause/resume, reorg, and partition
 drive existing compose/script surfaces. Treat access to this container as root-equivalent
 host access. Full schema and execution semantics: [SCENARIOS.md](SCENARIOS.md).
 
-## Dashboard / control panel (profile `panel`)
+## Simchain control plane (profile `control-plane`; alias `panel`)
 
-The panel is an opt-in localhost web UI + HTTP API + MCP endpoint for live retuning
+The control plane is an opt-in localhost web UI + HTTP API + MCP endpoint for live retuning
 (see [RETUNING.md](RETUNING.md)). Like the scenario engine it mounts
 `/var/run/docker.sock`; treat access to this container as root-equivalent host access.
 
 | Variable | Default | Description |
 |---|---|---|
-| `PANEL_WEB_PORT` | `8090` | Host port (bound to `127.0.0.1` only) for the browser UI, the `/api/v1` JSON API, and the `/mcp` MCP endpoint. |
-| `PANEL_API_TOKEN` | _(empty)_ | Bearer token required on `POST /api/v1/apply` and the whole `/mcp` endpoint. Empty means the panel generates one at first start and persists it to `.panel-token` (repo root, mode 0600, gitignored); it is reused across restarts. |
+| `CONTROL_PLANE_PORT` | `8090` | Host port (bound to `127.0.0.1` only) for the browser UI, the `/api/v1` JSON API, and the `/mcp` MCP endpoint. |
+| `CONTROL_PLANE_API_TOKEN` | _(empty)_ | Bearer token required on `PATCH /api/v1/config` and the whole `/mcp` endpoint. Empty generates `.simchain-control/token` (mode 0600, gitignored), reused across restarts. |
+| `SIMCHAIN_CONTROL_STATE_DIR` | `.simchain-control` | Narrow directory for the token and atomically written, versioned control state. |
 
-Panel-managed settings in v1 (the panel validates, canonicalizes and rewrites exactly
+Control-plane-managed settings in the transitional backend (it validates and rewrites exactly
 these keys in `.env`; everything else in the file is preserved verbatim):
 
 - Mining controller scope: `BLOCK_INTERVAL_MODE`, `BLOCK_INTERVAL_MEAN_SECS`,
@@ -450,7 +451,7 @@ these keys in `.env`; everything else in the file is preserved verbatim):
   `ENABLE_SPAM_REPLACES`, `SPAM_REPLACES_PER_MINER_PER_BLOCK`.
 
 Node-level settings (`BTC_IMAGE`, host ports, `MIN_RELAY_TX_FEE`, ZMQ,
-`BLOCK_RESERVED_WEIGHT`, credentials, ...) are deliberately not panel-managed: they are
+`BLOCK_RESERVED_WEIGHT`, credentials, ...) are deliberately not control-plane-managed: they are
 not safe live retunes.
 
 ## Tools: electrs (profiles `electrs`, `mempool`, `all-tools`)

@@ -1,5 +1,6 @@
 //! Parsing of `docker inspect` output into the state and env the panel needs.
 
+use crate::backend::ComponentInfo;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -35,20 +36,10 @@ struct RawConfig {
 
 /// One container's state and effective environment (keyed by container name
 /// in the maps this module returns).
-#[derive(Clone, Debug)]
-pub struct ContainerInfo {
-    pub status: String,
-    pub running: bool,
-    pub restarting: bool,
-    pub exit_code: i64,
-    pub restart_count: i64,
-    pub env: HashMap<String, String>,
-}
-
 /// Parse `docker inspect <names...>` stdout. Docker prints a JSON array of
 /// the containers it found (and exits non-zero listing the missing ones on
 /// stderr); missing containers are simply absent from the result map.
-pub fn parse_inspect_output(stdout: &str) -> anyhow::Result<HashMap<String, ContainerInfo>> {
+pub fn parse_inspect_output(stdout: &str) -> anyhow::Result<HashMap<String, ComponentInfo>> {
     let stdout = stdout.trim();
     if stdout.is_empty() || stdout == "[]" {
         return Ok(HashMap::new());
@@ -69,13 +60,13 @@ pub fn parse_inspect_output(stdout: &str) -> anyhow::Result<HashMap<String, Cont
                 .collect();
             (
                 name,
-                ContainerInfo {
+                ComponentInfo {
                     status: entry.state.status,
                     running: entry.state.running,
                     restarting: entry.state.restarting,
                     exit_code: entry.state.exit_code,
                     restart_count: entry.restart_count,
-                    env,
+                    effective_config: env,
                 },
             )
         })
@@ -108,7 +99,7 @@ mod tests {
         let spammer = &parsed["btc-simnet-spammer"];
         assert!(spammer.running);
         assert_eq!(spammer.restart_count, 2);
-        assert_eq!(spammer.env["FALLBACK_FEE"], "0.0001");
+        assert_eq!(spammer.effective_config["FALLBACK_FEE"], "0.0001");
     }
 
     #[test]
