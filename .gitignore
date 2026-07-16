@@ -13,6 +13,9 @@
 # Chain snapshots (./scripts/snapshot.sh): multi-MB machine-local archives
 /snapshots/
 
+# Scenario result artifacts.
+/results/
+
 # Control-plane state (token, durable desired state, job metadata/results).
 /.simchain-control/*
 !/.simchain-control/.gitkeep

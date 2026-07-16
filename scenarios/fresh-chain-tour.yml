@@ -1,0 +1,31 @@
+version: 1
+steps:
+  - type: wait_height
+    height: 210
+
+  - type: reorg
+    depth: 3
+    empty: true
+
+  - type: wait_height
+    height: 220
+
+  # Organic reorg: node3 is isolated, the connected side mines 5 blocks,
+  # the isolated side mines 6, then the network heals and node1 reorgs.
+  - type: partition
+    node: btc-simnet-node3
+    main_blocks: 5
+    isolated_blocks: 6
+
+  - type: wait_height
+    height: 230
+
+  # A second split on the other miner, again with unequal branch lengths so
+  # the winner is deterministic.
+  - type: partition
+    node: btc-simnet-node2
+    main_blocks: 5
+    isolated_blocks: 6
+
+  - type: wait_height
+    height: 240

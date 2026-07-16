@@ -34,12 +34,12 @@ cleanup() {
 trap cleanup EXIT
 
 docker export "$cid" | tar -tf - >"$rootfs_listing"
-rg_status=0
-forbidden="$(rg '(^|/)(docker|docker-compose|compose|sh|bash|dash|apt|apt-get|dpkg)$' "$rootfs_listing")" \
-  || rg_status=$?
-if ((rg_status > 1)); then
+grep_status=0
+forbidden="$(grep -E '(^|/)(docker|docker-compose|compose|sh|bash|dash|apt|apt-get|dpkg)$' "$rootfs_listing")" \
+  || grep_status=$?
+if ((grep_status > 1)); then
   echo "could not inspect the control-plane rootfs" >&2
-  exit "$rg_status"
+  exit "$grep_status"
 fi
 if [[ -n "$forbidden" ]]; then
   echo "forbidden control-plane executables found:" >&2

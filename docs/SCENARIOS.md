@@ -23,6 +23,12 @@ terminal job, checkpoint summaries, and persisted event history.
 Every scenario waits for node1 to reach bootstrap height 204 before step 1. Pre-bootstrap
 history mutation remains unsupported because bootstrap funding stages use fixed heights.
 
+Scenarios do not own Docker lifecycle or global runtime retuning. Start a fresh chain
+with `./scripts/fresh-chain.sh`, change runtime policy with `simchainctl config set`,
+and use standalone control-plane jobs for faucet funding or timed degradation. For an
+end-to-end tour that combines those outer operations with a valid scenario file, see
+`./scripts/run-fresh-chain-tour.sh` and `../scenarios/fresh-chain-tour.yml`.
+
 ## Schema
 
 Every file has exactly `version: 1` and an ordered `steps` list. Unknown fields and step
@@ -129,3 +135,6 @@ before another mutation may begin.
 - `reorg-during-sync.yml` creates a two-block reorganization and observation delay.
 - `partition-node3.yml` builds unequal branches across a temporary partition.
 - `ci-checkpoint.yml` holds a deterministic mempool state for external assertions.
+- `tutorial-one-block.yml` pauses background mining, manually mines one block, then resumes.
+- `fresh-chain-tour.yml` performs the scenario-owned part of the full tour: empty reorg,
+  organic partition reorg, another split, and height waits.

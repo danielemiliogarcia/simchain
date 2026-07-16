@@ -1,0 +1,15 @@
+version: 1
+steps:
+  - type: wait_height
+    height: 204
+
+  - type: pause_mining
+
+  - type: mine
+    node: btc-simnet-node2
+    blocks: 1
+
+  - type: sleep
+    secs: 1
+
+  - type: resume_mining
