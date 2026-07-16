@@ -26,11 +26,11 @@ then use the dashboard or the thin HTTP CLI:
 
 ```bash
 docker compose up -d --build
-cargo run -p simchainctl -- reorg --depth 3 --wait
-cargo run -p simchainctl -- reorg --depth 3 --empty --wait
+cargo run -p simchainctl -- reorg start --depth 3 --wait
+cargo run -p simchainctl -- reorg start --depth 3 --empty --wait
 cargo run -p simchainctl -- jobs list --json
 # Convenience wrapper over the same job API:
-./scripts/simulate-reorg.sh 3 empty
+./scripts/simulate-reorg.sh start 3 empty
 ```
 
 The server permits one chain-mutating job at a time. Before invalidating history it
@@ -63,10 +63,10 @@ docker compose run --rm btc-simnet-reorg 3 empty  # chaos: mine empty replacemen
 By default a reorg re-mines the orphaned transactions with the **same txids**, so a user's transaction only changes block hash/height, it never loses a confirmation. The `empty` mode above models the *temporary* drop (confirmed → 0-conf, re-confirmable). `REORG_DOUBLE_SPEND_PCT=1..100` models the *permanent* drop: for that percentage of the **eligible orphaned wallet txs on the reorg node**, the tool mines a same-input, different-output conflict into the replacement chain, so the originals become permanently invalid and can never re-confirm. This is the outcome exchanges, custody watchers and payment processors must detect: *"my confirmed deposit is gone forever."*
 
 ```bash
-REORG_DOUBLE_SPEND_PCT=100 ./scripts/simulate-reorg.sh 3        # drop all eligible
-REORG_DOUBLE_SPEND_PCT=50  ./scripts/simulate-reorg.sh 3        # drop half, re-mine the rest
+REORG_DOUBLE_SPEND_PCT=100 ./scripts/simulate-reorg.sh start 3  # drop all eligible
+REORG_DOUBLE_SPEND_PCT=50  ./scripts/simulate-reorg.sh start 3  # drop half, re-mine the rest
 # Direct CLI equivalent:
-cargo run -p simchainctl -- reorg --depth 3 --double-spend-pct 100 --wait
+cargo run -p simchainctl -- reorg start --depth 3 --double-spend-pct 100 --wait
 ```
 
 It logs the configured percentage, the eligible/selected counts, and every `old_txid -> new_txid` pair (with how many descendants each replacement pruned), so the drop is auditable.

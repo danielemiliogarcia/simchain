@@ -5,8 +5,8 @@ mod output;
 use clap::Parser;
 use client::{ClientError, ControlClient};
 use commands::{
-    Cli, Command, ConfigCommand, FaucetCommand, JobsCommand, MiningCommand, ScenarioCommand,
-    SpamCommand,
+    Cli, Command, ConfigCommand, DegradeCommand, FaucetCommand, JobsCommand, MiningCommand,
+    PartitionCommand, ReorgCommand, ScenarioCommand, SpamCommand,
 };
 use simchain_common::control_api::{
     CheckpointState, CleanupState, ConfigPatchRequest, DegradeJobRequest, FaucetDeliveryState,
@@ -181,6 +181,10 @@ fn run(cli: Cli) -> Result<(), ClientError> {
             }
         },
         Command::Reorg(args) => {
+            let args = match args.command {
+                Some(ReorgCommand::Start(start)) => start,
+                None => args.start,
+            };
             let response = client.start_reorg(
                 &ReorgJobRequest {
                     depth: args.depth,
@@ -198,6 +202,10 @@ fn run(cli: Cli) -> Result<(), ClientError> {
             }
         }
         Command::Partition(args) => {
+            let args = match args.command {
+                Some(PartitionCommand::Start(start)) => start,
+                None => args.start,
+            };
             let node = scenario_node(&args.node)?;
             let response = client.start_partition(
                 &PartitionJobRequest {
@@ -214,6 +222,12 @@ fn run(cli: Cli) -> Result<(), ClientError> {
             }
         }
         Command::Degrade(args) => {
+            let DegradeCommand::Start(args) = args.command;
+            if args.delay_ms == 0 && args.loss_pct == 0.0 {
+                return Err(ClientError::Local(
+                    "degrade must specify a positive --delay-ms or --loss-pct".to_string(),
+                ));
+            }
             let node = network_node(&args.node)?;
             let response = client.start_degrade(
                 &DegradeJobRequest {

@@ -361,9 +361,9 @@ simchainctl spam pause|resume
 
 simchainctl mine --node node2 --blocks N [--wait]
 simchainctl spam burst --node node2 --txs N [--outputs-per-tx N] [--wait]
-simchainctl reorg --depth N [--empty] [--wait]
-simchainctl partition --node node3 --main-blocks N --isolated-blocks N [--wait]
-simchainctl degrade --node node3 --delay-ms N --loss-pct P --seconds N [--wait]
+simchainctl reorg start --depth N [--empty] [--wait]
+simchainctl partition start --node node3 --main-blocks N --isolated-blocks N [--wait]
+simchainctl degrade start --node node3 --delay-ms N --loss-pct P --seconds N [--wait]
 
 simchainctl scenario start FILE [--json|--id-only]
 simchainctl scenario run FILE [--result FILE]          # start + wait terminal
@@ -394,10 +394,10 @@ success by parsing human prose.
 Keep familiar scripts, but make them thin clients:
 
 ```text
-scripts/simulate-reorg.sh -> simchainctl reorg
+scripts/simulate-reorg.sh -> simchainctl reorg start
 scripts/spam-burst.sh     -> simchainctl spam burst
-scripts/partition.sh      -> simchainctl partition / network status commands
-scripts/degrade.sh        -> simchainctl degrade
+scripts/partition.sh      -> simchainctl partition start / network status commands
+scripts/degrade.sh        -> simchainctl degrade start
 ```
 
 Low-level emergency/operator helpers may remain under an explicitly named `scripts/dev/`

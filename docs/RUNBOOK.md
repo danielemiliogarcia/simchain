@@ -63,7 +63,7 @@ job leases mining, spam, and node3's private network agent; mines three blocks o
 connected side and four on node3; heals; and witnesses the expected winner:
 
 ```bash
-cargo run -p simchainctl -- partition \
+cargo run -p simchainctl -- partition start \
   --node node3 --main-blocks 3 --isolated-blocks 4 --wait
 ```
 
@@ -85,15 +85,15 @@ external nodes disconnected during partition experiments.
 Degrade a node's P2P link for a bounded number of seconds:
 
 ```bash
-cargo run -p simchainctl -- degrade \
+cargo run -p simchainctl -- degrade start \
   --node node3 --delay-ms 500 --loss-pct 1 --seconds 60 --wait
 ```
 
 The convenience wrappers submit the same durable jobs:
 
 ```bash
-./scripts/partition.sh run btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
-./scripts/degrade.sh btc-simnet-node3 500 1 60s
+./scripts/partition.sh start btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
+./scripts/degrade.sh start btc-simnet-node3 500 1 60s
 ```
 
 The three resident agents each share one node namespace and receive only `NET_ADMIN`.
@@ -207,13 +207,13 @@ skipping bootstrap and funding (recipes: [SNAPSHOTS.md](SNAPSHOTS.md)):
 Run a durable three-block reorg and wait for convergence and cleanup:
 
 ```bash
-cargo run -p simchainctl -- reorg --depth 3 --wait
+cargo run -p simchainctl -- reorg start --depth 3 --wait
 ```
 
 Chaos reorg: replace them with empty blocks so orphaned transactions stay unconfirmed:
 
 ```bash
-cargo run -p simchainctl -- reorg --depth 3 --empty --wait
+cargo run -p simchainctl -- reorg start --depth 3 --empty --wait
 ```
 
 The standalone direct-RPC profile remains available for continuous low-level testing:

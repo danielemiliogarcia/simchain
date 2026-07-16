@@ -263,10 +263,11 @@ pub fn run() -> anyhow::Result<()> {
                             0
                         }
                     };
-                    control.finish_cycle(current_height, accepted);
+                    let cycle_duration = cycle_start.elapsed();
+                    control.finish_cycle(current_height, accepted, cycle_duration);
                     tracing::info!(
                         "Spam cycle done in {:.1}s ({accepted} txs accepted)",
-                        cycle_start.elapsed().as_secs_f32()
+                        cycle_duration.as_secs_f32()
                     );
                 }
                 if control.wait_for_block_poll(Duration::from_millis(200), generation)

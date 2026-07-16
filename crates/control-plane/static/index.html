@@ -14,13 +14,20 @@
   </header>
 
   <main>
+    <nav class="dashboard-tabs" role="tablist" aria-label="Dashboard sections">
+      <button id="tab-overview" class="dashboard-tab" type="button" role="tab" aria-selected="true" aria-controls="panel-overview" data-tab="overview">Overview</button>
+      <button id="tab-control" class="dashboard-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-control" data-tab="control">Control</button>
+      <button id="tab-faucet" class="dashboard-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-faucet" data-tab="faucet">Faucet</button>
+    </nav>
+
+    <section id="panel-overview" class="dashboard-panel active" role="tabpanel" aria-labelledby="tab-overview" data-panel="overview">
     <section class="card" id="chain-card">
       <div class="section-heading">
         <h2>Chain</h2>
         <div id="explorer-status" class="explorer-status">
           <span class="dot off"></span>
           <span>mempool.space unavailable</span>
-          <a id="explorer-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Open mempool.space ↗</a>
+          <a id="explorer-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Inspect fee rates in mempool.space ↗</a>
         </div>
       </div>
       <div class="tiles" id="tiles"></div>
@@ -33,8 +40,6 @@
           </table>
         </div>
         <div>
-          <h3>Mempool fees (sat/vB)</h3>
-          <div id="fees" class="fees"></div>
           <h3>Components</h3>
           <div id="services" class="services"></div>
           <div class="component-control">
@@ -56,34 +61,9 @@
         </div>
       </div>
     </section>
-
-    <section class="card" id="faucet-card">
-      <div class="section-heading">
-        <h2>Faucet</h2>
-        <span class="faucet-badge">SYSTEM FAUCET · 0 SAT FEE · MINER-PRIORITIZED</span>
-      </div>
-      <div id="faucet-availability" class="component-state">checking miner treasuries…</div>
-      <div id="faucet-wallets" class="faucet-wallets"></div>
-      <form id="faucet-form">
-        <div class="faucet-form-heading">
-          <h3>Destinations</h3>
-          <button id="faucet-add-output" class="small secondary" type="button">Add destination</button>
-        </div>
-        <div id="faucet-outputs" class="faucet-outputs"></div>
-        <label class="faucet-source">Source treasury
-          <select id="faucet-source">
-            <option value="auto">Auto (recommended)</option>
-            <option value="node2">node2</option>
-            <option value="node3">node3</option>
-          </select>
-        </label>
-        <button id="faucet-review" type="submit">Review transaction</button>
-      </form>
-      <div id="faucet-action-result" class="action-result"></div>
-      <div id="faucet-progress" class="faucet-progress" hidden></div>
-      <div id="faucet-transfer" class="faucet-transfer muted">no faucet transfer selected</div>
     </section>
 
+    <section id="panel-control" class="dashboard-panel" role="tabpanel" aria-labelledby="tab-control" data-panel="control" hidden>
     <section class="card" id="jobs-card">
       <h2>Jobs and scenarios</h2>
       <p class="hint">Mutations run as durable server-side jobs. Closing this page does not cancel
@@ -230,6 +210,36 @@ steps:
       </div>
       <pre id="result" class="result" hidden></pre>
     </section>
+    </section>
+
+    <section id="panel-faucet" class="dashboard-panel" role="tabpanel" aria-labelledby="tab-faucet" data-panel="faucet" hidden>
+    <section class="card" id="faucet-card">
+      <div class="section-heading">
+        <h2>Faucet</h2>
+        <span class="faucet-badge">SYSTEM FAUCET · 0 SAT FEE · MINER-PRIORITIZED</span>
+      </div>
+      <div id="faucet-availability" class="component-state">checking miner treasuries…</div>
+      <div id="faucet-wallets" class="faucet-wallets"></div>
+      <form id="faucet-form">
+        <div class="faucet-form-heading">
+          <h3>Destinations</h3>
+          <button id="faucet-add-output" class="small secondary" type="button">Add destination</button>
+        </div>
+        <div id="faucet-outputs" class="faucet-outputs"></div>
+        <label class="faucet-source">Source treasury
+          <select id="faucet-source">
+            <option value="auto">Auto (recommended)</option>
+            <option value="node2">node2</option>
+            <option value="node3">node3</option>
+          </select>
+        </label>
+        <button id="faucet-review" type="submit">Review transaction</button>
+      </form>
+      <div id="faucet-action-result" class="action-result"></div>
+      <div id="faucet-progress" class="faucet-progress" hidden></div>
+      <div id="faucet-transfer" class="faucet-transfer muted">no faucet transfer selected</div>
+    </section>
+    </section>
   </main>
 
   <dialog id="faucet-confirm-dialog">
@@ -238,7 +248,10 @@ steps:
       <div id="faucet-confirm-summary"></div>
       <p>This creates a real regtest transaction with a 0 sat fee. Simchain submits it
         directly to both miners with a local 100 BTC virtual priority delta so their next
-        block includes it. The virtual amount is not paid or transferred.</p>
+        block includes it. The virtual amount is not paid or transferred. This keeps
+        faucet transactions quick and models a dark-pool/direct-to-miner path, where
+        transactions with different public fee rates can still be included when they
+        reach a miner directly and match that miner's policy.</p>
       <div class="dialog-actions">
         <button class="secondary" value="cancel">Cancel</button>
         <button id="faucet-confirm" value="default">Create transaction</button>

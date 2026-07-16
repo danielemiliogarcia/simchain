@@ -27,14 +27,14 @@ traffic continue over `btc-simnet-control`.
 ## Deterministic hard partition
 
 ```bash
-cargo run -p simchainctl -- partition \
+cargo run -p simchainctl -- partition start \
   --node node3 --main-blocks 3 --isolated-blocks 4 --wait
 ```
 
 The convenience script submits the same job:
 
 ```bash
-./scripts/partition.sh run btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
+./scripts/partition.sh start btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
 ```
 
 The isolated node may be `node2` or `node3`. Branch lengths must be positive, at most
@@ -59,7 +59,7 @@ through Bitcoin RPC so the isolation witness does not depend on TCP timeouts.
 ## Timed latency and loss
 
 ```bash
-cargo run -p simchainctl -- degrade \
+cargo run -p simchainctl -- degrade start \
   --node node3 --delay-ms 500 --loss-pct 1 --seconds 60 --wait
 ```
 
@@ -68,7 +68,7 @@ percentage from 0 through 100. At least one must be nonzero, and the bounded obs
 window is 1–86400 seconds. The convenience wrapper is:
 
 ```bash
-./scripts/degrade.sh btc-simnet-node3 500 1 60s
+./scripts/degrade.sh start btc-simnet-node3 500 1 60s
 ```
 
 The old unbounded `netem.sh apply/clear` commands were removed. Every impairment now has

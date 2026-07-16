@@ -37,15 +37,35 @@ h3 { font-size: 0.85rem; margin: 0.8rem 0 0.35rem; color: var(--dim); }
 .conn.ok { color: var(--ok); }
 .conn.stale { color: var(--err); }
 main {
-  display: grid;
-  grid-template-columns: minmax(380px, 1fr) minmax(480px, 1.2fr);
-  gap: 1rem;
   padding: 1rem 1.2rem;
+}
+.dashboard-tabs {
+  display: flex;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
+  border-bottom: 1px solid var(--line);
+}
+.dashboard-tab {
+  background: transparent;
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  border-radius: 6px 6px 0 0;
+  color: var(--dim);
+  padding: 0.45rem 0.9rem;
+}
+.dashboard-tab[aria-selected="true"] {
+  background: var(--card);
+  color: var(--accent);
+}
+.dashboard-panel { display: none; }
+.dashboard-panel.active {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
   align-items: start;
 }
-@media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
-#settings-card { grid-column: 1 / -1; }
-@media (max-width: 1100px) { #settings-card { grid-column: auto; } }
+#panel-overview.active, #panel-faucet.active { grid-template-columns: 1fr; }
+@media (max-width: 1100px) { .dashboard-panel.active { grid-template-columns: 1fr; } }
 .card {
   background: var(--card);
   border: 1px solid var(--line);
@@ -70,10 +90,6 @@ table { border-collapse: collapse; width: 100%; font-size: 0.8rem; }
 th, td { text-align: right; padding: 0.15rem 0.45rem; border-bottom: 1px solid var(--line); }
 th { color: var(--dim); font-weight: normal; }
 td:first-child, th:first-child { text-align: left; }
-.fees .bar-row { display: flex; align-items: center; gap: 0.4rem; margin: 2px 0; font-size: 0.78rem; }
-.fees .lbl { width: 4.2rem; color: var(--dim); text-align: right; }
-.fees .bar { height: 10px; background: var(--accent); border-radius: 2px; min-width: 1px; }
-.fees .n { color: var(--dim); }
 .services .svc { display: flex; gap: 0.5rem; align-items: flex-start; margin: 4px 0; font-size: 0.76rem; overflow-wrap: anywhere; }
 .services .svc .dot { flex: 0 0 auto; margin-top: 0.25rem; }
 .component-control {
@@ -353,6 +369,8 @@ button:disabled { opacity: 0.5; cursor: default; }
 }
 @media (max-width: 620px) {
   main { padding: 0.7rem; }
+  .dashboard-tabs { overflow-x: auto; }
+  .dashboard-tab { flex: 0 0 auto; }
   .split, .bounded-actions, .faucet-wallets { grid-template-columns: 1fr; }
   .faucet-output-row { grid-template-columns: 1fr; }
   .faucet-remove-output { justify-self: start; }

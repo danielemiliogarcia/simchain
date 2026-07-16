@@ -48,6 +48,7 @@ struct Inner {
     observed_height: Option<u64>,
     cycle_phase: Option<String>,
     accepted_transactions: u64,
+    last_cycle_duration_ms: Option<u64>,
     in_flight: bool,
     last_error: Option<String>,
     started: Instant,
@@ -105,6 +106,7 @@ impl SpamControl {
                 observed_height: None,
                 cycle_phase: None,
                 accepted_transactions: 0,
+                last_cycle_duration_ms: None,
                 in_flight: false,
                 last_error: None,
                 started: Instant::now(),
@@ -459,11 +461,12 @@ impl SpamControl {
         !interrupted
     }
 
-    pub fn finish_cycle(&self, height: u64, accepted: usize) {
+    pub fn finish_cycle(&self, height: u64, accepted: usize, duration: Duration) {
         let mut inner = self.inner.lock().expect("spam control lock");
         inner.in_flight = false;
         inner.observed_height = Some(height);
         inner.accepted_transactions = inner.accepted_transactions.saturating_add(accepted as u64);
+        inner.last_cycle_duration_ms = Some(duration.as_millis().min(u64::MAX as u128) as u64);
         inner.cycle_phase = None;
         inner.phase = if pause_requested(&inner) {
             WorkerPhase::Paused
@@ -713,6 +716,7 @@ fn status_from(inner: &Inner) -> SpamWorkerStatus {
         observed_height: inner.observed_height,
         cycle_phase: inner.cycle_phase.clone(),
         accepted_transactions: inner.accepted_transactions,
+        last_cycle_duration_ms: inner.last_cycle_duration_ms,
         active_leases,
         reconciliation_pending: inner.reconciliation_pending,
         uptime_secs: inner.started.elapsed().as_secs(),
@@ -778,7 +782,8 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(20));
         assert!(!control.cycle_checkpoint(0, "after_transaction"));
-        control.finish_cycle(100, 1);
+        control.finish_cycle(100, 1, Duration::from_millis(42));
+        assert_eq!(control.status().last_cycle_duration_ms, Some(42));
         let ack = pause.join().expect("pause thread").expect("pause");
         assert_eq!(ack.phase, WorkerPhase::Paused);
     }

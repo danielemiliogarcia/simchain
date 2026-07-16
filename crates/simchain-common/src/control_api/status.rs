@@ -20,6 +20,8 @@ pub struct BlockSummary {
     pub tx_count: usize,
     pub size_bytes: usize,
     pub weight: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_fee_rate_sat_vb: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -63,6 +65,8 @@ pub struct ComponentState {
     pub cycle_phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_transactions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cycle_duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciliation_pending: Option<bool>,
 }

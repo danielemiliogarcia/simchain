@@ -371,8 +371,8 @@ pool in OUTPUT mode — see [When the floor leaks](#the-fee-market-what-spam-pay
 
 | Variable | Default | Description |
 |---|---|---|
-| `REORG_DEPTH` | `3` | How many blocks to orphan per reorg. CLI argument overrides it: `./scripts/simulate-reorg.sh 5`. |
-| _(CLI only)_ `empty` | off | Per-run argument, not an env var: `./scripts/simulate-reorg.sh 3 empty` mines empty replacement blocks (chaos reorg) and leaves the orphaned txs unconfirmed, instead of re-mining them. Chosen per run so real and empty reorgs can be interleaved on the same chain. |
+| `REORG_DEPTH` | `3` | How many blocks to orphan per reorg. CLI argument overrides it: `./scripts/simulate-reorg.sh start 5`. |
+| _(CLI only)_ `empty` | off | Per-run argument, not an env var: `./scripts/simulate-reorg.sh start 3 empty` mines empty replacement blocks (chaos reorg) and leaves the orphaned txs unconfirmed, instead of re-mining them. Chosen per run so real and empty reorgs can be interleaved on the same chain. |
 | `REORG_MODE` | `once` | `once` = single reorg then exit. `auto` = reorg every `AUTO_REORG_EVERY_BLOCKS`. |
 | `AUTO_REORG_EVERY_BLOCKS` | `20` | Auto mode cadence (x); must be greater than `REORG_DEPTH` (y). |
 | `REORG_NODE` | `btc-simnet-node3` | Node used to fork the chain (a hidden miner is realistic). |
@@ -394,7 +394,7 @@ can cascade the rest of the run to empty blocks.
 ## Network partitions and P2P netem
 
 Partition jobs are post-bootstrap-only and refuse to proceed below height 204. Branch
-lengths are request fields (`simchainctl partition --main-blocks ...
+lengths are request fields (`simchainctl partition start --main-blocks ...
 --isolated-blocks ...`); only settling timeouts are process settings:
 
 | Variable | Default | Description |

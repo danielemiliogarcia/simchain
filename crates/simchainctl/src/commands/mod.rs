@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use simchain_common::control_api::{DEFAULT_CONTROL_TOKEN, DEFAULT_CONTROL_URL};
 use std::path::PathBuf;
 
@@ -68,11 +68,11 @@ pub enum Command {
     Mine(MineArgs),
     /// Fund regtest addresses with a miner-prioritized exact-zero-fee transaction.
     Faucet(FaucetArgs),
-    /// Start a bounded server-side chain reorganization job.
+    /// Inspect or start bounded server-side chain reorganization jobs.
     Reorg(ReorgArgs),
-    /// Isolate one miner, mine deterministic competing branches, and heal.
+    /// Inspect or start deterministic partition/heal jobs.
     Partition(PartitionArgs),
-    /// Apply timed P2P-only latency and packet loss.
+    /// Inspect or start timed P2P-only latency/loss jobs.
     Degrade(DegradeArgs),
     /// Submit, run, or coordinate durable server-side scenarios.
     Scenario(ScenarioArgs),
@@ -243,7 +243,22 @@ pub struct FaucetTransferArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
 pub struct ReorgArgs {
+    #[command(subcommand)]
+    pub command: Option<ReorgCommand>,
+    #[command(flatten)]
+    pub start: ReorgStartArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ReorgCommand {
+    /// Start a bounded server-side chain reorganization job.
+    Start(ReorgStartArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ReorgStartArgs {
     /// Number of tip blocks to replace.
     #[arg(long, default_value_t = 3)]
     pub depth: u64,
@@ -274,7 +289,22 @@ pub struct ReorgArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
 pub struct PartitionArgs {
+    #[command(subcommand)]
+    pub command: Option<PartitionCommand>,
+    #[command(flatten)]
+    pub start: PartitionStartArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PartitionCommand {
+    /// Isolate one miner, mine deterministic competing branches, and heal.
+    Start(PartitionStartArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PartitionStartArgs {
     /// Miner to isolate: node2 or node3.
     #[arg(long, default_value = "node3")]
     pub node: String,
@@ -287,16 +317,41 @@ pub struct PartitionArgs {
     /// Wait for healing and terminal convergence.
     #[arg(long)]
     pub wait: bool,
+    /// Maximum wait in seconds when --wait is set.
     #[arg(long, default_value_t = 900)]
     pub timeout: u64,
+    /// Emit stable JSON instead of human-oriented output.
     #[arg(long)]
     pub json: bool,
+    /// Optional retry key; the server returns the original matching job.
     #[arg(long)]
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
 pub struct DegradeArgs {
+    #[command(subcommand)]
+    pub command: DegradeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DegradeCommand {
+    /// Apply timed P2P-only latency and/or packet loss.
+    Start(DegradeStartArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(
+    group(
+        ArgGroup::new("impairment")
+            .args(["delay_ms", "loss_pct"])
+            .required(true)
+            .multiple(true)
+    ),
+    after_help = "Examples:\n  simchainctl degrade start --node node3 --delay-ms 500 --seconds 60 --wait\n  simchainctl degrade start --node node2 --loss-pct 5 --seconds 30 --wait\n  simchainctl degrade start --node node1 --delay-ms 200 --loss-pct 2.5 --seconds 120"
+)]
+pub struct DegradeStartArgs {
     /// Node to impair: node1, node2, or node3.
     #[arg(long, default_value = "node3")]
     pub node: String,
@@ -312,10 +367,13 @@ pub struct DegradeArgs {
     /// Wait until the impairment is healed and the job is terminal.
     #[arg(long)]
     pub wait: bool,
+    /// Maximum wait in seconds when --wait is set.
     #[arg(long, default_value_t = 900)]
     pub timeout: u64,
+    /// Emit stable JSON instead of human-oriented output.
     #[arg(long)]
     pub json: bool,
+    /// Optional retry key; the server returns the original matching job.
     #[arg(long)]
     pub idempotency_key: Option<String>,
 }
@@ -530,9 +588,35 @@ mod tests {
         assert!(matches!(
             reorg.command,
             Command::Reorg(ReorgArgs {
-                depth: 4,
-                empty: true,
-                wait: true,
+                start: ReorgStartArgs {
+                    depth: 4,
+                    empty: true,
+                    wait: true,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let reorg_start = Cli::try_parse_from([
+            "simchainctl",
+            "reorg",
+            "start",
+            "--depth",
+            "4",
+            "--empty",
+            "--wait",
+        ])
+        .expect("reorg start command");
+        assert!(matches!(
+            reorg_start.command,
+            Command::Reorg(ReorgArgs {
+                command: Some(ReorgCommand::Start(ReorgStartArgs {
+                    depth: 4,
+                    empty: true,
+                    wait: true,
+                    ..
+                })),
                 ..
             })
         ));
@@ -634,16 +718,46 @@ mod tests {
         assert!(matches!(
             partition.command,
             Command::Partition(PartitionArgs {
-                main_blocks: 3,
-                isolated_blocks: 4,
-                wait: true,
+                start: PartitionStartArgs {
+                    main_blocks: 3,
+                    isolated_blocks: 4,
+                    wait: true,
+                    ..
+                },
                 ..
             })
         ));
 
-        let degrade = Cli::try_parse_from([
+        let partition_start = Cli::try_parse_from([
+            "simchainctl",
+            "partition",
+            "start",
+            "--node",
+            "node3",
+            "--main-blocks",
+            "3",
+            "--isolated-blocks",
+            "4",
+            "--wait",
+        ])
+        .expect("partition start");
+        assert!(matches!(
+            partition_start.command,
+            Command::Partition(PartitionArgs {
+                command: Some(PartitionCommand::Start(PartitionStartArgs {
+                    main_blocks: 3,
+                    isolated_blocks: 4,
+                    wait: true,
+                    ..
+                })),
+                ..
+            })
+        ));
+
+        let degrade_start = Cli::try_parse_from([
             "simchainctl",
             "degrade",
+            "start",
             "--node",
             "node1",
             "--delay-ms",
@@ -653,13 +767,15 @@ mod tests {
             "--seconds",
             "30",
         ])
-        .expect("degrade");
+        .expect("degrade start");
         assert!(matches!(
-            degrade.command,
+            degrade_start.command,
             Command::Degrade(DegradeArgs {
-                delay_ms: 250,
-                seconds: 30,
-                ..
+                command: DegradeCommand::Start(DegradeStartArgs {
+                    delay_ms: 250,
+                    seconds: 30,
+                    ..
+                }),
             })
         ));
     }

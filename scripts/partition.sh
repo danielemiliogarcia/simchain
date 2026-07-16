@@ -1,20 +1,47 @@
 #!/bin/bash
 # Convenience wrapper for the durable control-plane partition job.
-# Usage: ./scripts/partition.sh run <miner-node> [--main-blocks N] [--isolated-blocks N]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-if [[ "${1:-}" != run || $# -lt 2 ]]; then
-  echo "usage: $0 run <miner-node> [--main-blocks N] [--isolated-blocks N]" >&2
-  echo "raw disconnect/heal commands were replaced by TTL-healed control-plane jobs" >&2
+usage() {
+  cat <<'EOF'
+Usage:
+  ./scripts/partition.sh start <miner-node> [--main-blocks N] [--isolated-blocks N]
+  ./scripts/partition.sh --help
+
+Starts a TTL-healed control-plane partition job and waits for it to finish.
+
+Arguments:
+  start       Required confirmation that a partition should be started.
+  miner-node  node2, node3, btc-simnet-node2, or btc-simnet-node3.
+
+The legacy confirmation word "run" is still accepted as an alias for "start".
+EOF
+}
+
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  start|run)
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [[ $# -lt 2 ]]; then
+  usage >&2
   exit 2
 fi
 node="${2#btc-simnet-}"
 shift 2
-args=(partition --node "$node" --wait "$@")
+args=(partition start --node "$node" --wait "$@")
 
 if command -v simchainctl >/dev/null 2>&1; then
   exec simchainctl "${args[@]}"

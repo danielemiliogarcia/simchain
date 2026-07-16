@@ -545,6 +545,7 @@ impl SpamControlBackend for MockBackend {
             observed_height: Some(100),
             cycle_phase: Some("waiting_for_block".to_string()),
             accepted_transactions: 10,
+            last_cycle_duration_ms: Some(1_250),
             active_leases: world.spam_leases.values().cloned().collect(),
             reconciliation_pending: false,
             uptime_secs: 1,

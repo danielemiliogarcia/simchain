@@ -54,7 +54,7 @@ The engine should:
 - **The simnet already has the right primitive actions, but only manually.**
   Users can already:
   - stop/start the mining controller,
-  - run one-shot reorgs with `./scripts/simulate-reorg.sh`,
+  - run one-shot reorgs with `./scripts/simulate-reorg.sh start`,
   - send manual wallet txs from the runbook,
   - and, after feature #2, run partition/netem helpers.
 - **The mining controller is resumable.**
@@ -376,7 +376,7 @@ Direct RPC is simpler and more deterministic here than shelling out to `bitcoin-
 Reuse the existing helper surface:
 
 ```bash
-./scripts/simulate-reorg.sh <depth> [empty]
+./scripts/simulate-reorg.sh start <depth> [empty]
 ```
 
 The engine should invoke the script through `docker.rs`, capture stdout/stderr, and fail
@@ -408,7 +408,7 @@ Why in-engine instead of reusing the spammer binary:
 Do **not** reimplement partition logic in the scenario engine. Invoke:
 
 ```bash
-./scripts/partition.sh run <node> --main-blocks N --isolated-blocks M
+./scripts/partition.sh start <node> --main-blocks N --isolated-blocks M
 ```
 
 That keeps the partition feature as a single implementation reused both manually and by
@@ -644,4 +644,3 @@ codex
   - Scenario Docker image build
   - Docker socket/project discovery
   - Live read-only scenario smoke test against the running simnet, completing successfully at height 613.
-

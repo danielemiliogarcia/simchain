@@ -152,6 +152,8 @@ pub struct SpamWorkerStatus {
     pub observed_height: Option<u64>,
     pub cycle_phase: Option<String>,
     pub accepted_transactions: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cycle_duration_ms: Option<u64>,
     pub active_leases: Vec<PauseLease>,
     pub reconciliation_pending: bool,
     pub uptime_secs: u64,

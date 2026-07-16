@@ -65,6 +65,35 @@ function mutationBlockedMessage() {
   return jobId ? `mutation coordinator is held by ${jobId}` : null;
 }
 
+/* ------------------------------------------------------------------- tabs */
+
+const DASHBOARD_TABS = ["overview", "control", "faucet"];
+
+function selectTab(tab, updateHash = true) {
+  if (!DASHBOARD_TABS.includes(tab)) tab = "overview";
+  for (const name of DASHBOARD_TABS) {
+    const selected = name === tab;
+    const button = $(`#tab-${name}`);
+    const panel = $(`#panel-${name}`);
+    button.setAttribute("aria-selected", selected ? "true" : "false");
+    panel.hidden = !selected;
+    panel.classList.toggle("active", selected);
+  }
+  if (updateHash && location.hash !== `#${tab}`) {
+    history.replaceState(null, "", `#${tab}`);
+  }
+}
+
+function initTabs() {
+  for (const tab of DASHBOARD_TABS) {
+    $(`#tab-${tab}`).addEventListener("click", () => selectTab(tab));
+  }
+  window.addEventListener("hashchange", () =>
+    selectTab(location.hash.slice(1), false)
+  );
+  selectTab(location.hash.slice(1), false);
+}
+
 /* ------------------------------------------------------------------ status */
 
 function fmtBytes(n) {
@@ -72,6 +101,15 @@ function fmtBytes(n) {
   if (n > 1e6) return (n / 1e6).toFixed(2) + " MB";
   if (n > 1e3) return (n / 1e3).toFixed(1) + " kB";
   return n + " B";
+}
+
+function fmtNumber(n) {
+  return n == null ? "–" : Number(n).toLocaleString("en-US");
+}
+
+function fmtSeconds(seconds) {
+  if (seconds == null || !Number.isFinite(seconds)) return "–";
+  return `${seconds.toFixed(1)}s`;
 }
 
 function tile(k, v) {
@@ -128,13 +166,15 @@ function renderStatus(s) {
 
   const cadence = s.cadence ? `${s.cadence.mean_secs.toFixed(1)}s (n=${s.cadence.samples})` : "–";
   const mp = s.mempool;
+  const lastBlock = (s.recent_blocks || [])[0];
   $("#tiles").innerHTML =
     tile("height", s.height ?? "–") +
     tile("cadence", cadence) +
     tile("mempool txs", mp ? mp.tx_count : "–") +
     tile("mempool size", mp ? fmtBytes(mp.vbytes) + " vB" : "–") +
-    tile("min fee", mp ? (mp.min_fee * 1e5).toFixed(1) + " sat/vB" : "–") +
-    tile("best hash", s.best_hash ? s.best_hash.slice(0, 12) + "…" : "–");
+    tile("best hash", s.best_hash ? s.best_hash.slice(0, 12) + "…" : "–") +
+    tile("last block size", lastBlock ? fmtBytes(lastBlock.size_bytes) : "–") +
+    tile("last block weight", lastBlock ? fmtNumber(lastBlock.weight) + " WU" : "–");
   renderExplorer(s.explorer);
 
   const blockBody = $("#blocks tbody");
@@ -170,12 +210,6 @@ function renderStatus(s) {
     cell.textContent = "no blocks yet";
   }
 
-  const max = Math.max(1, ...(s.fee_histogram || []).map((b) => b.count));
-  $("#fees").innerHTML = (s.fee_histogram || []).map((b) =>
-    `<div class="bar-row"><span class="lbl">${escapeHtml(b.label)}</span>` +
-    `<div class="bar" style="width:${(100 * b.count / max).toFixed(1)}%"></div>` +
-    `<span class="n">${escapeHtml(b.count)}</span></div>`).join("") || "–";
-
   const services = $("#services");
   services.replaceChildren();
   for (const [name, component] of Object.entries(s.components || {})) {
@@ -191,6 +225,9 @@ function renderStatus(s) {
     if (component.observed_height != null) details.push(`height ${component.observed_height}`);
     if (component.active_lease_count) details.push(`${component.active_lease_count} lease(s)`);
     if (component.cycle_phase) details.push(`cycle ${component.cycle_phase}`);
+    if (name === "spam" && component.last_cycle_duration_ms != null) {
+      details.push(`last cycle ${fmtSeconds(component.last_cycle_duration_ms / 1000)}`);
+    }
     if (component.reconciliation_pending) details.push("reconciliation pending");
     text.textContent = `${name} · ${component.phase || component.status}` +
       (details.length ? ` · ${details.join(" · ")}` : "") +
@@ -234,8 +271,10 @@ function renderStatus(s) {
     const cycle = spam.cycle_phase ? ` · cycle ${spam.cycle_phase}` : "";
     const accepted = spam.accepted_transactions == null
       ? "" : ` · accepted ${spam.accepted_transactions}`;
+    const lastCycle = spam.last_cycle_duration_ms == null
+      ? "" : ` · last cycle ${fmtSeconds(spam.last_cycle_duration_ms / 1000)}`;
     const leases = spam.active_lease_count ? ` · ${spam.active_lease_count} job lease(s)` : "";
-    spamState.textContent = `desired ${desired} · effective ${effective} · phase ${spam.phase || spam.status}${cycle}${accepted}${leases}`;
+    spamState.textContent = `desired ${desired} · effective ${effective} · phase ${spam.phase || spam.status}${cycle}${accepted}${lastCycle}${leases}`;
     spamPause.disabled = changingComponentState.spam || desired === "paused" || activeMutationId() != null;
     spamResume.disabled = changingComponentState.spam || desired === "running" || activeMutationId() != null;
   }
@@ -699,6 +738,11 @@ function renderFaucetTransfer() {
 
 function renderFaucetJob(job) {
   const progress = $("#faucet-progress");
+  if (selectedFaucetTransfer && selectedFaucetTransfer.delivery_state === "confirmed") {
+    progress.hidden = true;
+    renderFaucetTransfer();
+    return;
+  }
   if (!job || job.kind !== "faucet") {
     progress.hidden = true;
     return;
@@ -727,8 +771,7 @@ async function refreshFaucet() {
       selectedFaucetTransfer = response.body;
       renderFaucetTransfer();
       if (selectedFaucetTransfer.delivery_state === "confirmed") {
-        $("#faucet-progress").hidden = false;
-        $("#faucet-progress").textContent = `Confirmed in block ${selectedFaucetTransfer.confirmed_height}`;
+        $("#faucet-progress").hidden = true;
       }
     }
   }
@@ -1281,6 +1324,7 @@ async function doApply() {
 /* -------------------------------------------------------------------- init */
 
 async function init() {
+  initTabs();
   const { body } = await api("/api/v1/config/schema");
   schema = body;
   buildForm();

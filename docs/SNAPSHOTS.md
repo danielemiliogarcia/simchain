@@ -28,7 +28,7 @@ the short version lives in the README "Chain snapshots" section.
 ./scripts/snapshot.sh save funded-wallets
 
 # 3. Run destructive tests against the chain (reorgs, double-spends, ...).
-./scripts/simulate-reorg.sh 5
+./scripts/simulate-reorg.sh start 5
 
 # 4. Chain trashed? Back to the funded state in ~30 s, no re-mining,
 #    no re-funding -- your keys still spend the same UTXOs:
@@ -192,4 +192,3 @@ already spent by its own still-in-mempool transactions with
 `gettxout(include_mempool)`. What it loses is only ephemeral bookkeeping (branch
 cursors, RBF shape cache); the funds are in the miner wallets and on-chain. After a
 restore, spam resumes and the mempool refills without intervention.
-

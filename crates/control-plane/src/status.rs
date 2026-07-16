@@ -7,6 +7,7 @@ use crate::state::{
     SPAM_COMPONENT,
 };
 use bitcoincore_rpc::{Client, RpcApi};
+use serde_json::json;
 pub use simchain_common::control_api::StatusResponse as StatusSnapshot;
 use simchain_common::control_api::{
     BlockSummary, Cadence, ComponentState, ExplorerStatus, FeeBucket, ImpairmentSummary,
@@ -235,6 +236,7 @@ fn spam_component(status: SpamWorkerStatus) -> ComponentState {
         active_lease_count: Some(status.active_leases.len()),
         cycle_phase: status.cycle_phase,
         accepted_transactions: Some(status.accepted_transactions),
+        last_cycle_duration_ms: status.last_cycle_duration_ms,
         reconciliation_pending: Some(status.reconciliation_pending),
         ..ComponentState::default()
     }
@@ -356,6 +358,13 @@ fn sample_chain_detail(
         let block_height = height - offset;
         let hash = client.get_block_hash(block_height)?;
         let info = client.get_block_info(&hash)?;
+        let median_fee_rate_sat_vb = if offset == 0 {
+            block_median_fee_rate_sat_vb(client, block_height)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         blocks.push(BlockSummary {
             height: block_height,
             hash: hash.to_string(),
@@ -364,6 +373,7 @@ fn sample_chain_detail(
             tx_count: info.n_tx,
             size_bytes: info.size,
             weight: info.weight,
+            median_fee_rate_sat_vb,
         });
     }
     let mut deltas = Vec::new();
@@ -380,6 +390,18 @@ fn sample_chain_detail(
     });
     blocks.truncate(10);
     Ok((blocks, cadence, fee_histogram(client)?))
+}
+
+fn block_median_fee_rate_sat_vb(client: &Client, height: u64) -> anyhow::Result<Option<f64>> {
+    let stats = client.call::<serde_json::Value>(
+        "getblockstats",
+        &[json!(height), json!(["feerate_percentiles"])],
+    )?;
+    Ok(stats
+        .get("feerate_percentiles")
+        .and_then(|value| value.as_array())
+        .and_then(|percentiles| percentiles.get(2))
+        .and_then(|value| value.as_f64()))
 }
 
 const BUCKETS: [(&str, f64, f64); 6] = [
