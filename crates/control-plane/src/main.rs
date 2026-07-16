@@ -4,6 +4,8 @@ mod api;
 mod apply;
 mod backend;
 mod control_state;
+mod faucet_job;
+mod faucet_store;
 mod internal_client;
 mod job_store;
 mod jobs;
@@ -114,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         spam.clone(),
     )?);
     let network_actions = Arc::new(network_job::RpcNetworkActionBackend::from_config(&config)?);
+    let faucet = Arc::new(faucet_job::RpcFaucetBackend::from_config(&config)?);
     let jobs = jobs::JobManager::open(
         &config.state_dir,
         jobs::JobDependencies {
@@ -123,6 +126,14 @@ async fn main() -> anyhow::Result<()> {
             reorg: reorg_executor,
             scenario: scenario_backend,
             network_actions,
+            faucet,
+            faucet_settings: jobs::FaucetSettings {
+                node2_wallet_name: config.node2_wallet_name.clone(),
+                node3_wallet_name: config.node3_wallet_name.clone(),
+                wallet_reserve_sats: config.faucet_wallet_reserve_sats,
+                max_request_sats: config.faucet_max_request_sats,
+                explorer_url: config.explorer_url.clone(),
+            },
         },
     )?;
     let app = Arc::new(AppState {
@@ -175,6 +186,10 @@ mod token_tests {
             internal_token: "test-internal-token".to_string(),
             explorer_url: "http://127.0.0.1:1080".to_string(),
             explorer_probe_url: "http://mempool-web:8080".to_string(),
+            node2_wallet_name: "node2".to_string(),
+            node3_wallet_name: "node3".to_string(),
+            faucet_wallet_reserve_sats: 60_000_000_000,
+            faucet_max_request_sats: 10_000_000_000,
         }
     }
 

@@ -303,6 +303,10 @@ services:
       - NODE3_WALLET_NAME=${NODE3_WALLET_NAME:-node3}
       - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
       - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
+      - NODE2_WALLET_NAME=${NODE2_WALLET_NAME:-node2}
+      - NODE3_WALLET_NAME=${NODE3_WALLET_NAME:-node3}
+      - FAUCET_WALLET_RESERVE_BTC=${FAUCET_WALLET_RESERVE_BTC:-600}
+      - FAUCET_MAX_REQUEST_BTC=${FAUCET_MAX_REQUEST_BTC:-100}
 
   btc-simnet-spammer:
     build:

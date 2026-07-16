@@ -1,7 +1,8 @@
 use crate::client::ClientError;
 use simchain_common::control_api::{
-    AbortJobResponse, ApplyReport, ComponentControlResponse, ConfigResponse, JobCheckpointResponse,
-    JobCreatedResponse, JobDetail, JobEvent, JobListResponse, StatusResponse,
+    AbortJobResponse, ApplyReport, ComponentControlResponse, ConfigResponse, FaucetStatusResponse,
+    FaucetTransfer, JobCheckpointResponse, JobCreatedResponse, JobDetail, JobEvent,
+    JobListResponse, StatusResponse,
 };
 use std::io::{self, Write};
 
@@ -116,6 +117,96 @@ pub fn print_job_created(response: &JobCreatedResponse, json: bool) -> Result<()
         response.state.as_str(),
         reused
     )?;
+    Ok(())
+}
+
+pub fn print_faucet_created(
+    response: &JobCreatedResponse,
+    idempotency_key: &str,
+    json: bool,
+) -> Result<(), ClientError> {
+    if json {
+        return print_json(&serde_json::json!({
+            "job_id": response.job_id,
+            "state": response.state,
+            "reused": response.reused,
+            "idempotency_key": idempotency_key
+        }));
+    }
+    let mut out = io::stdout().lock();
+    writeln!(out, "{}: {}", response.job_id, response.state.as_str())?;
+    writeln!(out, "idempotency key: {idempotency_key}")?;
+    Ok(())
+}
+
+pub fn print_faucet_status(response: &FaucetStatusResponse, json: bool) -> Result<(), ClientError> {
+    if json {
+        return print_json(response);
+    }
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
+        "faucet: {}",
+        if response.available {
+            "available"
+        } else {
+            "unavailable"
+        }
+    )?;
+    writeln!(out, "maximum request: {} sats", response.max_request_sats)?;
+    writeln!(out, "wallet reserve: {} sats", response.wallet_reserve_sats)?;
+    for wallet in &response.wallets {
+        writeln!(
+            out,
+            "{} ({}): {} eligible sats, {} available after reserve",
+            wallet.source.as_str(),
+            wallet.wallet_name,
+            wallet.eligible_confirmed_sats,
+            wallet.available_after_reserve_sats
+        )?;
+    }
+    if let Some(pending) = &response.pending_transfer {
+        writeln!(
+            out,
+            "pending: {} ({})",
+            pending.txid,
+            pending.delivery_state.as_str()
+        )?;
+    }
+    if let Some(error) = response.last_probe_error.as_deref() {
+        writeln!(out, "warning: {error}")?;
+    }
+    Ok(())
+}
+
+pub fn print_faucet_transfer(transfer: &FaucetTransfer, json: bool) -> Result<(), ClientError> {
+    if json {
+        return print_json(transfer);
+    }
+    let mut out = io::stdout().lock();
+    writeln!(out, "SYSTEM FAUCET · 0 SAT FEE · MINER-PRIORITIZED")?;
+    writeln!(out, "txid: {}", transfer.txid)?;
+    writeln!(out, "delivery: {}", transfer.delivery_state.as_str())?;
+    writeln!(
+        out,
+        "source: {} ({})",
+        transfer.source.as_str(),
+        transfer.wallet_name
+    )?;
+    writeln!(out, "total: {} sats", transfer.total_sats)?;
+    writeln!(out, "actual fee: {} sats", transfer.actual_fee_sats)?;
+    writeln!(
+        out,
+        "virtual priority: {} sats",
+        transfer.priority_delta_sats
+    )?;
+    if let Some(height) = transfer.confirmed_height {
+        writeln!(out, "confirmed height: {height}")?;
+    }
+    writeln!(out, "explorer: {}", transfer.explorer_url)?;
+    if let Some(error) = transfer.last_error.as_deref() {
+        writeln!(out, "warning: {error}")?;
+    }
     Ok(())
 }
 

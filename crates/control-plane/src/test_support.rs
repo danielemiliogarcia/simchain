@@ -4,12 +4,17 @@ use crate::backend::{
     ChainBackend, MiningControlBackend, NetworkControlBackend, SpamControlBackend,
 };
 use crate::control_state::{ControlState, ControlStateStore};
-use crate::jobs::{JobDependencies, JobManager};
+use crate::faucet_job::{
+    FaucetBackend, FaucetConfirmation, FaucetInput, FaucetPreflight, MinerVerification,
+    PreparedFaucetTransaction, PriorityUpdate,
+};
+use crate::jobs::{FaucetSettings, JobDependencies, JobManager};
 use crate::network_job::{ChainSnapshot, NetworkActionBackend};
 use crate::reorg_job::{ReorgExecution, ReorgExecutor, ReorgRecoveryContext};
 use crate::scenario_job::ScenarioActionBackend;
 use crate::state::{AppState, ControlPlaneConfig, MINING_COMPONENT, SPAM_COMPONENT};
 use crate::status::StatusSnapshot;
+use simchain_common::control_api::{FaucetOutput, FaucetSourceNode, FAUCET_PRIORITY_DELTA_SATS};
 use simchain_common::internal_api::{
     CommandAck, DesiredState, LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest,
     MiningWorkerStatus, NetworkAgentStatus, NetworkCommandAck, NetworkImpairmentLease,
@@ -187,6 +192,137 @@ impl ChainBackend for MockBackend {
     }
 
     fn wait(&self, _duration: Duration) {}
+}
+
+impl FaucetBackend for MockBackend {
+    fn preflight(&self) -> anyhow::Result<FaucetPreflight> {
+        let inputs = ["01", "02", "03"]
+            .into_iter()
+            .map(|byte| FaucetInput {
+                txid: byte.repeat(32),
+                vout: 0,
+                amount_sats: 50_000_000_000,
+                confirmations: 204,
+            })
+            .collect::<Vec<_>>();
+        Ok(FaucetPreflight {
+            height: 204,
+            best_hash: "04".repeat(32),
+            node2_inputs: inputs.clone(),
+            node3_inputs: inputs,
+        })
+    }
+
+    fn lock_inputs(
+        &self,
+        _source: FaucetSourceNode,
+        _inputs: &[FaucetInput],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn unlock_inputs(
+        &self,
+        _source: FaucetSourceNode,
+        _inputs: &[FaucetInput],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn prepare_transaction(
+        &self,
+        _source: FaucetSourceNode,
+        inputs: &[FaucetInput],
+        outputs: &[FaucetOutput],
+    ) -> anyhow::Result<PreparedFaucetTransaction> {
+        use bitcoincore_rpc::bitcoin::{
+            absolute::LockTime, consensus::encode::serialize_hex, transaction::Version, Amount,
+            OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        };
+        use std::str::FromStr;
+        let input_sats: u64 = inputs.iter().map(|input| input.amount_sats).sum();
+        let total_sats: u64 = outputs.iter().map(|output| output.amount_sats).sum();
+        let change_sats = input_sats - total_sats;
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_str(&inputs[0].txid)?, inputs[0].vout),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(input_sats),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        Ok(PreparedFaucetTransaction {
+            raw_tx_hex: serialize_hex(&transaction),
+            txid: transaction.compute_txid().to_string(),
+            input_sats,
+            change_sats,
+            vsize: transaction.vsize() as u64,
+        })
+    }
+
+    fn set_priority(
+        &self,
+        _node: FaucetSourceNode,
+        _txid: &str,
+        desired_delta_sats: i64,
+    ) -> anyhow::Result<PriorityUpdate> {
+        Ok(PriorityUpdate {
+            previous_delta_sats: 0,
+            desired_delta_sats,
+        })
+    }
+
+    fn test_accept(&self, _node: FaucetSourceNode, _raw_tx_hex: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn submit(
+        &self,
+        _node: FaucetSourceNode,
+        _raw_tx_hex: &str,
+        _txid: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn verify_miner(
+        &self,
+        _node: FaucetSourceNode,
+        _txid: &str,
+    ) -> anyhow::Result<MinerVerification> {
+        Ok(MinerVerification {
+            base_fee_sats: 0,
+            modified_fee_sats: FAUCET_PRIORITY_DELTA_SATS as u64,
+            fee_delta_sats: FAUCET_PRIORITY_DELTA_SATS,
+            vsize: 60,
+            weight: Some(240),
+            ancestor_count: 1,
+            greatest_competing_feerate_sat_vb: 10,
+            minimum_feerate_sat_vb: 1,
+        })
+    }
+
+    fn observer_contains_unconfirmed(&self, _txid: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn confirmation(&self, _txid: &str) -> anyhow::Result<Option<FaucetConfirmation>> {
+        Ok(None)
+    }
+
+    fn inputs_unspent(
+        &self,
+        _source: FaucetSourceNode,
+        _inputs: &[FaucetInput],
+    ) -> anyhow::Result<bool> {
+        Ok(true)
+    }
 }
 
 impl ScenarioActionBackend for MockBackend {
@@ -709,6 +845,14 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
             reorg: Arc::new(MockReorgExecutor),
             scenario: backend.clone(),
             network_actions: backend.clone(),
+            faucet: backend.clone(),
+            faucet_settings: FaucetSettings {
+                node2_wallet_name: "node2".to_string(),
+                node3_wallet_name: "node3".to_string(),
+                wallet_reserve_sats: 60_000_000_000,
+                max_request_sats: 10_000_000_000,
+                explorer_url: "http://127.0.0.1:1080".to_string(),
+            },
         },
     )
     .expect("job manager");
@@ -727,6 +871,10 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
             internal_token: "test-internal-token".to_string(),
             explorer_url: "http://127.0.0.1:1080".to_string(),
             explorer_probe_url: "http://mempool-web:8080".to_string(),
+            node2_wallet_name: "node2".to_string(),
+            node3_wallet_name: "node3".to_string(),
+            faucet_wallet_reserve_sats: 60_000_000_000,
+            faucet_max_request_sats: 10_000_000_000,
         },
         token: "test-token".to_string(),
         chain: backend.clone(),

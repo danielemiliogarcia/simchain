@@ -2,6 +2,11 @@
 //! leases, and restart recovery.
 
 use crate::backend::{MiningControlBackend, NetworkControlBackend, SpamControlBackend};
+use crate::faucet_job::{
+    eligible_total, select_inputs, FaucetBackend, FaucetInput, FaucetPreflight,
+    PreparedFaucetTransaction,
+};
+use crate::faucet_store::{FaucetStore, StoredFaucetTransfer};
 use crate::job_store::JobStore;
 use crate::network_job::NetworkActionBackend;
 use crate::reorg_job::{ReorgExecution, ReorgExecutor, ReorgRecoveryContext};
@@ -9,11 +14,14 @@ use crate::scenario_job::ScenarioActionBackend;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use simchain_common::control_api::{
-    AbortJobResponse, CheckpointState, CleanupState, DegradeJobRequest, ErrorCode, JobCheckpoint,
-    JobCheckpointResponse, JobCleanup, JobCreatedResponse, JobDetail, JobEvent, JobEventsResponse,
-    JobFailure, JobKind, JobLease, JobListResponse, JobState, JobSummary, MineJobRequest,
-    PartitionJobRequest, ReleaseCheckpointRequest, ReorgJobRequest, ScenarioStepStatus,
-    SpamBurstJobRequest,
+    AbortJobResponse, CheckpointState, CleanupState, DegradeJobRequest, ErrorCode,
+    FaucetDeliveryState, FaucetJobRequest, FaucetSource, FaucetSourceNode, FaucetStatusResponse,
+    FaucetTransfer, FaucetWalletStatus, JobCheckpoint, JobCheckpointResponse, JobCleanup,
+    JobCreatedResponse, JobDetail, JobEvent, JobEventsResponse, JobFailure, JobKind, JobLease,
+    JobListResponse, JobState, JobSummary, MineJobRequest, PartitionJobRequest,
+    ReleaseCheckpointRequest, ReorgJobRequest, ScenarioStepStatus, SpamBurstJobRequest,
+    FAUCET_MAX_OUTPUTS, FAUCET_MAX_TX_VBYTES, FAUCET_PRIORITY_DELTA_SATS,
+    FAUCET_PRIORITY_DOMINANCE_FACTOR,
 };
 use simchain_common::internal_api::{
     LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest, NetworkImpairment,
@@ -25,12 +33,13 @@ use simchain_scenario_engine::{
     ScenarioProgressPhase, Step,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const JOB_SCHEMA_VERSION: u32 = 1;
+const JOB_SCHEMA_VERSION: u32 = 2;
 const MAX_JOB_HISTORY: usize = 100;
 const EVENT_RING_CAPACITY: usize = 2_048;
 const DEFAULT_LEASE_TTL_SECS: u64 = 120;
@@ -46,8 +55,64 @@ struct StoredJob {
     #[serde(skip_serializing_if = "Option::is_none")]
     idempotency_key: Option<String>,
     request_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    faucet_recovery: Option<FaucetRecoveryContext>,
     #[serde(default)]
     reorg_recovery: ReorgRecoveryContext,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FaucetPhase {
+    #[default]
+    Validated,
+    InputsSelected,
+    InputsLocked,
+    Prepared,
+    Node2Prioritized,
+    Node3Prioritized,
+    Node2Submitted,
+    Node3Submitted,
+    Armed,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct FaucetRecoveryContext {
+    phase: FaucetPhase,
+    normalized_request: Option<FaucetJobRequest>,
+    source: Option<FaucetSourceNode>,
+    wallet_name: Option<String>,
+    selected_inputs: Vec<FaucetInput>,
+    input_sats: Option<u64>,
+    change_sats: Option<u64>,
+    raw_tx_hex: Option<String>,
+    txid: Option<String>,
+    desired_priority_delta_sats: i64,
+    node2_prioritized: bool,
+    node3_prioritized: bool,
+    node2_submitted: bool,
+    node3_submitted: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StoredJobV1 {
+    detail: JobDetail,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<String>,
+    request_fingerprint: String,
+    #[serde(default)]
+    reorg_recovery: ReorgRecoveryContext,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedJobsV1 {
+    schema_version: u32,
+    next_event_sequence: u64,
+    #[serde(default = "default_next_checkpoint_generation")]
+    next_checkpoint_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_job_id: Option<String>,
+    jobs: Vec<StoredJobV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -73,12 +138,50 @@ impl Default for PersistedJobs {
     }
 }
 
+fn load_and_migrate_jobs(store: &JobStore) -> anyhow::Result<PersistedJobs> {
+    let Some(value) = store.load_optional::<Value>()? else {
+        return Ok(PersistedJobs::default());
+    };
+    let version = value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("job index has no schema_version"))?;
+    match version {
+        1 => {
+            let old: PersistedJobsV1 = serde_json::from_value(value)?;
+            anyhow::ensure!(old.schema_version == 1, "invalid v1 job schema marker");
+            let migrated = PersistedJobs {
+                schema_version: JOB_SCHEMA_VERSION,
+                next_event_sequence: old.next_event_sequence,
+                next_checkpoint_generation: old.next_checkpoint_generation,
+                active_job_id: old.active_job_id,
+                jobs: old
+                    .jobs
+                    .into_iter()
+                    .map(|job| StoredJob {
+                        detail: job.detail,
+                        idempotency_key: job.idempotency_key,
+                        request_fingerprint: job.request_fingerprint,
+                        faucet_recovery: None,
+                        reorg_recovery: job.reorg_recovery,
+                    })
+                    .collect(),
+            };
+            store.save(&migrated)?;
+            Ok(migrated)
+        }
+        2 => serde_json::from_value(value).map_err(Into::into),
+        future => anyhow::bail!("unsupported job schema {future} (expected {JOB_SCHEMA_VERSION})"),
+    }
+}
+
 struct ManagerState {
     persisted: PersistedJobs,
     events: VecDeque<JobEvent>,
     aborts: HashMap<String, Arc<AtomicBool>>,
     recovering: HashSet<String>,
     recovery_errors: HashMap<String, String>,
+    delivery_recovering: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -115,9 +218,21 @@ pub struct JobManager {
     network_actions: Arc<dyn NetworkActionBackend>,
     reorg: Arc<dyn ReorgExecutor>,
     scenario: Arc<dyn ScenarioActionBackend>,
+    faucet: Arc<dyn FaucetBackend>,
+    faucet_store: FaucetStore,
+    faucet_settings: FaucetSettings,
     checkpoint_cv: Condvar,
     id_sequence: AtomicU64,
     lease_ttl_secs: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct FaucetSettings {
+    pub node2_wallet_name: String,
+    pub node3_wallet_name: String,
+    pub wallet_reserve_sats: u64,
+    pub max_request_sats: u64,
+    pub explorer_url: String,
 }
 
 pub struct JobDependencies {
@@ -127,6 +242,8 @@ pub struct JobDependencies {
     pub reorg: Arc<dyn ReorgExecutor>,
     pub scenario: Arc<dyn ScenarioActionBackend>,
     pub network_actions: Arc<dyn NetworkActionBackend>,
+    pub faucet: Arc<dyn FaucetBackend>,
+    pub faucet_settings: FaucetSettings,
 }
 
 impl JobManager {
@@ -144,12 +261,8 @@ impl JobManager {
     ) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!(lease_ttl_secs > 0, "job lease TTL must be positive");
         let store = JobStore::open(state_dir)?;
-        let mut persisted: PersistedJobs = store.load()?;
-        anyhow::ensure!(
-            persisted.schema_version == JOB_SCHEMA_VERSION,
-            "unsupported job schema {} (expected {JOB_SCHEMA_VERSION})",
-            persisted.schema_version
-        );
+        let mut persisted = load_and_migrate_jobs(&store)?;
+        let faucet_store = FaucetStore::open(state_dir)?;
 
         let mut all_events = Vec::new();
         for job in &persisted.jobs {
@@ -195,6 +308,7 @@ impl JobManager {
                 aborts: HashMap::new(),
                 recovering: HashSet::new(),
                 recovery_errors: HashMap::new(),
+                delivery_recovering: false,
             }),
             mining: dependencies.mining,
             spam: dependencies.spam,
@@ -202,6 +316,9 @@ impl JobManager {
             reorg: dependencies.reorg,
             scenario: dependencies.scenario,
             network_actions: dependencies.network_actions,
+            faucet: dependencies.faucet,
+            faucet_store,
+            faucet_settings: dependencies.faucet_settings,
             checkpoint_cv: Condvar::new(),
             id_sequence: AtomicU64::new(1),
             lease_ttl_secs,
@@ -216,11 +333,17 @@ impl JobManager {
             );
             manager.spawn_recovery(job_id);
         }
+        manager.spawn_delivery_guard();
         Ok(manager)
     }
 
     pub fn ensure_idle(&self) -> Result<(), JobManagerError> {
         let state = self.state.lock().expect("job manager lock");
+        if state.delivery_recovering {
+            return Err(JobManagerError::operation_in_progress(
+                "faucet-delivery-recovery".to_string(),
+            ));
+        }
         match state.persisted.active_job_id.clone() {
             Some(job_id) => Err(JobManagerError::operation_in_progress(job_id)),
             None => Ok(()),
@@ -231,6 +354,242 @@ impl JobManager {
         let state = self.state.lock().expect("job manager lock");
         let job_id = state.persisted.active_job_id.as_deref()?;
         find_stored(&state.persisted, job_id).map(|job| job.detail.summary.clone())
+    }
+
+    pub fn has_pending_faucet(&self) -> bool {
+        self.faucet_store.pending().is_some()
+    }
+
+    pub fn faucet_transfer(&self, txid: &str) -> Option<FaucetTransfer> {
+        self.faucet_store.get(txid)
+    }
+
+    pub fn faucet_status(&self) -> FaucetStatusResponse {
+        let preflight = self.faucet.preflight();
+        let (available, last_probe_error, wallets) = match preflight {
+            Ok(preflight) => {
+                let wallets = [
+                    (
+                        FaucetSourceNode::Node2,
+                        &self.faucet_settings.node2_wallet_name,
+                        &preflight.node2_inputs,
+                    ),
+                    (
+                        FaucetSourceNode::Node3,
+                        &self.faucet_settings.node3_wallet_name,
+                        &preflight.node3_inputs,
+                    ),
+                ]
+                .into_iter()
+                .map(|(source, wallet_name, inputs)| {
+                    let total = eligible_total(inputs).unwrap_or(0);
+                    FaucetWalletStatus {
+                        source,
+                        wallet_name: wallet_name.clone(),
+                        eligible_confirmed_sats: total,
+                        available_after_reserve_sats: total
+                            .saturating_sub(self.faucet_settings.wallet_reserve_sats),
+                        error: None,
+                    }
+                })
+                .collect();
+                (true, None, wallets)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let wallets = [
+                    (
+                        FaucetSourceNode::Node2,
+                        &self.faucet_settings.node2_wallet_name,
+                    ),
+                    (
+                        FaucetSourceNode::Node3,
+                        &self.faucet_settings.node3_wallet_name,
+                    ),
+                ]
+                .into_iter()
+                .map(|(source, wallet_name)| FaucetWalletStatus {
+                    source,
+                    wallet_name: wallet_name.clone(),
+                    eligible_confirmed_sats: 0,
+                    available_after_reserve_sats: 0,
+                    error: Some(message.clone()),
+                })
+                .collect();
+                (false, Some(message), wallets)
+            }
+        };
+        FaucetStatusResponse {
+            available,
+            last_probe_error,
+            max_request_sats: self.faucet_settings.max_request_sats,
+            max_outputs: FAUCET_MAX_OUTPUTS,
+            wallet_reserve_sats: self.faucet_settings.wallet_reserve_sats,
+            max_tx_vbytes: FAUCET_MAX_TX_VBYTES,
+            priority_delta_sats: FAUCET_PRIORITY_DELTA_SATS,
+            wallets,
+            pending_transfer: self.faucet_store.pending().map(|record| record.public),
+            recent_transfers: self.faucet_store.recent(),
+        }
+    }
+
+    fn ensure_pending_faucet_armed(&self) -> Result<(), JobManagerError> {
+        let Some(pending) = self.faucet_store.pending() else {
+            return Ok(());
+        };
+        for node in [FaucetSourceNode::Node2, FaucetSourceNode::Node3] {
+            let verification = self
+                .faucet
+                .verify_miner(node, &pending.public.txid)
+                .map_err(|error| {
+                    JobManagerError::new(
+                        ErrorCode::FaucetDeliveryPending,
+                        format!(
+                            "manual mining is waiting for faucet delivery recovery on {}: {error}",
+                            node.as_str()
+                        ),
+                    )
+                })?;
+            if verification.base_fee_sats != 0
+                || verification.modified_fee_sats != FAUCET_PRIORITY_DELTA_SATS as u64
+                || verification.fee_delta_sats != FAUCET_PRIORITY_DELTA_SATS
+                || verification.ancestor_count != 1
+            {
+                return Err(JobManagerError::new(
+                    ErrorCode::FaucetDeliveryPending,
+                    format!(
+                        "manual mining is blocked while faucet delivery is re-armed on {}",
+                        node.as_str()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn start_faucet(
+        self: &Arc<Self>,
+        request: FaucetJobRequest,
+        idempotency_key: Option<String>,
+    ) -> Result<JobCreatedResponse, JobManagerError> {
+        let request = normalize_faucet_request(request, self.faucet_settings.max_request_sats)?;
+        let request_value = serde_json::to_value(&request).map_err(internal_error)?;
+        let fingerprint = serde_json::to_string(&request).map_err(internal_error)?;
+        let idempotency_key = normalize_required_idempotency_key(idempotency_key)?;
+        let abort = Arc::new(AtomicBool::new(false));
+
+        let job_id = {
+            let mut state = self.state.lock().expect("job manager lock");
+            if let Some(existing) = state
+                .persisted
+                .jobs
+                .iter()
+                .find(|job| job.idempotency_key.as_deref() == Some(idempotency_key.as_str()))
+            {
+                if existing.detail.summary.kind != JobKind::Faucet
+                    || existing.request_fingerprint != fingerprint
+                {
+                    return Err(JobManagerError::new(
+                        ErrorCode::ValidationFailed,
+                        "idempotency key was already used for a different job request",
+                    ));
+                }
+                return Ok(JobCreatedResponse {
+                    job_id: existing.detail.summary.id.clone(),
+                    state: existing.detail.summary.state,
+                    reused: true,
+                });
+            }
+            if let Some(active) = state.persisted.active_job_id.clone() {
+                return Err(JobManagerError::operation_in_progress(active));
+            }
+            if state.delivery_recovering {
+                return Err(JobManagerError::operation_in_progress(
+                    "faucet-delivery-recovery".to_string(),
+                ));
+            }
+            if self.faucet_store.pending().is_some() {
+                return Err(JobManagerError::new(
+                    ErrorCode::FaucetDeliveryPending,
+                    "a faucet transfer is already armed and awaiting confirmation",
+                ));
+            }
+
+            let job_id = self.next_job_id();
+            let created_at_ms = now_ms();
+            state.persisted.jobs.push(StoredJob {
+                detail: JobDetail {
+                    summary: JobSummary {
+                        id: job_id.clone(),
+                        kind: JobKind::Faucet,
+                        state: JobState::Starting,
+                        phase: "validating_request".to_string(),
+                        created_at_ms,
+                        started_at_ms: None,
+                        ended_at_ms: None,
+                        cleanup: JobCleanup::default(),
+                    },
+                    request: request_value,
+                    leases: Vec::new(),
+                    current_step: None,
+                    checkpoints: Vec::new(),
+                    result: None,
+                    failure: None,
+                },
+                idempotency_key: Some(idempotency_key),
+                request_fingerprint: fingerprint,
+                faucet_recovery: Some(FaucetRecoveryContext {
+                    phase: FaucetPhase::Validated,
+                    normalized_request: Some(request.clone()),
+                    desired_priority_delta_sats: FAUCET_PRIORITY_DELTA_SATS,
+                    ..FaucetRecoveryContext::default()
+                }),
+                reorg_recovery: ReorgRecoveryContext::default(),
+            });
+            state.persisted.active_job_id = Some(job_id.clone());
+            state.aborts.insert(job_id.clone(), abort.clone());
+            self.trim_history_locked(&mut state)
+                .map_err(internal_error)?;
+            self.store.save(&state.persisted).map_err(internal_error)?;
+            job_id
+        };
+
+        if let Err(error) = self.emit(
+            &job_id,
+            "created",
+            "validating_request",
+            "faucet job accepted",
+            Some(json!({"source": request.source, "output_count": request.outputs.len()})),
+        ) {
+            self.fail_before_thread(&job_id, error.to_string());
+            return Err(internal_error(error));
+        }
+        let manager = self.clone();
+        let thread_job_id = job_id.clone();
+        let spawn = thread::Builder::new()
+            .name(format!("faucet-{job_id}"))
+            .spawn(move || {
+                let panic_manager = manager.clone();
+                let panic_job_id = thread_job_id.clone();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    manager.run_faucet_job(thread_job_id, request, abort)
+                }));
+                if outcome.is_err() {
+                    panic_manager.handle_executor_panic(&panic_job_id);
+                }
+            });
+        if let Err(error) = spawn {
+            self.fail_before_thread(&job_id, format!("failed to start faucet thread: {error}"));
+            return Err(JobManagerError::new(
+                ErrorCode::Internal,
+                format!("failed to start faucet thread: {error}"),
+            ));
+        }
+        Ok(JobCreatedResponse {
+            job_id,
+            state: JobState::Starting,
+            reused: false,
+        })
     }
 
     pub fn start_reorg(
@@ -272,6 +631,17 @@ impl JobManager {
             if let Some(active) = state.persisted.active_job_id.clone() {
                 return Err(JobManagerError::operation_in_progress(active));
             }
+            if state.delivery_recovering {
+                return Err(JobManagerError::operation_in_progress(
+                    "faucet-delivery-recovery".to_string(),
+                ));
+            }
+            if self.faucet_store.pending().is_some() {
+                return Err(JobManagerError::new(
+                    ErrorCode::FaucetDeliveryPending,
+                    "reorg is blocked until the armed faucet transfer confirms",
+                ));
+            }
 
             let job_id = self.next_job_id();
             let created_at_ms = now_ms();
@@ -300,6 +670,7 @@ impl JobManager {
                 // prove target/witness tips agree before releasing leases.
                 // The invalidating progress callback fills the block hash
                 // before the non-idempotent RPC is issued.
+                faucet_recovery: None,
                 reorg_recovery: ReorgRecoveryContext {
                     mutation_may_have_occurred: true,
                     request: Some(request.clone()),
@@ -423,6 +794,17 @@ impl JobManager {
             if let Some(active) = state.persisted.active_job_id.clone() {
                 return Err(JobManagerError::operation_in_progress(active));
             }
+            if state.delivery_recovering {
+                return Err(JobManagerError::operation_in_progress(
+                    "faucet-delivery-recovery".to_string(),
+                ));
+            }
+            if self.faucet_store.pending().is_some() {
+                return Err(JobManagerError::new(
+                    ErrorCode::FaucetDeliveryPending,
+                    "scenario is blocked until the armed faucet transfer confirms",
+                ));
+            }
 
             let job_id = self.next_job_id();
             state.persisted.jobs.push(StoredJob {
@@ -446,6 +828,7 @@ impl JobManager {
                 },
                 idempotency_key,
                 request_fingerprint: fingerprint,
+                faucet_recovery: None,
                 reorg_recovery: ReorgRecoveryContext::default(),
             });
             state.persisted.active_job_id = Some(job_id.clone());
@@ -502,6 +885,7 @@ impl JobManager {
         idempotency_key: Option<String>,
     ) -> Result<JobCreatedResponse, JobManagerError> {
         let (request, node) = normalize_mine_request(request)?;
+        self.ensure_pending_faucet_armed()?;
         let request_value = serde_json::to_value(&request).map_err(internal_error)?;
         let (created, abort) = self.reserve_action_job(
             JobKind::Mine,
@@ -712,6 +1096,22 @@ impl JobManager {
             if let Some(active) = state.persisted.active_job_id.clone() {
                 return Err(JobManagerError::operation_in_progress(active));
             }
+            if state.delivery_recovering {
+                return Err(JobManagerError::operation_in_progress(
+                    "faucet-delivery-recovery".to_string(),
+                ));
+            }
+            if self.faucet_store.pending().is_some()
+                && !matches!(kind, JobKind::Mine | JobKind::SpamBurst)
+            {
+                return Err(JobManagerError::new(
+                    ErrorCode::FaucetDeliveryPending,
+                    format!(
+                        "{} is blocked until the armed faucet transfer confirms",
+                        kind.as_str()
+                    ),
+                ));
+            }
             let job_id = self.next_job_id();
             state.persisted.jobs.push(StoredJob {
                 detail: JobDetail {
@@ -734,6 +1134,7 @@ impl JobManager {
                 },
                 idempotency_key,
                 request_fingerprint: fingerprint,
+                faucet_recovery: None,
                 reorg_recovery: ReorgRecoveryContext::default(),
             });
             state.persisted.active_job_id = Some(job_id.clone());
@@ -978,6 +1379,559 @@ impl JobManager {
         Ok(JobCheckpointResponse {
             job_id: job_id.to_string(),
             checkpoint,
+        })
+    }
+
+    fn run_faucet_job(
+        self: Arc<Self>,
+        job_id: String,
+        request: FaucetJobRequest,
+        abort: Arc<AtomicBool>,
+    ) {
+        if abort.load(Ordering::Acquire) {
+            self.finish_job(
+                &job_id,
+                JobState::Aborted,
+                "aborted_before_start",
+                None,
+                None,
+                successful_cleanup(),
+            );
+            return;
+        }
+        self.set_running(&job_id, "faucet_preflight");
+        let initial = match self.faucet.preflight() {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.finish_job(
+                    &job_id,
+                    JobState::Failed,
+                    "faucet_preflight_failed",
+                    None,
+                    Some(JobFailure {
+                        code: "faucet_unavailable".to_string(),
+                        message: error.to_string(),
+                    }),
+                    successful_cleanup(),
+                );
+                return;
+            }
+        };
+        self.emit_best_effort(
+            &job_id,
+            "faucet_preflight_completed",
+            "faucet_preflight",
+            "faucet wallets, miners, and common tip are ready",
+            Some(json!({"height": initial.height, "best_hash": initial.best_hash})),
+        );
+
+        self.set_phase(&job_id, "acquiring_mining_lease");
+        let lease = match self.acquire_scenario_lease(
+            &job_id,
+            "mining",
+            "faucet exact-zero transaction arming",
+            1,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.finish_job(
+                    &job_id,
+                    JobState::Failed,
+                    "mining_lease_failed",
+                    None,
+                    Some(JobFailure {
+                        code: "faucet_unavailable".to_string(),
+                        message: error.to_string(),
+                    }),
+                    successful_cleanup(),
+                );
+                return;
+            }
+        };
+        self.emit_best_effort(
+            &job_id,
+            "mining_lease_acquired",
+            "acquiring_mining_lease",
+            "mining paused at a safe point",
+            None,
+        );
+        let renewer = match OwnedLeaseRenewer::start(
+            self.clone(),
+            job_id.clone(),
+            abort.clone(),
+            self.lease_ttl_secs,
+        ) {
+            Ok(renewer) => renewer,
+            Err(error) => {
+                self.finish_failed_before_mutation(&job_id, error, vec![lease], abort);
+                return;
+            }
+        };
+
+        let outcome = self.execute_faucet(&job_id, &request, &abort);
+        let context = self.faucet_context(&job_id).unwrap_or_default();
+        let submitted = context.node2_submitted || context.node3_submitted;
+        let stop_error = renewer.stop().err().map(|error| error.to_string());
+        let mut extra_cleanup_errors = Vec::new();
+
+        if outcome.is_err() || abort.load(Ordering::Acquire) {
+            if let Some(txid) = context.txid.as_deref() {
+                for node in [FaucetSourceNode::Node2, FaucetSourceNode::Node3] {
+                    if let Err(error) = self.faucet.set_priority(node, txid, 0) {
+                        extra_cleanup_errors.push(format!("{} priority: {error}", node.as_str()));
+                    }
+                }
+            }
+            if let Some(source) = context.source {
+                if !context.selected_inputs.is_empty() {
+                    if let Err(error) = self.faucet.unlock_inputs(source, &context.selected_inputs)
+                    {
+                        extra_cleanup_errors.push(format!("wallet input unlock: {error}"));
+                    }
+                }
+            }
+        }
+        let mut cleanup = self.cleanup_leases(&job_id, &[lease], false, stop_error);
+        cleanup.errors.extend(extra_cleanup_errors);
+        if !cleanup.errors.is_empty() {
+            cleanup.state = CleanupState::Failed;
+        }
+
+        match outcome {
+            Ok(transfer) if abort.load(Ordering::Acquire) => {
+                let _ = self.faucet_store.mark_failed(
+                    &transfer.txid,
+                    FaucetDeliveryState::AbortedAfterSubmission,
+                    "aborted after miner submission; transaction may still confirm".to_string(),
+                );
+                self.finish_job(
+                    &job_id,
+                    JobState::Aborted,
+                    "aborted_after_submission",
+                    serde_json::to_value(&transfer).ok(),
+                    None,
+                    cleanup,
+                );
+            }
+            Ok(transfer) => {
+                self.clear_faucet_job_recovery_material(&job_id);
+                self.finish_job(
+                    &job_id,
+                    JobState::Succeeded,
+                    "armed_for_next_block",
+                    serde_json::to_value(&transfer).ok(),
+                    None,
+                    cleanup,
+                );
+            }
+            Err(_error) if abort.load(Ordering::Acquire) => {
+                if submitted {
+                    if let Some(txid) = context.txid.as_deref() {
+                        if let Some(transfer) = self.transfer_from_context(
+                            &request,
+                            &context,
+                            initial.height,
+                            initial.best_hash,
+                            true,
+                        ) {
+                            let _ = self.faucet_store.arm(StoredFaucetTransfer {
+                                public: transfer,
+                                raw_tx_hex: context.raw_tx_hex.clone(),
+                                selected_inputs: context.selected_inputs.clone(),
+                            });
+                            let _ = self.faucet_store.mark_failed(
+                                txid,
+                                FaucetDeliveryState::AbortedAfterSubmission,
+                                "aborted after miner submission; transaction may still confirm"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                self.finish_job(
+                    &job_id,
+                    JobState::Aborted,
+                    if submitted {
+                        "aborted_after_submission"
+                    } else {
+                        "aborted_safely"
+                    },
+                    context
+                        .txid
+                        .map(|txid| json!({"txid": txid, "may_still_confirm": submitted})),
+                    None,
+                    cleanup,
+                );
+            }
+            Err(error) => self.finish_job(
+                &job_id,
+                JobState::Failed,
+                "faucet_failed",
+                context
+                    .txid
+                    .map(|txid| json!({"txid": txid, "may_still_confirm": submitted})),
+                Some(JobFailure {
+                    code: error.code.to_string(),
+                    message: error.message,
+                }),
+                cleanup,
+            ),
+        }
+    }
+
+    fn execute_faucet(
+        &self,
+        job_id: &str,
+        request: &FaucetJobRequest,
+        abort: &AtomicBool,
+    ) -> Result<FaucetTransfer, FaucetRunError> {
+        if abort.load(Ordering::Acquire) {
+            return Err(FaucetRunError::aborted());
+        }
+        self.set_phase(job_id, "selecting_faucet_inputs");
+        let preflight = self
+            .faucet
+            .preflight()
+            .map_err(FaucetRunError::unavailable)?;
+        let total_sats = request
+            .outputs
+            .iter()
+            .try_fold(0_u64, |total, output| total.checked_add(output.amount_sats))
+            .ok_or_else(|| FaucetRunError::validation("output amount overflow"))?;
+        let (source, candidates) = choose_faucet_source(
+            request.source,
+            &preflight,
+            total_sats,
+            self.faucet_settings.wallet_reserve_sats,
+        )?;
+        let selected = select_inputs(
+            candidates,
+            total_sats,
+            self.faucet_settings.wallet_reserve_sats,
+        )
+        .map_err(FaucetRunError::insufficient)?;
+        let wallet_name = self.wallet_name(source).to_string();
+        self.update_faucet_context(job_id, |context| {
+            context.phase = FaucetPhase::InputsSelected;
+            context.source = Some(source);
+            context.wallet_name = Some(wallet_name.clone());
+            context.selected_inputs = selected.clone();
+        })?;
+
+        self.faucet
+            .lock_inputs(source, &selected)
+            .map_err(FaucetRunError::unavailable)?;
+        self.update_faucet_context(job_id, |context| {
+            context.phase = FaucetPhase::InputsLocked;
+        })?;
+        self.emit_best_effort(
+            job_id,
+            "faucet_inputs_locked",
+            "selecting_faucet_inputs",
+            "mature miner funds selected and locked",
+            Some(json!({"source": source, "input_count": selected.len()})),
+        );
+        if abort.load(Ordering::Acquire) {
+            return Err(FaucetRunError::aborted());
+        }
+
+        self.set_phase(job_id, "building_exact_zero_transaction");
+        let prepared = self
+            .faucet
+            .prepare_transaction(source, &selected, &request.outputs)
+            .map_err(FaucetRunError::validation_error)?;
+        self.update_faucet_context(job_id, |context| {
+            context.phase = FaucetPhase::Prepared;
+            context.input_sats = Some(prepared.input_sats);
+            context.change_sats = Some(prepared.change_sats);
+            context.raw_tx_hex = Some(prepared.raw_tx_hex.clone());
+            context.txid = Some(prepared.txid.clone());
+        })?;
+        self.emit_best_effort(
+            job_id,
+            "faucet_transaction_prepared",
+            "building_exact_zero_transaction",
+            "exact-zero transaction signed and durably prepared",
+            Some(json!({"txid": prepared.txid, "vsize": prepared.vsize, "actual_fee_sats": 0})),
+        );
+
+        self.arm_prepared(job_id, &prepared, abort)?;
+        let observer_unconfirmed = self
+            .faucet
+            .observer_contains_unconfirmed(&prepared.txid)
+            .unwrap_or(false);
+        let transfer = self
+            .transfer_from_context(
+                request,
+                &self.faucet_context(job_id).unwrap_or_default(),
+                preflight.height,
+                preflight.best_hash,
+                observer_unconfirmed,
+            )
+            .ok_or_else(|| FaucetRunError::internal("prepared faucet context is incomplete"))?;
+        self.faucet_store
+            .arm(StoredFaucetTransfer {
+                public: transfer.clone(),
+                raw_tx_hex: Some(prepared.raw_tx_hex.clone()),
+                selected_inputs: selected.clone(),
+            })
+            .map_err(FaucetRunError::internal_error)?;
+        self.update_faucet_context(job_id, |context| {
+            context.phase = FaucetPhase::Armed;
+        })?;
+        self.emit_best_effort(
+            job_id,
+            "faucet_armed",
+            "armed_for_next_block",
+            "both miners verified; mining may resume",
+            Some(json!({
+                "txid": prepared.txid,
+                "source": source,
+                "output_count": request.outputs.len(),
+                "total_sats": total_sats
+            })),
+        );
+        Ok(transfer)
+    }
+
+    fn arm_prepared(
+        &self,
+        job_id: &str,
+        prepared: &PreparedFaucetTransaction,
+        abort: &AtomicBool,
+    ) -> Result<(), FaucetRunError> {
+        for (node, phase, context_phase) in [
+            (
+                FaucetSourceNode::Node2,
+                "arming_node2",
+                FaucetPhase::Node2Prioritized,
+            ),
+            (
+                FaucetSourceNode::Node3,
+                "arming_node3",
+                FaucetPhase::Node3Prioritized,
+            ),
+        ] {
+            self.set_phase(job_id, phase);
+            let update = self
+                .faucet
+                .set_priority(node, &prepared.txid, FAUCET_PRIORITY_DELTA_SATS)
+                .map_err(FaucetRunError::priority)?;
+            self.update_faucet_context(job_id, |context| {
+                context.phase = context_phase;
+                match node {
+                    FaucetSourceNode::Node2 => context.node2_prioritized = true,
+                    FaucetSourceNode::Node3 => context.node3_prioritized = true,
+                }
+            })?;
+            self.emit_best_effort(
+                job_id,
+                "faucet_priority_set",
+                phase,
+                &format!("{} virtual priority set", node.as_str()),
+                Some(json!({
+                    "node": node,
+                    "desired_delta_sats": FAUCET_PRIORITY_DELTA_SATS,
+                    "previous_delta_sats": update.previous_delta_sats
+                })),
+            );
+        }
+        for node in [FaucetSourceNode::Node2, FaucetSourceNode::Node3] {
+            self.faucet
+                .test_accept(node, &prepared.raw_tx_hex)
+                .map_err(FaucetRunError::priority)?;
+        }
+
+        for node in [FaucetSourceNode::Node2, FaucetSourceNode::Node3] {
+            loop {
+                if abort.load(Ordering::Acquire) {
+                    return Err(FaucetRunError::aborted());
+                }
+                match self
+                    .faucet
+                    .submit(node, &prepared.raw_tx_hex, &prepared.txid)
+                {
+                    Ok(already_present) => {
+                        self.update_faucet_context(job_id, |context| {
+                            context.phase = match node {
+                                FaucetSourceNode::Node2 => FaucetPhase::Node2Submitted,
+                                FaucetSourceNode::Node3 => FaucetPhase::Node3Submitted,
+                            };
+                            match node {
+                                FaucetSourceNode::Node2 => context.node2_submitted = true,
+                                FaucetSourceNode::Node3 => context.node3_submitted = true,
+                            }
+                        })?;
+                        self.emit_best_effort(
+                            job_id,
+                            "faucet_submission_accepted",
+                            &format!("submitting_{}", node.as_str()),
+                            &format!("{} accepted the exact faucet transaction", node.as_str()),
+                            Some(json!({"node": node, "already_present": already_present})),
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        self.emit_best_effort(
+                            job_id,
+                            "faucet_submission_retry",
+                            &format!("submitting_{}", node.as_str()),
+                            &format!("{} submission retry: {error}", node.as_str()),
+                            None,
+                        );
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            }
+        }
+
+        self.set_phase(job_id, "verifying_next_block_priority");
+        let spam_bound = self
+            .spam
+            .status()
+            .map_err(FaucetRunError::unavailable)?
+            .policy
+            .max_generated_feerate_sat_vb()
+            .ceil() as u64;
+        for node in [FaucetSourceNode::Node2, FaucetSourceNode::Node3] {
+            let verification = self
+                .faucet
+                .verify_miner(node, &prepared.txid)
+                .map_err(FaucetRunError::priority)?;
+            if verification.base_fee_sats != 0
+                || verification.modified_fee_sats != FAUCET_PRIORITY_DELTA_SATS as u64
+                || verification.fee_delta_sats != FAUCET_PRIORITY_DELTA_SATS
+                || verification.vsize != prepared.vsize
+                || verification.ancestor_count != 1
+            {
+                return Err(FaucetRunError::priority(format!(
+                    "{} mempool verification failed: base={}, modified={}, delta={}, vsize={}, ancestors={}",
+                    node.as_str(),
+                    verification.base_fee_sats,
+                    verification.modified_fee_sats,
+                    verification.fee_delta_sats,
+                    verification.vsize,
+                    verification.ancestor_count
+                )));
+            }
+            let competitor = verification
+                .greatest_competing_feerate_sat_vb
+                .max(verification.minimum_feerate_sat_vb)
+                .max(spam_bound);
+            let faucet_rate = FAUCET_PRIORITY_DELTA_SATS as u64 / prepared.vsize.max(1);
+            let required = competitor.saturating_mul(FAUCET_PRIORITY_DOMINANCE_FACTOR);
+            if faucet_rate < required {
+                return Err(FaucetRunError::priority(format!(
+                    "{} faucet modified feerate {faucet_rate} sat/vB is below required {required} sat/vB (competitor {competitor})",
+                    node.as_str()
+                )));
+            }
+            self.emit_best_effort(
+                job_id,
+                "faucet_miner_verified",
+                "verifying_next_block_priority",
+                &format!("{} mempool and priority verified", node.as_str()),
+                Some(json!({
+                    "node": node,
+                    "base_fee_sats": verification.base_fee_sats,
+                    "modified_fee_sats": verification.modified_fee_sats,
+                    "vsize": verification.vsize
+                })),
+            );
+        }
+        Ok(())
+    }
+
+    fn update_faucet_context(
+        &self,
+        job_id: &str,
+        update: impl FnOnce(&mut FaucetRecoveryContext),
+    ) -> Result<(), FaucetRunError> {
+        let mut state = self.state.lock().expect("job manager lock");
+        let job = find_stored_mut(&mut state.persisted, job_id)
+            .ok_or_else(|| FaucetRunError::internal("faucet job disappeared"))?;
+        let context = job
+            .faucet_recovery
+            .as_mut()
+            .ok_or_else(|| FaucetRunError::internal("faucet recovery context disappeared"))?;
+        update(context);
+        self.store
+            .save(&state.persisted)
+            .map_err(FaucetRunError::internal_error)
+    }
+
+    fn faucet_context(&self, job_id: &str) -> Option<FaucetRecoveryContext> {
+        let state = self.state.lock().expect("job manager lock");
+        find_stored(&state.persisted, job_id)?
+            .faucet_recovery
+            .clone()
+    }
+
+    fn clear_faucet_job_recovery_material(&self, job_id: &str) {
+        let mut state = self.state.lock().expect("job manager lock");
+        if let Some(context) = find_stored_mut(&mut state.persisted, job_id)
+            .and_then(|job| job.faucet_recovery.as_mut())
+        {
+            context.raw_tx_hex = None;
+            context.selected_inputs.clear();
+        }
+        if let Err(error) = self.store.save(&state.persisted) {
+            tracing::error!(
+                job_id,
+                "failed to clear duplicate faucet recovery material: {error}"
+            );
+        }
+    }
+
+    fn wallet_name(&self, source: FaucetSourceNode) -> &str {
+        match source {
+            FaucetSourceNode::Node2 => &self.faucet_settings.node2_wallet_name,
+            FaucetSourceNode::Node3 => &self.faucet_settings.node3_wallet_name,
+        }
+    }
+
+    fn transfer_from_context(
+        &self,
+        request: &FaucetJobRequest,
+        context: &FaucetRecoveryContext,
+        height: u64,
+        block_hash: String,
+        observer_unconfirmed: bool,
+    ) -> Option<FaucetTransfer> {
+        let txid = context.txid.clone()?;
+        let source = context.source?;
+        let input_sats = context.input_sats?;
+        let change_sats = context.change_sats?;
+        let total_sats = input_sats.checked_sub(change_sats)?;
+        let raw = context.raw_tx_hex.as_deref()?;
+        let transaction: bitcoincore_rpc::bitcoin::Transaction =
+            bitcoincore_rpc::bitcoin::consensus::encode::deserialize_hex(raw).ok()?;
+        Some(FaucetTransfer {
+            delivery_state: FaucetDeliveryState::Armed,
+            txid: txid.clone(),
+            source,
+            wallet_name: context.wallet_name.clone()?,
+            outputs: request.outputs.clone(),
+            total_sats,
+            change_sats,
+            actual_fee_sats: 0,
+            priority_delta_sats: FAUCET_PRIORITY_DELTA_SATS,
+            vsize: transaction.vsize() as u64,
+            armed_nodes: vec!["node2".to_string(), "node3".to_string()],
+            visibility: "miner_only_unconfirmed".to_string(),
+            armed_at_height: height,
+            armed_at_block_hash: block_hash,
+            armed_at_ms: now_ms(),
+            confirmed_height: None,
+            confirmed_block_hash: None,
+            confirmed_at_ms: None,
+            last_error: None,
+            observer_unconfirmed,
+            transfer_url: format!("/api/v1/faucet/transfers/{txid}"),
+            explorer_url: format!(
+                "{}/tx/{txid}",
+                self.faucet_settings.explorer_url.trim_end_matches('/')
+            ),
         })
     }
 
@@ -2261,6 +3215,231 @@ impl JobManager {
         format!("job-{}-{sequence}", now_ms())
     }
 
+    fn spawn_delivery_guard(self: &Arc<Self>) {
+        let manager = self.clone();
+        if let Err(error) = thread::Builder::new()
+            .name("faucet-delivery-guard".to_string())
+            .spawn(move || loop {
+                if let Err(error) = manager.poll_faucet_delivery() {
+                    tracing::warn!("faucet delivery guard probe failed: {error}");
+                }
+                thread::sleep(Duration::from_secs(2));
+            })
+        {
+            tracing::error!("failed to start faucet delivery guard: {error}");
+        }
+    }
+
+    fn poll_faucet_delivery(self: &Arc<Self>) -> anyhow::Result<()> {
+        let Some(pending) = self.faucet_store.pending() else {
+            return self.poll_confirmed_faucet();
+        };
+        let txid = pending.public.txid.clone();
+        if let Some(confirmation) = self.faucet.confirmation(&txid)? {
+            self.faucet_store.mark_confirmed(
+                &txid,
+                confirmation.height,
+                confirmation.block_hash.clone(),
+                now_ms(),
+            )?;
+            self.emit_faucet_transfer_event(
+                &txid,
+                "faucet_confirmed",
+                "confirmed",
+                &format!(
+                    "faucet transaction confirmed in block {}",
+                    confirmation.height
+                ),
+                Some(json!({
+                    "txid": txid,
+                    "height": confirmation.height,
+                    "block_hash": confirmation.block_hash
+                })),
+            );
+            return Ok(());
+        }
+
+        let both_armed = [FaucetSourceNode::Node2, FaucetSourceNode::Node3]
+            .into_iter()
+            .all(|node| {
+                self.faucet
+                    .verify_miner(node, &txid)
+                    .is_ok_and(|verification| {
+                        verification.base_fee_sats == 0
+                            && verification.modified_fee_sats == FAUCET_PRIORITY_DELTA_SATS as u64
+                            && verification.fee_delta_sats == FAUCET_PRIORITY_DELTA_SATS
+                            && verification.ancestor_count == 1
+                    })
+            });
+        if both_armed {
+            if pending.public.delivery_state == FaucetDeliveryState::Recovering {
+                self.faucet_store.mark_armed(&txid)?;
+            }
+            return Ok(());
+        }
+
+        {
+            let mut state = self.state.lock().expect("job manager lock");
+            if state.delivery_recovering || state.persisted.active_job_id.is_some() {
+                return Ok(());
+            }
+            state.delivery_recovering = true;
+        }
+        let result = self.recover_pending_transfer(&pending);
+        self.state
+            .lock()
+            .expect("job manager lock")
+            .delivery_recovering = false;
+        result
+    }
+
+    fn poll_confirmed_faucet(&self) -> anyhow::Result<()> {
+        let Some(transfer) = self.faucet_store.latest_confirmed() else {
+            return Ok(());
+        };
+        let Some(confirmation) = self.faucet.confirmation(&transfer.txid)? else {
+            let message = format!(
+                "previously confirmed faucet transaction is no longer in the active chain at block {}",
+                transfer.confirmed_block_hash.as_deref().unwrap_or("unknown")
+            );
+            self.faucet_store
+                .mark_orphaned(&transfer.txid, message.clone())?;
+            self.emit_faucet_transfer_event(
+                &transfer.txid,
+                "faucet_orphaned_after_confirmation",
+                "orphaned_after_confirmation",
+                &message,
+                Some(json!({"txid": transfer.txid})),
+            );
+            return Ok(());
+        };
+        if transfer.confirmed_block_hash.as_deref() != Some(&confirmation.block_hash) {
+            self.faucet_store.mark_confirmed(
+                &transfer.txid,
+                confirmation.height,
+                confirmation.block_hash,
+                now_ms(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn recover_pending_transfer(&self, pending: &StoredFaucetTransfer) -> anyhow::Result<()> {
+        let txid = &pending.public.txid;
+        self.faucet_store.mark_recovering(txid, None)?;
+        self.emit_faucet_transfer_event(
+            txid,
+            "faucet_recovery_started",
+            "recovering",
+            "re-arming saved faucet transaction after miner state changed",
+            None,
+        );
+        let raw = pending.raw_tx_hex.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("pending faucet transfer has no recovery transaction")
+        })?;
+        if !self
+            .faucet
+            .inputs_unspent(pending.public.source, &pending.selected_inputs)?
+        {
+            let message = "prepared faucet inputs were spent by a conflicting transaction";
+            self.faucet_store.mark_failed(
+                txid,
+                FaucetDeliveryState::DeliveryFailed,
+                message.to_string(),
+            )?;
+            anyhow::bail!(message);
+        }
+
+        let lease_id = format!("faucet-delivery-{}", &txid[..txid.len().min(16)]);
+        self.mining.acquire_lease(LeaseRequest {
+            lease_id: lease_id.clone(),
+            owner_job_id: "faucet-delivery-recovery".to_string(),
+            purpose: "restore faucet next-block delivery".to_string(),
+            ttl_secs: self.lease_ttl_secs,
+            request_id: format!("{lease_id}-acquire-{}", now_ms()),
+        })?;
+        let recovery = (|| -> anyhow::Result<()> {
+            for node in [FaucetSourceNode::Node2, FaucetSourceNode::Node3] {
+                self.faucet
+                    .set_priority(node, txid, FAUCET_PRIORITY_DELTA_SATS)?;
+                self.faucet.test_accept(node, raw)?;
+                self.faucet.submit(node, raw, txid)?;
+            }
+            for node in [FaucetSourceNode::Node2, FaucetSourceNode::Node3] {
+                let verification = self.faucet.verify_miner(node, txid)?;
+                anyhow::ensure!(
+                    verification.base_fee_sats == 0
+                        && verification.modified_fee_sats == FAUCET_PRIORITY_DELTA_SATS as u64
+                        && verification.fee_delta_sats == FAUCET_PRIORITY_DELTA_SATS
+                        && verification.ancestor_count == 1,
+                    "{} did not restore the exact faucet priority invariant",
+                    node.as_str()
+                );
+            }
+            Ok(())
+        })();
+        let release = self.mining.release_lease(
+            &lease_id,
+            LeaseReleaseRequest {
+                request_id: format!("{lease_id}-release-{}", now_ms()),
+                chain_changed: false,
+            },
+        );
+        if let Err(error) = recovery {
+            let message = error.to_string();
+            let _ = self
+                .faucet_store
+                .mark_recovering(txid, Some(message.clone()));
+            let _ = release;
+            return Err(error);
+        }
+        release?;
+        self.faucet_store.mark_armed(txid)?;
+        self.emit_faucet_transfer_event(
+            txid,
+            "faucet_recovery_completed",
+            "armed_for_next_block",
+            "saved faucet transaction is armed on both miners again",
+            None,
+        );
+        Ok(())
+    }
+
+    fn emit_faucet_transfer_event(
+        &self,
+        txid: &str,
+        event: &str,
+        phase: &str,
+        message: &str,
+        data: Option<Value>,
+    ) {
+        let job_id = {
+            let state = self.state.lock().expect("job manager lock");
+            state
+                .persisted
+                .jobs
+                .iter()
+                .rev()
+                .find(|job| {
+                    job.faucet_recovery
+                        .as_ref()
+                        .and_then(|context| context.txid.as_deref())
+                        == Some(txid)
+                        || job
+                            .detail
+                            .result
+                            .as_ref()
+                            .and_then(|result| result.get("txid"))
+                            .and_then(Value::as_str)
+                            == Some(txid)
+                })
+                .map(|job| job.detail.summary.id.clone())
+        };
+        if let Some(job_id) = job_id {
+            self.emit_best_effort(&job_id, event, phase, message, data);
+        }
+    }
+
     fn spawn_recovery(self: &Arc<Self>, job_id: String) {
         {
             let mut state = self.state.lock().expect("job manager lock");
@@ -2378,7 +3557,7 @@ impl JobManager {
     }
 
     fn recover_job_resources(self: &Arc<Self>, job_id: &str) -> anyhow::Result<()> {
-        let (kind, detail_request, context) = {
+        let (kind, detail_request, context, faucet_context) = {
             let state = self.state.lock().expect("job manager lock");
             let job = find_stored(&state.persisted, job_id)
                 .ok_or_else(|| anyhow::anyhow!("recovery job {job_id} is missing"))?;
@@ -2386,8 +3565,12 @@ impl JobManager {
                 job.detail.summary.kind,
                 job.detail.request.clone(),
                 job.reorg_recovery.clone(),
+                job.faucet_recovery.clone(),
             )
         };
+        if kind == JobKind::Faucet {
+            return self.recover_faucet_job(job_id, detail_request, faucet_context);
+        }
         self.recover_network_resources(job_id)?;
         if context.mutation_may_have_occurred {
             let request = match context.request.clone() {
@@ -2407,6 +3590,167 @@ impl JobManager {
             self.reorg.recover(&request, &context, &observer)?;
         }
         self.recover_worker_leases(job_id)
+    }
+
+    fn recover_faucet_job(
+        self: &Arc<Self>,
+        job_id: &str,
+        detail_request: Value,
+        context: Option<FaucetRecoveryContext>,
+    ) -> anyhow::Result<()> {
+        let context =
+            context.ok_or_else(|| anyhow::anyhow!("faucet recovery context is missing"))?;
+        let request = context
+            .normalized_request
+            .clone()
+            .or_else(|| serde_json::from_value(detail_request).ok())
+            .ok_or_else(|| anyhow::anyhow!("normalized faucet request is missing"))?;
+        let Some(raw_tx_hex) = context.raw_tx_hex.clone() else {
+            if let Some(source) = context.source {
+                if !context.selected_inputs.is_empty() {
+                    self.faucet
+                        .unlock_inputs(source, &context.selected_inputs)?;
+                }
+            }
+            return self.recover_worker_leases(job_id);
+        };
+        let txid = context
+            .txid
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("prepared faucet transaction has no txid"))?;
+
+        if let Some(confirmation) = self.faucet.confirmation(&txid)? {
+            if self.faucet_store.get(&txid).is_none() {
+                let preflight = self.faucet.preflight()?;
+                let transfer = self
+                    .transfer_from_context(
+                        &request,
+                        &context,
+                        preflight.height,
+                        preflight.best_hash,
+                        false,
+                    )
+                    .ok_or_else(|| anyhow::anyhow!("faucet context cannot form a transfer"))?;
+                self.faucet_store.arm(StoredFaucetTransfer {
+                    public: transfer,
+                    raw_tx_hex: Some(raw_tx_hex),
+                    selected_inputs: context.selected_inputs.clone(),
+                })?;
+            }
+            self.faucet_store.mark_confirmed(
+                &txid,
+                confirmation.height,
+                confirmation.block_hash,
+                now_ms(),
+            )?;
+            self.mark_recovered_faucet_succeeded(job_id, &txid)?;
+            return self.recover_worker_leases(job_id);
+        }
+
+        let source = context
+            .source
+            .ok_or_else(|| anyhow::anyhow!("prepared faucet source is missing"))?;
+        if !self
+            .faucet
+            .inputs_unspent(source, &context.selected_inputs)?
+        {
+            for node in [FaucetSourceNode::Node2, FaucetSourceNode::Node3] {
+                let _ = self.faucet.set_priority(node, &txid, 0);
+            }
+            let mut state = self.state.lock().expect("job manager lock");
+            if let Some(job) = find_stored_mut(&mut state.persisted, job_id) {
+                job.detail.summary.state = JobState::Failed;
+                job.detail.summary.phase = "prepared_inputs_conflicted".to_string();
+                job.detail.failure = Some(JobFailure {
+                    code: "prepared_inputs_conflicted".to_string(),
+                    message: "prepared faucet inputs were spent elsewhere; no replacement was constructed"
+                        .to_string(),
+                });
+            }
+            self.store.save(&state.persisted)?;
+            drop(state);
+            return self.recover_worker_leases(job_id);
+        }
+
+        self.ensure_faucet_recovery_mining_lease(job_id)?;
+        self.faucet.lock_inputs(source, &context.selected_inputs)?;
+        let transaction: bitcoincore_rpc::bitcoin::Transaction =
+            bitcoincore_rpc::bitcoin::consensus::encode::deserialize_hex(&raw_tx_hex)?;
+        let prepared = PreparedFaucetTransaction {
+            raw_tx_hex: raw_tx_hex.clone(),
+            txid: txid.clone(),
+            input_sats: context
+                .input_sats
+                .ok_or_else(|| anyhow::anyhow!("prepared faucet input total is missing"))?,
+            change_sats: context
+                .change_sats
+                .ok_or_else(|| anyhow::anyhow!("prepared faucet change is missing"))?,
+            vsize: transaction.vsize() as u64,
+        };
+        self.arm_prepared(job_id, &prepared, &AtomicBool::new(false))?;
+        if self.faucet_store.get(&txid).is_none() {
+            let preflight = self.faucet.preflight()?;
+            let transfer = self
+                .transfer_from_context(
+                    &request,
+                    &self.faucet_context(job_id).unwrap_or(context.clone()),
+                    preflight.height,
+                    preflight.best_hash,
+                    self.faucet
+                        .observer_contains_unconfirmed(&txid)
+                        .unwrap_or(false),
+                )
+                .ok_or_else(|| anyhow::anyhow!("faucet context cannot form a transfer"))?;
+            self.faucet_store.arm(StoredFaucetTransfer {
+                public: transfer,
+                raw_tx_hex: Some(raw_tx_hex),
+                selected_inputs: context.selected_inputs.clone(),
+            })?;
+        }
+        self.mark_recovered_faucet_succeeded(job_id, &txid)?;
+        self.recover_worker_leases(job_id)
+    }
+
+    fn ensure_faucet_recovery_mining_lease(&self, job_id: &str) -> anyhow::Result<()> {
+        let status = self.mining.status()?;
+        if owned_leases(&status.active_leases, job_id).is_empty() {
+            let lease_id = format!("{job_id}-mining-1");
+            let lease = JobLease {
+                component: "mining".to_string(),
+                lease_id: lease_id.clone(),
+                purpose: "interrupted faucet recovery".to_string(),
+            };
+            self.persist_lease_intent(job_id, lease.clone())?;
+            self.mining.acquire_lease(LeaseRequest {
+                lease_id,
+                owner_job_id: job_id.to_string(),
+                purpose: lease.purpose.clone(),
+                ttl_secs: self.lease_ttl_secs,
+                request_id: format!("{job_id}-faucet-recovery-acquire-{}", now_ms()),
+            })?;
+            self.acknowledge_lease(job_id, &lease);
+        }
+        Ok(())
+    }
+
+    fn mark_recovered_faucet_succeeded(&self, job_id: &str, txid: &str) -> anyhow::Result<()> {
+        let transfer = self
+            .faucet_store
+            .get(txid)
+            .ok_or_else(|| anyhow::anyhow!("recovered faucet transfer is missing"))?;
+        let mut state = self.state.lock().expect("job manager lock");
+        if let Some(job) = find_stored_mut(&mut state.persisted, job_id) {
+            job.detail.summary.state = JobState::Succeeded;
+            job.detail.summary.phase = "armed_for_next_block".to_string();
+            job.detail.result = Some(serde_json::to_value(transfer)?);
+            job.detail.failure = None;
+            if let Some(context) = job.faucet_recovery.as_mut() {
+                context.raw_tx_hex = None;
+                context.selected_inputs.clear();
+                context.phase = FaucetPhase::Armed;
+            }
+        }
+        self.store.save(&state.persisted)
     }
 
     fn recover_network_resources(&self, job_id: &str) -> anyhow::Result<()> {
@@ -3257,6 +4601,171 @@ impl Drop for OwnedLeaseRenewer {
     }
 }
 
+#[derive(Debug)]
+struct FaucetRunError {
+    code: &'static str,
+    message: String,
+}
+
+impl FaucetRunError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn aborted() -> Self {
+        Self::new("aborted", "faucet operation was aborted")
+    }
+
+    fn validation(message: impl Into<String>) -> Self {
+        Self::new("validation_failed", message)
+    }
+
+    fn validation_error(error: impl std::fmt::Display) -> Self {
+        Self::validation(error.to_string())
+    }
+
+    fn unavailable(error: impl std::fmt::Display) -> Self {
+        Self::new("faucet_unavailable", error.to_string())
+    }
+
+    fn insufficient(error: impl std::fmt::Display) -> Self {
+        Self::new("insufficient_faucet_funds", error.to_string())
+    }
+
+    fn priority(error: impl std::fmt::Display) -> Self {
+        Self::new("faucet_priority_invariant_failed", error.to_string())
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new("internal", message)
+    }
+
+    fn internal_error(error: impl std::fmt::Display) -> Self {
+        Self::internal(error.to_string())
+    }
+}
+
+impl From<FaucetRunError> for anyhow::Error {
+    fn from(error: FaucetRunError) -> Self {
+        anyhow::anyhow!("{}: {}", error.code, error.message)
+    }
+}
+
+fn normalize_faucet_request(
+    mut request: FaucetJobRequest,
+    max_request_sats: u64,
+) -> Result<FaucetJobRequest, JobManagerError> {
+    if request.outputs.is_empty() || request.outputs.len() > FAUCET_MAX_OUTPUTS {
+        return Err(JobManagerError::new(
+            ErrorCode::ValidationFailed,
+            format!("faucet requires 1 through {FAUCET_MAX_OUTPUTS} outputs"),
+        ));
+    }
+    let mut addresses = HashSet::new();
+    let mut total = 0_u64;
+    for output in &mut request.outputs {
+        output.address = output.address.trim().to_string();
+        if output.amount_sats == 0 {
+            return Err(JobManagerError::new(
+                ErrorCode::ValidationFailed,
+                format!("destination {} has a zero amount", output.address),
+            ));
+        }
+        let address =
+            bitcoincore_rpc::bitcoin::Address::from_str(&output.address).map_err(|error| {
+                JobManagerError::new(
+                    ErrorCode::ValidationFailed,
+                    format!("invalid destination {}: {error}", output.address),
+                )
+            })?;
+        let checked = simchain_common::require_regtest_address(address).map_err(|error| {
+            JobManagerError::new(
+                ErrorCode::ValidationFailed,
+                format!(
+                    "destination {} is not a regtest address: {error}",
+                    output.address
+                ),
+            )
+        })?;
+        output.address = checked.to_string();
+        if !addresses.insert(output.address.clone()) {
+            return Err(JobManagerError::new(
+                ErrorCode::ValidationFailed,
+                format!("duplicate faucet destination {}", output.address),
+            ));
+        }
+        total = total.checked_add(output.amount_sats).ok_or_else(|| {
+            JobManagerError::new(ErrorCode::ValidationFailed, "faucet total amount overflow")
+        })?;
+    }
+    if total > max_request_sats {
+        return Err(JobManagerError::new(
+            ErrorCode::ValidationFailed,
+            format!("faucet total {total} sats exceeds maximum {max_request_sats} sats"),
+        ));
+    }
+    request
+        .outputs
+        .sort_by(|left, right| left.address.cmp(&right.address));
+    Ok(request)
+}
+
+fn normalize_required_idempotency_key(key: Option<String>) -> Result<String, JobManagerError> {
+    normalize_idempotency_key(key)?.ok_or_else(|| {
+        JobManagerError::new(
+            ErrorCode::ValidationFailed,
+            "Idempotency-Key is required for faucet requests",
+        )
+    })
+}
+
+fn choose_faucet_source(
+    requested: FaucetSource,
+    preflight: &FaucetPreflight,
+    recipient_sats: u64,
+    reserve_sats: u64,
+) -> Result<(FaucetSourceNode, &[FaucetInput]), FaucetRunError> {
+    let node2_total =
+        eligible_total(&preflight.node2_inputs).map_err(FaucetRunError::internal_error)?;
+    let node3_total =
+        eligible_total(&preflight.node3_inputs).map_err(FaucetRunError::internal_error)?;
+    let can_fund = |total: u64| {
+        total
+            .checked_sub(reserve_sats)
+            .is_some_and(|available| available >= recipient_sats.saturating_add(546))
+    };
+    match requested {
+        FaucetSource::Node2 if can_fund(node2_total) => {
+            Ok((FaucetSourceNode::Node2, &preflight.node2_inputs))
+        }
+        FaucetSource::Node3 if can_fund(node3_total) => {
+            Ok((FaucetSourceNode::Node3, &preflight.node3_inputs))
+        }
+        FaucetSource::Node2 => Err(FaucetRunError::insufficient(format!(
+            "node2 has {node2_total} eligible sats and must retain {reserve_sats} sats"
+        ))),
+        FaucetSource::Node3 => Err(FaucetRunError::insufficient(format!(
+            "node3 has {node3_total} eligible sats and must retain {reserve_sats} sats"
+        ))),
+        FaucetSource::Auto => {
+            let node2_available = node2_total.saturating_sub(reserve_sats);
+            let node3_available = node3_total.saturating_sub(reserve_sats);
+            if can_fund(node2_total) && node2_available >= node3_available {
+                Ok((FaucetSourceNode::Node2, &preflight.node2_inputs))
+            } else if can_fund(node3_total) {
+                Ok((FaucetSourceNode::Node3, &preflight.node3_inputs))
+            } else {
+                Err(FaucetRunError::insufficient(format!(
+                    "neither miner wallet can fund {recipient_sats} sats while retaining {reserve_sats} sats (node2={node2_total}, node3={node3_total})"
+                )))
+            }
+        }
+    }
+}
+
 fn normalize_reorg_request(
     mut request: ReorgJobRequest,
 ) -> Result<ReorgJobRequest, JobManagerError> {
@@ -3581,6 +5090,8 @@ mod tests {
                 reorg: executor,
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
+                faucet: backend.clone(),
+                faucet_settings: test_faucet_settings(),
             },
             60,
         )
@@ -3593,6 +5104,16 @@ mod tests {
         while !predicate() {
             assert!(std::time::Instant::now() < deadline, "condition timed out");
             thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn test_faucet_settings() -> FaucetSettings {
+        FaucetSettings {
+            node2_wallet_name: "node2".to_string(),
+            node3_wallet_name: "node3".to_string(),
+            wallet_reserve_sats: 60_000_000_000,
+            max_request_sats: 10_000_000_000,
+            explorer_url: "http://127.0.0.1:1080".to_string(),
         }
     }
 
@@ -3722,6 +5243,7 @@ mod tests {
                     },
                     idempotency_key: None,
                     request_fingerprint: "request".to_string(),
+                    faucet_recovery: None,
                     reorg_recovery: ReorgRecoveryContext {
                         mutation_may_have_occurred: true,
                         request: Some(ReorgJobRequest::default()),
@@ -3739,7 +5261,9 @@ mod tests {
                 network: backend.clone(),
                 reorg: Arc::new(BlockingExecutor::new()),
                 scenario: backend.clone(),
-                network_actions: backend,
+                network_actions: backend.clone(),
+                faucet: backend,
+                faucet_settings: test_faucet_settings(),
             },
             60,
         )
@@ -3811,6 +5335,7 @@ mod tests {
                     },
                     idempotency_key: None,
                     request_fingerprint: "request".to_string(),
+                    faucet_recovery: None,
                     reorg_recovery: ReorgRecoveryContext {
                         mutation_may_have_occurred: true,
                         request: Some(ReorgJobRequest::default()),
@@ -3832,6 +5357,8 @@ mod tests {
                 reorg: executor.clone(),
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
+                faucet: backend.clone(),
+                faucet_settings: test_faucet_settings(),
             },
             60,
         )
@@ -3927,6 +5454,7 @@ mod tests {
                     },
                     idempotency_key: None,
                     request_fingerprint: "scenario".to_string(),
+                    faucet_recovery: None,
                     reorg_recovery: ReorgRecoveryContext::default(),
                 }],
             })
@@ -3941,6 +5469,8 @@ mod tests {
                 reorg: Arc::new(BlockingExecutor::new()),
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
+                faucet: backend.clone(),
+                faucet_settings: test_faucet_settings(),
             },
             60,
         )
@@ -4195,6 +5725,56 @@ steps:
             manager.get(&created.job_id).expect("job").summary.state,
             JobState::Succeeded
         );
+    }
+
+    #[test]
+    fn job_store_v1_migrates_to_v2_without_faucet_recovery_material() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = JobStore::open(dir.path()).expect("store");
+        store
+            .save(&PersistedJobsV1 {
+                schema_version: 1,
+                next_event_sequence: 9,
+                next_checkpoint_generation: 4,
+                active_job_id: None,
+                jobs: vec![StoredJobV1 {
+                    detail: JobDetail {
+                        summary: JobSummary {
+                            id: "job-v1".to_string(),
+                            kind: JobKind::Reorg,
+                            state: JobState::Succeeded,
+                            phase: "succeeded".to_string(),
+                            created_at_ms: 1,
+                            started_at_ms: Some(2),
+                            ended_at_ms: Some(3),
+                            cleanup: successful_cleanup(),
+                        },
+                        request: json!({"depth": 3}),
+                        leases: Vec::new(),
+                        current_step: None,
+                        checkpoints: Vec::new(),
+                        result: None,
+                        failure: None,
+                    },
+                    idempotency_key: Some("v1-key".to_string()),
+                    request_fingerprint: "v1-request".to_string(),
+                    reorg_recovery: ReorgRecoveryContext::default(),
+                }],
+            })
+            .expect("seed v1 index");
+
+        let migrated = load_and_migrate_jobs(&store).expect("migrate v1 index");
+        assert_eq!(migrated.schema_version, JOB_SCHEMA_VERSION);
+        assert_eq!(migrated.next_event_sequence, 9);
+        assert_eq!(migrated.next_checkpoint_generation, 4);
+        assert_eq!(migrated.jobs.len(), 1);
+        assert!(migrated.jobs[0].faucet_recovery.is_none());
+        let persisted = store
+            .load_optional::<Value>()
+            .expect("load migrated index")
+            .expect("migrated index");
+        assert_eq!(persisted["schema_version"], JOB_SCHEMA_VERSION);
+        assert!(persisted["jobs"][0].get("faucet_recovery").is_none());
     }
 
     #[test]

@@ -31,15 +31,15 @@ impl JobStore {
         })
     }
 
-    pub fn load<T: DeserializeOwned + Default>(&self) -> anyhow::Result<T> {
+    pub fn load_optional<T: DeserializeOwned>(&self) -> anyhow::Result<Option<T>> {
         match fs::read_to_string(&self.index_path) {
-            Ok(content) => serde_json::from_str(&content).map_err(|error| {
+            Ok(content) => serde_json::from_str(&content).map(Some).map_err(|error| {
                 anyhow::anyhow!(
                     "job index {} is corrupt: {error}",
                     self.index_path.display()
                 )
             }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
@@ -149,7 +149,13 @@ mod tests {
         let store = JobStore::open(dir.path()).expect("store");
         let value = serde_json::json!({"schema_version": 1, "jobs": []});
         store.save(&value).expect("save");
-        assert_eq!(store.load::<serde_json::Value>().expect("load"), value);
+        assert_eq!(
+            store
+                .load_optional::<serde_json::Value>()
+                .expect("load")
+                .expect("stored value"),
+            value
+        );
         let event = JobEvent {
             sequence: 7,
             job_id: "job-1".to_string(),

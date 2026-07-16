@@ -47,6 +47,15 @@ leases. It is part of ordinary startup, publishes only localhost port 8090, cont
 Docker CLI, drops all Linux capabilities, uses a read-only root filesystem, and mounts
 neither the repository nor the Docker socket.
 
+The same backend exposes a regtest-only faucet. It spends mature confirmed UTXOs from
+one of the existing node2/node3 miner wallets, which act as separate treasuries, and
+preserves a configured reserve in the selected wallet. A faucet request is one real,
+signed, multi-recipient transaction with an exact 0 sat fee. The control plane pauses
+mining at a safe point, assigns the tx a fixed 100 BTC virtual priority delta locally on
+both miners, submits and verifies the same tx on both, persists it, and then releases
+mining. Node1 keeps ordinary relay policy and learns the transaction from the block.
+The virtual delta affects miner ordering only; no extra bitcoin is paid or transferred.
+
 ### Partition and network agents
 
 The control plane produces organic competing branches by leasing a namespace-local

@@ -1,10 +1,10 @@
 use serde::de::DeserializeOwned;
 use simchain_common::control_api::{
     AbortJobResponse, ApiErrorEnvelope, ApplyReport, ComponentControlResponse, ConfigPatchRequest,
-    ConfigResponse, DegradeJobRequest, JobCheckpointResponse, JobCreatedResponse, JobDetail,
-    JobEventsResponse, JobListResponse, MineJobRequest, PartitionJobRequest,
-    ReleaseCheckpointRequest, ReorgJobRequest, ScenarioJobRequest, SetComponentStateRequest,
-    SpamBurstJobRequest, StatusResponse, API_PREFIX,
+    ConfigResponse, DegradeJobRequest, FaucetJobRequest, FaucetStatusResponse, FaucetTransfer,
+    JobCheckpointResponse, JobCreatedResponse, JobDetail, JobEventsResponse, JobListResponse,
+    MineJobRequest, PartitionJobRequest, ReleaseCheckpointRequest, ReorgJobRequest,
+    ScenarioJobRequest, SetComponentStateRequest, SpamBurstJobRequest, StatusResponse, API_PREFIX,
 };
 use simchain_common::internal_api::DesiredState;
 use std::fmt;
@@ -87,6 +87,26 @@ impl ControlClient {
             request,
             idempotency_key,
         )
+    }
+
+    pub fn start_faucet(
+        &self,
+        request: &FaucetJobRequest,
+        idempotency_key: &str,
+    ) -> Result<JobCreatedResponse, ClientError> {
+        self.post_json(
+            &format!("{API_PREFIX}/jobs/faucet"),
+            request,
+            Some(idempotency_key),
+        )
+    }
+
+    pub fn faucet_status(&self) -> Result<FaucetStatusResponse, ClientError> {
+        self.get(&format!("{API_PREFIX}/faucet"))
+    }
+
+    pub fn faucet_transfer(&self, txid: &str) -> Result<FaucetTransfer, ClientError> {
+        self.get(&format!("{API_PREFIX}/faucet/transfers/{txid}"))
     }
 
     pub fn start_scenario(

@@ -66,6 +66,8 @@ pub enum Command {
     Spam(SpamArgs),
     /// Mine a bounded number of blocks through a server-side action job.
     Mine(MineArgs),
+    /// Fund regtest addresses with a miner-prioritized exact-zero-fee transaction.
+    Faucet(FaucetArgs),
     /// Start a bounded server-side chain reorganization job.
     Reorg(ReorgArgs),
     /// Isolate one miner, mine deterministic competing branches, and heal.
@@ -194,6 +196,50 @@ pub struct SpamBurstArgs {
     pub json: bool,
     #[arg(long)]
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct FaucetArgs {
+    #[command(subcommand)]
+    pub command: Option<FaucetCommand>,
+    /// Destination and exact amount, for example bcrt1q...=1btc or bcrt1p...=25000000sat.
+    #[arg(long = "to", value_name = "ADDRESS=AMOUNT")]
+    pub outputs: Vec<String>,
+    /// Treasury selector: auto, node2, or node3.
+    #[arg(long, default_value = "auto")]
+    pub source: String,
+    /// Retry key. A UUID v4 is generated when omitted.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+    /// Wait until the request is armed on both miners.
+    #[arg(long)]
+    pub wait: bool,
+    /// Maximum wait in seconds when --wait is set.
+    #[arg(long, default_value_t = 900)]
+    pub timeout: u64,
+    /// Emit stable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FaucetCommand {
+    /// Show limits, treasury balances, pending delivery, and recent transfers.
+    Status(JsonArgs),
+    /// Show or watch one faucet transfer through confirmation.
+    Transfer(FaucetTransferArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct FaucetTransferArgs {
+    pub txid: String,
+    /// Poll until the transfer reaches a terminal delivery state.
+    #[arg(long)]
+    pub watch: bool,
+    #[arg(long, default_value_t = 900, requires = "watch")]
+    pub timeout: u64,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

@@ -5,11 +5,13 @@ mod output;
 use clap::Parser;
 use client::{ClientError, ControlClient};
 use commands::{
-    Cli, Command, ConfigCommand, JobsCommand, MiningCommand, ScenarioCommand, SpamCommand,
+    Cli, Command, ConfigCommand, FaucetCommand, JobsCommand, MiningCommand, ScenarioCommand,
+    SpamCommand,
 };
 use simchain_common::control_api::{
-    CheckpointState, CleanupState, ConfigPatchRequest, DegradeJobRequest, JobCheckpointResponse,
-    JobDetail, JobEventsResponse, JobState, MineJobRequest, PartitionJobRequest, ReorgJobRequest,
+    CheckpointState, CleanupState, ConfigPatchRequest, DegradeJobRequest, FaucetDeliveryState,
+    FaucetJobRequest, FaucetOutput, FaucetSource, JobCheckpointResponse, JobDetail,
+    JobEventsResponse, JobState, MineJobRequest, PartitionJobRequest, ReorgJobRequest,
     SpamBurstJobRequest,
 };
 use simchain_common::internal_api::DesiredState;
@@ -122,6 +124,62 @@ fn run(cli: Cli) -> Result<(), ClientError> {
                 terminal_result(&job)?;
             }
         }
+        Command::Faucet(args) => match args.command {
+            Some(FaucetCommand::Status(status)) => {
+                output::print_faucet_status(&client.faucet_status()?, status.json)?;
+            }
+            Some(FaucetCommand::Transfer(transfer)) => {
+                if transfer.watch {
+                    let response = watch_faucet_transfer(
+                        &client,
+                        &transfer.txid,
+                        transfer.json,
+                        transfer.timeout,
+                    )?;
+                    ensure_faucet_delivery_succeeded(&response)?;
+                } else {
+                    output::print_faucet_transfer(
+                        &client.faucet_transfer(&transfer.txid)?,
+                        transfer.json,
+                    )?;
+                }
+            }
+            None => {
+                if args.outputs.is_empty() {
+                    return Err(ClientError::Local(
+                        "faucet funding requires at least one --to ADDRESS=AMOUNT".to_string(),
+                    ));
+                }
+                let outputs = parse_faucet_outputs(&args.outputs)?;
+                let source = parse_faucet_source(&args.source)?;
+                let idempotency_key = args
+                    .idempotency_key
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let response =
+                    client.start_faucet(&FaucetJobRequest { source, outputs }, &idempotency_key)?;
+                output::print_faucet_created(&response, &idempotency_key, args.json)?;
+                if args.wait {
+                    let job = match watch_job(&client, &response.job_id, args.json, args.timeout) {
+                        Err(ClientError::Timeout(_)) => {
+                            return Err(ClientError::Timeout(format!(
+                                "timed out waiting for faucet job {} (idempotency key {})",
+                                response.job_id, idempotency_key
+                            )))
+                        }
+                        other => other?,
+                    };
+                    terminal_result(&job)?;
+                    if let Some(txid) = job
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("txid"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        output::print_faucet_transfer(&client.faucet_transfer(txid)?, args.json)?;
+                    }
+                }
+            }
+        },
         Command::Reorg(args) => {
             let response = client.start_reorg(
                 &ReorgJobRequest {
@@ -249,6 +307,104 @@ fn parse_assignments(assignments: &[String]) -> Result<BTreeMap<String, String>,
         }
     }
     Ok(settings)
+}
+
+fn parse_faucet_outputs(values: &[String]) -> Result<Vec<FaucetOutput>, ClientError> {
+    values
+        .iter()
+        .map(|value| {
+            let Some((address, amount)) = value.rsplit_once('=') else {
+                return Err(ClientError::Local(format!(
+                    "invalid faucet destination '{value}': expected ADDRESS=AMOUNT"
+                )));
+            };
+            let address = address.trim();
+            if address.is_empty() {
+                return Err(ClientError::Local(
+                    "faucet destination address must not be empty".to_string(),
+                ));
+            }
+            let amount_sats = if let Some(btc) = amount.strip_suffix("btc") {
+                simchain_common::parse_btc_sats(btc).map_err(|error| {
+                    ClientError::Local(format!("invalid faucet BTC amount '{amount}': {error}"))
+                })?
+            } else if let Some(sats) = amount.strip_suffix("sat") {
+                if sats.is_empty() || !sats.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(ClientError::Local(format!(
+                        "invalid faucet satoshi amount '{amount}'"
+                    )));
+                }
+                sats.parse::<u64>().map_err(|_| {
+                    ClientError::Local(format!("faucet satoshi amount '{amount}' is out of range"))
+                })?
+            } else {
+                return Err(ClientError::Local(format!(
+                    "faucet amount '{amount}' must end in btc or sat"
+                )));
+            };
+            Ok(FaucetOutput {
+                address: address.to_string(),
+                amount_sats,
+            })
+        })
+        .collect()
+}
+
+fn parse_faucet_source(value: &str) -> Result<FaucetSource, ClientError> {
+    match value {
+        "auto" => Ok(FaucetSource::Auto),
+        "node2" => Ok(FaucetSource::Node2),
+        "node3" => Ok(FaucetSource::Node3),
+        _ => Err(ClientError::Local(
+            "--source must be auto, node2, or node3".to_string(),
+        )),
+    }
+}
+
+fn watch_faucet_transfer(
+    client: &ControlClient,
+    txid: &str,
+    json: bool,
+    timeout_secs: u64,
+) -> Result<simchain_common::control_api::FaucetTransfer, ClientError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut previous = None;
+    loop {
+        let transfer = client.faucet_transfer(txid)?;
+        if previous != Some(transfer.delivery_state) {
+            output::print_faucet_transfer(&transfer, json)?;
+            previous = Some(transfer.delivery_state);
+        }
+        if matches!(
+            transfer.delivery_state,
+            FaucetDeliveryState::Confirmed
+                | FaucetDeliveryState::DeliveryFailed
+                | FaucetDeliveryState::AbortedAfterSubmission
+                | FaucetDeliveryState::OrphanedAfterConfirmation
+        ) {
+            return Ok(transfer);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ClientError::Timeout(format!(
+                "timed out waiting for faucet transfer {txid}"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+fn ensure_faucet_delivery_succeeded(
+    transfer: &simchain_common::control_api::FaucetTransfer,
+) -> Result<(), ClientError> {
+    if transfer.delivery_state == FaucetDeliveryState::Confirmed {
+        Ok(())
+    } else {
+        Err(ClientError::Api(format!(
+            "faucet transfer {} ended {}",
+            transfer.txid,
+            transfer.delivery_state.as_str()
+        )))
+    }
 }
 
 fn read_scenario(path: &std::path::Path) -> Result<String, ClientError> {
@@ -469,5 +625,19 @@ mod tests {
         assert_eq!(values["MINING_RNG_SEED"], "");
         assert!(parse_assignments(&["NO_EQUALS".to_string()]).is_err());
         assert!(parse_assignments(&["A=1".to_string(), "A=2".to_string()]).is_err());
+    }
+
+    #[test]
+    fn faucet_destinations_parse_exact_suffixed_amounts() {
+        let outputs = parse_faucet_outputs(&[
+            "bcrt1qfirst=1.00000001btc".to_string(),
+            "bcrt1psecond=25000000sat".to_string(),
+        ])
+        .expect("faucet outputs");
+        assert_eq!(outputs[0].amount_sats, 100_000_001);
+        assert_eq!(outputs[1].amount_sats, 25_000_000);
+        assert!(parse_faucet_outputs(&["bcrt1qfirst=1.000000001btc".to_string()]).is_err());
+        assert!(parse_faucet_outputs(&["bcrt1qfirst=1".to_string()]).is_err());
+        assert!(parse_faucet_outputs(&["bcrt1qfirst=1BTC".to_string()]).is_err());
     }
 }

@@ -180,8 +180,8 @@ wider spread of fee rates with real competition inside a block is a proposed fea
 | `BLOCK_INTERVAL_MAX_SECS` | `20` | Poisson upper clamp in seconds; fractional values are accepted. Set empty for unbounded. Must be greater than zero and no lower than `BLOCK_INTERVAL_MIN_SECS`. Validated but does not affect fixed mode. |
 | `MINER_WEIGHTS` | _(empty)_ | Empty means strict node2/node3 alternation. Set two relative non-negative integer weights such as `70,30` to draw a miner independently for every block; `0,100` and `100,0` are valid. `50,50` is random selection, not alternation. |
 | `MINING_RNG_SEED` | _(empty)_ | Optional `u64` seed for reproducible Poisson intervals and weighted miner picks. When omitted, the controller derives a seed from system time and logs it. It is parsed but has no behavioral effect while both stochastic modes are off. |
-| `NODE2_WALLET_NAME` | `node2` | Wallet created on node2 by the controller, also used by the spammer. |
-| `NODE3_WALLET_NAME` | `node3` | Wallet created on node3 by the controller, also used by the spammer. |
+| `NODE2_WALLET_NAME` | `node2` | Wallet created on node2 by the controller, used by the spammer, and propagated to the control plane as a faucet treasury. |
+| `NODE3_WALLET_NAME` | `node3` | Wallet created on node3 by the controller, used by the spammer, and propagated to the control plane as a faucet treasury. |
 
 Poisson timing and weighted selection are independent: either can be enabled without
 the other. They affect only continuous mining after the deterministic bootstrap through
@@ -423,6 +423,8 @@ control-plane process per durable state store.
 | `CONTROL_PLANE_PORT` | `8090` | Host port (bound to `127.0.0.1` only) for the browser UI, the `/api/v1` JSON API, and the `/mcp` MCP endpoint. |
 | `CONTROL_PLANE_API_TOKEN` | `simchain-control-dev-token` in Compose | Bearer token required on every mutation and the whole `/mcp` endpoint. Override it for shared machines and pass the same value to host tools with `SIMCHAIN_CONTROL_TOKEN` or `--token`. |
 | `SIMCHAIN_CONTROL_STATE_DIR` | `/var/lib/simchain-control` in Compose | Narrow directory for the token, atomically written desired state, and bounded job metadata/JSONL events. Compose stores it in the `btc-simnet-control-state` named volume. |
+| `FAUCET_WALLET_RESERVE_BTC` | `600` | Boot-only exact BTC amount retained as mature confirmed spendable value in a selected miner treasury after a faucet transfer. |
+| `FAUCET_MAX_REQUEST_BTC` | `100` | Boot-only exact BTC cap on the sum of all outputs in one faucet transaction. |
 | `MINING_CONTROL_URL` | `http://btc-simnet-mining-controller:9081` | Private Compose-network endpoint used by the control plane; never publish this port to the host. |
 | `MINING_CONTROL_LISTEN_ADDR` | `0.0.0.0:9081` | Mining worker's private control listener. Boot-only. |
 | `SPAM_CONTROL_URL` | `http://btc-simnet-spammer:9082` | Private Compose-network spam endpoint; never publish this port to the host. |
@@ -435,6 +437,13 @@ control-plane process per durable state store.
 | `SIMCHAIN_INTERNAL_TOKEN` | `simchain-internal-dev-token` | Shared bearer token for control-plane-to-worker/agent requests. Supply the same non-empty value to the control plane, both workers, and all three agents when overriding it. |
 | `MEMPOOL_WEB_URL` | `http://127.0.0.1:$MEMPOOL_WEB_PORT` | Browser-facing explorer URL shown by the dashboard. |
 | `MEMPOOL_WEB_INTERNAL_URL` | `http://mempool-web:8080` | Private health-probe URL used by the control plane. |
+
+The faucet also has fixed safety invariants: at most 100 outputs, at most 10,000 vB,
+an actual transaction fee of exactly 0 sat, and a 10,000,000,000 sat (100 BTC) virtual
+priority delta on each miner. The virtual delta is intentionally not configurable. It
+affects local block selection only and is neither paid nor transferred. Faucet limits
+are parsed as decimal strings without floating-point arithmetic and require a control
+plane restart to change.
 
 Control-plane-managed runtime settings (durable desired values live only in the
 control-state volume after initialization):

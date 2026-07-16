@@ -1557,6 +1557,7 @@ dependencies = [
  "serde_json",
  "simchain-common",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]

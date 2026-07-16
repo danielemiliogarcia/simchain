@@ -8,6 +8,7 @@
 //! of drifting apart.
 
 mod address;
+mod amount;
 mod burn;
 pub mod config;
 pub mod control_api;
@@ -18,6 +19,7 @@ mod logging;
 mod rpc;
 
 pub use address::require_regtest_address;
+pub use amount::parse_btc_sats;
 pub use burn::burn_address;
 pub use config::{CommonConfig, ConfigError, RpcUrl};
 pub use error::CommonError;

@@ -10,6 +10,11 @@ pub enum ErrorCode {
     OperationInProgress,
     ApplyInProgress,
     ComponentUnavailable,
+    FaucetDeliveryPending,
+    InsufficientFaucetFunds,
+    PreparedInputsConflicted,
+    FaucetUnavailable,
+    FaucetPriorityInvariantFailed,
     JobNotFound,
     CheckpointConflict,
     RollbackFailed,
@@ -25,8 +30,14 @@ impl ErrorCode {
             Self::StaleRevision
             | Self::OperationInProgress
             | Self::ApplyInProgress
-            | Self::CheckpointConflict => 409,
-            Self::ComponentUnavailable | Self::RpcUnavailable => 503,
+            | Self::CheckpointConflict
+            | Self::FaucetDeliveryPending
+            | Self::InsufficientFaucetFunds
+            | Self::PreparedInputsConflicted => 409,
+            Self::ComponentUnavailable
+            | Self::RpcUnavailable
+            | Self::FaucetUnavailable
+            | Self::FaucetPriorityInvariantFailed => 503,
             Self::JobNotFound => 404,
             Self::Unauthorized => 401,
             Self::RollbackFailed | Self::Internal => 500,

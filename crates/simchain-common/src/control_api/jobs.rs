@@ -4,6 +4,7 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
+    Faucet,
     Reorg,
     Scenario,
     Partition,
@@ -15,6 +16,7 @@ pub enum JobKind {
 impl JobKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Faucet => "faucet",
             Self::Reorg => "reorg",
             Self::Scenario => "scenario",
             Self::Partition => "partition",

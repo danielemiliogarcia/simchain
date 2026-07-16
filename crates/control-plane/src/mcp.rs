@@ -5,11 +5,13 @@
 
 use crate::apply::{apply, ApplyRequest};
 use crate::service::{
-    abort_job as abort_job_service, config, get_job as get_job_service,
+    abort_job as abort_job_service, config, faucet_status as faucet_status_service,
+    faucet_transfer as faucet_transfer_service, get_job as get_job_service,
     list_jobs as list_jobs_service, schema, set_mining_state as set_mining_state_service,
     set_spam_state as set_spam_state_service, start_degrade as start_degrade_service,
-    start_partition as start_partition_service, start_reorg as start_reorg_service,
-    start_scenario as start_scenario_service, status, ServiceError,
+    start_faucet as start_faucet_service, start_partition as start_partition_service,
+    start_reorg as start_reorg_service, start_scenario as start_scenario_service, status,
+    ServiceError,
 };
 use crate::state::SharedState;
 use rmcp::handler::server::wrapper::Parameters;
@@ -64,6 +66,35 @@ pub struct SetMiningStateParams {
 pub struct SetSpamStateParams {
     /// Desired manual state: `running` or `paused`.
     pub state: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FaucetOutputParams {
+    /// Regtest destination address.
+    pub address: String,
+    /// Exact positive amount in satoshis.
+    pub amount_sats: u64,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FundAddressesParams {
+    /// One through 100 regtest destinations with exact satoshi amounts.
+    pub outputs: Vec<FaucetOutputParams>,
+    /// Treasury selector: `auto`, `node2`, or `node3`.
+    #[serde(default = "default_faucet_source")]
+    pub source: String,
+    /// Required retry key. Reuse it with the identical canonical request.
+    pub idempotency_key: String,
+}
+
+fn default_faucet_source() -> String {
+    "auto".to_string()
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FaucetTransferParams {
+    /// Faucet transaction ID.
+    pub txid: String,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -306,6 +337,90 @@ impl ControlPlaneMcp {
             .await
             .map_err(join_error)?
         {
+            Ok(response) => success_json(&response),
+            Err(error) => error_json(error),
+        }
+    }
+
+    #[tool(
+        name = "fund_addresses",
+        description = "Create one durable zero-fee regtest faucet transaction funded by node2 or node3 and arm it with the pinned virtual priority on both miners. The idempotency key is required.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn fund_addresses(
+        &self,
+        Parameters(params): Parameters<FundAddressesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let source = match params.source.as_str() {
+            "auto" => simchain_common::control_api::FaucetSource::Auto,
+            "node2" => simchain_common::control_api::FaucetSource::Node2,
+            "node3" => simchain_common::control_api::FaucetSource::Node3,
+            _ => {
+                return error_json(ServiceError::new(
+                    crate::service::ErrorCode::ValidationFailed,
+                    "faucet source must be auto, node2, or node3",
+                ));
+            }
+        };
+        let request = simchain_common::control_api::FaucetJobRequest {
+            source,
+            outputs: params
+                .outputs
+                .into_iter()
+                .map(|output| simchain_common::control_api::FaucetOutput {
+                    address: output.address,
+                    amount_sats: output.amount_sats,
+                })
+                .collect(),
+        };
+        let app = self.app.clone();
+        match tokio::task::spawn_blocking(move || {
+            start_faucet_service(&app, request, Some(params.idempotency_key))
+        })
+        .await
+        .map_err(join_error)?
+        {
+            Ok(response) => success_json(&response),
+            Err(error) => error_json(error),
+        }
+    }
+
+    #[tool(
+        name = "get_faucet_status",
+        description = "Get faucet limits, eligible miner-wallet balances, the pending delivery, and recent transfer history.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn get_faucet_status(&self) -> Result<CallToolResult, ErrorData> {
+        let app = self.app.clone();
+        let response = tokio::task::spawn_blocking(move || faucet_status_service(&app))
+            .await
+            .map_err(join_error)?;
+        success_json(&response)
+    }
+
+    #[tool(
+        name = "get_faucet_transfer",
+        description = "Get one faucet transfer's armed, recovery, confirmation, or failure state by txid.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn get_faucet_transfer(
+        &self,
+        Parameters(params): Parameters<FaucetTransferParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match faucet_transfer_service(&self.app, &params.txid) {
             Ok(response) => success_json(&response),
             Err(error) => error_json(error),
         }

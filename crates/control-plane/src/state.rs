@@ -35,6 +35,10 @@ pub struct ControlPlaneConfig {
     pub internal_token: String,
     pub explorer_url: String,
     pub explorer_probe_url: String,
+    pub node2_wallet_name: String,
+    pub node3_wallet_name: String,
+    pub faucet_wallet_reserve_sats: u64,
+    pub faucet_max_request_sats: u64,
 }
 
 impl ControlPlaneConfig {
@@ -86,6 +90,14 @@ impl ControlPlaneConfig {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| explorer_url.clone());
         ensure_http_url("MEMPOOL_WEB_INTERNAL_URL", &explorer_probe_url)?;
+        let node2_wallet_name = non_empty_env("NODE2_WALLET_NAME", "node2")?;
+        let node3_wallet_name = non_empty_env("NODE3_WALLET_NAME", "node3")?;
+        let faucet_wallet_reserve_sats = exact_btc_env("FAUCET_WALLET_RESERVE_BTC", "600")?;
+        let faucet_max_request_sats = exact_btc_env("FAUCET_MAX_REQUEST_BTC", "100")?;
+        anyhow::ensure!(
+            faucet_max_request_sats > 0,
+            "FAUCET_MAX_REQUEST_BTC must be positive"
+        );
         Ok(Self {
             listen_addr,
             node1_url,
@@ -100,8 +112,25 @@ impl ControlPlaneConfig {
             internal_token,
             explorer_url,
             explorer_probe_url,
+            node2_wallet_name,
+            node3_wallet_name,
+            faucet_wallet_reserve_sats,
+            faucet_max_request_sats,
         })
     }
+}
+
+fn non_empty_env(key: &str, default: &str) -> anyhow::Result<String> {
+    let value = std::env::var(key).unwrap_or_else(|_| default.to_string());
+    let value = value.trim();
+    anyhow::ensure!(!value.is_empty(), "{key} must not be empty");
+    Ok(value.to_string())
+}
+
+fn exact_btc_env(key: &str, default: &str) -> anyhow::Result<u64> {
+    let value = std::env::var(key).unwrap_or_else(|_| default.to_string());
+    simchain_common::parse_btc_sats(&value)
+        .map_err(|error| anyhow::anyhow!("invalid {key}: {error}"))
 }
 
 fn ensure_http_url(key: &str, value: &str) -> anyhow::Result<()> {

@@ -22,6 +22,11 @@ let startingJob = false;
 let startingScenario = false;
 const startingAction = { mine: false, burst: false, partition: false, degrade: false };
 let abortingJob = false;
+let faucetStatus = null;
+let faucetSubmitting = false;
+let reviewedFaucetRequest = null;
+let selectedFaucetTxid = null;
+let selectedFaucetTransfer = null;
 const releasingCheckpoints = new Set();
 const changingComponentState = { mining: false, spam: false };
 
@@ -473,6 +478,328 @@ function formatJobTime(milliseconds) {
   return milliseconds == null ? "–" : new Date(milliseconds).toLocaleString();
 }
 
+/* ------------------------------------------------------------------ faucet */
+
+const FAUCET_IDEMPOTENCY_STORAGE_KEY = "simchain-faucet-idempotency-key";
+const FAUCET_PHASES = {
+  faucet_preflight: "Checking faucet availability",
+  acquiring_mining_lease: "Pausing mining safely",
+  selecting_faucet_inputs: "Selecting mature miner funds",
+  building_exact_zero_transaction: "Building and signing exact-zero transaction",
+  arming_node2: "Arming node2",
+  arming_node3: "Arming node3",
+  submitting_node2: "Arming node2",
+  submitting_node3: "Arming node3",
+  verifying_next_block_priority: "Verifying next-block priority",
+  armed_for_next_block: "Mining restored — waiting for next block",
+};
+
+function satsToBtc(sats) {
+  const value = BigInt(sats || 0);
+  const whole = value / 100000000n;
+  const fraction = (value % 100000000n).toString().padStart(8, "0").replace(/0+$/, "");
+  return fraction ? `${whole}.${fraction}` : String(whole);
+}
+
+function parseBtcSats(value) {
+  const text = String(value).trim();
+  const match = /^(0|[1-9][0-9]*)(?:\.([0-9]{1,8}))?$/.exec(text);
+  if (!match) throw new Error("enter a positive BTC amount with at most 8 decimal places");
+  const sats = BigInt(match[1]) * 100000000n + BigInt((match[2] || "").padEnd(8, "0") || "0");
+  if (sats <= 0n || sats > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("amount is outside the supported range");
+  }
+  return Number(sats);
+}
+
+function validRegtestAddress(value) {
+  const address = value.trim();
+  return /^(bcrt1[ac-hj-np-z02-9]{8,}|[mn2][1-9A-HJ-NP-Za-km-z]{20,})$/.test(address);
+}
+
+function addFaucetOutput(address = "", amount = "1") {
+  const outputs = $("#faucet-outputs");
+  if (outputs.children.length >= 100) return;
+  const row = document.createElement("div");
+  row.className = "faucet-output-row";
+
+  const addressLabel = document.createElement("label");
+  addressLabel.textContent = "Regtest address";
+  const addressInput = document.createElement("input");
+  addressInput.type = "text";
+  addressInput.autocomplete = "off";
+  addressInput.spellcheck = false;
+  addressInput.placeholder = "bcrt1q…";
+  addressInput.value = address;
+  addressInput.required = true;
+  addressLabel.append(addressInput);
+
+  const amountLabel = document.createElement("label");
+  amountLabel.textContent = "Amount (BTC)";
+  const amountInput = document.createElement("input");
+  amountInput.type = "text";
+  amountInput.inputMode = "decimal";
+  amountInput.placeholder = "1.00000000";
+  amountInput.value = amount;
+  amountInput.required = true;
+  amountLabel.append(amountInput);
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "small secondary faucet-remove-output";
+  remove.textContent = "Remove";
+  remove.addEventListener("click", () => {
+    row.remove();
+    renderFaucetControls();
+  });
+  for (const input of [addressInput, amountInput]) {
+    input.addEventListener("input", () => {
+      input.setCustomValidity("");
+      renderFaucetControls();
+    });
+  }
+  row.append(addressLabel, amountLabel, remove);
+  outputs.append(row);
+  renderFaucetControls();
+}
+
+function collectFaucetRequest() {
+  const outputs = [];
+  const seen = new Set();
+  for (const row of $("#faucet-outputs").children) {
+    const [addressInput, amountInput] = row.querySelectorAll("input");
+    const address = addressInput.value.trim();
+    if (!validRegtestAddress(address)) {
+      addressInput.setCustomValidity("enter a valid regtest address");
+      addressInput.reportValidity();
+      throw new Error("invalid regtest destination");
+    }
+    addressInput.setCustomValidity("");
+    if (seen.has(address)) {
+      addressInput.setCustomValidity("destination addresses must be unique");
+      addressInput.reportValidity();
+      throw new Error("duplicate destination address");
+    }
+    seen.add(address);
+    let amountSats;
+    try {
+      amountSats = parseBtcSats(amountInput.value);
+      amountInput.setCustomValidity("");
+    } catch (error) {
+      amountInput.setCustomValidity(error.message);
+      amountInput.reportValidity();
+      throw error;
+    }
+    outputs.push({ address, amount_sats: amountSats });
+  }
+  if (outputs.length === 0) throw new Error("add at least one destination");
+  const total = outputs.reduce((sum, output) => sum + BigInt(output.amount_sats), 0n);
+  if (faucetStatus && total > BigInt(faucetStatus.max_request_sats)) {
+    throw new Error(`request exceeds the ${satsToBtc(faucetStatus.max_request_sats)} BTC cap`);
+  }
+  return { source: $("#faucet-source").value, outputs, total_sats: total };
+}
+
+function renderFaucetControls() {
+  const count = $("#faucet-outputs") ? $("#faucet-outputs").children.length : 0;
+  if (!count) return;
+  $("#faucet-add-output").disabled = count >= 100 || faucetSubmitting;
+  for (const button of document.querySelectorAll(".faucet-remove-output")) {
+    button.disabled = count === 1 || faucetSubmitting;
+  }
+  $("#faucet-review").disabled = faucetSubmitting || !faucetStatus || !faucetStatus.available ||
+    faucetStatus.pending_transfer != null || activeMutationId() != null;
+  $("#faucet-review").textContent = faucetSubmitting ? "Submitting…" : "Review transaction";
+}
+
+function renderFaucetStatus(status) {
+  faucetStatus = status;
+  const availability = $("#faucet-availability");
+  if (status.available) {
+    availability.textContent = `available · request cap ${satsToBtc(status.max_request_sats)} BTC · reserve ${satsToBtc(status.wallet_reserve_sats)} BTC per treasury`;
+  } else {
+    availability.textContent = `unavailable${status.last_probe_error ? ` · ${status.last_probe_error}` : ""}`;
+  }
+  const wallets = $("#faucet-wallets");
+  wallets.replaceChildren();
+  for (const wallet of status.wallets || []) {
+    const item = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = `${wallet.source} · ${wallet.wallet_name}`;
+    const balance = document.createElement("span");
+    balance.textContent = wallet.error
+      ? wallet.error
+      : `${satsToBtc(wallet.eligible_confirmed_sats)} BTC confirmed · ${satsToBtc(wallet.available_after_reserve_sats)} BTC available after reserve`;
+    item.append(title, balance);
+    wallets.append(item);
+  }
+  if (status.pending_transfer) {
+    selectedFaucetTxid = status.pending_transfer.txid;
+    selectedFaucetTransfer = status.pending_transfer;
+  } else if (!selectedFaucetTxid && status.recent_transfers && status.recent_transfers.length) {
+    selectedFaucetTxid = status.recent_transfers[0].txid;
+    selectedFaucetTransfer = status.recent_transfers[0];
+  }
+  renderFaucetTransfer();
+  renderFaucetControls();
+}
+
+function transferExplorerUrl(transfer) {
+  return transfer && httpUrl(transfer.explorer_url);
+}
+
+function renderFaucetTransfer() {
+  const container = $("#faucet-transfer");
+  const transfer = selectedFaucetTransfer;
+  if (!transfer) {
+    container.textContent = "no faucet transfer selected";
+    container.className = "faucet-transfer muted";
+    return;
+  }
+  container.replaceChildren();
+  container.className = `faucet-transfer transfer-${transfer.delivery_state}`;
+  const badge = document.createElement("strong");
+  badge.className = "faucet-badge";
+  badge.textContent = "SYSTEM FAUCET · 0 SAT FEE · MINER-PRIORITIZED";
+  const state = document.createElement("div");
+  state.className = "faucet-transfer-state";
+  state.textContent = transfer.delivery_state === "armed"
+    ? "armed in miner mempools; observer sees it after the block"
+    : transfer.delivery_state === "confirmed"
+      ? `confirmed in block ${transfer.confirmed_height}`
+      : transfer.delivery_state.replaceAll("_", " ");
+  const facts = document.createElement("div");
+  facts.textContent = `${transfer.source} · ${transfer.outputs.length} destination(s) · ${satsToBtc(transfer.total_sats)} BTC · actual fee ${transfer.actual_fee_sats} sat · virtual delta ${satsToBtc(transfer.priority_delta_sats)} BTC · ${transfer.vsize} vB`;
+  const txid = document.createElement("div");
+  txid.className = "faucet-txid";
+  txid.textContent = transfer.txid;
+  const destinations = document.createElement("ul");
+  for (const output of transfer.outputs) {
+    const item = document.createElement("li");
+    item.textContent = `${output.address} · ${satsToBtc(output.amount_sats)} BTC`;
+    destinations.append(item);
+  }
+  container.append(badge, state, facts, txid, destinations);
+  const explorer = transferExplorerUrl(transfer);
+  if (explorer) {
+    const link = document.createElement("a");
+    link.href = explorer.toString();
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "Open transaction in mempool.space ↗";
+    container.append(link);
+  }
+  if (transfer.last_error) {
+    const error = document.createElement("div");
+    error.className = "faucet-transfer-error";
+    error.textContent = transfer.last_error;
+    container.append(error);
+  }
+}
+
+function renderFaucetJob(job) {
+  const progress = $("#faucet-progress");
+  if (!job || job.kind !== "faucet") {
+    progress.hidden = true;
+    return;
+  }
+  progress.hidden = false;
+  const result = job.result;
+  if (result && result.txid &&
+      (!selectedFaucetTransfer || selectedFaucetTransfer.txid !== result.txid ||
+       selectedFaucetTransfer.delivery_state !== "confirmed")) {
+    selectedFaucetTxid = result.txid;
+    selectedFaucetTransfer = result;
+  }
+  const phase = result && result.delivery_state === "confirmed"
+    ? `Confirmed in block ${result.confirmed_height}`
+    : (FAUCET_PHASES[job.phase] || job.phase.replaceAll("_", " "));
+  progress.textContent = `${phase} · job ${job.state}`;
+  renderFaucetTransfer();
+}
+
+async function refreshFaucet() {
+  const { ok, body } = await api("/api/v1/faucet");
+  if (ok && body) renderFaucetStatus(body);
+  if (selectedFaucetTxid) {
+    const response = await api(`/api/v1/faucet/transfers/${encodeURIComponent(selectedFaucetTxid)}`);
+    if (response.ok && response.body) {
+      selectedFaucetTransfer = response.body;
+      renderFaucetTransfer();
+      if (selectedFaucetTransfer.delivery_state === "confirmed") {
+        $("#faucet-progress").hidden = false;
+        $("#faucet-progress").textContent = `Confirmed in block ${selectedFaucetTransfer.confirmed_height}`;
+      }
+    }
+  }
+}
+
+function faucetIdempotencyKey() {
+  let key = sessionStorage.getItem(FAUCET_IDEMPOTENCY_STORAGE_KEY);
+  if (!key) {
+    key = browserIdempotencyKey();
+    sessionStorage.setItem(FAUCET_IDEMPOTENCY_STORAGE_KEY, key);
+  }
+  return key;
+}
+
+function reviewFaucet(event) {
+  event.preventDefault();
+  const result = $("#faucet-action-result");
+  try {
+    reviewedFaucetRequest = collectFaucetRequest();
+    const summary = $("#faucet-confirm-summary");
+    summary.textContent = `${reviewedFaucetRequest.outputs.length} destination(s) · ${satsToBtc(reviewedFaucetRequest.total_sats)} BTC total · source ${reviewedFaucetRequest.source}`;
+    $("#faucet-confirm-dialog").showModal();
+    result.textContent = "";
+    result.className = "action-result";
+  } catch (error) {
+    result.textContent = error.message;
+    result.className = "action-result err";
+  }
+}
+
+async function submitFaucet(event) {
+  event.preventDefault();
+  if (!reviewedFaucetRequest || faucetSubmitting) return;
+  $("#faucet-confirm-dialog").close();
+  faucetSubmitting = true;
+  renderFaucetControls();
+  const result = $("#faucet-action-result");
+  result.textContent = "Submitting durable faucet job…";
+  result.className = "action-result";
+  const request = {
+    source: reviewedFaucetRequest.source,
+    outputs: reviewedFaucetRequest.outputs,
+  };
+  try {
+    const { ok, body } = await api("/api/v1/jobs/faucet", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + TOKEN,
+        "Idempotency-Key": faucetIdempotencyKey(),
+      },
+      body: JSON.stringify(request),
+    });
+    if (!ok) {
+      sessionStorage.removeItem(FAUCET_IDEMPOTENCY_STORAGE_KEY);
+      throw new Error((body && body.error && body.error.message) || "faucet request failed");
+    }
+    sessionStorage.removeItem(FAUCET_IDEMPOTENCY_STORAGE_KEY);
+    result.textContent = `${body.reused ? "Reused" : "Started"} ${body.job_id}`;
+    await selectJob(body.job_id);
+  } catch (error) {
+    result.textContent = error.message || String(error);
+    result.className = "action-result err";
+  } finally {
+    faucetSubmitting = false;
+    renderFaucetControls();
+    await refreshFaucet();
+    await refreshJobs();
+  }
+}
+
 function renderJobs() {
   const active = latestJobs && latestJobs.active_job_id;
   const lock = $("#mutation-lock");
@@ -568,6 +895,7 @@ function renderSelectedJob() {
   }
 
   renderCheckpoints();
+  renderFaucetJob(selectedJob);
 
   const events = $("#job-events");
   events.replaceChildren();
@@ -958,6 +1286,8 @@ async function init() {
   buildForm();
   await refreshState();
   await refreshStatus();
+  addFaucetOutput();
+  await refreshFaucet();
   await refreshJobs();
   $("#apply").addEventListener("click", doApply);
   $("#reset").addEventListener("click", () => { dirty.clear(); fieldErrors.clear(); refreshForm(); });
@@ -985,7 +1315,12 @@ async function init() {
   $("#partition-form").addEventListener("input", renderJobs);
   $("#degrade-form").addEventListener("submit", (event) => startNetworkAction(event, "degrade"));
   $("#degrade-form").addEventListener("input", renderJobs);
+  $("#faucet-form").addEventListener("submit", reviewFaucet);
+  $("#faucet-add-output").addEventListener("click", () => addFaucetOutput("", "1"));
+  $("#faucet-source").addEventListener("change", renderFaucetControls);
+  $("#faucet-confirm").addEventListener("click", submitFaucet);
   setInterval(refreshStatus, 2000);
+  setInterval(refreshFaucet, 2000);
   setInterval(() => { if (!applying) refreshState(); }, 4000);
   setInterval(refreshJobs, 1000);
 }

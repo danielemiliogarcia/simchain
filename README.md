@@ -309,6 +309,13 @@ is active. Configuration applies never touch the nodes or chain, and a mixed app
 back transactionally. See
 [RETUNING.md](./docs/RETUNING.md).
 
+The Faucet card funds up to 100 regtest destinations from one existing miner treasury.
+It creates a real transaction with an actual fee of exactly 0 sat, then gives that tx a
+fixed, miner-local 100 BTC virtual priority delta on node2 and node3 so the next normal
+block includes it. The virtual amount is ordering metadata: it is not paid to the miner
+or transferred to the recipient. This is a private regtest facility, not a public or
+mainnet faucet.
+
 Everything the UI shows comes from the versioned localhost HTTP API
 (`/api/v1/status`, `/api/v1/config`, `/api/v1/config/schema`). Mutating calls need the
 bearer token. The default zero-config stack uses `simchain-control-dev-token`; if you
@@ -337,8 +344,9 @@ curl -s "localhost:8090/api/v1/jobs/$job_id/events?after=0" | jq .
 The same operations are exposed over MCP (streamable HTTP) at
 `http://localhost:8090/mcp`, so coding agents can inspect and retune the simnet
 directly. Mutation tools include `start_reorg`, `start_partition`, `start_degrade`,
-`start_scenario`, `get_job`, `list_jobs`, and `abort_job` over the same coordinator and
-validation as HTTP. Register it in Claude Code with:
+`start_scenario`, `fund_addresses`, `get_faucet_status`, `get_faucet_transfer`,
+`get_job`, `list_jobs`, and `abort_job` over the same coordinator and validation as
+HTTP. Register it in Claude Code with:
 
 ```bash
 claude mcp add --transport http simchain-control-plane \
@@ -363,6 +371,9 @@ cargo run -p simchainctl -- jobs watch JOB_ID --timeout 900
 cargo run -p simchainctl -- jobs abort JOB_ID
 cargo run -p simchainctl -- mine --node node2 --blocks 1 --wait
 cargo run -p simchainctl -- spam burst --node node2 --txs 100 --outputs-per-tx 25 --wait
+cargo run -p simchainctl -- faucet --to bcrt1q...=1btc --to bcrt1p...=25000000sat --wait
+cargo run -p simchainctl -- faucet status
+cargo run -p simchainctl -- faucet transfer TXID --watch
 ```
 
 `reorg --wait` streams progress and exits `0` only after successful cleanup. Stable

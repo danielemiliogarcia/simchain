@@ -60,6 +60,7 @@ use bitcoincore_rpc::{
     Client, RpcApi,
 };
 use serde_json::json;
+use simchain_common::live_tuning::SpamTuning;
 use simchain_common::rpc_retry;
 use std::{collections::HashSet, thread, time::Duration};
 
@@ -90,12 +91,10 @@ const FILL_VSIZE: u64 = 110;
 // In DATA/HYBRID mode, bulk spam pays a tiny premium over the floor fills so
 // block assembly drains bulk weight first and uses floor fills only to seal
 // residual gaps. The visible floor still comes from fills at FALLBACK_FEE.
-const BULK_FEE_PREMIUM_SAT_VB: f64 = 1.0;
 const POOL_FANOUT_CHUNK_OUTPUTS: usize = 500;
 // Fan-out/refill transactions must confirm even when floor-priced spam fills
 // every block. Paying above the floor keeps the refill path from competing
 // with the traffic it is trying to replenish.
-const FANOUT_FEE_MULTIPLIER: u64 = 2;
 
 // One funding pull for the floor pool. Kept modest because fills only burn
 // fees and recycle their change 1:1 after confirmation.
@@ -295,7 +294,8 @@ impl RawSpammer {
 
     fn bulk_fee_from_vsize(&self, vsize: u64) -> Amount {
         Amount::from_sat(
-            (vsize as f64 * (self.fee_rate_sat_vb + BULK_FEE_PREMIUM_SAT_VB)).ceil() as u64,
+            (vsize as f64 * (self.fee_rate_sat_vb + SpamTuning::BULK_FEE_PREMIUM_SAT_VB)).ceil()
+                as u64,
         )
     }
 
@@ -405,7 +405,8 @@ impl RawSpammer {
     // outputs, no data. It deliberately pays above the simulated floor so
     // refill transactions confirm promptly under saturation.
     fn consolidation_fee(&self, n_in: usize, n_out: usize) -> Amount {
-        self.fee_from_vsize((11 + 68 * n_in + 31 * n_out) as u64) * FANOUT_FEE_MULTIPLIER
+        self.fee_from_vsize((11 + 68 * n_in + 31 * n_out) as u64)
+            * SpamTuning::FANOUT_FEE_MULTIPLIER
     }
 
     // Build, sign and broadcast one transaction spending the engine key's

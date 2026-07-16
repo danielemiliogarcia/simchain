@@ -2,15 +2,15 @@
 
 ## Status
 
-**READY TO IMPLEMENT** — written 2026-07-15.
+**IMPLEMENTED** — written and implemented 2026-07-15.
 
-This is the engineering handoff for adding a user faucet to the implemented Simchain
-control plane. It pins the treasury model, exact-zero-fee transaction construction,
+This is the implemented design for the user faucet in the Simchain control plane. It
+pins the treasury model, exact-zero-fee transaction construction,
 miner-local prioritization, next-block coordination, API/CLI/MCP/dashboard contracts,
 durability and recovery rules, implementation phases, and acceptance tests.
 
-The target branch is `control-plane`. This document plans a feature; it does not claim
-that the faucet is already implemented.
+The implementation follows the contracts, durability rules, and trust boundaries in
+this document.
 
 ## 1. Decision summary
 

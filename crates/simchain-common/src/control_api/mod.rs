@@ -4,6 +4,7 @@
 
 mod config;
 mod error;
+mod faucet;
 mod jobs;
 mod status;
 
@@ -12,6 +13,11 @@ pub use config::{
     SchemaResponse, SettingSchema,
 };
 pub use error::{ApiError, ApiErrorEnvelope, ErrorCode, ErrorDetail, RollbackReport};
+pub use faucet::{
+    FaucetDeliveryState, FaucetJobRequest, FaucetJobResult, FaucetOutput, FaucetSource,
+    FaucetSourceNode, FaucetStatusResponse, FaucetTransfer, FaucetWalletStatus, FAUCET_MAX_OUTPUTS,
+    FAUCET_MAX_TX_VBYTES, FAUCET_PRIORITY_DELTA_SATS, FAUCET_PRIORITY_DOMINANCE_FACTOR,
+};
 pub use jobs::{
     AbortJobResponse, CheckpointState, CleanupState, DegradeJobRequest, JobCheckpoint,
     JobCheckpointResponse, JobCleanup, JobCreatedResponse, JobDetail, JobEvent, JobEventsResponse,

@@ -122,6 +122,61 @@ cargo run -p simchainctl -- spam burst \
   --node node3 --txs 10 --outputs-per-tx 0 --wait
 ```
 
+## Miner-prioritized zero-fee faucet
+
+Fund one or more externally controlled regtest addresses through the control plane:
+
+```bash
+cargo run -p simchainctl -- faucet \
+  --to bcrt1q...=1btc \
+  --to bcrt1p...=25000000sat \
+  --source auto --wait
+```
+
+Amounts require an exact `btc` or `sat` suffix. The command prints its generated
+idempotency UUID before submission; reuse it with `--idempotency-key` if the client
+loses the response. `--wait` stops when the durable job has armed the same signed tx on
+both miners. It does not wait indefinitely for mining.
+
+Inspect treasury availability and follow delivery separately:
+
+```bash
+cargo run -p simchainctl -- faucet status
+cargo run -p simchainctl -- faucet transfer TXID --watch --timeout 900
+```
+
+The transaction spends real regtest miner funds and pays exactly 0 sat in actual fees.
+The displayed 100 BTC delta is virtual miner-local priority only; it is not paid or
+transferred. While delivery is armed, another faucet, reorg, scenario, partition, or
+degradation is rejected. Spam remains live, read operations remain available, and a
+bounded manual mine is allowed.
+
+If mining was manually paused before the request, the faucet restores that paused
+state after arming. Mine the first block through the coordinated action, then watch the
+transfer become confirmed:
+
+```bash
+cargo run -p simchainctl -- mine --node node3 --blocks 1 --wait
+cargo run -p simchainctl -- faucet transfer TXID --watch
+```
+
+For `insufficient_faucet_funds`, inspect `faucet status`. Reduce the request, choose the
+other source treasury, or lower `FAUCET_WALLET_RESERVE_BTC` and restart the control
+plane only if the test's reserve policy permits it. Do not refill by weakening relay or
+mempool policy.
+
+For `faucet_delivery_pending`, inspect the pending txid and both miner mempools, then
+mine a block or let normal mining continue. The control-plane delivery guard repairs a
+missing miner copy from its private durable transaction before manual mining. On a
+control-plane restart it resumes the same prepared txid; it never constructs a second
+payment. The private recovery record is in the `btc-simnet-control-state` named volume
+and must not be copied into logs or public API output.
+
+An abort before submission unlocks inputs and clears any priority entries. An abort
+after either miner accepted the tx cannot retract it: the job reports the txid as
+`aborted_after_submission`, clears owned virtual priority where possible, and the tx
+may still confirm. Always inspect that transfer before issuing a replacement payment.
+
 ## UTXOs & balance
 
 Get UTXOs:

@@ -31,6 +31,12 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     app.jobs
         .ensure_idle()
         .map_err(crate::service::job_manager_error)?;
+    if request.settings.contains_key("FALLBACK_FEE") && app.jobs.has_pending_faucet() {
+        return Err(ServiceError::new(
+            ErrorCode::FaucetDeliveryPending,
+            "FALLBACK_FEE cannot change while a faucet transfer is armed",
+        ));
+    }
     let _file_guard = app
         .control_store
         .try_apply_lock()

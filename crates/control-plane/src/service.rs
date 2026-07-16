@@ -8,9 +8,10 @@ use crate::status::StatusSnapshot;
 use simchain_common::config::ConfigError;
 use simchain_common::control_api::{
     AbortJobResponse, ApplyMode, ComponentControlResponse, ConfigResponse, DegradeJobRequest,
-    EffectiveComponentConfig, JobCheckpointResponse, JobCreatedResponse, JobDetail,
-    JobEventsResponse, JobListResponse, MineJobRequest, OperationSummary, PartitionJobRequest,
-    ReleaseCheckpointRequest, ReorgJobRequest, SchemaResponse, SettingSchema, SpamBurstJobRequest,
+    EffectiveComponentConfig, FaucetJobRequest, FaucetStatusResponse, FaucetTransfer,
+    JobCheckpointResponse, JobCreatedResponse, JobDetail, JobEventsResponse, JobListResponse,
+    MineJobRequest, OperationSummary, PartitionJobRequest, ReleaseCheckpointRequest,
+    ReorgJobRequest, SchemaResponse, SettingSchema, SpamBurstJobRequest,
 };
 pub use simchain_common::control_api::{
     ApiError as ServiceError, ErrorCode, ErrorDetail, RollbackReport,
@@ -235,6 +236,32 @@ pub fn start_reorg(
     app.jobs
         .start_reorg(request, idempotency_key, tuning.spam.use_raw)
         .map_err(job_manager_error)
+}
+
+pub fn start_faucet(
+    app: &std::sync::Arc<AppState>,
+    request: FaucetJobRequest,
+    idempotency_key: Option<String>,
+) -> Result<JobCreatedResponse, ServiceError> {
+    let Ok(_guard) = app.apply_lock.try_lock() else {
+        return Err(ServiceError::new(
+            ErrorCode::ApplyInProgress,
+            "another desired-state mutation is already in progress",
+        ));
+    };
+    app.jobs
+        .start_faucet(request, idempotency_key)
+        .map_err(job_manager_error)
+}
+
+pub fn faucet_status(app: &AppState) -> FaucetStatusResponse {
+    app.jobs.faucet_status()
+}
+
+pub fn faucet_transfer(app: &AppState, txid: &str) -> Result<FaucetTransfer, ServiceError> {
+    app.jobs
+        .faucet_transfer(txid)
+        .ok_or_else(|| ServiceError::new(ErrorCode::JobNotFound, "faucet transfer not found"))
 }
 
 pub fn start_scenario(

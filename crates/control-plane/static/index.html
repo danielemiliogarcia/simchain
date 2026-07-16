@@ -57,6 +57,33 @@
       </div>
     </section>
 
+    <section class="card" id="faucet-card">
+      <div class="section-heading">
+        <h2>Faucet</h2>
+        <span class="faucet-badge">SYSTEM FAUCET · 0 SAT FEE · MINER-PRIORITIZED</span>
+      </div>
+      <div id="faucet-availability" class="component-state">checking miner treasuries…</div>
+      <div id="faucet-wallets" class="faucet-wallets"></div>
+      <form id="faucet-form">
+        <div class="faucet-form-heading">
+          <h3>Destinations</h3>
+          <button id="faucet-add-output" class="small secondary" type="button">Add destination</button>
+        </div>
+        <div id="faucet-outputs" class="faucet-outputs"></div>
+        <label class="faucet-source">Source treasury
+          <select id="faucet-source">
+            <option value="auto">Auto (recommended)</option>
+            <option value="node2">node2</option>
+            <option value="node3">node3</option>
+          </select>
+        </label>
+        <button id="faucet-review" type="submit">Review transaction</button>
+      </form>
+      <div id="faucet-action-result" class="action-result"></div>
+      <div id="faucet-progress" class="faucet-progress" hidden></div>
+      <div id="faucet-transfer" class="faucet-transfer muted">no faucet transfer selected</div>
+    </section>
+
     <section class="card" id="jobs-card">
       <h2>Jobs and scenarios</h2>
       <p class="hint">Mutations run as durable server-side jobs. Closing this page does not cancel
@@ -204,6 +231,20 @@ steps:
       <pre id="result" class="result" hidden></pre>
     </section>
   </main>
+
+  <dialog id="faucet-confirm-dialog">
+    <form method="dialog" class="faucet-confirm">
+      <h2>Confirm faucet transaction</h2>
+      <div id="faucet-confirm-summary"></div>
+      <p>This creates a real regtest transaction with a 0 sat fee. Simchain submits it
+        directly to both miners with a local 100 BTC virtual priority delta so their next
+        block includes it. The virtual amount is not paid or transferred.</p>
+      <div class="dialog-actions">
+        <button class="secondary" value="cancel">Cancel</button>
+        <button id="faucet-confirm" value="default">Create transaction</button>
+      </div>
+    </form>
+  </dialog>
 
   <script src="/app.js"></script>
 </body>

@@ -3,9 +3,10 @@
 
 use crate::apply::{apply, ApplyRequest};
 use crate::service::{
-    abort_job, config, get_checkpoint, get_job, job_events, list_jobs, release_checkpoint, schema,
-    set_mining_state, set_spam_state, start_degrade, start_mine, start_partition, start_reorg,
-    start_scenario, start_spam_burst, status, ErrorCode, ServiceError,
+    abort_job, config, faucet_status, faucet_transfer, get_checkpoint, get_job, job_events,
+    list_jobs, release_checkpoint, schema, set_mining_state, set_spam_state, start_degrade,
+    start_faucet, start_mine, start_partition, start_reorg, start_scenario, start_spam_burst,
+    status, ErrorCode, ServiceError,
 };
 use crate::state::SharedState;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -47,12 +48,18 @@ pub fn router(app: SharedState) -> Router {
         .route("/api/v1/spam/state", put(spam_state_handler))
         .route("/api/v1/events", get(global_events_handler))
         .route("/api/v1/jobs", get(jobs_handler))
+        .route("/api/v1/jobs/faucet", post(faucet_job_handler))
         .route("/api/v1/jobs/reorg", post(reorg_job_handler))
         .route("/api/v1/jobs/scenario", post(scenario_job_handler))
         .route("/api/v1/jobs/mine", post(mine_job_handler))
         .route("/api/v1/jobs/spam-burst", post(spam_burst_job_handler))
         .route("/api/v1/jobs/partition", post(partition_job_handler))
         .route("/api/v1/jobs/degrade", post(degrade_job_handler))
+        .route("/api/v1/faucet", get(faucet_status_handler))
+        .route(
+            "/api/v1/faucet/transfers/{txid}",
+            get(faucet_transfer_handler),
+        )
         .route("/api/v1/jobs/{job_id}", get(job_handler))
         .route("/api/v1/jobs/{job_id}/events", get(job_events_handler))
         .route("/api/v1/jobs/{job_id}/abort", post(abort_job_handler))
@@ -386,6 +393,69 @@ fn events_query(
             format!("invalid event cursor query: {rejection}"),
         )
     })
+}
+
+async fn faucet_status_handler(State(app): State<SharedState>) -> Response {
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || faucet_status(&worker)).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
+async fn faucet_transfer_handler(
+    State(app): State<SharedState>,
+    AxumPath(txid): AxumPath<String>,
+) -> Response {
+    match faucet_transfer(&app, &txid) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error_response(&error),
+    }
+}
+
+async fn faucet_job_handler(State(app): State<SharedState>, request: Request) -> Response {
+    if !request_has_token(&app, &request) {
+        return error_response(&ServiceError::new(
+            ErrorCode::Unauthorized,
+            "missing or invalid bearer token (set SIMCHAIN_CONTROL_TOKEN or use the local dev default)",
+        ));
+    }
+    let idempotency_key = match request_idempotency_key(&request) {
+        Ok(key) => key,
+        Err(error) => return faucet_error_response(&error),
+    };
+    let payload: Result<Json<simchain_common::control_api::FaucetJobRequest>, JsonRejection> =
+        Json::from_request(request, &()).await;
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return faucet_error_response(&ServiceError::new(
+                ErrorCode::ValidationFailed,
+                format!("invalid request body: {rejection}"),
+            ));
+        }
+    };
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || start_faucet(&worker, payload, idempotency_key)).await
+    {
+        Ok(Ok(response)) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Ok(Err(error)) => faucet_error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
+fn faucet_error_response(error: &ServiceError) -> Response {
+    if error.code == ErrorCode::ValidationFailed {
+        (StatusCode::BAD_REQUEST, Json(error.envelope())).into_response()
+    } else {
+        error_response(error)
+    }
 }
 
 async fn reorg_job_handler(State(app): State<SharedState>, request: Request) -> Response {
@@ -809,6 +879,25 @@ mod tests {
             .expect("request")
     }
 
+    fn post_faucet(
+        payload: serde_json::Value,
+        token: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::post("/api/v1/jobs/faucet")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if let Some(key) = idempotency_key {
+            builder = builder.header("Idempotency-Key", key);
+        }
+        builder
+            .body(Body::from(payload.to_string()))
+            .expect("request")
+    }
+
     fn post_abort(job_id: &str, token: Option<&str>) -> HttpRequest<Body> {
         let mut builder = HttpRequest::post(format!("/api/v1/jobs/{job_id}/abort"))
             .header(header::HOST, "localhost");
@@ -897,6 +986,66 @@ mod tests {
 
         let (status, _) = send(&fx.router, get("/api/v1/status")).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn faucet_route_requires_idempotency_and_uses_shared_transfer_reads() {
+        let fx = fixture(None);
+        let request = serde_json::json!({
+            "source": "auto",
+            "outputs": [{
+                "address": "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr",
+                "amount_sats": 100_000_000
+            }]
+        });
+        let (status, body) = send(
+            &fx.router,
+            post_faucet(request.clone(), Some("test-token"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "validation_failed");
+
+        let (status, body) = send(
+            &fx.router,
+            post_faucet(request.clone(), Some("test-token"), Some("faucet-retry")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+        let job = loop {
+            let (status, body) = send(&fx.router, get(&format!("/api/v1/jobs/{job_id}"))).await;
+            assert_eq!(status, StatusCode::OK);
+            if matches!(body["state"].as_str(), Some("succeeded" | "failed")) {
+                break body;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert_eq!(job["state"], "succeeded", "{job}");
+        assert_eq!(job["result"]["actual_fee_sats"], 0);
+        assert_eq!(job["result"]["priority_delta_sats"], 10_000_000_000_i64);
+        assert!(!job.to_string().contains("raw_tx_hex"));
+        let txid = job["result"]["txid"].as_str().unwrap();
+
+        let (status, transfer) =
+            send(&fx.router, get(&format!("/api/v1/faucet/transfers/{txid}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(transfer["delivery_state"], "armed");
+        assert_eq!(transfer["actual_fee_sats"], 0);
+        assert!(!transfer.to_string().contains("raw_tx_hex"));
+
+        let (status, faucet) = send(&fx.router, get("/api/v1/faucet")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(faucet["pending_transfer"]["txid"], txid);
+
+        let (status, reused) = send(
+            &fx.router,
+            post_faucet(request, Some("test-token"), Some("faucet-retry")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(reused["job_id"], job_id);
+        assert_eq!(reused["reused"], true);
     }
 
     #[tokio::test]
@@ -1444,8 +1593,11 @@ steps:
             names,
             vec![
                 "abort_job",
+                "fund_addresses",
                 "get_config",
                 "get_config_schema",
+                "get_faucet_status",
+                "get_faucet_transfer",
                 "get_job",
                 "get_status",
                 "list_jobs",

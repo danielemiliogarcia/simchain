@@ -50,6 +50,7 @@ main {
   background: var(--card);
   border: 1px solid var(--line);
   border-radius: 8px;
+  min-width: 0;
   padding: 1rem;
 }
 .tiles { display: flex; flex-wrap: wrap; gap: 0.6rem; }
@@ -63,6 +64,8 @@ main {
 .tile .k { font-size: 0.7rem; color: var(--dim); text-transform: uppercase; }
 .tile .v { font-size: 1.05rem; }
 .split { display: grid; grid-template-columns: 1.2fr 1fr; gap: 1rem; }
+.split > * { min-width: 0; }
+.split > div:first-child { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 0.8rem; }
 th, td { text-align: right; padding: 0.15rem 0.45rem; border-bottom: 1px solid var(--line); }
 th { color: var(--dim); font-weight: normal; }
@@ -84,6 +87,66 @@ td:first-child, th:first-child { text-align: left; }
 #mining-resume, #spam-resume { background: var(--ok); }
 .action-result { color: var(--dim); font-size: 0.72rem; min-height: 1rem; margin-top: 0.35rem; }
 .action-result.err { color: var(--err); }
+.faucet-badge {
+  color: var(--accent);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+.faucet-wallets { display: grid; grid-template-columns: 1fr 1fr; gap: 0.45rem; margin-bottom: 0.7rem; }
+.faucet-wallets > div { border: 1px solid var(--line); border-radius: 5px; padding: 0.4rem 0.5rem; }
+.faucet-wallets strong, .faucet-wallets span { display: block; }
+.faucet-wallets span { color: var(--dim); font-size: 0.7rem; overflow-wrap: anywhere; }
+.faucet-form-heading { display: flex; justify-content: space-between; align-items: center; }
+.faucet-form-heading h3 { margin-top: 0; }
+.faucet-outputs { display: grid; gap: 0.4rem; }
+.faucet-output-row {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) minmax(7rem, 0.35fr) auto;
+  gap: 0.45rem;
+  align-items: end;
+}
+.faucet-output-row label, .faucet-source { color: var(--dim); font-size: 0.72rem; }
+.faucet-output-row input, .faucet-source select {
+  display: block;
+  width: 100%;
+  margin-top: 0.15rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.3rem 0.45rem;
+  font: inherit;
+}
+.faucet-source { display: block; margin: 0.65rem 0; max-width: 16rem; }
+.faucet-progress, .faucet-transfer {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 5px;
+  padding: 0.5rem 0.6rem;
+  margin-top: 0.6rem;
+  font-size: 0.74rem;
+  overflow-wrap: anywhere;
+}
+.faucet-transfer > * { margin-bottom: 0.3rem; }
+.faucet-transfer-state { font-weight: 700; }
+.faucet-transfer ul { margin: 0.35rem 0; padding-left: 1.2rem; }
+.faucet-transfer a { color: var(--accent); }
+.faucet-transfer-error { color: var(--err); }
+.transfer-confirmed { border-left-color: var(--ok); }
+.transfer-delivery_failed, .transfer-aborted_after_submission { border-left-color: var(--err); }
+dialog {
+  width: min(38rem, calc(100vw - 2rem));
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0;
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.72); }
+.faucet-confirm { padding: 1rem; }
+.faucet-confirm p, #faucet-confirm-summary { font-size: 0.8rem; }
+#faucet-confirm-summary { color: var(--accent); font-weight: 700; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1rem; }
 .mutation-lock {
   border: 1px solid var(--line);
   border-radius: 5px;
@@ -287,4 +350,11 @@ button:disabled { opacity: 0.5; cursor: default; }
   padding: 0.5rem 0.7rem;
   font-size: 0.78rem;
   margin-bottom: 0.7rem;
+}
+@media (max-width: 620px) {
+  main { padding: 0.7rem; }
+  .split, .bounded-actions, .faucet-wallets { grid-template-columns: 1fr; }
+  .faucet-output-row { grid-template-columns: 1fr; }
+  .faucet-remove-output { justify-self: start; }
+  .section-heading { align-items: flex-start; flex-direction: column; gap: 0.2rem; }
 }
