@@ -124,9 +124,9 @@ cp .env.example .env        # the most used settings (image, credentials, blockt
 cp .env.full.example .env
 ```
 
-After first startup, live mining/spam desired policy is stored in
-`.simchain-control/state.json` and changed through the dashboard, CLI, API, or MCP; the
-control plane never rewrites `.env`. Every setting and its ownership is documented in
+After first startup, live mining/spam desired policy is stored in the
+`btc-simnet-control-state` Docker volume and changed through the dashboard, CLI, API,
+or MCP; the control plane never rewrites `.env`. Every setting and its ownership is documented in
 **[SETTINGS.md](./docs/SETTINGS.md)**.
 
 ### Choosing the bitcoin node image
@@ -254,7 +254,7 @@ durable server-side jobs under one mutation lock. Reorgs and partitions pause wo
 with expiring leases; namespace-local network agents also heal on TTL expiry. Scenarios
 persist ordered steps, checkpoints, results, and owned cleanup. Its distroless image
 contains no Docker CLI, has no Docker socket, drops all capabilities, uses a read-only
-root filesystem, and mounts only `.simchain-control`:
+root filesystem, and mounts only its narrow named state volume:
 
 ```bash
 docker compose up -d --build
@@ -273,20 +273,23 @@ back transactionally. See
 
 Everything the UI shows comes from the versioned localhost HTTP API
 (`/api/v1/status`, `/api/v1/config`, `/api/v1/config/schema`). Mutating calls need the
-bearer token stored at `.simchain-control/token` (gitignored, mode 0600):
+bearer token. The default zero-config stack uses `simchain-control-dev-token`; if you
+override `CONTROL_PLANE_API_TOKEN`, pass the same value with `--token` or
+`SIMCHAIN_CONTROL_TOKEN`:
 
 ```bash
+token="${SIMCHAIN_CONTROL_TOKEN:-simchain-control-dev-token}"
 curl -s localhost:8090/api/v1/status | jq .height
 curl -s -X PATCH localhost:8090/api/v1/config \
-  -H "Authorization: Bearer $(cat .simchain-control/token)" \
+  -H "Authorization: Bearer $token" \
   -H "Content-Type: application/json" \
   -d '{"settings": {"SPAM_FILL_BLOCK_RATIO": "0.5"}}'
 curl -s -X PUT localhost:8090/api/v1/mining/state \
-  -H "Authorization: Bearer $(cat .simchain-control/token)" \
+  -H "Authorization: Bearer $token" \
   -H "Content-Type: application/json" \
   -d '{"state": "paused"}'
 job_id="$(curl -s -X POST localhost:8090/api/v1/jobs/reorg \
-  -H "Authorization: Bearer $(cat .simchain-control/token)" \
+  -H "Authorization: Bearer $token" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: example-reorg-1" \
   -d '{"depth":3,"empty":true,"node":"node3"}' | jq -r .job_id)"
@@ -303,7 +306,7 @@ Code with:
 ```bash
 claude mcp add --transport http simchain-control-plane \
   "http://localhost:8090/mcp" \
-  --header "Authorization: Bearer $(cat .simchain-control/token)"
+  --header "Authorization: Bearer ${SIMCHAIN_CONTROL_TOKEN:-simchain-control-dev-token}"
 ```
 
 The CLI uses the same API and service operations:
@@ -328,8 +331,8 @@ cargo run -p simchainctl -- spam burst --node node2 --txs 100 --outputs-per-tx 2
 `reorg --wait` streams progress and exits `0` only after successful cleanup. Stable
 automation exit codes are `1` for operation/job failure, `2` for CLI usage, `3` for
 API/authentication failure, `4` for wait timeout, and `5` for aborted/interrupted jobs
-or cleanup failure. Job metadata and the most recent 100 summaries are stored under
-`.simchain-control/jobs/`; a control-plane restart marks an unfinished job interrupted
+or cleanup failure. Job metadata and the most recent 100 summaries are stored in the
+`btc-simnet-control-state` volume; a control-plane restart marks an unfinished job interrupted
 and keeps the coordinator locked until its network impairment is healed, convergence is
 witnessed, and worker leases are confirmed clear.
 

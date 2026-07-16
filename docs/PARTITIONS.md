@@ -81,7 +81,7 @@ The dashboard's Network section shows current impairments and starts either job.
 uses the same bearer token as every mutation:
 
 ```bash
-token="$(cat .simchain-control/token)"
+token="${SIMCHAIN_CONTROL_TOKEN:-simchain-control-dev-token}"
 
 curl -s -X POST localhost:8090/api/v1/jobs/partition \
   -H "Authorization: Bearer $token" \
