@@ -398,6 +398,7 @@ exclude = ["path/to/simchain"]
 
 - [INTRO.md](./docs/INTRO.md), detailed component descriptions and project objective.
 - [RETUNING.md](./docs/RETUNING.md), how to retune mining cadence, fee floor, and block fill on a live chain.
+- [MCP.md](./docs/MCP.md), connecting coding agents to the Simchain MCP endpoint.
 - [REORGS.md](./docs/REORGS.md), simulating chain reorganizations, commands, and modes.
 - [PARTITIONS.md](./docs/PARTITIONS.md), network partitions and P2P latency: organic
   reorgs, double-spend windows, propagation lag.

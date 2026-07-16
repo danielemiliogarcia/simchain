@@ -99,6 +99,9 @@ claude mcp add --transport http simchain-control-plane \
   --header "Authorization: Bearer ${SIMCHAIN_CONTROL_TOKEN:-simchain-control-dev-token}"
 ```
 
+For setup guidance, example prompts, and browser/auth troubleshooting, see
+[MCP.md](MCP.md).
+
 ## CLI
 
 `simchainctl` is a thin first-party HTTP client over the same control-plane API and
@@ -140,4 +143,3 @@ Job metadata and the most recent 100 summaries are stored in the
 `btc-simnet-control-state` volume. A control-plane restart marks an unfinished job
 interrupted and keeps the coordinator locked until any network impairment is healed,
 convergence is witnessed, and worker leases are confirmed clear.
-
