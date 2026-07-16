@@ -141,7 +141,7 @@ async fn require_token(State(app): State<SharedState>, request: Request, next: N
     } else {
         error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .simchain-control/token)",
+            "missing or invalid bearer token (set SIMCHAIN_CONTROL_TOKEN or use the local dev default)",
         ))
     }
 }
@@ -220,7 +220,7 @@ async fn config_patch_handler(State(app): State<SharedState>, request: Request) 
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .simchain-control/token)",
+            "missing or invalid bearer token (set SIMCHAIN_CONTROL_TOKEN or use the local dev default)",
         ));
     }
     let payload: Result<Json<ApplyRequest>, JsonRejection> = Json::from_request(request, &()).await;
@@ -248,7 +248,7 @@ async fn mining_state_handler(State(app): State<SharedState>, request: Request) 
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .simchain-control/token)",
+            "missing or invalid bearer token (set SIMCHAIN_CONTROL_TOKEN or use the local dev default)",
         ));
     }
     let payload: Result<
@@ -279,7 +279,7 @@ async fn spam_state_handler(State(app): State<SharedState>, request: Request) ->
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .simchain-control/token)",
+            "missing or invalid bearer token (set SIMCHAIN_CONTROL_TOKEN or use the local dev default)",
         ));
     }
     let payload: Result<
@@ -392,7 +392,7 @@ async fn reorg_job_handler(State(app): State<SharedState>, request: Request) -> 
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .simchain-control/token)",
+            "missing or invalid bearer token (set SIMCHAIN_CONTROL_TOKEN or use the local dev default)",
         ));
     }
     let idempotency_key = match request.headers().get("idempotency-key") {
@@ -434,7 +434,7 @@ async fn scenario_job_handler(State(app): State<SharedState>, request: Request) 
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .simchain-control/token)",
+            "missing or invalid bearer token (set SIMCHAIN_CONTROL_TOKEN or use the local dev default)",
         ));
     }
     let idempotency_key = match request.headers().get("idempotency-key") {
@@ -507,7 +507,7 @@ async fn mine_job_handler(State(app): State<SharedState>, request: Request) -> R
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .simchain-control/token)",
+            "missing or invalid bearer token (set SIMCHAIN_CONTROL_TOKEN or use the local dev default)",
         ));
     }
     let idempotency_key = match request_idempotency_key(&request) {
@@ -540,7 +540,7 @@ async fn spam_burst_job_handler(State(app): State<SharedState>, request: Request
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .simchain-control/token)",
+            "missing or invalid bearer token (set SIMCHAIN_CONTROL_TOKEN or use the local dev default)",
         ));
     }
     let idempotency_key = match request_idempotency_key(&request) {
@@ -605,7 +605,7 @@ where
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .simchain-control/token)",
+            "missing or invalid bearer token (set SIMCHAIN_CONTROL_TOKEN or use the local dev default)",
         ));
     }
     let idempotency_key = match request_idempotency_key(&request) {
@@ -666,7 +666,7 @@ async fn release_checkpoint_handler(
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .simchain-control/token)",
+            "missing or invalid bearer token (set SIMCHAIN_CONTROL_TOKEN or use the local dev default)",
         ));
     }
     let payload: Result<
@@ -696,7 +696,7 @@ async fn abort_job_handler(
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
             ErrorCode::Unauthorized,
-            "missing or invalid bearer token (see .simchain-control/token)",
+            "missing or invalid bearer token (set SIMCHAIN_CONTROL_TOKEN or use the local dev default)",
         ));
     }
     match abort_job(&app, &job_id) {

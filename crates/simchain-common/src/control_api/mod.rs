@@ -27,3 +27,4 @@ pub use status::{
 
 pub const API_PREFIX: &str = "/api/v1";
 pub const DEFAULT_CONTROL_URL: &str = "http://127.0.0.1:8090";
+pub const DEFAULT_CONTROL_TOKEN: &str = "simchain-control-dev-token";

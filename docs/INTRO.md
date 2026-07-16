@@ -41,7 +41,7 @@ A Rust tool (same stack as the other tools, pure RPC calls) that forces chain re
 ### Control plane `btc-simnet-control-plane`
 
 The single public dashboard/API/MCP backend. It stores desired runtime policy and job
-history under `.simchain-control`, reconciles resident workers through authenticated
+history in the `btc-simnet-control-state` Docker volume, reconciles resident workers through authenticated
 private APIs, and runs bounded reorg/scenario/network jobs through Bitcoin RPC and
 leases. It is part of ordinary startup, publishes only localhost port 8090, contains no
 Docker CLI, drops all Linux capabilities, uses a read-only root filesystem, and mounts

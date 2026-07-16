@@ -1,9 +1,10 @@
 # Retuning a Live Chain
 
 Mining and spam policy can change without restarting nodes or either resident worker.
-The control plane owns durable desired state in `.simchain-control/state.json`, applies a
-complete typed policy through private worker APIs, verifies the effective generation,
-and restores the prior runtime policy if a multi-worker transaction fails.
+The control plane owns durable desired state in the `btc-simnet-control-state` Docker
+volume, applies a complete typed policy through private worker APIs, verifies the
+effective generation, and restores the prior runtime policy if a multi-worker
+transaction fails.
 
 Start the ordinary stack and open [http://localhost:8090/](http://localhost:8090/):
 
@@ -27,7 +28,7 @@ editor receives `409 stale_revision` and does not mutate either worker.
 The equivalent HTTP request is:
 
 ```bash
-token="$(cat .simchain-control/token)"
+token="${SIMCHAIN_CONTROL_TOKEN:-simchain-control-dev-token}"
 generation="$(curl -s localhost:8090/api/v1/config | jq .generation)"
 curl -s -X PATCH localhost:8090/api/v1/config \
   -H "Authorization: Bearer $token" \
@@ -66,13 +67,20 @@ resume a manually paused worker.
 `.env` is Compose boot input. It still owns infrastructure such as images, credentials,
 ports, RPC endpoints, node policy, and the initial mining/spam policy used when no
 control-state file exists. The control plane never rewrites `.env`; after first boot,
-runtime desired policy lives only in `.simchain-control/state.json`.
+runtime desired policy lives only in the `btc-simnet-control-state` volume.
 The same private directory holds the mutation and process-instance locks, so a second
 control-plane process cannot coordinate jobs against the same state concurrently.
 
 To intentionally reset runtime desired policy to new boot values, stop the stack,
-remove `.simchain-control/state.json`, edit `.env`, and start again. Removing that file
-is an explicit reset and also resets its generation.
+remove only the control-state volume, edit `.env`, and start again:
+
+```bash
+docker compose down
+docker volume rm btc-simnet-control-state
+```
+
+Removing that volume is an explicit reset and also resets its generation and job
+history. It does not remove the node chain volumes.
 
 Node settings such as `BTC_IMAGE`, host ports, `MIN_RELAY_TX_FEE`, ZMQ ports, and
 `BLOCK_RESERVED_WEIGHT` are boot-only. Change those through Compose with the normal

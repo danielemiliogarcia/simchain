@@ -28,11 +28,11 @@ networks:
       config:
         - subnet: 172.30.0.0/24
 
-# Node datadirs persist on named volumes: the chain survives `docker compose
-# down` (the controller detects the height and skips the bootstrap) and can be
-# archived/restored with ./scripts/snapshot.sh. `docker compose down -v` wipes
-# them for a fresh chain. Explicit names (like the container and network names
-# above) keep ./scripts/snapshot.sh independent of the compose project name.
+# Node and control-plane state persist on named volumes: the chain, durable
+# runtime policy, job history, and API token survive `docker compose down`.
+# `docker compose down -v` wipes them for a fresh stack. Explicit names (like
+# the container and network names above) keep helper scripts independent of the
+# compose project name.
 volumes:
   node1-data:
     name: btc-simnet-node1-data
@@ -40,6 +40,8 @@ volumes:
     name: btc-simnet-node2-data
   node3-data:
     name: btc-simnet-node3-data
+  control-state:
+    name: btc-simnet-control-state
 
 services:
   btc-simnet-node1:
@@ -430,7 +432,8 @@ services:
   # Browser UI, versioned HTTP API and MCP endpoint on
   # http://localhost:${CONTROL_PLANE_PORT:-8090}. Mining and spam state and
   # policy use private worker APIs; mutation jobs use worker/network leases
-  # plus Bitcoin RPC. It has no Docker API and sees only its narrow state dir.
+  # plus Bitcoin RPC. It has no Docker API and sees only its narrow named
+  # state volume.
   # ---------------------------------------------------------------------------
   btc-simnet-control-plane:
     build:
@@ -443,7 +446,7 @@ services:
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
     volumes:
-      - ./.simchain-control:/var/lib/simchain-control
+      - control-state:/var/lib/simchain-control
     ports:
       - "127.0.0.1:${CONTROL_PLANE_PORT:-8090}:8080"
     depends_on:
@@ -470,9 +473,9 @@ services:
       - NODE2_NETWORK_AGENT_URL=http://btc-simnet-node2:9083
       - NODE3_NETWORK_AGENT_URL=http://btc-simnet-node3:9083
       - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
-      # Optional pre-set API token; empty means generate one and persist it
-      # to .simchain-control/token (bearer auth for API/MCP mutations)
-      - CONTROL_PLANE_API_TOKEN=${CONTROL_PLANE_API_TOKEN:-}
+      # Optional pre-set API token; the default matches simchainctl's local
+      # fallback and is for localhost development only.
+      - CONTROL_PLANE_API_TOKEN=${CONTROL_PLANE_API_TOKEN:-simchain-control-dev-token}
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
       - NODE1_RPC_URL=${NODE1_RPC_URL:-http://btc-simnet-node1:18443}

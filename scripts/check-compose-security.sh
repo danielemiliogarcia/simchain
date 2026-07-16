@@ -30,9 +30,9 @@ jq -e '
   and (($control.cap_drop // []) == ["ALL"])
   and (($control.security_opt // []) | index("no-new-privileges:true") != null)
   and (($control.volumes // []) | length == 1)
-  and $control.volumes[0].type == "bind"
+  and $control.volumes[0].type == "volume"
   and $control.volumes[0].target == "/var/lib/simchain-control"
-  and ($control.volumes[0].source | endswith("/.simchain-control"))
+  and $control.volumes[0].source == "control-state"
   and ((($control.networks // {}) | keys) == ["btc-simnet-control"])
   and (($control.ports // []) | all(.host_ip == "127.0.0.1"))
   and (

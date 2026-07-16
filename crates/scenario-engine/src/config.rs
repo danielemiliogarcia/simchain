@@ -1,6 +1,10 @@
 use anyhow::{bail, Context, Result};
-use simchain_common::control_api::DEFAULT_CONTROL_URL;
-use std::{env, path::PathBuf, time::Duration};
+use simchain_common::control_api::{DEFAULT_CONTROL_TOKEN, DEFAULT_CONTROL_URL};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -33,10 +37,7 @@ impl Config {
             .filter(|token| !token.trim().is_empty())
             .map(|token| token.trim().to_string())
             .filter(|token| !token.is_empty());
-        let token = match configured_token {
-            Some(token) => token,
-            None => wait_for_token(&state_dir.join("token"))?,
-        };
+        let token = resolve_token(configured_token, &state_dir);
 
         Ok(Self {
             scenario_file,
@@ -50,21 +51,17 @@ impl Config {
     }
 }
 
-fn wait_for_token(path: &std::path::Path) -> Result<String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(token) = std::fs::read_to_string(path)
-            .ok()
-            .map(|token| token.trim().to_string())
-            .filter(|token| !token.is_empty())
-        {
-            return Ok(token);
-        }
-        if std::time::Instant::now() >= deadline {
-            bail!("control-plane token is unavailable at {}", path.display());
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
+fn resolve_token(configured_token: Option<String>, state_dir: &Path) -> String {
+    configured_token
+        .or_else(|| read_token(&state_dir.join("token")))
+        .unwrap_or_else(|| DEFAULT_CONTROL_TOKEN.to_string())
+}
+
+fn read_token(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -72,4 +69,25 @@ fn env_or(key: &str, default: &str) -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_resolution_falls_back_to_default_without_local_file() {
+        assert_eq!(
+            resolve_token(None, Path::new("/definitely/not/a/simchain/state/dir")),
+            DEFAULT_CONTROL_TOKEN
+        );
+    }
+
+    #[test]
+    fn token_resolution_prefers_configured_token() {
+        assert_eq!(
+            resolve_token(Some("configured".to_string()), Path::new(".")),
+            "configured"
+        );
+    }
 }

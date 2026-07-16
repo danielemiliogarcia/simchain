@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand};
-use simchain_common::control_api::DEFAULT_CONTROL_URL;
+use simchain_common::control_api::{DEFAULT_CONTROL_TOKEN, DEFAULT_CONTROL_URL};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -37,7 +37,8 @@ impl ConnectionArgs {
             .token
             .or_else(|| std::env::var("SIMCHAIN_CONTROL_TOKEN").ok())
             .filter(|value| !value.trim().is_empty())
-            .or_else(read_local_token);
+            .or_else(read_local_token)
+            .or_else(|| Some(DEFAULT_CONTROL_TOKEN.to_string()));
         ResolvedConnection { url, token }
     }
 }
@@ -380,6 +381,35 @@ pub struct ScenarioReleaseArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestore {
+        values: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                values: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var(key).ok()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.values {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn parses_control_commands() {
@@ -586,5 +616,66 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn connection_uses_default_local_token_when_no_file_or_env_exists() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _restore = EnvRestore::capture(&[
+            "SIMCHAIN_CONTROL_URL",
+            "SIMCHAIN_CONTROL_TOKEN",
+            "SIMCHAIN_CONTROL_STATE_DIR",
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::remove_var("SIMCHAIN_CONTROL_URL");
+        std::env::remove_var("SIMCHAIN_CONTROL_TOKEN");
+        std::env::set_var("SIMCHAIN_CONTROL_STATE_DIR", dir.path());
+
+        let connection = ConnectionArgs {
+            url: None,
+            token: None,
+        }
+        .resolve();
+
+        assert_eq!(connection.url, DEFAULT_CONTROL_URL);
+        assert_eq!(connection.token.as_deref(), Some(DEFAULT_CONTROL_TOKEN));
+    }
+
+    #[test]
+    fn connection_prefers_local_token_file_over_default() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _restore =
+            EnvRestore::capture(&["SIMCHAIN_CONTROL_TOKEN", "SIMCHAIN_CONTROL_STATE_DIR"]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("token"), "from-file\n").expect("token");
+        std::env::remove_var("SIMCHAIN_CONTROL_TOKEN");
+        std::env::set_var("SIMCHAIN_CONTROL_STATE_DIR", dir.path());
+
+        let connection = ConnectionArgs {
+            url: None,
+            token: None,
+        }
+        .resolve();
+
+        assert_eq!(connection.token.as_deref(), Some("from-file"));
+    }
+
+    #[test]
+    fn connection_prefers_env_token_over_local_file() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _restore =
+            EnvRestore::capture(&["SIMCHAIN_CONTROL_TOKEN", "SIMCHAIN_CONTROL_STATE_DIR"]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("token"), "from-file\n").expect("token");
+        std::env::set_var("SIMCHAIN_CONTROL_TOKEN", "from-env");
+        std::env::set_var("SIMCHAIN_CONTROL_STATE_DIR", dir.path());
+
+        let connection = ConnectionArgs {
+            url: None,
+            token: None,
+        }
+        .resolve();
+
+        assert_eq!(connection.token.as_deref(), Some("from-env"));
     }
 }

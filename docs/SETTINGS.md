@@ -413,16 +413,16 @@ The control plane is part of ordinary Compose startup. It is the single localhos
 UI + HTTP API + MCP backend for live retuning and jobs (see
 [RETUNING.md](RETUNING.md)). Mining and spam control use private authenticated worker
 APIs; reorg, scenario, partition, and degradation jobs use worker/network leases plus
-Bitcoin RPC directly. Its image has no Docker CLI, and its only bind mount is the narrow
-`.simchain-control` state directory; the rest of its filesystem is read-only and all
-Linux capabilities are dropped. A lock in that directory enforces one control-plane
-process per durable state store.
+Bitcoin RPC directly. Its image has no Docker CLI, and its only writable mount is the
+narrow `btc-simnet-control-state` Docker volume; the rest of its filesystem is
+read-only and all Linux capabilities are dropped. A lock in that directory enforces one
+control-plane process per durable state store.
 
 | Variable | Default | Description |
 |---|---|---|
 | `CONTROL_PLANE_PORT` | `8090` | Host port (bound to `127.0.0.1` only) for the browser UI, the `/api/v1` JSON API, and the `/mcp` MCP endpoint. |
-| `CONTROL_PLANE_API_TOKEN` | _(empty)_ | Bearer token required on every mutation and the whole `/mcp` endpoint. Empty generates `.simchain-control/token` (mode 0600, gitignored), reused across restarts. |
-| `SIMCHAIN_CONTROL_STATE_DIR` | `/var/lib/simchain-control` in Compose | Narrow directory for the token, atomically written desired state, and bounded job metadata/JSONL events. The host bind is `.simchain-control`. |
+| `CONTROL_PLANE_API_TOKEN` | `simchain-control-dev-token` in Compose | Bearer token required on every mutation and the whole `/mcp` endpoint. Override it for shared machines and pass the same value to host tools with `SIMCHAIN_CONTROL_TOKEN` or `--token`. |
+| `SIMCHAIN_CONTROL_STATE_DIR` | `/var/lib/simchain-control` in Compose | Narrow directory for the token, atomically written desired state, and bounded job metadata/JSONL events. Compose stores it in the `btc-simnet-control-state` named volume. |
 | `MINING_CONTROL_URL` | `http://btc-simnet-mining-controller:9081` | Private Compose-network endpoint used by the control plane; never publish this port to the host. |
 | `MINING_CONTROL_LISTEN_ADDR` | `0.0.0.0:9081` | Mining worker's private control listener. Boot-only. |
 | `SPAM_CONTROL_URL` | `http://btc-simnet-spammer:9082` | Private Compose-network spam endpoint; never publish this port to the host. |
@@ -436,8 +436,8 @@ process per durable state store.
 | `MEMPOOL_WEB_URL` | `http://127.0.0.1:$MEMPOOL_WEB_PORT` | Browser-facing explorer URL shown by the dashboard. |
 | `MEMPOOL_WEB_INTERNAL_URL` | `http://mempool-web:8080` | Private health-probe URL used by the control plane. |
 
-Control-plane-managed runtime settings (durable desired values live only in
-`.simchain-control/state.json` after initialization):
+Control-plane-managed runtime settings (durable desired values live only in the
+control-state volume after initialization):
 
 - Mining controller scope: `BLOCK_INTERVAL_MODE`, `BLOCK_INTERVAL_MEAN_SECS`,
   `BLOCK_INTERVAL_MIN_SECS`, `BLOCK_INTERVAL_MAX_SECS`, `MINER_WEIGHTS`,
