@@ -326,6 +326,16 @@ button.small { padding: 0.15rem 0.45rem; font-size: 0.7rem; }
 .field .running { font-size: 0.72rem; color: var(--dim); overflow-wrap: anywhere; }
 .field .running.differs { color: var(--warn); }
 .fieldwarn { grid-column: 1 / -1; color: var(--warn); font-size: 0.74rem; padding-left: 0.2rem; }
+.field.boot label { color: var(--dim); }
+.field.boot .bootvalue {
+  width: 100%;
+  color: var(--dim);
+  border: 1px dashed var(--line);
+  border-radius: 4px;
+  padding: 0.25rem 0.45rem;
+  font: inherit;
+}
+.boothelp { grid-column: 1 / -1; color: var(--dim); font-size: 0.72rem; padding-left: 0.2rem; }
 .field-error { grid-column: 2 / -1; color: var(--err); font-size: 0.72rem; min-height: 0.9rem; }
 .applybar { display: flex; gap: 0.7rem; align-items: center; justify-content: flex-end; margin-top: 0.6rem; }
 .impact { color: var(--dim); font-size: 0.78rem; margin-right: auto; }

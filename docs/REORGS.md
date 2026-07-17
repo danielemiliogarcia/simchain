@@ -87,13 +87,15 @@ ordered by oldest orphaned block first and then by their original transaction or
 Eligibility is based on whether the configured wallet can sign, not on whether a
 transaction was semantically created as spam.
 
-Only transactions whose keys are available to the reorg wallet qualify. The default
-raw spam engine (`USE_RAW_TX_SPAM=true`) signs with keys that wallet does not hold, so
-stock settings usually produce zero eligible transactions. Set
-`USE_RAW_TX_SPAM=false` to use wallet-engine spam. If the percentage is above zero,
-raw spam is enabled, and the orphaned window has zero eligible transactions, the tool
-emits a highlighted warning explaining the mismatch. Transactions signed by external
-user keys are likewise ineligible; their conflict must be supplied separately.
+Only transactions whose keys are available to the reorg wallet qualify. Raw-engine
+spam signs with keys that wallet does not hold, so stock settings usually produce
+zero eligible transactions — and the node-wallet engine that produced eligible spam
+is deprecated and no longer selectable. If the percentage is above zero and the
+orphaned window has zero eligible transactions, the tool emits a highlighted
+warning explaining the mismatch. Transactions signed by external user keys are
+likewise ineligible; their conflict must be supplied separately. Making
+double-spends work against raw-engine spam is planned (see
+`docs/reorg-double-spend-raw-engine-plan.md`).
 
 ### Why conflicts are mined directly
 

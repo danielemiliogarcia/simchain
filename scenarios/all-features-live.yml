@@ -8,7 +8,7 @@ steps:
       BLOCK_INTERVAL_MAX_SECS: 20
       ENABLE_SPAM: true
       SPAM_FILL_BLOCK_RATIO: 3
-      FALLBACK_FEE: 0.0005
+      SPAM_FEE: 0.0005
 
   - type: assert_config
     effective: true
@@ -19,7 +19,7 @@ steps:
       BLOCK_INTERVAL_MAX_SECS: 20
       ENABLE_SPAM: true
       SPAM_FILL_BLOCK_RATIO: 3
-      FALLBACK_FEE: 0.0005
+      SPAM_FEE: 0.0005
 
   - type: wait_height
     height: 204

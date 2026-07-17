@@ -9,8 +9,8 @@ mod jobs;
 mod status;
 
 pub use config::{
-    ApplyMode, ApplyReport, ConfigPatchRequest, ConfigResponse, EffectiveComponentConfig,
-    SchemaResponse, SettingSchema,
+    ApplyMode, ApplyReport, BootSettingSchema, ConfigPatchRequest, ConfigResponse,
+    EffectiveComponentConfig, SchemaResponse, SettingSchema,
 };
 pub use error::{ApiError, ApiErrorEnvelope, ErrorCode, ErrorDetail, RollbackReport};
 pub use faucet::{

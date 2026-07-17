@@ -350,6 +350,17 @@ impl ScenarioActionBackend for MockBackend {
         }))
     }
 
+    fn prepare_spam_burst(
+        &self,
+        nodes: &[simchain_scenario_engine::MinerNode],
+        control: &dyn simchain_scenario_engine::ScenarioControl,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "prepared": nodes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "aborted": control.abort_requested()
+        }))
+    }
+
     fn spam_burst(
         &self,
         node: simchain_scenario_engine::MinerNode,

@@ -6,7 +6,7 @@
 const TOKEN = window.CONTROL_PLANE_TOKEN;
 const $ = (sel) => document.querySelector(sel);
 
-let schema = null;          // [{key, default, group, scope, control, options, optional, help, warning}]
+let schema = null;          // {settings: [{key, default, group, scope, control, options, optional, help, warning}], boot_settings: [{key, value, group, help}]}
 let lastState = null;       // last /api/v1/config payload
 let dirty = new Map();      // key -> edited value (string)
 let fieldErrors = new Map(); // key -> latest client/server validation message
@@ -373,8 +373,43 @@ function buildForm() {
       }
       div.append(field);
     }
+    for (const boot of bootSettingsFor(group)) {
+      div.append(buildBootField(boot));
+    }
     container.append(div);
   }
+}
+
+/* Boot-time settings (e.g. the nodes' -fallbackfee) are shown for context
+   only: the control plane cannot change them, so they render as read-only
+   labels instead of inputs. */
+function bootSettingsFor(group) {
+  return (schema.boot_settings || []).filter((boot) => boot.group === group);
+}
+
+function buildBootField(boot) {
+  const field = document.createElement("div");
+  field.className = "field boot";
+  field.dataset.bootKey = boot.key;
+
+  const label = document.createElement("label");
+  label.textContent = boot.key;
+  label.title = boot.help;
+
+  const value = document.createElement("div");
+  value.className = "bootvalue";
+  value.textContent = boot.value;
+
+  const note = document.createElement("div");
+  note.className = "running";
+  note.textContent = boot.note || "read-only";
+
+  const help = document.createElement("div");
+  help.className = "boothelp";
+  help.textContent = boot.help;
+
+  field.append(label, value, note, help);
+  return field;
 }
 
 function onEdit(key, value) {

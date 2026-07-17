@@ -19,6 +19,10 @@ enum SpamEngine {
         node2: Box<RawSpammer>,
         node3: Box<RawSpammer>,
     },
+    // DEPRECATED and unreachable in practice: USE_RAW_TX_SPAM is pinned to
+    // true, so policies always select the raw engine. Sends through the miner
+    // nodes' wallets, putting coin-selection and signing load on nodes that
+    // should stay light to mine blocks. See node_wallet_spammer.rs.
     Wallet {
         wallet2: Client,
         wallet3: Client,
@@ -62,6 +66,9 @@ impl SpamEngine {
                 vec![create_jsonrpc_client(&config.node3_url).map_err(EngineBuildError::safe)?],
                 wallet2,
                 &config.wallet2_name,
+                // Key namespace: keep the pre-namespace derivation so a
+                // restarted spammer recovers its existing coins.
+                &config.wallet2_name,
                 "Node 2",
                 policy.fee_rate_sat_vb(),
                 policy.sendmany_outputs,
@@ -73,6 +80,7 @@ impl SpamEngine {
                 create_jsonrpc_client(&config.node3_url).map_err(EngineBuildError::safe)?,
                 vec![create_jsonrpc_client(&config.node2_url).map_err(EngineBuildError::safe)?],
                 wallet3,
+                &config.wallet3_name,
                 &config.wallet3_name,
                 "Node 3",
                 policy.fee_rate_sat_vb(),
@@ -93,12 +101,15 @@ impl SpamEngine {
                 node3: Box::new(node3),
             })
         } else {
+            tracing::warn!(
+                "USE_RAW_TX_SPAM=false selects the deprecated node-wallet engine: coin selection and signing run inside the miner nodes, which should stay light to mine blocks"
+            );
             set_wallet_fees(
                 &wallet2,
                 &config.wallet2_name,
                 &wallet3,
                 &config.wallet3_name,
-                policy.fallback_fee,
+                policy.spam_fee,
                 previous_wallet_fee,
                 previous_engine_uses_wallet_fee,
             )?;
@@ -281,7 +292,7 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 fn configured_fee(control: &SpamControl) -> f64 {
-    control.status().policy.fallback_fee
+    control.status().policy.spam_fee
 }
 
 fn set_wallet_tx_fee(wallet: &Client, name: &str, fee_btc_per_kvb: f64) -> anyhow::Result<()> {
@@ -292,7 +303,7 @@ fn set_wallet_tx_fee(wallet: &Client, name: &str, fee_btc_per_kvb: f64) -> anyho
         accepted,
         "wallet '{name}' rejected settxfee {fee_btc_per_kvb}"
     );
-    tracing::info!("Wallet '{name}' paytxfee pinned to {fee_btc_per_kvb} BTC/kvB (FALLBACK_FEE)");
+    tracing::info!("Wallet '{name}' paytxfee pinned to {fee_btc_per_kvb} BTC/kvB (SPAM_FEE)");
     Ok(())
 }
 

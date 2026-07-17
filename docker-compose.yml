@@ -329,12 +329,16 @@ services:
       - btc-simnet-control
     environment:
       - ENABLE_SPAM=${ENABLE_SPAM:-true}
-      # true = raw engine (spammer signs its own txs, immune to wallet
-      # fatigue); false = original node-wallet engine (sendtoaddress/sendmany)
+      # Pinned to the raw engine; the node-wallet engine is deprecated and a
+      # legacy false here is ignored with a warning.
       - USE_RAW_TX_SPAM=${USE_RAW_TX_SPAM:-true}
-      # Floor price level. Floor fills pay exactly this; DATA/HYBRID bulk
-      # spam pays a small premium so floor fills remain residual-gap sealers.
-      - FALLBACK_FEE=${FALLBACK_FEE:-0.0001}
+      # Spam floor price level (BTC/kvB). Floor fills pay exactly this;
+      # DATA/HYBRID bulk spam pays a small premium so floor fills remain
+      # residual-gap sealers. Distinct from the nodes' boot-time -fallbackfee.
+      - SPAM_FEE=${SPAM_FEE:-}
+      # Legacy migration only: when SPAM_FEE is unset, a set FALLBACK_FEE
+      # still seeds the spam fee (the spammer logs a warning to migrate).
+      - FALLBACK_FEE=${FALLBACK_FEE:-}
       # Fixed tx count for OUTPUT modes (sequential/batch) and the wallet
       # engine. Ignored in DATA/HYBRID mode (fill is driven by the ratio below).
       - SPAM_FIXED_TXS_PER_BLOCK=${SPAM_FIXED_TXS_PER_BLOCK:-100}
@@ -417,9 +421,9 @@ services:
       - REORG_ADDS_NEW_TXS=${REORG_ADDS_NEW_TXS:-5}
       # Percentage (0-100) of eligible orphaned wallet txs to permanently drop
       # by mining a same-input, different-output conflict into the replacement
-      # chain (0 disables; ignored for `empty` reorgs). Only reorg-node
-      # wallet-engine spam is eligible; with USE_RAW_TX_SPAM=true there may be
-      # nothing to conflict.
+      # chain (0 disables; ignored for `empty` reorgs). Only txs the reorg
+      # node's wallet can re-sign are eligible; raw-engine spam is signed with
+      # external keys, so there is usually nothing to conflict.
       - REORG_DOUBLE_SPEND_PCT=${REORG_DOUBLE_SPEND_PCT:-0}
       # Passed through so the reorg tool can warn when permanent-drop mode is
       # requested against raw-engine spam, whose keys its wallet cannot sign.
@@ -495,6 +499,9 @@ services:
       - MINING_RNG_SEED=${MINING_RNG_SEED:-}
       - ENABLE_SPAM=${ENABLE_SPAM:-true}
       - USE_RAW_TX_SPAM=${USE_RAW_TX_SPAM:-true}
+      - SPAM_FEE=${SPAM_FEE:-}
+      # The nodes' boot-time -fallbackfee, mirrored here for the dashboard's
+      # read-only label and for legacy SPAM_FEE seeding.
       - FALLBACK_FEE=${FALLBACK_FEE:-0.0001}
       - SPAM_FIXED_TXS_PER_BLOCK=${SPAM_FIXED_TXS_PER_BLOCK:-100}
       - SPAM_SENDMANY_OUTPUTS=${SPAM_SENDMANY_OUTPUTS:-0}

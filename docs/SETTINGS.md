@@ -96,7 +96,10 @@ The three fee settings look similar but act at different points of a transaction
   wallet uses when fee estimation has no data, which is always the case on a fresh
   regtest chain. Without it `sendtoaddress` fails with "Fee estimation failed". Keep it
   at or above `MIN_RELAY_TX_FEE`, or the wallet creates transactions that its own node
-  refuses to relay.
+  refuses to relay. **Boot-only**: it is baked into the node commands at container
+  start and fixed until the containers are recreated, so the dashboard shows it as a
+  read-only label. The spam price level is the separate, live-retunable
+  [`SPAM_FEE`](#spammer) — before the split one `FALLBACK_FEE` variable served both roles.
 - **`MAX_TX_FEE`** (`-maxtxfee`, whole BTC; an absolute amount, not a rate) is the
   **wallet's safety cap**: any wallet transaction that would pay more total fee than this
   aborts. It is set absurdly high here so spam volume never trips it (the mainnet
@@ -105,29 +108,26 @@ The three fee settings look similar but act at different points of a transaction
 | Variable | Default | Description |
 |---|---|---|
 | `MIN_RELAY_TX_FEE` | `0.00001` | Node mempool/relay floor (feerate, BTC/kvB). Keep at the mainnet default; see [The fee market](#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor) for why it is the wrong knob for a fee floor. |
-| `FALLBACK_FEE` | `0.0001` | Wallet feerate when estimation has no data (BTC/kvB). Also the simnet's floor price level: floor fills pay this rate, and DATA/HYBRID bulk spam pays a tiny premium so miners use floor fills only for residual gaps. Raising it sets an economic fee floor — see [The fee market](#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor). |
+| `FALLBACK_FEE` | `0.0001` | Wallet feerate when estimation has no data (BTC/kvB). Boot-only node flag; the simnet's live spam price level is `SPAM_FEE`. A legacy `.env` that sets only `FALLBACK_FEE` still seeds `SPAM_FEE` from it (with a migration warning). |
 | `MAX_TX_FEE` | `10000000` | Wallet cap on the total fee of one tx (whole BTC). |
 | `BLOCK_RESERVED_WEIGHT` | `2000` | Regtest mining template reserve (`-blockreservedweight`, WU). Bitcoin Core defaults to reserving 8000 WU for mining RPC clients; `2000` is Core's minimum safety value and avoids most of the permanent ~7.4k-WU gap. Deviating from the Core default here *imitates mainnet*: real pools reserve just enough for their actual coinbase, so congested mainnet blocks pack to ~3,999,8xx WU — with the default 8000 the simnet's blocks would cap at ~3.993M WU, unlike anything on mainnet. Mining-template-only: consensus (4M WU) and relay/mempool policy are untouched, so all nodes still behave like stock mainnet nodes. |
 | `NODE1_DISABLE_WALLET` | `1` | node1 has no wallet by default: it mimics a 3rd-party production endpoint with no hot wallet online, so the user manages keys externally and submits signed raw transactions. Set `0` to enable the wallet. |
 
 ### The fee market: what spam pays, and how to set a price floor
 
-Both spam engines use `FALLBACK_FEE` as the price anchor; they just reach it
-differently. The raw engine (`USE_RAW_TX_SPAM=true`, the default) sets fees explicitly:
-floor fills pay `FALLBACK_FEE`, DATA/HYBRID bulk spam pays a tiny premium above it, and
-OUTPUT-mode spam pays it directly. The wallet engine never sets a fee: every send lets
-the sending node's wallet choose, the wallet asks its own fee estimator, the estimator
-has no data on a fresh chain, and the wallet falls back to `FALLBACK_FEE`. With the
-defaults, the floor is ~10 sat/vB.
+Spam uses `SPAM_FEE` as the price anchor. The raw engine sets fees explicitly:
+floor fills pay `SPAM_FEE`, DATA/HYBRID bulk spam pays a tiny premium above it, and
+OUTPUT-mode spam (including scenario bursts) pays it directly. With the defaults,
+the floor is ~10 sat/vB.
 
-Under the wallet engine the estimator never escapes that level either. Once it has
-data, its only data is the spam itself, and all of it confirmed at the fallback
-rate — so it recommends that same rate back and the spam keeps paying it.
-`FALLBACK_FEE` is therefore not just a bootstrap value: it sets the simnet's price
-level permanently, whichever engine is active.
+The estimator never escapes that level either: its only data is the spam itself,
+and all of it confirmed at the floor rate — so it recommends that same rate back.
+`SPAM_FEE` is therefore not just a bootstrap value: it sets the simnet's price
+level permanently — and unlike the nodes' boot-time `FALLBACK_FEE`, it retunes
+live from the dashboard.
 
 That makes it a one-line **economic fee floor**. Combine a
-[full-blocks recipe](#full-blocks) with, say, `FALLBACK_FEE=0.001` (100 sat/vB) and
+[full-blocks recipe](#full-blocks) with, say, `SPAM_FEE=0.001` (100 sat/vB) and
 the background traffic outbids anything cheaper: a user transaction paying more than
 the spam rate jumps the queue and confirms next block; one paying less still relays
 fine (the relay floor stays at 1 sat/vB), sits visibly in the mempool, and full
@@ -205,7 +205,8 @@ long fixed interval while `.env` keeps the default bounds.
 | Variable | Default | Description |
 |---|---|---|
 | `ENABLE_SPAM` | `true` | Spam transactions after each block so blocks are not empty. |
-| `USE_RAW_TX_SPAM` | `true` | Selects the spam engine. `true`: **raw engine** — the spammer holds its own keys, tracks its own UTXO set in memory, signs every tx locally and submits with `sendrawtransaction`. The node wallets are bypassed, so the send rate stays flat forever (no wallet fatigue). Floor-fill txs pay exactly `FALLBACK_FEE`; DATA/HYBRID bulk spam pays a tiny premium so miners drain bulk first and keep floor fills for residual gaps; rare refill fan-outs pay above the floor so they confirm under saturation. `false`: **node-wallet engine** — spam is sent with `sendtoaddress`/`sendmany` on the miner wallets, so bitcoind does coin selection and signing (wallet-realistic traffic, the original behavior); throughput is bound by the wallet lock and degrades as wallet history grows (see [Full blocks](#full-blocks)). All other spam knobs apply to both engines. |
+| `SPAM_FEE` | `0.0001` | The spam fee floor and the simnet's live price level (BTC/kvB): floor fills pay this rate, DATA/HYBRID bulk spam pays a tiny premium, and scenario bursts price from it too. Live-retunable (the engine rebuilds at a safe boundary); keep it ≥ `MIN_RELAY_TX_FEE`. Distinct from the boot-only node flag `FALLBACK_FEE`. |
+| `USE_RAW_TX_SPAM` | `true` (pinned) | **Pinned to the raw engine, shown read-only in the dashboard**: the spammer holds its own keys, tracks its own UTXO set in memory, signs every tx locally and submits with `sendrawtransaction`. The node wallets are bypassed, so the send rate stays flat forever (no wallet fatigue). Floor-fill txs pay exactly `SPAM_FEE`; DATA/HYBRID bulk spam pays a tiny premium so miners drain bulk first and keep floor fills for residual gaps; rare refill fan-outs pay above the floor so they confirm under saturation. The node-wallet engine (`false`) is **deprecated and no longer selectable**: it put coin-selection and signing load on the miner nodes, which we deliberately keep light so they can mine blocks, and its throughput degraded as wallet history grew (see [Full blocks](#full-blocks)). A legacy `.env` setting `false` is ignored with a warning. |
 | `SPAM_FIXED_TXS_PER_BLOCK` | `100` | Fixed tx count for the **OUTPUT** spam modes (sequential/batch) and the wallet engine — the number a block explorer shows per block (plus coinbase) until blocks are full; excess waits in the mempool. Split across the miner nodes for you. **Ignored in DATA/HYBRID mode**, where the fill is driven by `SPAM_FILL_BLOCK_RATIO`. The standalone spammer still accepts the deprecated boot aliases `SPAM_TXS_PER_BLOCK` and `SPAM_PER_MINER_PER_BLOCK` (× 2); they are not runtime-managed keys. |
 | `SPAM_SENDMANY_OUTPUTS` | `0` | OUTPUT-mode fatness. `0`: sequential — one tx with a single burn output at a time, p2p-like arrival. `N > 0`: batch — each spam tx carries N burn outputs (exchange-payout-shaped). Ignored in DATA/HYBRID mode. |
 | `SPAM_TX_DATA_MAX_BYTES` | `90000` | Raw engine only. `N > 0` (the default): **DATA/HYBRID mode** — the fill comes from OP_RETURN data txs (biggest payload = N). An OP_RETURN is provably unspendable, so it never enters the UTXO set: pure block weight at near-zero node cost (a handful of fat txs fill a 4M WU block vs ~1130 in output mode; measured node CPU ~100% → ~2%). Capped just under the 100k-vB standard-tx limit; needs Core 30+ (the default image). `0`: legacy OUTPUT mode (fatness from burn outputs, UTXO-heavy). The standalone spammer still accepts `SPAM_TX_DATA_BYTES` as a deprecated boot alias; it is not runtime-managed. See [Hybrid: varied sizes and mempool depth](#hybrid-varied-sizes-and-mempool-depth). |
@@ -224,8 +225,8 @@ The nodes keep Bitcoin Core's consensus-default block weight (4M WU, ~7,100 smal
 spam txs), so filling blocks is purely a question of feeding the mempool fast enough.
 A 1-in/2-out spam tx is ~561 WU; sequential sending is bound by RPC round-trips
 (~22 accepted tx/s on a mid-range desktop). The measured numbers in this section
-were taken with the wallet engine (`USE_RAW_TX_SPAM=false`); the raw engine
-(default) is substantially faster at the same settings — check your real cycle time
+were taken with the now-removed-from-service wallet engine; the raw engine is
+substantially faster at the same settings — check your real cycle time
 in the `Spam cycle done in ...` log line. Two ready-made setups:
 
 Fast full blocks, under 1 minute each (batch mode):
@@ -255,11 +256,10 @@ check the real cycle time in `docker logs btc-simnet-spammer` (the
 `Spam cycle done in ...` line each round) and keep `BLOCK_INTERVAL_MEAN_SECS` above it.
 If the cycle time *grows* over the session instead, that is wallet fatigue:
 bitcoind keeps the whole wallet tx history in memory and scans it on every send
-(measured: ~13s cycle fresh → ~67s after ~50 full blocks). It is inherent to
-wallet-based spam, i.e. to `USE_RAW_TX_SPAM=false`; the raw engine (default) is
-immune — its bookkeeping is a constant-size in-memory UTXO set, so switching back
-to it is the structural fix. Wallet-engine resets: a stack restart
-(`docker compose down -v`) or lowering the offered tx count.
+(measured: ~13s cycle fresh → ~67s after ~50 full blocks). It was inherent to the
+deprecated wallet-based spam engine; the raw engine is immune — its bookkeeping is
+a constant-size in-memory UTXO set, which is one of the reasons the wallet engine
+is no longer selectable.
 
 With `BLOCK_INTERVAL_MODE=poisson`, `BLOCK_INTERVAL_MEAN_SECS` is only the underlying
 mean: individual gaps will routinely be shorter than the spam cycle even when the mean
@@ -306,7 +306,7 @@ SPAM_TX_DATA_MIN_BYTES=250     # spread each tx's size log-uniformly in [MIN, MA
 SPAM_SMALL_TXS_PER_BLOCK=40    # small realistic payment-shaped txs (cosmetic)
 SPAM_FLOOR_POOL_TXS=4000       # standing 110-vB standalone fills -> airtight floor (see below)
 SPAM_FILL_BLOCK_RATIO=2        # keep ~2 blocks of weight pending in the mempool
-FALLBACK_FEE=0.001             # 100 sat/vB floor; bulk DATA pays a small premium
+SPAM_FEE=0.001                 # 100 sat/vB floor; bulk DATA pays a small premium
 ```
 
 `SPAM_FILL_BLOCK_RATIO` is measured live each block and topped up, so it controls both
@@ -321,7 +321,7 @@ grows (only the small txs add outputs).
 
 ### The fee floor
 
-Raising `FALLBACK_FEE` with full blocks makes the estimator and mempool.space show a
+Raising `SPAM_FEE` with full blocks makes the estimator and mempool.space show a
 price floor (e.g. floor fills at 100 sat/vB while bulk DATA sits just above it). Whether
 that floor is **airtight** against tiny below-floor transactions depends on
 `SPAM_FLOOR_POOL_TXS`.
@@ -359,7 +359,7 @@ BLOCK_INTERVAL_MEAN_SECS=15
 ENABLE_SPAM=true
 SPAM_FIXED_TXS_PER_BLOCK=250
 SPAM_SENDMANY_OUTPUTS=250
-FALLBACK_FEE=0.001
+SPAM_FEE=0.001
 
 ```
 Kept for wallet-realistic burn-output traffic. Note the trade-offs vs the default
@@ -379,7 +379,7 @@ pool in OUTPUT mode — see [When the floor leaks](#the-fee-market-what-spam-pay
 | `REORG_NODE_RPC_PORT` | `18443` | RPC port of `REORG_NODE` inside the compose network. |
 | `REORG_MINE_ADDRESS` | `bcrt1qtmjq...tf3rr` | Address receiving the replacement block rewards. **The default is the same address as `USER_ADDRESS`'s default** (intentional), so after a reorg plus 100 blocks of maturity the user balance grows beyond the bootstrap 2x50 BTC. Set a separate throwaway address if your test asserts exact user balances. |
 | `REORG_ADDS_NEW_TXS` | `5` | Fresh wallet txs seeded into the reorg node's mempool before mining, modelling a node that received transactions its peers have not yet seen; they are mined into the winning chain alongside the returned txs. `0` disables. Ignored for `empty` reorgs. To match spammed block fullness, set it near `SPAM_FIXED_TXS_PER_BLOCK` (OUTPUT mode). |
-| `REORG_DOUBLE_SPEND_PCT` | `0` | Percentage (`0`–`100`) of the **eligible orphaned wallet txs on the reorg node** to permanently drop, by mining a same-input, different-output conflict into the replacement chain so the originals can never re-confirm. `0` keeps today's behavior (orphaned txs re-mined unchanged); ignored for `empty` reorgs. Applies **only** to txs the reorg node's own wallet can re-sign (its wallet-engine spam), and only to root orphaned txs (not descendants of another orphaned tx). With the default `USE_RAW_TX_SPAM=true` there may be **zero** eligible txs; set `USE_RAW_TX_SPAM=false` to exercise it. Selection is deterministic (oldest orphaned block first) and `1`–`100` always selects at least one eligible tx. See [REORGS.md](./REORGS.md). |
+| `REORG_DOUBLE_SPEND_PCT` | `0` | Percentage (`0`–`100`) of the **eligible orphaned wallet txs on the reorg node** to permanently drop, by mining a same-input, different-output conflict into the replacement chain so the originals can never re-confirm. `0` keeps today's behavior (orphaned txs re-mined unchanged); ignored for `empty` reorgs. Applies **only** to txs the reorg node's own wallet can re-sign (its wallet-engine spam), and only to root orphaned txs (not descendants of another orphaned tx). Raw-engine spam is signed with keys outside the reorg wallet, so there are usually **zero** eligible txs; the wallet engine that produced eligible txs is deprecated and no longer selectable (see the parked raw-engine double-spend plan). Selection is deterministic (oldest orphaned block first) and `1`–`100` always selects at least one eligible tx. See [REORGS.md](./REORGS.md). |
 | `REORG_WALLET_NAME` | `NODE3_WALLET_NAME` (`node3`) | Wallet used to send the `REORG_ADDS_NEW_TXS` transactions on the reorg node, and to sign the `REORG_DOUBLE_SPEND_PCT` conflicts. Falls back to the first loaded wallet if it is not loaded. |
 | `REORG_WITNESS_NODE` | `btc-simnet-node1` | Node polled after mining the replacements to confirm the whole network adopted the new chain. If the mining controller extended the old chain during the reorg window (tie), extra blocks are mined (up to 10) until the witness follows the new tip. `none` disables the check. |
 
@@ -451,7 +451,7 @@ control-state volume after initialization):
 - Mining controller scope: `BLOCK_INTERVAL_MODE`, `BLOCK_INTERVAL_MEAN_SECS`,
   `BLOCK_INTERVAL_MIN_SECS`, `BLOCK_INTERVAL_MAX_SECS`, `MINER_WEIGHTS`,
   `MINING_RNG_SEED`.
-- Spammer scope: `ENABLE_SPAM`, `USE_RAW_TX_SPAM`, `FALLBACK_FEE`,
+- Spammer scope: `ENABLE_SPAM`, `SPAM_FEE`,
   `SPAM_FIXED_TXS_PER_BLOCK`, `SPAM_SENDMANY_OUTPUTS`, `SPAM_TX_DATA_MAX_BYTES`,
   `SPAM_TX_DATA_MIN_BYTES`, `SPAM_SMALL_TXS_PER_BLOCK`, `SPAM_FLOOR_POOL_TXS`,
   `SPAM_FILL_BLOCK_RATIO`, `SPAM_FANOUT_AUTO`, `SPAM_FANOUT_UTXOS`,

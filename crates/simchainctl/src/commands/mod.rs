@@ -178,13 +178,14 @@ pub struct MineArgs {
 
 #[derive(Debug, Args)]
 pub struct SpamBurstArgs {
-    /// Wallet node: node2 or node3.
+    /// Target node: node2 or node3.
     #[arg(long, default_value = "node2")]
     pub node: String,
     /// Positive number of transactions to submit.
     #[arg(long)]
     pub txs: u64,
-    /// Outputs per transaction; zero selects sequential sendtoaddress.
+    /// Burn outputs per raw transaction; zero selects sequential
+    /// single-output transactions.
     #[arg(long, default_value_t = 0)]
     pub outputs_per_tx: u64,
     /// Wait for the server-side action to finish.

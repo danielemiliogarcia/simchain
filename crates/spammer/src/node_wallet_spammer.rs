@@ -1,9 +1,17 @@
 //! Node-wallet spam engine: spam is sent with sendtoaddress/sendmany on the
 //! miner node wallets, so bitcoind does coin selection, change handling and
-//! signing. This is the original engine, kept selectable with
-//! USE_RAW_TX_SPAM=false: its transactions are exactly what a real wallet
-//! produces, but throughput is bound by the wallet lock and degrades as the
-//! wallet's tx history grows (see SETTINGS.md "Full blocks").
+//! signing. This is the original engine: its transactions are exactly what a
+//! real wallet produces, but throughput is bound by the wallet lock and
+//! degrades as the wallet's tx history grows (see SETTINGS.md "Full blocks").
+//!
+//! DEPRECATED AND NO LONGER SELECTABLE: every send here runs coin selection
+//! and signing inside the miner nodes' bitcoind wallets — load we
+//! deliberately keep off the miners so they stay light to mine blocks.
+//! USE_RAW_TX_SPAM is pinned to true (a legacy false is ignored with a
+//! warning), so this engine is unreachable in practice. The raw engine
+//! ([`crate::raw_transaction_spammer`]) produces the same traffic shapes
+//! while signing everything in the spammer process; the nodes only see
+//! sendrawtransaction. Kept for reference until removal.
 
 use bitcoincore_rpc::{
     bitcoin::{Address, Amount, Txid},

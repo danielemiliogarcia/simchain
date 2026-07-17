@@ -31,9 +31,24 @@ pub struct SettingSchema {
     pub warning: Option<String>,
 }
 
+/// A setting surfaced for context only: shown read-only in UIs, never
+/// editable through the control plane — boot-time node flags (changing them
+/// requires recreating containers) and pinned values.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BootSettingSchema {
+    pub key: String,
+    pub value: String,
+    pub group: String,
+    /// Short badge shown next to the value, e.g. "boot-time · read-only".
+    pub note: String,
+    pub help: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct SchemaResponse {
     pub settings: Vec<SettingSchema>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boot_settings: Vec<BootSettingSchema>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]

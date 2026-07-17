@@ -104,7 +104,7 @@ impl ControlStateStore {
 
     fn load(&self) -> std::io::Result<ControlState> {
         let content = fs::read_to_string(&self.path)?;
-        let state: ControlState = serde_json::from_str(&content).map_err(|error| {
+        let mut state: ControlState = serde_json::from_str(&content).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("control state {} is corrupt: {error}", self.path.display()),
@@ -119,6 +119,7 @@ impl ControlStateStore {
                 ),
             ));
         }
+        migrate_legacy_desired(&mut state.desired);
         Ok(state)
     }
 
@@ -161,12 +162,35 @@ impl ControlStateStore {
     }
 }
 
+/// Pre-split state stored the spam fee under `FALLBACK_FEE`, which now names
+/// only the nodes' boot-time flag and is no longer a managed key. Carry the
+/// value over so an upgrade keeps the running spam fee.
+fn migrate_legacy_desired(desired: &mut BTreeMap<String, String>) {
+    if let Some(value) = desired.remove("FALLBACK_FEE") {
+        desired.entry("SPAM_FEE".to_string()).or_insert(value);
+    }
+    // The engine toggle is pinned to the raw engine and no longer managed.
+    desired.remove("USE_RAW_TX_SPAM");
+}
+
 /// Initial desired values are the boot policy passed to the workers and
 /// control plane. Once state.json exists it is authoritative.
 pub fn desired_from_process_env() -> anyhow::Result<BTreeMap<String, String>> {
-    let overrides: BTreeMap<String, String> = std::env::vars()
+    let mut overrides: BTreeMap<String, String> = std::env::vars()
         .filter(|(key, _)| simchain_common::live_tuning::is_managed_key(key))
         .collect();
+    // Legacy boot environment: before the split FALLBACK_FEE also set the
+    // spam fee. Seed SPAM_FEE from it so the first state.json keeps the fee.
+    if overrides
+        .get("SPAM_FEE")
+        .is_none_or(|v| v.trim().is_empty())
+    {
+        if let Ok(value) = std::env::var("FALLBACK_FEE") {
+            if !value.trim().is_empty() {
+                overrides.insert("SPAM_FEE".to_string(), value);
+            }
+        }
+    }
     desired_from_source(&overrides)
 }
 
@@ -243,6 +267,26 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn legacy_fallback_fee_state_migrates_to_spam_fee_on_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ControlStateStore::open(dir.path().to_path_buf()).expect("store");
+        let mut legacy = ControlState::default();
+        legacy.desired.remove("SPAM_FEE");
+        legacy
+            .desired
+            .insert("FALLBACK_FEE".to_string(), "0.0005".to_string());
+        legacy
+            .desired
+            .insert("USE_RAW_TX_SPAM".to_string(), "false".to_string());
+        store.save(&legacy).expect("save legacy state");
+
+        let loaded = store.load_current().expect("load");
+        assert!(!loaded.desired.contains_key("FALLBACK_FEE"));
+        assert_eq!(loaded.desired["SPAM_FEE"], "0.0005");
+        assert!(!loaded.desired.contains_key("USE_RAW_TX_SPAM"));
     }
 
     #[test]

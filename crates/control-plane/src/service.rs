@@ -7,11 +7,11 @@ use crate::state::{AppState, MINING_COMPONENT, SPAM_COMPONENT};
 use crate::status::StatusSnapshot;
 use simchain_common::config::ConfigError;
 use simchain_common::control_api::{
-    AbortJobResponse, ApplyMode, ComponentControlResponse, ConfigResponse, DegradeJobRequest,
-    EffectiveComponentConfig, FaucetJobRequest, FaucetStatusResponse, FaucetTransfer,
-    JobCheckpointResponse, JobCreatedResponse, JobDetail, JobEventsResponse, JobListResponse,
-    MineJobRequest, OperationSummary, PartitionJobRequest, ReleaseCheckpointRequest,
-    ReorgJobRequest, SchemaResponse, SettingSchema, SpamBurstJobRequest,
+    AbortJobResponse, ApplyMode, BootSettingSchema, ComponentControlResponse, ConfigResponse,
+    DegradeJobRequest, EffectiveComponentConfig, FaucetJobRequest, FaucetStatusResponse,
+    FaucetTransfer, JobCheckpointResponse, JobCreatedResponse, JobDetail, JobEventsResponse,
+    JobListResponse, MineJobRequest, OperationSummary, PartitionJobRequest,
+    ReleaseCheckpointRequest, ReorgJobRequest, SchemaResponse, SettingSchema, SpamBurstJobRequest,
 };
 pub use simchain_common::control_api::{
     ApiError as ServiceError, ErrorCode, ErrorDetail, RollbackReport,
@@ -68,14 +68,42 @@ pub fn schema() -> SchemaResponse {
                 warning: spec.warning.map(str::to_string),
             })
             .collect(),
+        boot_settings: vec![
+            BootSettingSchema {
+                key: "USE_RAW_TX_SPAM".to_string(),
+                value: "true".to_string(),
+                group: live_tuning::SettingGroup::SpamBasics.as_str().to_string(),
+                note: "pinned · read-only".to_string(),
+                help: "Always true: the raw engine signs spam locally and bypasses the node wallets. The node-wallet engine is deprecated and no longer selectable."
+                    .to_string(),
+            },
+            BootSettingSchema {
+                key: "FALLBACK_FEE".to_string(),
+                value: boot_fallback_fee(),
+                group: live_tuning::SettingGroup::SpamBasics.as_str().to_string(),
+                note: "boot-time · read-only".to_string(),
+                help: "The nodes' boot-time -fallbackfee (BTC/kvB): the wallet feerate when fee estimation has no data. Fixed until the node containers are recreated; the live spam fee is SPAM_FEE."
+                    .to_string(),
+            },
+        ],
     }
+}
+
+/// The `-fallbackfee` the nodes booted with: docker-compose interpolates the
+/// same `FALLBACK_FEE` variable into the node commands and this process's
+/// environment. If the .env changed since the nodes started, this reflects
+/// the current .env, not the running flag.
+fn boot_fallback_fee() -> String {
+    std::env::var("FALLBACK_FEE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "0.0001".to_string())
 }
 
 fn spam_apply_mode(key: &str) -> ApplyMode {
     match key {
         "ENABLE_SPAM"
-        | "USE_RAW_TX_SPAM"
-        | "FALLBACK_FEE"
+        | "SPAM_FEE"
         | "SPAM_SENDMANY_OUTPUTS"
         | "SPAM_TX_DATA_MIN_BYTES"
         | "SPAM_TX_DATA_MAX_BYTES" => ApplyMode::EngineRebuild,
@@ -86,7 +114,7 @@ fn spam_apply_mode(key: &str) -> ApplyMode {
 fn validation_bounds(key: &str) -> (Option<f64>, Option<f64>) {
     match key {
         "BLOCK_INTERVAL_MEAN_SECS" => (Some(1.0), None),
-        "BLOCK_INTERVAL_MIN_SECS" | "FALLBACK_FEE" | "SPAM_FILL_BLOCK_RATIO" => (Some(0.0), None),
+        "BLOCK_INTERVAL_MIN_SECS" | "SPAM_FEE" | "SPAM_FILL_BLOCK_RATIO" => (Some(0.0), None),
         "BLOCK_INTERVAL_MAX_SECS" => (Some(f64::EPSILON), None),
         "SPAM_TX_DATA_MAX_BYTES" => (Some(0.0), Some(live_tuning::MAX_DATA_BYTES as f64)),
         key if live_tuning::spec(key).is_some_and(|spec| spec.control == ControlKind::Integer) => {
@@ -581,8 +609,12 @@ mod tests {
         assert!(validate_input("BLOCK_INTERVAL_MODE", "gaussian").is_err());
         assert!(validate_input("SPAM_FLOOR_POOL_TXS", "100").is_ok());
         assert!(validate_input("SPAM_FLOOR_POOL_TXS", "-1").is_err());
-        assert!(validate_input("FALLBACK_FEE", "0.0002").is_ok());
-        assert!(validate_input("FALLBACK_FEE", "abc").is_err());
+        assert!(validate_input("SPAM_FEE", "0.0002").is_ok());
+        assert!(validate_input("SPAM_FEE", "abc").is_err());
+        // FALLBACK_FEE is boot-only and USE_RAW_TX_SPAM is pinned: neither is
+        // a managed key, so neither is settable.
+        assert!(validate_input("FALLBACK_FEE", "0.0002").is_err());
+        assert!(validate_input("USE_RAW_TX_SPAM", "false").is_err());
         assert!(validate_input("MINER_WEIGHTS", "70,30").is_ok());
         assert!(validate_input("NOT_A_KEY", "1").is_err());
         // Empty always means "reset to default".
@@ -596,13 +628,22 @@ mod tests {
         let fee = view
             .settings
             .iter()
-            .find(|s| s.key == "FALLBACK_FEE")
-            .expect("FALLBACK_FEE in schema");
-        assert!(
-            fee.warning.is_some(),
-            "boot fallback caveat must be visible"
-        );
+            .find(|s| s.key == "SPAM_FEE")
+            .expect("SPAM_FEE in schema");
+        assert!(fee.warning.is_none(), "SPAM_FEE needs no warning banner");
         assert_eq!(fee.component, SPAM_COMPONENT);
+        let boot_fee = view
+            .boot_settings
+            .iter()
+            .find(|s| s.key == "FALLBACK_FEE")
+            .expect("FALLBACK_FEE boot setting in schema");
+        assert!(!boot_fee.value.is_empty());
+        let engine = view
+            .boot_settings
+            .iter()
+            .find(|s| s.key == "USE_RAW_TX_SPAM")
+            .expect("pinned engine toggle in schema");
+        assert_eq!(engine.value, "true");
         let cadence = view
             .settings
             .iter()
@@ -623,11 +664,10 @@ mod tests {
         let view = schema();
         let engine_rebuild = [
             "ENABLE_SPAM",
-            "FALLBACK_FEE",
+            "SPAM_FEE",
             "SPAM_SENDMANY_OUTPUTS",
             "SPAM_TX_DATA_MAX_BYTES",
             "SPAM_TX_DATA_MIN_BYTES",
-            "USE_RAW_TX_SPAM",
         ];
         for spec in live_tuning::MANAGED_SETTINGS {
             let setting = view

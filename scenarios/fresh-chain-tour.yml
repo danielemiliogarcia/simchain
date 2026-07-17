@@ -8,7 +8,7 @@ steps:
       BLOCK_INTERVAL_MAX_SECS: 10
       ENABLE_SPAM: true
       SPAM_FILL_BLOCK_RATIO: 4
-      FALLBACK_FEE: 0.002
+      SPAM_FEE: 0.002
 
   - type: wait_until
     timeout_secs: 120
@@ -47,7 +47,7 @@ steps:
       BLOCK_INTERVAL_MAX_SECS: 10
       ENABLE_SPAM: true
       SPAM_FILL_BLOCK_RATIO: 4
-      FALLBACK_FEE: 0.002
+      SPAM_FEE: 0.002
 
   - type: reorg
     depth: 3
@@ -88,9 +88,9 @@ steps:
 
   - type: set_config
     settings:
-      FALLBACK_FEE: 0.0001
+      SPAM_FEE: 0.0001
 
   - type: assert_config
     effective: true
     settings:
-      FALLBACK_FEE: 0.0001
+      SPAM_FEE: 0.0001

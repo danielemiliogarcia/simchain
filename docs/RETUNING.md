@@ -33,7 +33,7 @@ generation="$(curl -s localhost:8090/api/v1/config | jq .generation)"
 curl -s -X PATCH localhost:8090/api/v1/config \
   -H "Authorization: Bearer $token" \
   -H 'Content-Type: application/json' \
-  -d "{\"settings\":{\"FALLBACK_FEE\":\"0.0002\"},\"base_generation\":$generation}"
+  -d "{\"settings\":{\"SPAM_FEE\":\"0.0002\"},\"base_generation\":$generation}"
 ```
 
 MCP exposes the same operation as `set_config` at `http://localhost:8090/mcp`.
@@ -86,6 +86,8 @@ Node settings such as `BTC_IMAGE`, host ports, `MIN_RELAY_TX_FEE`, ZMQ ports, an
 `BLOCK_RESERVED_WEIGHT` are boot-only. Change those through Compose with the normal
 operational care for node restarts; they are deliberately absent from the live schema.
 
-`FALLBACK_FEE` is shared at boot: nodes use it for wallet fallback, while the spammer
-uses it as the live fee floor. A runtime change updates the spam engine (and wallet
-`paytxfee` in wallet mode) but does not rewrite a running node's boot fallback fee.
+`FALLBACK_FEE` is boot-only too: it sets the nodes' wallet estimator fallback and
+appears in the dashboard as a read-only label. The live fee floor is the separate
+`SPAM_FEE` — changing it rebuilds the spam engine at a safe boundary (and repins the
+wallet `paytxfee` in the deprecated wallet mode) without touching the running nodes.
+A legacy `.env` that sets only `FALLBACK_FEE` still seeds `SPAM_FEE` at first boot.

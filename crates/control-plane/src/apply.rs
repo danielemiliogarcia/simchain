@@ -52,10 +52,10 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
         app.jobs
             .ensure_idle()
             .map_err(crate::service::job_manager_error)?;
-        if request.settings.contains_key("FALLBACK_FEE") && app.jobs.has_pending_faucet() {
+        if request.settings.contains_key("SPAM_FEE") && app.jobs.has_pending_faucet() {
             return Err(ServiceError::new(
                 ErrorCode::FaucetDeliveryPending,
-                "FALLBACK_FEE cannot change while a faucet transfer is armed",
+                "SPAM_FEE cannot change while a faucet transfer is armed",
             ));
         }
         Ok(())
@@ -115,8 +115,8 @@ pub fn apply_with_context(
     let source = live_tuning::staged_map(&merged);
     let (tuning, mut warnings) = parse_merged_tuning(&source)?;
 
-    if proposed.contains_key("FALLBACK_FEE") {
-        validate_dynamic_fee(context, tuning.spam.fallback_fee)?;
+    if proposed.contains_key("SPAM_FEE") {
+        validate_dynamic_fee(context, tuning.spam.spam_fee)?;
     }
 
     let desired = tuning
@@ -260,21 +260,21 @@ fn validate_patch(
     }
 }
 
-fn validate_dynamic_fee(context: &ApplyContext<'_>, fallback_fee: f64) -> Result<(), ServiceError> {
+fn validate_dynamic_fee(context: &ApplyContext<'_>, spam_fee: f64) -> Result<(), ServiceError> {
     let required = context.chain.spam_min_fee().map_err(|error| {
         ServiceError::new(
             ErrorCode::RpcUnavailable,
-            format!("cannot validate FALLBACK_FEE against the running nodes: {error}"),
+            format!("cannot validate SPAM_FEE against the running nodes: {error}"),
         )
     })?;
-    if fallback_fee + 1e-12 < required {
+    if spam_fee + 1e-12 < required {
         return Err(ServiceError::new(
             ErrorCode::ValidationFailed,
-            "FALLBACK_FEE is below a running node's relay/mempool minimum",
+            "SPAM_FEE is below a running node's relay/mempool minimum",
         )
         .with_details(vec![ErrorDetail {
-            key: Some("FALLBACK_FEE".to_string()),
-            value: Some(fallback_fee.to_string()),
+            key: Some("SPAM_FEE".to_string()),
+            value: Some(spam_fee.to_string()),
             cause: format!("the highest active minimum is {required} BTC/kvB"),
         }]));
     }
@@ -757,7 +757,7 @@ mod tests {
     fn dynamic_fee_validation_happens_before_worker_mutation() {
         let (_dir, mock, app) = fixture();
 
-        let error = apply(&app, request(&[("FALLBACK_FEE", "0.000001")], Some(0)))
+        let error = apply(&app, request(&[("SPAM_FEE", "0.000001")], Some(0)))
             .expect_err("fee below runtime minimum");
 
         assert_eq!(error.code, ErrorCode::ValidationFailed);

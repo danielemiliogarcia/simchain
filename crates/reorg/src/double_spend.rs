@@ -87,10 +87,10 @@ impl DoubleSpendPlan {
             if use_raw_tx_spam && self.eligible_count == 0 {
                 tracing::warn!(
                     "DOUBLE-SPEND CONFIGURATION MISMATCH: REORG_DOUBLE_SPEND_PCT={} but \
-                     USE_RAW_TX_SPAM=true; raw-engine spam is signed with keys outside the \
-                     reorg wallet, so 0 txs are eligible for permanent replacement. Set \
-                     USE_RAW_TX_SPAM=false to exercise double-spend drops. The reorg will \
-                     continue without permanent drops.",
+                     the spam is raw-engine traffic signed with keys outside the reorg \
+                     wallet, so 0 txs are eligible for permanent replacement. The \
+                     node-wallet engine that produced eligible txs is deprecated and no \
+                     longer selectable. The reorg will continue without permanent drops.",
                     self.configured_pct
                 );
             } else {
@@ -153,7 +153,7 @@ impl DoubleSpendPlan {
         if !self.wallet_resolved {
             "no wallet loaded on the reorg node"
         } else if self.wallet_txs_seen == 0 {
-            "no wallet txs in the orphaned window (wrong spam engine? the default USE_RAW_TX_SPAM=true produces none)"
+            "no wallet txs in the orphaned window (raw-engine spam produces none)"
         } else {
             "all wallet txs in the window were non-root descendants or could not be re-signed"
         }

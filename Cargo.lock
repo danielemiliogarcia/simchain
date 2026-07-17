@@ -1473,6 +1473,7 @@ dependencies = [
  "simchain-common",
  "simchain-reorg",
  "simchain-scenario-engine",
+ "simchain-spammer",
  "tempfile",
  "tokio",
  "tower",

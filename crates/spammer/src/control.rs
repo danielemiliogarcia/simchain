@@ -608,7 +608,7 @@ pub fn requires_rebuild(current: &SpamTuning, next: &SpamTuning) -> bool {
     next.enabled
         && (!current.enabled
             || current.use_raw != next.use_raw
-            || current.fallback_fee != next.fallback_fee
+            || current.spam_fee != next.spam_fee
             || current.sendmany_outputs != next.sendmany_outputs
             || current.data_min_bytes != next.data_min_bytes
             || current.data_max_bytes != next.data_max_bytes)
@@ -919,7 +919,7 @@ mod tests {
         let control = SpamControl::new(initial.clone());
         initialize(&control);
         let mut changed = initial.clone();
-        changed.use_raw = false;
+        changed.spam_fee = 0.0002;
         let setter = control.clone();
         let for_setter = changed.clone();
         let apply = std::thread::spawn(move || {
@@ -951,7 +951,7 @@ mod tests {
         let control = SpamControl::new(initial.clone());
         initialize(&control);
         let mut changed = initial.clone();
-        changed.use_raw = false;
+        changed.spam_fee = 0.0002;
         let setter = control.clone();
         let apply = std::thread::spawn(move || {
             setter.set_policy(SetSpamPolicyRequest {

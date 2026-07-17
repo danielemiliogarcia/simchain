@@ -90,7 +90,7 @@ const BRANCH_MIN_TXS: u64 = 16;
 const FILL_VSIZE: u64 = 110;
 // In DATA/HYBRID mode, bulk spam pays a tiny premium over the floor fills so
 // block assembly drains bulk weight first and uses floor fills only to seal
-// residual gaps. The visible floor still comes from fills at FALLBACK_FEE.
+// residual gaps. The visible floor still comes from fills at SPAM_FEE.
 const POOL_FANOUT_CHUNK_OUTPUTS: usize = 500;
 // Fan-out/refill transactions must confirm even when floor-priced spam fills
 // every block. Paying above the floor keeps the refill path from competing
@@ -216,6 +216,7 @@ impl RawSpammer {
         relay_nodes: Vec<JsonClient>,
         wallet: Client,
         wallet_name: &str,
+        key_namespace: &str,
         label: &str,
         fee_rate_sat_vb: f64,
         sendmany_outputs: u64,
@@ -226,8 +227,11 @@ impl RawSpammer {
         // restarts, so a restarted spammer recovers its previous coins with
         // scantxoutset instead of starting broke. Regtest-only money, so a
         // publicly derivable key is fine -- same spirit as the burn addresses.
+        // The namespace keeps independent engine instances (the resident
+        // spammer vs a control-plane scenario burst) on disjoint keys so they
+        // never track and double-spend the same UTXO set.
         let secp = Secp256k1::new();
-        let tag = sha256::Hash::hash(format!("simchain-raw-spam-{wallet_name}").as_bytes());
+        let tag = sha256::Hash::hash(format!("simchain-raw-spam-{key_namespace}").as_bytes());
         let secret =
             SecretKey::from_slice(tag.as_byte_array()).expect("sha256 of tag is a valid key");
         let pubkey = PublicKey::from_secret_key(&secp, &secret);
@@ -244,7 +248,7 @@ impl RawSpammer {
         // The floor pool's own key, same recovery story as the engine key: a
         // restarted spammer derives the same address and picks its confirmed
         // pool UTXOs back up with scantxoutset.
-        let pool_tag = sha256::Hash::hash(format!("simchain-raw-floor-{wallet_name}").as_bytes());
+        let pool_tag = sha256::Hash::hash(format!("simchain-raw-floor-{key_namespace}").as_bytes());
         let pool_secret =
             SecretKey::from_slice(pool_tag.as_byte_array()).expect("sha256 of tag is a valid key");
         let pool_pubkey = PublicKey::from_secret_key(&secp, &pool_secret);
@@ -411,7 +415,7 @@ impl RawSpammer {
 
     // Build, sign and broadcast one transaction spending the engine key's
     // P2WPKH UTXOs. maxfeerate=0 disables sendrawtransaction's 0.1 BTC/kvB
-    // safety cap, so a deliberately high FALLBACK_FEE price level still
+    // safety cap, so a deliberately high SPAM_FEE price level still
     // broadcasts.
     fn send_tx(
         &self,
@@ -609,6 +613,30 @@ impl RawSpammer {
         Ok(())
     }
 
+    /// Make sure `branches` confirmed, usable branch UTXOs exist, pulling and
+    /// confirming a wallet funding transaction and fan-out if needed. Blocks
+    /// on confirmations, so it needs block production to make progress on a
+    /// broke engine; call it while mining runs (the control plane calls this
+    /// before scenarios that burst under paused mining). Returns false when
+    /// interrupted through the checkpoint.
+    pub fn ensure_branches(&mut self, branches: u64, checkpoint: &impl Fn(&str) -> bool) -> bool {
+        self.ensure_funds(branches, branches, checkpoint)
+    }
+
+    /// Retarget the OUTPUT-mode burn shape and fee rate for the next round,
+    /// so an owner can reuse one engine instance (and its in-memory branch
+    /// state) across differently-shaped bursts.
+    pub fn set_burst_shape(&mut self, fee_rate_sat_vb: f64, sendmany_outputs: u64) {
+        self.fee_rate_sat_vb = fee_rate_sat_vb;
+        self.burn_scripts = if sendmany_outputs == 0 {
+            vec![burn::burn_address(0).script_pubkey()]
+        } else {
+            (1..=sendmany_outputs)
+                .map(|i| burn::burn_address(i).script_pubkey())
+                .collect()
+        };
+    }
+
     // Rebuild the data-branch UTXO set from the chain.
     fn resync(&mut self) {
         self.utxos = self.scan_address_utxos(&self.address);
@@ -692,7 +720,11 @@ impl RawSpammer {
                 < 1
             {
                 if !checkpoint("raw_funding_confirmation") {
+                    // Interrupted (pause, policy change, abort): stop waiting
+                    // now. The funding tx stays in the mempool and the next
+                    // resync picks it up once it confirms.
                     continue_work = false;
+                    break;
                 }
                 thread::sleep(Duration::from_millis(500));
             }
@@ -747,9 +779,16 @@ impl RawSpammer {
                 let mut continue_work = checkpoint("raw_fanout_submitted");
                 while !matches!(self.node.get_tx_out(&txid, 0, Some(false)), Ok(Some(_))) {
                     if !checkpoint("raw_fanout_confirmation") {
+                        // Interrupted: leave the unconfirmed fan-out in the
+                        // mempool; a later resync recovers its outputs.
                         continue_work = false;
+                        break;
                     }
                     thread::sleep(Duration::from_millis(500));
+                }
+                if !continue_work {
+                    self.resync();
+                    return false;
                 }
                 self.utxos = (0..target)
                     .map(|i| Utxo {

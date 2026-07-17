@@ -5,25 +5,35 @@
 use crate::backend::{MiningControlBackend, SpamControlBackend};
 use crate::state::ControlPlaneConfig;
 use anyhow::{Context, Result};
-use bitcoincore_rpc::bitcoin::{Amount, Txid};
+use bitcoincore_rpc::bitcoin::Txid;
 use bitcoincore_rpc::RpcApi;
 use serde_json::{json, Value};
 use simchain_common::config::{
     parse_rpc_url, RpcUrl, DEFAULT_NODE2_WALLET_NAME, DEFAULT_NODE3_WALLET_NAME,
 };
-use simchain_common::{burn_address, create_client, create_wallet_client, require_regtest_address};
+use simchain_common::{
+    create_client, create_jsonrpc_client, create_wallet_client, require_regtest_address,
+};
 use simchain_scenario_engine::{MinerNode, ScenarioControl, TxWaitState};
+use simchain_spammer::raw_transaction_spammer::RawSpammer;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const DUST_SATS: u64 = 546;
 const DEFAULT_SCENARIO_TIMEOUT_SECS: u64 = 1_800;
 
 pub trait ScenarioActionBackend: Send + Sync {
     fn wait_height(&self, height: u64, control: &dyn ScenarioControl) -> Result<Value>;
     fn mine(&self, node: MinerNode, blocks: u64) -> Result<Value>;
+    /// Fund the raw burst engines for `nodes` so later `spam_burst` steps can
+    /// run without block production (funding needs confirmations, bursts do
+    /// not). Called before the scenario's steps, while mining still runs.
+    fn prepare_spam_burst(
+        &self,
+        nodes: &[MinerNode],
+        control: &dyn ScenarioControl,
+    ) -> Result<Value>;
     fn spam_burst(
         &self,
         node: MinerNode,
@@ -42,6 +52,14 @@ pub trait ScenarioActionBackend: Send + Sync {
     fn live_summary(&self) -> Result<Value>;
 }
 
+/// One cached raw burst engine per miner node. Kept across bursts so
+/// consecutive bursts chain correctly off in-memory unconfirmed change.
+#[derive(Default)]
+struct BurstEngines {
+    node2: Option<RawSpammer>,
+    node3: Option<RawSpammer>,
+}
+
 pub struct RpcScenarioActionBackend {
     node1_url: RpcUrl,
     node2_url: RpcUrl,
@@ -51,6 +69,7 @@ pub struct RpcScenarioActionBackend {
     timeout: Duration,
     mining: Arc<dyn MiningControlBackend>,
     spam: Arc<dyn SpamControlBackend>,
+    burst_engines: Mutex<BurstEngines>,
 }
 
 impl RpcScenarioActionBackend {
@@ -76,6 +95,7 @@ impl RpcScenarioActionBackend {
             timeout: Duration::from_secs(timeout_secs),
             mining,
             spam,
+            burst_engines: Mutex::new(BurstEngines::default()),
         })
     }
 
@@ -84,6 +104,56 @@ impl RpcScenarioActionBackend {
             MinerNode::Node2 => (&self.node2_url, &self.node2_wallet),
             MinerNode::Node3 => (&self.node3_url, &self.node3_wallet),
         }
+    }
+
+    /// Scenario bursts run on a dedicated raw engine per miner node: locally
+    /// signed transactions submitted with sendrawtransaction, so no coin
+    /// selection or signing load lands on the miner nodes' wallets (the
+    /// engine pulls one wallet funding transaction only when broke). The key
+    /// namespace is scenario-specific so these instances never track — and
+    /// double-spend — the resident spammer's UTXO set.
+    fn with_burst_engine<R>(
+        &self,
+        node: MinerNode,
+        fee_rate_sat_vb: f64,
+        action: impl FnOnce(&mut RawSpammer) -> Result<R>,
+    ) -> Result<R> {
+        let mut engines = self.burst_engines.lock().expect("burst engine lock");
+        let slot = match node {
+            MinerNode::Node2 => &mut engines.node2,
+            MinerNode::Node3 => &mut engines.node3,
+        };
+        if slot.is_none() {
+            let (rpc_url, wallet_name) = self.target(node);
+            let mut engine = RawSpammer::new(
+                create_client(rpc_url)?,
+                create_jsonrpc_client(rpc_url)?,
+                Vec::new(),
+                create_wallet_client(rpc_url, wallet_name)?,
+                wallet_name,
+                &format!("scenario-{wallet_name}"),
+                &format!("Scenario burst {}", node.short_name()),
+                fee_rate_sat_vb,
+                0,
+                0,
+                0,
+            );
+            engine
+                .reconcile()
+                .with_context(|| format!("reconcile the scenario burst engine for {node}"))?;
+            *slot = Some(engine);
+        }
+        action(slot.as_mut().expect("burst engine present"))
+    }
+
+    /// The live spam policy supplies the burst fee rate and branch sizing so
+    /// scenario traffic prices like resident spam.
+    fn burst_policy(&self) -> Result<simchain_common::live_tuning::SpamTuning> {
+        Ok(self
+            .spam
+            .status()
+            .context("read the live spam policy for scenario bursts")?
+            .policy)
     }
 }
 
@@ -138,6 +208,29 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
         }))
     }
 
+    fn prepare_spam_burst(
+        &self,
+        nodes: &[MinerNode],
+        control: &dyn ScenarioControl,
+    ) -> Result<Value> {
+        let policy = self.burst_policy()?;
+        let branches = policy.fanout_utxos.max(1);
+        let mut prepared = Vec::new();
+        for node in nodes {
+            self.with_burst_engine(*node, policy.fee_rate_sat_vb(), |engine| {
+                engine.set_burst_shape(policy.fee_rate_sat_vb(), 0);
+                let checkpoint = |_: &str| !control.abort_requested();
+                anyhow::ensure!(
+                    engine.ensure_branches(branches, &checkpoint),
+                    "interrupted while funding the scenario burst engine for {node}"
+                );
+                Ok(())
+            })?;
+            prepared.push(node.to_string());
+        }
+        Ok(json!({"prepared": prepared, "branches": branches}))
+    }
+
     fn spam_burst(
         &self,
         node: MinerNode,
@@ -145,59 +238,31 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
         outputs_per_tx: u64,
         control: &dyn ScenarioControl,
     ) -> Result<Value> {
-        let (rpc_url, wallet_name) = self.target(node);
-        let wallet = create_wallet_client(rpc_url, wallet_name)?;
-        let mut accepted = 0u64;
-        if outputs_per_tx == 0 {
-            let address = burn_address(0);
-            for number in 1..=txs {
-                if control.abort_requested() {
-                    break;
-                }
-                wallet
-                    .send_to_address(
-                        &address,
-                        Amount::from_sat(DUST_SATS),
-                        None,
-                        None,
-                        None,
-                        Some(false),
-                        None,
-                        None,
-                    )
-                    .with_context(|| format!("spam transaction {number}/{txs} failed"))?;
-                accepted += 1;
+        let policy = self.burst_policy()?;
+        let fanout = policy.fanout_utxos.max(1);
+        self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
+            engine.set_burst_shape(policy.fee_rate_sat_vb(), outputs_per_tx);
+            let checkpoint = |_: &str| !control.abort_requested();
+            let mut txids = engine.output_round(txs, fanout, false, 0, &checkpoint);
+            if (txids.len() as u64) < txs && !control.abort_requested() {
+                // A chain mutation between steps (reorg, partition) may have
+                // invalidated in-memory branches; resync once and finish the
+                // remainder.
+                engine
+                    .reconcile()
+                    .context("reconcile the scenario burst engine mid-burst")?;
+                let remaining = txs - txids.len() as u64;
+                txids.extend(engine.output_round(remaining, fanout, false, 0, &checkpoint));
             }
-        } else {
-            let mut amounts = serde_json::Map::new();
-            for index in 1..=outputs_per_tx {
-                amounts.insert(burn_address(index).to_string(), json!("0.00000546"));
-            }
-            let params = [
-                json!(""),
-                json!(amounts),
-                json!(0),
-                json!("scenario spam burst"),
-                json!([]),
-                json!(false),
-            ];
-            for number in 1..=txs {
-                if control.abort_requested() {
-                    break;
-                }
-                wallet
-                    .call::<String>("sendmany", &params)
-                    .with_context(|| format!("spam batch {number}/{txs} failed"))?;
-                accepted += 1;
-            }
-        }
-        Ok(json!({
-            "node": node.to_string(),
-            "requested_transactions": txs,
-            "accepted_transactions": accepted,
-            "outputs_per_transaction": outputs_per_tx,
-            "aborted": control.abort_requested()
-        }))
+            Ok(json!({
+                "node": node.to_string(),
+                "requested_transactions": txs,
+                "accepted_transactions": txids.len() as u64,
+                "outputs_per_transaction": outputs_per_tx,
+                "engine": "raw",
+                "aborted": control.abort_requested()
+            }))
+        })
     }
 
     fn wait_tx(

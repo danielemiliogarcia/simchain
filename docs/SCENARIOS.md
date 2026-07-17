@@ -62,7 +62,7 @@ steps:
       BLOCK_INTERVAL_MODE: fixed
       BLOCK_INTERVAL_MEAN_SECS: 10
       SPAM_FILL_BLOCK_RATIO: 4
-      FALLBACK_FEE: 0.002
+      SPAM_FEE: 0.002
 
   - type: assert_config
     effective: true
@@ -70,7 +70,7 @@ steps:
       BLOCK_INTERVAL_MODE: fixed
       BLOCK_INTERVAL_MEAN_SECS: 10
       SPAM_FILL_BLOCK_RATIO: 4
-      FALLBACK_FEE: 0.002
+      SPAM_FEE: 0.002
 
   - type: wait_until
     timeout_secs: 120
@@ -157,8 +157,12 @@ Validation rules:
 - `sleep.secs`, `mine.blocks`, `reorg.depth`, `spam_burst.txs`, and both partition
   block counts are positive.
 - Miner nodes are `btc-simnet-node2` or `btc-simnet-node3`.
-- `spam_burst.outputs_per_tx` may be zero. Zero uses sequential `sendtoaddress`; a
-  positive value uses `sendmany` with that many 546-sat outputs.
+- `spam_burst.outputs_per_tx` may be zero. Zero sends sequential single-output
+  transactions; a positive value sends that many 546-sat burn outputs per
+  transaction. Bursts run on a dedicated raw engine (locally signed, submitted with
+  `sendrawtransaction`, priced from the live `SPAM_FEE`), so no coin-selection or
+  signing load lands on the miner node wallets; the job funds the engine before the
+  scenario's steps run, while mining still produces blocks.
 - `set_config.settings` is a partial runtime desired-state patch using the same keys as
   `simchainctl config set`. Values may be strings, numbers, booleans, or null/empty reset
   values.

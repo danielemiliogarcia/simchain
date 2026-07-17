@@ -975,7 +975,14 @@ mod tests {
 
         let (status, body) = send(&fx.router, get("/api/v1/config/schema")).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body["settings"].as_array().expect("settings").len() >= 20);
+        assert_eq!(
+            body["settings"].as_array().expect("settings").len(),
+            simchain_common::live_tuning::MANAGED_SETTINGS.len()
+        );
+        assert!(!body["boot_settings"]
+            .as_array()
+            .expect("boot settings")
+            .is_empty());
 
         let (status, body) = send(&fx.router, get("/health/live")).await;
         assert_eq!(status, StatusCode::OK);
@@ -1074,7 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn config_patch_without_token_is_unauthorized() {
         let fx = fixture(None);
-        let payload = serde_json::json!({"settings": {"FALLBACK_FEE": "0.0002"}});
+        let payload = serde_json::json!({"settings": {"SPAM_FEE": "0.0002"}});
         let (status, body) = send(&fx.router, patch_config(payload.clone(), None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"]["code"], "unauthorized");
@@ -1098,14 +1105,14 @@ mod tests {
         );
         let (_, config) = send(&fx.router, get("/api/v1/config")).await;
         assert_eq!(config["desired"]["MINER_WEIGHTS"], "70,30");
-        assert_eq!(config["desired"]["FALLBACK_FEE"], "0.0001");
+        assert_eq!(config["desired"]["SPAM_FEE"], "0.0001");
     }
 
     #[tokio::test]
     async fn stale_generation_yields_409_with_code() {
         let fx = fixture(None);
         let payload = serde_json::json!({
-            "settings": {"FALLBACK_FEE": "0.0003"},
+            "settings": {"SPAM_FEE": "0.0003"},
             "base_generation": 99
         });
         let (status, body) = send(&fx.router, patch_config(payload, Some("test-token"))).await;

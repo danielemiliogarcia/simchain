@@ -2128,7 +2128,23 @@ impl JobManager {
 
         let bootstrap = self
             .scenario
-            .wait_height(simchain_scenario_engine::BOOTSTRAP_HEIGHT, &actions);
+            .wait_height(simchain_scenario_engine::BOOTSTRAP_HEIGHT, &actions)
+            .and_then(|_| {
+                // Fund the raw burst engines up front, while mining still
+                // runs: funding needs confirmations, and scenarios may pause
+                // mining before their first burst step.
+                let burst_nodes = spam_burst_nodes(&scenario);
+                if burst_nodes.is_empty() || abort.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                self.set_phase(&job_id, "funding_spam_burst_engines");
+                self.scenario
+                    .prepare_spam_burst(&burst_nodes, &actions)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        anyhow::anyhow!("fund the scenario spam burst engines: {error:#}")
+                    })
+            });
         let result = match bootstrap {
             Ok(_) if !abort.load(Ordering::Acquire) => {
                 self.set_phase(&job_id, "running_scenario");
@@ -4931,12 +4947,10 @@ impl ScenarioActions for JobScenarioActions {
                 base_generation: None,
             },
             |request| {
-                if request.settings.contains_key("FALLBACK_FEE")
-                    && self.manager.has_pending_faucet()
-                {
+                if request.settings.contains_key("SPAM_FEE") && self.manager.has_pending_faucet() {
                     return Err(simchain_common::control_api::ApiError::new(
                         ErrorCode::FaucetDeliveryPending,
-                        "FALLBACK_FEE cannot change while a faucet transfer is armed",
+                        "SPAM_FEE cannot change while a faucet transfer is armed",
                     ));
                 }
                 Ok(())
@@ -5481,6 +5495,22 @@ impl From<FaucetRunError> for anyhow::Error {
     fn from(error: FaucetRunError) -> Self {
         anyhow::anyhow!("{}: {}", error.code, error.message)
     }
+}
+
+/// Miner nodes targeted by the scenario's spam_burst steps, deduplicated in
+/// a stable order.
+fn spam_burst_nodes(scenario: &Scenario) -> Vec<MinerNode> {
+    let mut nodes: Vec<MinerNode> = scenario
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::SpamBurst { node, .. } => Some(*node),
+            _ => None,
+        })
+        .collect();
+    nodes.sort_by_key(|node| node.short_name());
+    nodes.dedup();
+    nodes
 }
 
 fn normalize_faucet_request(
@@ -6633,13 +6663,13 @@ steps:
     settings:
       BLOCK_INTERVAL_MODE: fixed
       BLOCK_INTERVAL_MEAN_SECS: 10
-      FALLBACK_FEE: 0.0002
+      SPAM_FEE: 0.0002
   - type: assert_config
     effective: true
     settings:
       BLOCK_INTERVAL_MODE: fixed
       BLOCK_INTERVAL_MEAN_SECS: 10
-      FALLBACK_FEE: 0.0002
+      SPAM_FEE: 0.0002
   - type: degrade
     node: node2
     delay_ms: 1
