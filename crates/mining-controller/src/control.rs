@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const SAFE_POINT_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPLETED_REQUEST_LIMIT: usize = 1_024;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct LeaseEntry {
     view: PauseLease,
     deadline: Instant,
@@ -110,6 +110,14 @@ impl MiningControl {
     }
 
     pub fn acquire_lease(&self, request: LeaseRequest) -> anyhow::Result<CommandAck> {
+        self.acquire_lease_with_timeout(request, SAFE_POINT_TIMEOUT)
+    }
+
+    fn acquire_lease_with_timeout(
+        &self,
+        request: LeaseRequest,
+        timeout: Duration,
+    ) -> anyhow::Result<CommandAck> {
         validate_lease_request(&request)?;
         let fingerprint = request_fingerprint("lease-acquire", &request)?;
         let mut inner = self.inner.lock().expect("mining control lock");
@@ -124,24 +132,31 @@ impl MiningControl {
                 anyhow::bail!("lease ID is already owned by a different request");
             }
         }
+        let lease_id = request.lease_id.clone();
         let expires_at_ms = now_ms().saturating_add(request.ttl_secs.saturating_mul(1000));
-        inner.leases.insert(
-            request.lease_id.clone(),
-            LeaseEntry {
-                view: PauseLease {
-                    lease_id: request.lease_id,
-                    owner_job_id: request.owner_job_id,
-                    purpose: request.purpose,
-                    expires_at_ms,
-                },
-                deadline: Instant::now() + Duration::from_secs(request.ttl_secs),
+        let tentative_lease = LeaseEntry {
+            view: PauseLease {
+                lease_id: request.lease_id,
+                owner_job_id: request.owner_job_id,
+                purpose: request.purpose,
+                expires_at_ms,
             },
-        );
+            deadline: Instant::now() + Duration::from_secs(request.ttl_secs),
+        };
+        let previous_lease = inner
+            .leases
+            .insert(lease_id.clone(), tentative_lease.clone());
         if !is_effectively_paused(&inner) {
             inner.phase = WorkerPhase::Pausing;
         }
         self.changed.notify_all();
-        inner = self.wait_for_safe_pause(inner, SAFE_POINT_TIMEOUT)?;
+        inner = match self.wait_for_safe_pause(inner, timeout) {
+            Ok(inner) => inner,
+            Err(error) => {
+                self.rollback_unacquired_lease(&lease_id, &tentative_lease, previous_lease);
+                return Err(error);
+            }
+        };
         let ack = ack(&inner, request.request_id.clone());
         remember_request(&mut inner, request.request_id, fingerprint, ack.clone());
         Ok(ack)
@@ -418,6 +433,27 @@ impl MiningControl {
             .wait_timeout(inner, wait)
             .expect("mining control wait")
             .0
+    }
+
+    fn rollback_unacquired_lease(
+        &self,
+        lease_id: &str,
+        tentative: &LeaseEntry,
+        previous: Option<LeaseEntry>,
+    ) {
+        let mut inner = self.inner.lock().expect("mining control lock");
+        if inner.leases.get(lease_id) == Some(tentative) {
+            match previous {
+                Some(lease) => {
+                    inner.leases.insert(lease_id.to_string(), lease);
+                }
+                None => {
+                    inner.leases.remove(lease_id);
+                }
+            }
+            expire_leases(&mut inner);
+            self.changed.notify_all();
+        }
     }
 }
 
@@ -777,6 +813,28 @@ mod tests {
             control.changed.notify_all();
         }
         handle.join().expect("worker resumed");
+        assert!(control.status().active_leases.is_empty());
+        assert_eq!(control.status().effective_state, DesiredState::Running);
+    }
+
+    #[test]
+    fn failed_lease_acquire_does_not_leave_orphan_pause() {
+        let control = MiningControl::new(policy(), 7);
+        let error = control
+            .acquire_lease_with_timeout(
+                LeaseRequest {
+                    lease_id: "timed-out".to_string(),
+                    owner_job_id: "job".to_string(),
+                    purpose: "test timeout".to_string(),
+                    ttl_secs: 60,
+                    request_id: "acquire-timeout".to_string(),
+                },
+                Duration::from_millis(5),
+            )
+            .expect_err("safe point never arrives");
+        assert!(error
+            .to_string()
+            .contains("timed out waiting for mining safe point"));
         assert!(control.status().active_leases.is_empty());
         assert_eq!(control.status().effective_state, DesiredState::Running);
     }

@@ -1,7 +1,7 @@
 //! Mining-controller wallet bootstrap.
 
 use anyhow::{anyhow, Context};
-use bitcoincore_rpc::{bitcoin::Address, Client, RpcApi};
+use bitcoincore_rpc::{bitcoin::Address, Client, Error as RpcError, RpcApi};
 use simchain_common::{create_wallet_client, require_regtest_address, rpc_retry, RpcUrl};
 use std::str::FromStr;
 
@@ -40,17 +40,22 @@ fn mining_address_label(wallet_name: &str) -> String {
 }
 
 fn get_or_create_mining_address(wallet: &Client, label: &str) -> anyhow::Result<Address> {
-    let existing = wallet
-        .call::<serde_json::Map<String, serde_json::Value>>("getaddressesbylabel", &[label.into()]);
+    let existing = rpc_retry("get labeled mining wallet address", || match wallet
+        .call::<serde_json::Map<String, serde_json::Value>>("getaddressesbylabel", &[label.into()])
+    {
+        Ok(addresses) => Ok(Some(addresses)),
+        Err(error) if is_no_addresses_with_label(&error) => Ok(None),
+        Err(error) => Err(error),
+    });
     match existing {
-        Ok(addresses) => {
+        Some(addresses) => {
             if let Some(address) = addresses.keys().min() {
                 return require_regtest_address(Address::from_str(address)?)
                     .context("stored mining wallet address must be a regtest address");
             }
         }
-        Err(error) => {
-            tracing::debug!("No existing mining address for label '{label}': {error}");
+        None => {
+            tracing::debug!("No existing mining address for label '{label}'");
         }
     }
 
@@ -58,4 +63,11 @@ fn get_or_create_mining_address(wallet: &Client, label: &str) -> anyhow::Result<
         wallet.get_new_address(Some(label), None)
     });
     require_regtest_address(address).context("mining wallet address must be a regtest address")
+}
+
+fn is_no_addresses_with_label(error: &RpcError) -> bool {
+    matches!(
+        error,
+        RpcError::JsonRpc(bitcoincore_rpc::jsonrpc::error::Error::Rpc(error)) if error.code == -11
+    )
 }

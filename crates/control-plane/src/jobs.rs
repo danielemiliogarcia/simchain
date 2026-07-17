@@ -49,6 +49,7 @@ const JOB_SCHEMA_VERSION: u32 = 2;
 const MAX_JOB_HISTORY: usize = 100;
 const EVENT_RING_CAPACITY: usize = 2_048;
 const DEFAULT_LEASE_TTL_SECS: u64 = 120;
+const FAUCET_SUBMIT_TIMEOUT_SECS: u64 = 30;
 const MAX_EVENT_PAGE: usize = 500;
 
 fn default_next_checkpoint_generation() -> u64 {
@@ -1761,10 +1762,13 @@ impl JobManager {
         }
 
         for node in [FaucetSourceNode::Node2, FaucetSourceNode::Node3] {
+            let deadline = Instant::now() + Duration::from_secs(FAUCET_SUBMIT_TIMEOUT_SECS);
+            let mut attempts = 0u64;
             loop {
                 if abort.load(Ordering::Acquire) {
                     return Err(FaucetRunError::aborted());
                 }
+                attempts += 1;
                 match self
                     .faucet
                     .submit(node, &prepared.raw_tx_hex, &prepared.txid)
@@ -1790,6 +1794,13 @@ impl JobManager {
                         break;
                     }
                     Err(error) => {
+                        if Instant::now() >= deadline {
+                            return Err(FaucetRunError::priority(format!(
+                                "{} did not accept the faucet transaction within {}s after {attempts} attempt(s); last error: {error}",
+                                node.as_str(),
+                                FAUCET_SUBMIT_TIMEOUT_SECS
+                            )));
+                        }
                         self.emit_best_effort(
                             job_id,
                             "faucet_submission_retry",
@@ -1797,7 +1808,10 @@ impl JobManager {
                             &format!("{} submission retry: {error}", node.as_str()),
                             None,
                         );
-                        thread::sleep(Duration::from_secs(1));
+                        thread::sleep(
+                            Duration::from_secs(1)
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        );
                     }
                 }
             }
@@ -2083,13 +2097,14 @@ impl JobManager {
             job_id: job_id.clone(),
             abort: abort.clone(),
             use_raw_tx_spam,
-            runtime: Mutex::new(ScenarioRuntime::default()),
+            runtime: Arc::new(Mutex::new(ScenarioRuntime::default())),
         };
-        let renewer = match OwnedLeaseRenewer::start(
+        let renewer = match OwnedLeaseRenewer::start_for_scenario(
             self.clone(),
             job_id.clone(),
             abort.clone(),
             self.lease_ttl_secs,
+            actions.runtime.clone(),
         ) {
             Ok(renewer) => renewer,
             Err(error) => {
@@ -2988,6 +3003,51 @@ impl JobManager {
                     },
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    fn renew_scenario_runtime_leases(
+        &self,
+        sequence: u64,
+        runtime: &Mutex<ScenarioRuntime>,
+    ) -> anyhow::Result<()> {
+        let (spam, mining, network) = {
+            let runtime = runtime.lock().expect("scenario runtime lock");
+            (
+                runtime.spam_lease.clone(),
+                runtime.mining_lease.clone(),
+                runtime.network_leases.clone(),
+            )
+        };
+        if let Some(lease) = spam {
+            self.spam.renew_lease(
+                &lease.lease_id,
+                LeaseRenewRequest {
+                    ttl_secs: self.lease_ttl_secs,
+                    request_id: format!("{}-renew-{sequence}", lease.lease_id),
+                },
+            )?;
+        }
+        if let Some(lease) = mining {
+            self.mining.renew_lease(
+                &lease.lease_id,
+                LeaseRenewRequest {
+                    ttl_secs: self.lease_ttl_secs,
+                    request_id: format!("{}-renew-{sequence}", lease.lease_id),
+                },
+            )?;
+        }
+        for lease in network {
+            let node = network_lease_node(&lease)?;
+            self.network.renew_lease(
+                node,
+                &lease.lease_id,
+                LeaseRenewRequest {
+                    ttl_secs: self.lease_ttl_secs,
+                    request_id: format!("{}-renew-{sequence}", lease.lease_id),
+                },
+            )?;
         }
         Ok(())
     }
@@ -4150,6 +4210,7 @@ struct ScenarioRuntime {
     next_lease_sequence: u64,
     mining_lease: Option<JobLease>,
     spam_lease: Option<JobLease>,
+    network_leases: Vec<JobLease>,
     mining_paused_by_step: bool,
     chain_changed: bool,
 }
@@ -4159,7 +4220,7 @@ struct JobScenarioActions {
     job_id: String,
     abort: Arc<AtomicBool>,
     use_raw_tx_spam: bool,
-    runtime: Mutex<ScenarioRuntime>,
+    runtime: Arc<Mutex<ScenarioRuntime>>,
 }
 
 impl JobScenarioActions {
@@ -4246,6 +4307,24 @@ impl JobScenarioActions {
             return Err(error);
         }
         Ok(true)
+    }
+
+    fn remember_network_lease(&self, lease: JobLease) {
+        let mut runtime = self.runtime.lock().expect("scenario runtime lock");
+        if !runtime
+            .network_leases
+            .iter()
+            .any(|existing| existing.lease_id == lease.lease_id)
+        {
+            runtime.network_leases.push(lease);
+        }
+    }
+
+    fn forget_network_lease(&self, lease_id: &str) {
+        let mut runtime = self.runtime.lock().expect("scenario runtime lock");
+        runtime
+            .network_leases
+            .retain(|lease| lease.lease_id != lease_id);
     }
 
     fn resolve_faucet_outputs(
@@ -4993,6 +5072,7 @@ impl ScenarioActions for JobScenarioActions {
                 runtime.next_lease_sequence
             },
         )?;
+        self.remember_network_lease(network.clone());
         let chain_changed = AtomicBool::new(false);
         let execution = self.manager.execute_partition(
             &self.job_id,
@@ -5013,7 +5093,7 @@ impl ScenarioActions for JobScenarioActions {
             // worker leases can now be released in the required spam/mining
             // order. On failure, retain all three for final cleanup, which
             // heals the network before either worker resumes.
-            let _ = network;
+            self.forget_network_lease(&network.lease_id);
             if acquired_spam {
                 if let Err(error) = self.release_component("spam") {
                     cleanup_errors.push(format!("spam lease: {error}"));
@@ -5059,6 +5139,7 @@ impl ScenarioActions for JobScenarioActions {
                 runtime.next_lease_sequence
             },
         )?;
+        self.remember_network_lease(network.clone());
         self.manager
             .set_phase(&self.job_id, "observing_degraded_network");
         let started = Instant::now();
@@ -5082,6 +5163,9 @@ impl ScenarioActions for JobScenarioActions {
         };
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let release_result = self.manager.release_network_lease(&self.job_id, &network);
+        if release_result.is_ok() {
+            self.forget_network_lease(&network.lease_id);
+        }
         let wait_value = match (wait_result, release_result) {
             (Ok(value), Ok(())) => value,
             (Err(wait_error), Ok(())) => return Err(wait_error),
@@ -5265,6 +5349,47 @@ impl OwnedLeaseRenewer {
                     }
                     sequence = sequence.saturating_add(1);
                     if let Err(error) = manager.renew_owned_leases(&job_id, sequence) {
+                        abort.store(true, Ordering::Release);
+                        manager.checkpoint_cv.notify_all();
+                        manager.emit_best_effort(
+                            &job_id,
+                            "lease_renewal_failed",
+                            "lease_renewal_failed",
+                            &format!("scenario worker lease renewal failed: {error}"),
+                            None,
+                        );
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            thread: Some(handle),
+        })
+    }
+
+    fn start_for_scenario(
+        manager: Arc<JobManager>,
+        job_id: String,
+        abort: Arc<AtomicBool>,
+        ttl_secs: u64,
+        runtime: Arc<Mutex<ScenarioRuntime>>,
+    ) -> anyhow::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let interval = Duration::from_secs((ttl_secs / 3).max(1));
+        let handle = thread::Builder::new()
+            .name(format!("scenario-lease-renew-{job_id}"))
+            .spawn(move || {
+                let mut sequence = 0u64;
+                while !thread_stop.load(Ordering::Acquire) {
+                    thread::park_timeout(interval);
+                    if thread_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    sequence = sequence.saturating_add(1);
+                    if let Err(error) =
+                        manager.renew_scenario_runtime_leases(sequence, runtime.as_ref())
+                    {
                         abort.store(true, Ordering::Release);
                         manager.checkpoint_cv.notify_all();
                         manager.emit_best_effort(
@@ -6369,6 +6494,27 @@ steps:
             .expect("mining status")
             .active_leases
             .is_empty());
+    }
+
+    #[test]
+    fn scenario_runtime_renewal_skips_workers_without_active_leases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(BlockingExecutor::new());
+        let (backend, manager) = manager(dir.path(), executor);
+        {
+            let mut world = backend.world.lock().expect("world");
+            world.mining_status_fail_times = 1;
+            world.spam_status_fail_times = 1;
+        }
+
+        let runtime = Mutex::new(ScenarioRuntime::default());
+        manager
+            .renew_scenario_runtime_leases(1, &runtime)
+            .expect("no active leases means no worker status dependency");
+
+        let world = backend.world.lock().expect("world");
+        assert_eq!(world.mining_status_fail_times, 1);
+        assert_eq!(world.spam_status_fail_times, 1);
     }
 
     #[test]

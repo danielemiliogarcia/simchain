@@ -27,6 +27,22 @@ No open findings from the last review remain.
   heterogeneous network (the compose file already declares each node in full to
   allow this)
 
+### Walletless mainnet transaction fixture importer
+
+**Status (2026-07-17): planned/design only** — full design in
+[raw-transaction-fixture-importer-plan.md](raw-transaction-fixture-importer-plan.md).
+
+Import selected mainnet transactions as Simchain-valid raw transaction fixtures without
+using node wallets. The importer would fetch source transactions from a mainnet node,
+preserve useful artifacts such as OP_RETURN data, witness payloads, script shape, value
+layout, and fee/weight profile where possible, replace inputs with Simchain-funded UTXOs,
+rewrite spendable outputs to fixture-owned regtest keys, sign raw transactions, broadcast
+them, and return a manifest mapping source txids to Simchain txids plus the external
+spend authority needed by user tests.
+
+This is not a mainnet fork and cannot preserve original txids after sanitization; it is a
+way to replay interesting transaction artifacts under controlled regtest funds.
+
 
 # Simchain Nice-to-have Features
 

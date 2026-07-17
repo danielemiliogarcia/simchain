@@ -120,7 +120,7 @@ async function waitForMiningAddress(node) {
 async function upsertPool(connection, node, address) {
   const addresses = JSON.stringify([address]);
   const regexes = '[]';
-  const link = 'https://github.com/openai/simchain';
+  const link = 'https://github.com/danielemiliogarcia/simchain';
   const [existing] = await connection.execute(
     'SELECT id FROM pools WHERE unique_id = ? OR slug = ? LIMIT 1',
     [node.uniqueId, node.slug],
