@@ -35,14 +35,30 @@ For detailed component descriptions, see [INTRO.md](./docs/INTRO.md).
 - **P2P link degradation.** Add latency and packet loss for a duration or number of
   blocks, with automatic recovery, to exercise block and transaction propagation
   without impairing RPC traffic.
-- **Reusable chain state.** Named volumes make bootstrap resumable; validated
+- **Declarative scenario orchestration.** Check in YAML scenarios that retune live
+  policy, wait for chain or mempool conditions, pause/resume mining, fund wallets,
+  mine blocks, run spam bursts, trigger reorgs, create partitions, degrade links, and
+  expose durable checkpoints for CI.
+- **Built-in regtest faucet.** Fund one or many application addresses from miner
+  treasury coins through the same dashboard, CLI, HTTP API, MCP, and scenario job
+  coordinator.
+- **Reusable chain snapshots.** Named volumes make bootstrap resumable; validated
   snapshots preserve blocks, chainstate, miner wallets, the mempool, and the active
   Compose profile for fast restoration.
-- **Application integration.** Use Bitcoin Core RPC and all five ZMQ topics, with
-  optional Electrum and mempool.space services enabled through Compose profiles.
-- **Configuration without patching code.** Every setting has a default, `.env`
-  controls the full stack, and mining and spam behavior can be retuned on a live
-  chain without restarting the nodes.
+- **First-party control dashboard.** Watch chain status, retune mining/spam behavior,
+  pause workers, start jobs, inspect job progress, use the faucet, and jump to the
+  local mempool.space explorer when it is enabled.
+- **CLI interface.** Automate control-plane operations from `simchainctl` with stable
+  commands and exit codes for humans, scripts, and CI.
+- **HTTP API.** Drive the same dashboard and job operations through a versioned
+  localhost API with token-protected mutation routes.
+- **MCP interface.** Let coding agents inspect, retune, and operate the simnet through
+  the control plane's streamable HTTP MCP endpoint.
+- **Application integration.** Use Bitcoin Core RPC, all five ZMQ topics, optional
+  Electrum RPC, and an optional local mempool.space explorer connected to node1.
+- **Live hot-reloaded configuration.** Retune mining cadence, miner selection, spam
+  fill, fee floor, and worker pause/resume state on a running chain without restarting
+  Bitcoin nodes or helper services.
 
 ## Network topology
 
