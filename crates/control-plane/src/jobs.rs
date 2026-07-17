@@ -1,7 +1,11 @@
 //! Single-mutation job coordinator, persistence, events, abort, worker/network
 //! leases, and restart recovery.
 
-use crate::backend::{MiningControlBackend, NetworkControlBackend, SpamControlBackend};
+use crate::apply::{apply_with_context, ApplyContext, ApplyRequest};
+use crate::backend::{
+    ChainBackend, MiningControlBackend, NetworkControlBackend, SpamControlBackend,
+};
+use crate::control_state::{ControlState, ControlStateStore};
 use crate::faucet_job::{
     eligible_total, select_inputs, FaucetBackend, FaucetInput, FaucetPreflight,
     PreparedFaucetTransaction,
@@ -14,11 +18,11 @@ use crate::scenario_job::ScenarioActionBackend;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use simchain_common::control_api::{
-    AbortJobResponse, CheckpointState, CleanupState, DegradeJobRequest, ErrorCode,
-    FaucetDeliveryState, FaucetJobRequest, FaucetSource, FaucetSourceNode, FaucetStatusResponse,
-    FaucetTransfer, FaucetWalletStatus, JobCheckpoint, JobCheckpointResponse, JobCleanup,
-    JobCreatedResponse, JobDetail, JobEvent, JobEventsResponse, JobFailure, JobKind, JobLease,
-    JobListResponse, JobState, JobSummary, MineJobRequest, PartitionJobRequest,
+    AbortJobResponse, CheckpointState, CleanupState, ComponentState, DegradeJobRequest, ErrorCode,
+    FaucetDeliveryState, FaucetJobRequest, FaucetOutput, FaucetSource, FaucetSourceNode,
+    FaucetStatusResponse, FaucetTransfer, FaucetWalletStatus, JobCheckpoint, JobCheckpointResponse,
+    JobCleanup, JobCreatedResponse, JobDetail, JobEvent, JobEventsResponse, JobFailure, JobKind,
+    JobLease, JobListResponse, JobState, JobSummary, MineJobRequest, PartitionJobRequest,
     ReleaseCheckpointRequest, ReorgJobRequest, ScenarioStepStatus, SpamBurstJobRequest,
     FAUCET_MAX_OUTPUTS, FAUCET_MAX_TX_VBYTES, FAUCET_PRIORITY_DELTA_SATS,
     FAUCET_PRIORITY_DOMINANCE_FACTOR,
@@ -27,15 +31,17 @@ use simchain_common::internal_api::{
     LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest, NetworkImpairment,
     NetworkLeaseReleaseRequest, NetworkLeaseRequest, PauseLease,
 };
+use simchain_common::live_tuning::{self, ServiceScope};
 use simchain_reorg::{ReorgObserver, ReorgPhase, ReorgProgress};
 use simchain_scenario_engine::{
-    CheckpointStep, MinerNode, Scenario, ScenarioActions, ScenarioControl, ScenarioProgress,
-    ScenarioProgressPhase, Step,
+    CheckpointStep, ComponentExpectation, FaucetScenarioOutput, MinerNode, NetworkNode, Scenario,
+    ScenarioActions, ScenarioComponent, ScenarioControl, ScenarioProgress, ScenarioProgressPhase,
+    Step, WaitCondition,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -214,6 +220,10 @@ pub struct JobManager {
     state: Mutex<ManagerState>,
     mining: Arc<dyn MiningControlBackend>,
     spam: Arc<dyn SpamControlBackend>,
+    chain: Arc<dyn ChainBackend>,
+    control_store: ControlStateStore,
+    control_state: Arc<RwLock<ControlState>>,
+    apply_lock: Arc<Mutex<()>>,
     network: Arc<dyn NetworkControlBackend>,
     network_actions: Arc<dyn NetworkActionBackend>,
     reorg: Arc<dyn ReorgExecutor>,
@@ -238,6 +248,10 @@ pub struct FaucetSettings {
 pub struct JobDependencies {
     pub mining: Arc<dyn MiningControlBackend>,
     pub spam: Arc<dyn SpamControlBackend>,
+    pub chain: Arc<dyn ChainBackend>,
+    pub control_store: ControlStateStore,
+    pub control_state: Arc<RwLock<ControlState>>,
+    pub apply_lock: Arc<Mutex<()>>,
     pub network: Arc<dyn NetworkControlBackend>,
     pub reorg: Arc<dyn ReorgExecutor>,
     pub scenario: Arc<dyn ScenarioActionBackend>,
@@ -312,6 +326,10 @@ impl JobManager {
             }),
             mining: dependencies.mining,
             spam: dependencies.spam,
+            chain: dependencies.chain,
+            control_store: dependencies.control_store,
+            control_state: dependencies.control_state,
+            apply_lock: dependencies.apply_lock,
             network: dependencies.network,
             reorg: dependencies.reorg,
             scenario: dependencies.scenario,
@@ -3571,6 +3589,9 @@ impl JobManager {
         if kind == JobKind::Faucet {
             return self.recover_faucet_job(job_id, detail_request, faucet_context);
         }
+        if faucet_context.is_some() {
+            self.recover_faucet_job(job_id, detail_request.clone(), faucet_context)?;
+        }
         self.recover_network_resources(job_id)?;
         if context.mutation_may_have_occurred {
             let request = match context.request.clone() {
@@ -3740,10 +3761,12 @@ impl JobManager {
             .ok_or_else(|| anyhow::anyhow!("recovered faucet transfer is missing"))?;
         let mut state = self.state.lock().expect("job manager lock");
         if let Some(job) = find_stored_mut(&mut state.persisted, job_id) {
-            job.detail.summary.state = JobState::Succeeded;
-            job.detail.summary.phase = "armed_for_next_block".to_string();
-            job.detail.result = Some(serde_json::to_value(transfer)?);
-            job.detail.failure = None;
+            if job.detail.summary.kind == JobKind::Faucet {
+                job.detail.summary.state = JobState::Succeeded;
+                job.detail.summary.phase = "armed_for_next_block".to_string();
+                job.detail.result = Some(serde_json::to_value(transfer)?);
+                job.detail.failure = None;
+            }
             if let Some(context) = job.faucet_recovery.as_mut() {
                 context.raw_tx_hex = None;
                 context.selected_inputs.clear();
@@ -4140,6 +4163,17 @@ struct JobScenarioActions {
 }
 
 impl JobScenarioActions {
+    fn apply_context(&self) -> ApplyContext<'_> {
+        ApplyContext {
+            apply_lock: self.manager.apply_lock.as_ref(),
+            control_store: &self.manager.control_store,
+            control_state: self.manager.control_state.as_ref(),
+            chain: self.manager.chain.as_ref(),
+            mining: self.manager.mining.as_ref(),
+            spam: self.manager.spam.as_ref(),
+        }
+    }
+
     fn acquire(&self, component: &str, purpose: &str) -> anyhow::Result<JobLease> {
         let sequence = {
             let mut runtime = self.runtime.lock().expect("scenario runtime lock");
@@ -4213,6 +4247,409 @@ impl JobScenarioActions {
         }
         Ok(true)
     }
+
+    fn resolve_faucet_outputs(
+        &self,
+        outputs: &[FaucetScenarioOutput],
+    ) -> anyhow::Result<Vec<FaucetOutput>> {
+        outputs
+            .iter()
+            .map(|output| {
+                let address = match (&output.address, &output.address_env) {
+                    (Some(address), None) => address.trim().to_string(),
+                    (None, Some(env)) => std::env::var(env)
+                        .map(|value| value.trim().to_string())
+                        .map_err(|_| {
+                        anyhow::anyhow!("environment variable {env} is not set for faucet address")
+                    })?,
+                    _ => anyhow::bail!("exactly one of address or address_env is required"),
+                };
+                anyhow::ensure!(!address.is_empty(), "faucet address must not be empty");
+                Ok(FaucetOutput {
+                    address,
+                    amount_sats: output.amount_sats()?,
+                })
+            })
+            .collect()
+    }
+
+    fn wait_faucet_confirmation(
+        &self,
+        txid: &str,
+        timeout_secs: u64,
+        control: &dyn ScenarioControl,
+    ) -> anyhow::Result<Value> {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            if control.abort_requested() {
+                return Ok(json!({"txid": txid, "aborted": true}));
+            }
+            if let Some(transfer) = self.manager.faucet_transfer(txid) {
+                match transfer.delivery_state {
+                    FaucetDeliveryState::Confirmed => {
+                        return serde_json::to_value(transfer).map_err(Into::into);
+                    }
+                    FaucetDeliveryState::DeliveryFailed
+                    | FaucetDeliveryState::AbortedAfterSubmission
+                    | FaucetDeliveryState::OrphanedAfterConfirmation => {
+                        anyhow::bail!(
+                            "faucet transfer {txid} ended {}{}",
+                            transfer.delivery_state.as_str(),
+                            transfer
+                                .last_error
+                                .as_deref()
+                                .map(|error| format!(": {error}"))
+                                .unwrap_or_default()
+                        );
+                    }
+                    FaucetDeliveryState::Armed | FaucetDeliveryState::Recovering => {}
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for faucet transfer {txid} to confirm");
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    fn configure_faucet_recovery(&self, request: &FaucetJobRequest) -> anyhow::Result<()> {
+        let mut state = self.manager.state.lock().expect("job manager lock");
+        let job = find_stored_mut(&mut state.persisted, &self.job_id)
+            .ok_or_else(|| anyhow::anyhow!("scenario job disappeared"))?;
+        job.faucet_recovery = Some(FaucetRecoveryContext {
+            phase: FaucetPhase::Validated,
+            normalized_request: Some(request.clone()),
+            desired_priority_delta_sats: FAUCET_PRIORITY_DELTA_SATS,
+            ..FaucetRecoveryContext::default()
+        });
+        self.manager.store.save(&state.persisted)?;
+        Ok(())
+    }
+
+    fn assert_effective_config(
+        &self,
+        desired_generation: u64,
+        expected: &BTreeMap<String, String>,
+    ) -> anyhow::Result<()> {
+        let mining = self.manager.mining.status()?;
+        let spam = self.manager.spam.status()?;
+        let mining_values = mining
+            .policy
+            .canonical_values()
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect::<BTreeMap<_, _>>();
+        let spam_values = spam
+            .policy
+            .canonical_values()
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect::<BTreeMap<_, _>>();
+        let mut mismatches = Vec::new();
+        for (key, expected_value) in expected {
+            let spec = live_tuning::spec(key.as_str())
+                .ok_or_else(|| anyhow::anyhow!("unknown runtime setting {key}"))?;
+            let (component, generation, values) = match spec.scope {
+                ServiceScope::MiningController => {
+                    ("mining", mining.effective_generation, &mining_values)
+                }
+                ServiceScope::Spammer => ("spam", spam.effective_generation, &spam_values),
+            };
+            if generation != desired_generation {
+                mismatches.push(format!(
+                    "{component} generation {generation}, expected {desired_generation}"
+                ));
+            }
+            match values.get(key) {
+                Some(actual) if actual == expected_value => {}
+                Some(actual) => mismatches.push(format!(
+                    "{component}.{key}={actual}, expected {expected_value}"
+                )),
+                None => mismatches.push(format!("{component}.{key} is not exposed")),
+            }
+        }
+        anyhow::ensure!(
+            mismatches.is_empty(),
+            "effective config mismatch: {}",
+            mismatches.join("; ")
+        );
+        Ok(())
+    }
+
+    fn current_height(&self) -> anyhow::Result<u64> {
+        let summary = self.manager.scenario.live_summary()?;
+        summary
+            .get("height")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("live summary did not include a numeric height"))
+    }
+
+    fn current_mempool_tx_count(&self) -> anyhow::Result<usize> {
+        let summary = self.manager.scenario.live_summary()?;
+        let count = summary
+            .get("mempool")
+            .and_then(|mempool| mempool.get("transactions"))
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                anyhow::anyhow!("live summary did not include a numeric mempool transaction count")
+            })?;
+        count
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("mempool transaction count is out of range"))
+    }
+
+    fn unreachable_component(error: impl ToString) -> ComponentState {
+        ComponentState {
+            reachable: false,
+            status: "unreachable".to_string(),
+            last_error: Some(error.to_string()),
+            ..ComponentState::default()
+        }
+    }
+
+    fn component_snapshot(&self, component: ScenarioComponent) -> ComponentState {
+        match component {
+            ScenarioComponent::Mining => match self.manager.mining.status() {
+                Ok(status) => ComponentState {
+                    reachable: true,
+                    status: status.phase.as_str().to_string(),
+                    phase: Some(status.phase.as_str().to_string()),
+                    effective_generation: Some(status.effective_generation),
+                    uptime_secs: Some(status.uptime_secs),
+                    last_error: status.last_error,
+                    desired_state: Some(status.desired_state),
+                    effective_state: Some(status.effective_state),
+                    observed_height: status.height,
+                    next_scheduled_attempt_ms: status.next_scheduled_attempt_ms,
+                    last_mined_block: status.last_mined_block,
+                    active_lease_count: Some(status.active_leases.len()),
+                    ..ComponentState::default()
+                },
+                Err(error) => Self::unreachable_component(error),
+            },
+            ScenarioComponent::Spam => match self.manager.spam.status() {
+                Ok(status) => ComponentState {
+                    reachable: true,
+                    status: status.phase.as_str().to_string(),
+                    phase: Some(status.phase.as_str().to_string()),
+                    effective_generation: Some(status.effective_generation),
+                    uptime_secs: Some(status.uptime_secs),
+                    last_error: status.last_error,
+                    desired_state: Some(status.desired_state),
+                    effective_state: Some(status.effective_state),
+                    observed_height: status.observed_height,
+                    active_lease_count: Some(status.active_leases.len()),
+                    cycle_phase: status.cycle_phase,
+                    accepted_transactions: Some(status.accepted_transactions),
+                    last_cycle_duration_ms: status.last_cycle_duration_ms,
+                    reconciliation_pending: Some(status.reconciliation_pending),
+                    ..ComponentState::default()
+                },
+                Err(error) => Self::unreachable_component(error),
+            },
+            ScenarioComponent::NetworkAgentNode1
+            | ScenarioComponent::NetworkAgentNode2
+            | ScenarioComponent::NetworkAgentNode3 => {
+                let node = component
+                    .network_node()
+                    .expect("network component has a node");
+                match self.manager.network.status(node) {
+                    Ok(status) => {
+                        let impaired = status.active_lease.is_some();
+                        ComponentState {
+                            reachable: true,
+                            status: if impaired { "impaired" } else { "clear" }.to_string(),
+                            phase: Some(if impaired { "active" } else { "clear" }.to_string()),
+                            effective_generation: Some(status.effective_generation),
+                            uptime_secs: Some(status.uptime_secs),
+                            last_error: status.last_error,
+                            active_lease_count: Some(usize::from(impaired)),
+                            ..ComponentState::default()
+                        }
+                    }
+                    Err(error) => Self::unreachable_component(error),
+                }
+            }
+        }
+    }
+
+    fn assert_component_expectation(
+        &self,
+        expected: &ComponentExpectation,
+    ) -> anyhow::Result<ComponentState> {
+        let actual = self.component_snapshot(expected.component);
+        let mut mismatches = Vec::new();
+
+        if let Some(expected_reachable) = expected.reachable {
+            if actual.reachable != expected_reachable {
+                mismatches.push(format!(
+                    "reachable={}, expected {expected_reachable}",
+                    actual.reachable
+                ));
+            }
+        }
+        if let Some(expected_status) = expected.status.as_deref() {
+            if actual.status != expected_status {
+                mismatches.push(format!(
+                    "status={}, expected {expected_status}",
+                    actual.status
+                ));
+            }
+        }
+        if let Some(expected_phase) = expected.phase.as_deref() {
+            match actual.phase.as_deref() {
+                Some(actual_phase) if actual_phase == expected_phase => {}
+                Some(actual_phase) => {
+                    mismatches.push(format!("phase={actual_phase}, expected {expected_phase}"));
+                }
+                None => mismatches.push(format!("phase is not exposed, expected {expected_phase}")),
+            }
+        }
+        if let Some(expected_state) = expected.desired_state {
+            match actual.desired_state {
+                Some(actual_state) if actual_state == expected_state => {}
+                Some(actual_state) => mismatches.push(format!(
+                    "desired_state={}, expected {}",
+                    actual_state.as_str(),
+                    expected_state.as_str()
+                )),
+                None => mismatches.push(format!(
+                    "desired_state is not exposed, expected {}",
+                    expected_state.as_str()
+                )),
+            }
+        }
+        if let Some(expected_state) = expected.effective_state {
+            match actual.effective_state {
+                Some(actual_state) if actual_state == expected_state => {}
+                Some(actual_state) => mismatches.push(format!(
+                    "effective_state={}, expected {}",
+                    actual_state.as_str(),
+                    expected_state.as_str()
+                )),
+                None => mismatches.push(format!(
+                    "effective_state is not exposed, expected {}",
+                    expected_state.as_str()
+                )),
+            }
+        }
+        if let Some(expected_generation) = expected.effective_generation {
+            match actual.effective_generation {
+                Some(actual_generation) if actual_generation == expected_generation => {}
+                Some(actual_generation) => mismatches.push(format!(
+                    "effective_generation={actual_generation}, expected {expected_generation}"
+                )),
+                None => mismatches.push(format!(
+                    "effective_generation is not exposed, expected {expected_generation}"
+                )),
+            }
+        }
+        if let Some(min_height) = expected.observed_height_at_least {
+            match actual.observed_height {
+                Some(actual_height) if actual_height >= min_height => {}
+                Some(actual_height) => mismatches.push(format!(
+                    "observed_height={actual_height}, expected at least {min_height}"
+                )),
+                None => mismatches.push(format!(
+                    "observed_height is not exposed, expected at least {min_height}"
+                )),
+            }
+        }
+        if let Some(expected_count) = expected.active_lease_count {
+            match actual.active_lease_count {
+                Some(actual_count) if actual_count == expected_count => {}
+                Some(actual_count) => mismatches.push(format!(
+                    "active_lease_count={actual_count}, expected {expected_count}"
+                )),
+                None => mismatches.push(format!(
+                    "active_lease_count is not exposed, expected {expected_count}"
+                )),
+            }
+        }
+        if let Some(expected_phase) = expected.cycle_phase.as_deref() {
+            match actual.cycle_phase.as_deref() {
+                Some(actual_phase) if actual_phase == expected_phase => {}
+                Some(actual_phase) => mismatches.push(format!(
+                    "cycle_phase={actual_phase}, expected {expected_phase}"
+                )),
+                None => mismatches.push(format!(
+                    "cycle_phase is not exposed, expected {expected_phase}"
+                )),
+            }
+        }
+
+        anyhow::ensure!(
+            mismatches.is_empty(),
+            "component {} mismatch: {}",
+            expected.component,
+            mismatches.join("; ")
+        );
+        Ok(actual)
+    }
+
+    fn assert_height_bounds(
+        &self,
+        equals: Option<u64>,
+        at_least: Option<u64>,
+        at_most: Option<u64>,
+    ) -> anyhow::Result<Value> {
+        let height = self.current_height()?;
+        let mut mismatches = Vec::new();
+        if let Some(expected) = equals {
+            if height != expected {
+                mismatches.push(format!("height={height}, expected {expected}"));
+            }
+        }
+        if let Some(minimum) = at_least {
+            if height < minimum {
+                mismatches.push(format!("height={height}, expected at least {minimum}"));
+            }
+        }
+        if let Some(maximum) = at_most {
+            if height > maximum {
+                mismatches.push(format!("height={height}, expected at most {maximum}"));
+            }
+        }
+        anyhow::ensure!(
+            mismatches.is_empty(),
+            "height assertion failed: {}",
+            mismatches.join("; ")
+        );
+        Ok(json!({
+            "height": height,
+            "equals": equals,
+            "at_least": at_least,
+            "at_most": at_most
+        }))
+    }
+
+    fn check_wait_condition(&self, condition: &WaitCondition) -> anyhow::Result<Value> {
+        match condition {
+            WaitCondition::HeightAtLeast { height } => {
+                self.assert_height_bounds(None, Some(*height), None)
+            }
+            WaitCondition::MempoolTxsAtLeast { count } => {
+                let actual = self.current_mempool_tx_count()?;
+                anyhow::ensure!(
+                    actual >= *count,
+                    "mempool tx count {actual}, expected at least {count}"
+                );
+                Ok(json!({"mempool_txs": actual, "at_least": count}))
+            }
+            WaitCondition::MempoolTxsAtMost { count } => {
+                let actual = self.current_mempool_tx_count()?;
+                anyhow::ensure!(
+                    actual <= *count,
+                    "mempool tx count {actual}, expected at most {count}"
+                );
+                Ok(json!({"mempool_txs": actual, "at_most": count}))
+            }
+            WaitCondition::Component { expected } => {
+                serde_json::to_value(self.assert_component_expectation(expected)?)
+                    .map_err(Into::into)
+            }
+        }
+    }
 }
 
 impl ScenarioControl for JobScenarioActions {
@@ -4257,6 +4694,9 @@ impl ScenarioActions for JobScenarioActions {
         &self,
         depth: u64,
         empty: bool,
+        node: MinerNode,
+        adds_new_txs: u64,
+        double_spend_pct: u8,
         _control: &dyn ScenarioControl,
     ) -> anyhow::Result<Value> {
         let acquired_spam = self.ensure_spam_lease("scenario reorg step")?;
@@ -4264,7 +4704,9 @@ impl ScenarioActions for JobScenarioActions {
         let request = ReorgJobRequest {
             depth,
             empty,
-            ..ReorgJobRequest::default()
+            node: node.short_name().to_string(),
+            adds_new_txs,
+            double_spend_pct,
         };
         self.manager
             .prepare_scenario_reorg(&self.job_id, &request)?;
@@ -4317,6 +4759,53 @@ impl ScenarioActions for JobScenarioActions {
         Ok(execution.result)
     }
 
+    fn assert_height(
+        &self,
+        equals: Option<u64>,
+        at_least: Option<u64>,
+        at_most: Option<u64>,
+    ) -> anyhow::Result<Value> {
+        self.assert_height_bounds(equals, at_least, at_most)
+    }
+
+    fn assert_component(&self, expected: &ComponentExpectation) -> anyhow::Result<Value> {
+        serde_json::to_value(self.assert_component_expectation(expected)?).map_err(Into::into)
+    }
+
+    fn wait_until(
+        &self,
+        condition: &WaitCondition,
+        timeout_secs: u64,
+        control: &dyn ScenarioControl,
+    ) -> anyhow::Result<Value> {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            if control.abort_requested() {
+                return Ok(json!({
+                    "condition": condition.kind(),
+                    "aborted": true
+                }));
+            }
+            let last_error = match self.check_wait_condition(condition) {
+                Ok(value) => {
+                    return Ok(json!({
+                        "condition": condition.kind(),
+                        "satisfied": true,
+                        "data": value
+                    }));
+                }
+                Err(error) => format!("{error:#}"),
+            };
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out after {timeout_secs}s waiting for condition {}; last observed: {last_error}",
+                    condition.kind(),
+                );
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     fn spam_burst(
         &self,
         node: MinerNode,
@@ -4327,6 +4816,133 @@ impl ScenarioActions for JobScenarioActions {
         self.manager
             .scenario
             .spam_burst(node, txs, outputs_per_tx, control)
+    }
+
+    fn set_config(&self, settings: &BTreeMap<String, String>) -> anyhow::Result<Value> {
+        let context = self.apply_context();
+        let report = apply_with_context(
+            &context,
+            ApplyRequest {
+                settings: settings.clone(),
+                base_generation: None,
+            },
+            |request| {
+                if request.settings.contains_key("FALLBACK_FEE")
+                    && self.manager.has_pending_faucet()
+                {
+                    return Err(simchain_common::control_api::ApiError::new(
+                        ErrorCode::FaucetDeliveryPending,
+                        "FALLBACK_FEE cannot change while a faucet transfer is armed",
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("config apply failed: {}", error.message))?;
+        serde_json::to_value(report).map_err(Into::into)
+    }
+
+    fn assert_config(
+        &self,
+        settings: &BTreeMap<String, String>,
+        effective: bool,
+    ) -> anyhow::Result<Value> {
+        let control = self.manager.control_store.load_current()?;
+        let mut mismatches = Vec::new();
+        for (key, expected) in settings {
+            match control.desired.get(key) {
+                Some(actual) if actual == expected => {}
+                Some(actual) => {
+                    mismatches.push(format!("desired.{key}={actual}, expected {expected}"));
+                }
+                None => mismatches.push(format!("desired.{key} is not set")),
+            }
+        }
+        anyhow::ensure!(
+            mismatches.is_empty(),
+            "desired config mismatch: {}",
+            mismatches.join("; ")
+        );
+        if effective {
+            self.assert_effective_config(control.generation, settings)?;
+        }
+        Ok(json!({
+            "generation": control.generation,
+            "settings": settings,
+            "effective": effective
+        }))
+    }
+
+    fn faucet(
+        &self,
+        source: FaucetSource,
+        outputs: &[FaucetScenarioOutput],
+        wait_confirmed: bool,
+        timeout_secs: u64,
+        control: &dyn ScenarioControl,
+    ) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            self.manager.faucet_store.pending().is_none(),
+            "a faucet transfer is already armed and awaiting confirmation"
+        );
+        let request = FaucetJobRequest {
+            source,
+            outputs: self.resolve_faucet_outputs(outputs)?,
+        };
+        let request =
+            normalize_faucet_request(request, self.manager.faucet_settings.max_request_sats)
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+        self.configure_faucet_recovery(&request)?;
+        self.manager.set_phase(&self.job_id, "faucet_preflight");
+        let initial = self.manager.faucet.preflight()?;
+        self.manager.emit_best_effort(
+            &self.job_id,
+            "faucet_preflight_completed",
+            "faucet_preflight",
+            "faucet wallets, miners, and common tip are ready",
+            Some(json!({"height": initial.height, "best_hash": initial.best_hash})),
+        );
+
+        let acquired_mining = self.ensure_mining_lease("scenario faucet step")?;
+        let outcome = self
+            .manager
+            .execute_faucet(&self.job_id, &request, self.abort.as_ref());
+        let context = self
+            .manager
+            .faucet_context(&self.job_id)
+            .unwrap_or_default();
+        if outcome.is_err() || control.abort_requested() {
+            if let Some(txid) = context.txid.as_deref() {
+                for node in [FaucetSourceNode::Node2, FaucetSourceNode::Node3] {
+                    let _ = self.manager.faucet.set_priority(node, txid, 0);
+                }
+            }
+            if let Some(source) = context.source {
+                if !context.selected_inputs.is_empty() {
+                    let _ = self
+                        .manager
+                        .faucet
+                        .unlock_inputs(source, &context.selected_inputs);
+                }
+            }
+        }
+
+        let mining_paused_by_step = self
+            .runtime
+            .lock()
+            .expect("scenario runtime lock")
+            .mining_paused_by_step;
+        if acquired_mining && !mining_paused_by_step {
+            self.release_component("mining")?;
+        }
+
+        let transfer = outcome.map_err(anyhow::Error::from)?;
+        self.manager
+            .clear_faucet_job_recovery_material(&self.job_id);
+        if !wait_confirmed {
+            return serde_json::to_value(transfer).map_err(Into::into);
+        }
+        self.wait_faucet_confirmation(&transfer.txid, timeout_secs, control)
     }
 
     fn run_partition(
@@ -4396,6 +5012,69 @@ impl ScenarioActions for JobScenarioActions {
             cleanup_errors.join("; ")
         );
         Ok(value)
+    }
+
+    fn degrade(
+        &self,
+        node: NetworkNode,
+        delay_ms: u64,
+        loss_pct: f64,
+        seconds: Option<u64>,
+        until_height: Option<u64>,
+        control: &dyn ScenarioControl,
+    ) -> anyhow::Result<Value> {
+        let network = self.manager.acquire_network_lease(
+            &self.job_id,
+            node.short_name(),
+            "scenario timed network degradation",
+            NetworkImpairment::Netem { delay_ms, loss_pct },
+            {
+                let mut runtime = self.runtime.lock().expect("scenario runtime lock");
+                runtime.next_lease_sequence = runtime.next_lease_sequence.saturating_add(1);
+                runtime.next_lease_sequence
+            },
+        )?;
+        self.manager
+            .set_phase(&self.job_id, "observing_degraded_network");
+        let started = Instant::now();
+        let wait_result = if let Some(seconds) = seconds {
+            let duration = Duration::from_secs(seconds);
+            while started.elapsed() < duration && !control.abort_requested() {
+                thread::sleep(
+                    Duration::from_millis(100).min(duration.saturating_sub(started.elapsed())),
+                );
+            }
+            Ok(json!({
+                "requested_seconds": seconds,
+                "aborted": control.abort_requested()
+            }))
+        } else if let Some(height) = until_height {
+            self.manager.scenario.wait_height(height, control)
+        } else {
+            Err(anyhow::anyhow!(
+                "validated scenario degradation duration disappeared"
+            ))
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let release_result = self.manager.release_network_lease(&self.job_id, &network);
+        let wait_value = match (wait_result, release_result) {
+            (Ok(value), Ok(())) => value,
+            (Err(wait_error), Ok(())) => return Err(wait_error),
+            (Ok(_), Err(release_error)) => return Err(release_error),
+            (Err(wait_error), Err(release_error)) => {
+                anyhow::bail!("{wait_error:#}; network lease release failed: {release_error:#}");
+            }
+        };
+        Ok(json!({
+            "node": node.short_name(),
+            "delay_ms": delay_ms,
+            "loss_pct": loss_pct,
+            "seconds": seconds,
+            "until_height": until_height,
+            "wait": wait_value,
+            "elapsed_ms": elapsed_ms,
+            "aborted": control.abort_requested()
+        }))
     }
 
     fn reach_checkpoint(
@@ -5081,12 +5760,23 @@ mod tests {
     ) -> (Arc<MockBackend>, Arc<JobManager>) {
         let backend = Arc::new(MockBackend::new());
         backend.sync_workers();
+        let control_store = ControlStateStore::open(dir.to_path_buf()).expect("control store");
+        let control_state = Arc::new(RwLock::new(
+            control_store
+                .load_or_initialize(ControlState::default().desired)
+                .expect("control state"),
+        ));
+        let apply_lock = Arc::new(Mutex::new(()));
         let manager = JobManager::open_with_ttl(
             dir,
             JobDependencies {
                 mining: backend.clone(),
                 spam: backend.clone(),
                 network: backend.clone(),
+                chain: backend.clone(),
+                control_store,
+                control_state,
+                apply_lock,
                 reorg: executor,
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
@@ -5100,7 +5790,7 @@ mod tests {
     }
 
     fn wait_until(mut predicate: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !predicate() {
             assert!(std::time::Instant::now() < deadline, "condition timed out");
             thread::sleep(Duration::from_millis(5));
@@ -5115,6 +5805,18 @@ mod tests {
             max_request_sats: 10_000_000_000,
             explorer_url: "http://127.0.0.1:1080".to_string(),
         }
+    }
+
+    fn control_fixture(
+        dir: &std::path::Path,
+    ) -> (ControlStateStore, Arc<RwLock<ControlState>>, Arc<Mutex<()>>) {
+        let control_store = ControlStateStore::open(dir.to_path_buf()).expect("control store");
+        let control_state = Arc::new(RwLock::new(
+            control_store
+                .load_or_initialize(ControlState::default().desired)
+                .expect("control state"),
+        ));
+        (control_store, control_state, Arc::new(Mutex::new(())))
     }
 
     #[test]
@@ -5253,12 +5955,17 @@ mod tests {
             })
             .expect("seed active job");
 
+        let (control_store, control_state, apply_lock) = control_fixture(dir.path());
         let manager = JobManager::open_with_ttl(
             dir.path(),
             JobDependencies {
                 mining: backend.clone(),
                 spam: backend.clone(),
                 network: backend.clone(),
+                chain: backend.clone(),
+                control_store,
+                control_state,
+                apply_lock,
                 reorg: Arc::new(BlockingExecutor::new()),
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
@@ -5348,12 +6055,17 @@ mod tests {
             attempted: AtomicBool::new(false),
             allow: AtomicBool::new(false),
         });
+        let (control_store, control_state, apply_lock) = control_fixture(dir.path());
         let manager = JobManager::open_with_ttl(
             dir.path(),
             JobDependencies {
                 mining: backend.clone(),
                 spam: backend.clone(),
                 network: backend.clone(),
+                chain: backend.clone(),
+                control_store,
+                control_state,
+                apply_lock,
                 reorg: executor.clone(),
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
@@ -5460,12 +6172,17 @@ mod tests {
             })
             .expect("seed held scenario");
 
+        let (control_store, control_state, apply_lock) = control_fixture(dir.path());
         let manager = JobManager::open_with_ttl(
             dir.path(),
             JobDependencies {
                 mining: backend.clone(),
                 spam: backend.clone(),
                 network: backend.clone(),
+                chain: backend.clone(),
+                control_store,
+                control_state,
+                apply_lock,
                 reorg: Arc::new(BlockingExecutor::new()),
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
@@ -5725,6 +6442,64 @@ steps:
             manager.get(&created.job_id).expect("job").summary.state,
             JobState::Succeeded
         );
+    }
+
+    #[test]
+    fn hot_control_scenario_steps_run_inline_under_the_scenario_job() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(BlockingExecutor::new());
+        let (backend, manager) = manager(dir.path(), executor);
+        let created = manager
+            .start_scenario(
+                r#"
+version: 1
+steps:
+  - type: set_config
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      FALLBACK_FEE: 0.0002
+  - type: assert_config
+    effective: true
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      FALLBACK_FEE: 0.0002
+  - type: degrade
+    node: node2
+    delay_ms: 1
+    seconds: 1
+  - type: faucet
+    source: auto
+    wait_confirmed: false
+    outputs:
+      - address: bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr
+        amount: 1btc
+"#
+                .to_string(),
+                None,
+                true,
+            )
+            .expect("start scenario");
+        wait_until(|| {
+            manager
+                .get(&created.job_id)
+                .expect("job")
+                .summary
+                .state
+                .is_terminal()
+        });
+        let job = manager.get(&created.job_id).expect("job");
+        assert_eq!(job.summary.state, JobState::Succeeded);
+        assert_eq!(job.summary.cleanup.state, CleanupState::Succeeded);
+        assert!(manager.list().active_job_id.is_none());
+        assert_eq!(
+            NetworkControlBackend::status(backend.as_ref(), "node2")
+                .expect("node2 network")
+                .active_lease,
+            None
+        );
+        assert!(manager.faucet_status().pending_transfer.is_some());
     }
 
     #[test]

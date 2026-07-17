@@ -108,7 +108,10 @@ async fn main() -> anyhow::Result<()> {
         config.node2_url.clone(),
         config.node3_url.clone(),
     ));
-    let control_state = store.load_or_initialize(control_state::desired_from_process_env()?)?;
+    let control_state = Arc::new(RwLock::new(
+        store.load_or_initialize(control_state::desired_from_process_env()?)?,
+    ));
+    let apply_lock = Arc::new(Mutex::new(()));
     let reorg_executor = Arc::new(reorg_job::RpcReorgExecutor::from_config(&config)?);
     let scenario_backend = Arc::new(scenario_job::RpcScenarioActionBackend::from_config(
         &config,
@@ -123,6 +126,10 @@ async fn main() -> anyhow::Result<()> {
             mining: mining.clone(),
             spam: spam.clone(),
             network: network.clone(),
+            chain: chain.clone(),
+            control_store: store.clone(),
+            control_state: control_state.clone(),
+            apply_lock: apply_lock.clone(),
             reorg: reorg_executor,
             scenario: scenario_backend,
             network_actions,
@@ -144,11 +151,11 @@ async fn main() -> anyhow::Result<()> {
         spam,
         network,
         jobs,
-        control_state: RwLock::new(control_state),
+        control_state,
         control_store: store,
         status: RwLock::new(status::StatusSnapshot::default()),
         _instance_guard: instance_guard,
-        apply_lock: Mutex::new(()),
+        apply_lock,
     });
 
     status::spawn_sampler(app.clone());

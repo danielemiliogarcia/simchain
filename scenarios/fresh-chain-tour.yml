@@ -1,26 +1,73 @@
 version: 1
 steps:
+  - type: set_config
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      BLOCK_INTERVAL_MIN_SECS: 10
+      BLOCK_INTERVAL_MAX_SECS: 10
+      ENABLE_SPAM: true
+      SPAM_FILL_BLOCK_RATIO: 4
+      FALLBACK_FEE: 0.002
+
+  - type: wait_until
+    timeout_secs: 120
+    condition:
+      kind: component
+      component: spam
+      status: active
+
+  - type: assert_component
+    component: mining
+    reachable: true
+    effective_state: running
+
+  - type: wait_height
+    height: 205
+
+  - type: faucet
+    source: auto
+    wait_confirmed: true
+    timeout_secs: 900
+    outputs:
+      - address_env: FUND_ADD_1
+        amount: 1btc
+      - address_env: FUND_ADD_2
+        amount: 1btc
+
   - type: wait_height
     height: 210
+
+  - type: assert_config
+    effective: true
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      BLOCK_INTERVAL_MIN_SECS: 10
+      BLOCK_INTERVAL_MAX_SECS: 10
+      ENABLE_SPAM: true
+      SPAM_FILL_BLOCK_RATIO: 4
+      FALLBACK_FEE: 0.002
 
   - type: reorg
     depth: 3
     empty: true
+    node: node3
 
   - type: wait_height
     height: 220
 
-  # Organic reorg: node3 is isolated, the connected side mines 5 blocks,
-  # the isolated side mines 6, then the network heals and node1 reorgs.
-  - type: partition
-    node: btc-simnet-node3
-    main_blocks: 5
-    isolated_blocks: 6
+  - type: reorg
+    depth: 5
+    empty: false
+    node: node3
+    adds_new_txs: 25
+    double_spend_pct: 10
 
   - type: wait_height
     height: 230
 
-  # A second split on the other miner, again with unequal branch lengths so
+  # Split one miner with unequal branch lengths so
   # the winner is deterministic.
   - type: partition
     node: btc-simnet-node2
@@ -29,3 +76,21 @@ steps:
 
   - type: wait_height
     height: 240
+
+  - type: degrade
+    node: node2
+    delay_ms: 500
+    loss_pct: 1
+    seconds: 60
+
+  - type: wait_height
+    height: 250
+
+  - type: set_config
+    settings:
+      FALLBACK_FEE: 0.0001
+
+  - type: assert_config
+    effective: true
+    settings:
+      FALLBACK_FEE: 0.0001

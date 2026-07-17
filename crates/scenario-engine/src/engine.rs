@@ -1,6 +1,11 @@
-use crate::{CheckpointStep, MinerNode, Scenario, ScenarioResult, ScenarioStepResult, Step};
+use crate::{
+    CheckpointStep, ComponentExpectation, FaucetScenarioOutput, MinerNode, NetworkNode, Scenario,
+    ScenarioResult, ScenarioStepResult, Step, WaitCondition,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use simchain_common::control_api::FaucetSource;
+use std::collections::BTreeMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,6 +22,22 @@ pub trait ScenarioActions: Send + Sync {
         &self,
         depth: u64,
         empty: bool,
+        node: MinerNode,
+        adds_new_txs: u64,
+        double_spend_pct: u8,
+        control: &dyn ScenarioControl,
+    ) -> anyhow::Result<Value>;
+    fn assert_height(
+        &self,
+        equals: Option<u64>,
+        at_least: Option<u64>,
+        at_most: Option<u64>,
+    ) -> anyhow::Result<Value>;
+    fn assert_component(&self, expected: &ComponentExpectation) -> anyhow::Result<Value>;
+    fn wait_until(
+        &self,
+        condition: &WaitCondition,
+        timeout_secs: u64,
         control: &dyn ScenarioControl,
     ) -> anyhow::Result<Value>;
     fn spam_burst(
@@ -26,11 +47,34 @@ pub trait ScenarioActions: Send + Sync {
         outputs_per_tx: u64,
         control: &dyn ScenarioControl,
     ) -> anyhow::Result<Value>;
+    fn set_config(&self, settings: &BTreeMap<String, String>) -> anyhow::Result<Value>;
+    fn assert_config(
+        &self,
+        settings: &BTreeMap<String, String>,
+        effective: bool,
+    ) -> anyhow::Result<Value>;
+    fn faucet(
+        &self,
+        source: FaucetSource,
+        outputs: &[FaucetScenarioOutput],
+        wait_confirmed: bool,
+        timeout_secs: u64,
+        control: &dyn ScenarioControl,
+    ) -> anyhow::Result<Value>;
     fn run_partition(
         &self,
         node: MinerNode,
         main_blocks: u64,
         isolated_blocks: u64,
+        control: &dyn ScenarioControl,
+    ) -> anyhow::Result<Value>;
+    fn degrade(
+        &self,
+        node: NetworkNode,
+        delay_ms: u64,
+        loss_pct: f64,
+        seconds: Option<u64>,
+        until_height: Option<u64>,
         control: &dyn ScenarioControl,
     ) -> anyhow::Result<Value>;
     fn reach_checkpoint(
@@ -207,6 +251,16 @@ fn execute_step(
 ) -> anyhow::Result<Value> {
     match step {
         Step::WaitHeight { height } => actions.wait_height(*height, control),
+        Step::WaitUntil {
+            condition,
+            timeout_secs,
+        } => actions.wait_until(condition, *timeout_secs, control),
+        Step::AssertHeight {
+            equals,
+            at_least,
+            at_most,
+        } => actions.assert_height(*equals, *at_least, *at_most),
+        Step::AssertComponent { expected } => actions.assert_component(expected),
         Step::Sleep { secs } => {
             let deadline = Instant::now() + Duration::from_secs(*secs);
             while Instant::now() < deadline {
@@ -224,17 +278,55 @@ fn execute_step(
         Step::PauseMining => actions.set_mining_paused(true),
         Step::ResumeMining => actions.set_mining_paused(false),
         Step::Mine { node, blocks } => actions.mine(*node, *blocks),
-        Step::Reorg { depth, empty } => actions.run_reorg(*depth, *empty, control),
+        Step::Reorg {
+            depth,
+            empty,
+            node,
+            adds_new_txs,
+            double_spend_pct,
+        } => actions.run_reorg(
+            *depth,
+            *empty,
+            *node,
+            *adds_new_txs,
+            *double_spend_pct,
+            control,
+        ),
         Step::SpamBurst {
             node,
             txs,
             outputs_per_tx,
         } => actions.spam_burst(*node, *txs, *outputs_per_tx, control),
+        Step::SetConfig { settings } => actions.set_config(settings),
+        Step::AssertConfig {
+            settings,
+            effective,
+        } => actions.assert_config(settings, *effective),
+        Step::Faucet {
+            source,
+            outputs,
+            wait_confirmed,
+            timeout_secs,
+        } => actions.faucet(*source, outputs, *wait_confirmed, *timeout_secs, control),
         Step::Partition {
             node,
             main_blocks,
             isolated_blocks,
         } => actions.run_partition(*node, *main_blocks, *isolated_blocks, control),
+        Step::Degrade {
+            node,
+            delay_ms,
+            loss_pct,
+            seconds,
+            until_height,
+        } => actions.degrade(
+            *node,
+            *delay_ms,
+            *loss_pct,
+            *seconds,
+            *until_height,
+            control,
+        ),
         Step::Checkpoint { checkpoint } => {
             actions.reach_checkpoint(checkpoint, step_index, control)
         }
@@ -298,8 +390,40 @@ mod tests {
         fn mine(&self, _: MinerNode, blocks: u64) -> anyhow::Result<Value> {
             Ok(json!({"blocks": blocks}))
         }
-        fn run_reorg(&self, depth: u64, _: bool, _: &dyn ScenarioControl) -> anyhow::Result<Value> {
-            Ok(json!({"depth": depth}))
+        fn run_reorg(
+            &self,
+            depth: u64,
+            _: bool,
+            node: MinerNode,
+            adds_new_txs: u64,
+            double_spend_pct: u8,
+            _: &dyn ScenarioControl,
+        ) -> anyhow::Result<Value> {
+            Ok(json!({
+                "depth": depth,
+                "node": node.short_name(),
+                "adds_new_txs": adds_new_txs,
+                "double_spend_pct": double_spend_pct
+            }))
+        }
+        fn assert_height(
+            &self,
+            equals: Option<u64>,
+            at_least: Option<u64>,
+            at_most: Option<u64>,
+        ) -> anyhow::Result<Value> {
+            Ok(json!({"equals": equals, "at_least": at_least, "at_most": at_most}))
+        }
+        fn assert_component(&self, expected: &ComponentExpectation) -> anyhow::Result<Value> {
+            Ok(json!({"component": expected.component.as_str()}))
+        }
+        fn wait_until(
+            &self,
+            condition: &WaitCondition,
+            timeout_secs: u64,
+            _: &dyn ScenarioControl,
+        ) -> anyhow::Result<Value> {
+            Ok(json!({"condition": condition.kind(), "timeout_secs": timeout_secs}))
         }
         fn spam_burst(
             &self,
@@ -310,6 +434,26 @@ mod tests {
         ) -> anyhow::Result<Value> {
             Ok(json!({"txs": txs}))
         }
+        fn set_config(&self, settings: &BTreeMap<String, String>) -> anyhow::Result<Value> {
+            Ok(json!({"settings": settings}))
+        }
+        fn assert_config(
+            &self,
+            settings: &BTreeMap<String, String>,
+            effective: bool,
+        ) -> anyhow::Result<Value> {
+            Ok(json!({"settings": settings, "effective": effective}))
+        }
+        fn faucet(
+            &self,
+            _: FaucetSource,
+            outputs: &[FaucetScenarioOutput],
+            wait_confirmed: bool,
+            _: u64,
+            _: &dyn ScenarioControl,
+        ) -> anyhow::Result<Value> {
+            Ok(json!({"outputs": outputs.len(), "wait_confirmed": wait_confirmed}))
+        }
         fn run_partition(
             &self,
             _: MinerNode,
@@ -318,6 +462,23 @@ mod tests {
             _: &dyn ScenarioControl,
         ) -> anyhow::Result<Value> {
             Ok(json!({"main": main_blocks, "isolated": isolated_blocks}))
+        }
+        fn degrade(
+            &self,
+            node: NetworkNode,
+            delay_ms: u64,
+            loss_pct: f64,
+            seconds: Option<u64>,
+            until_height: Option<u64>,
+            _: &dyn ScenarioControl,
+        ) -> anyhow::Result<Value> {
+            Ok(json!({
+                "node": node.short_name(),
+                "delay_ms": delay_ms,
+                "loss_pct": loss_pct,
+                "seconds": seconds,
+                "until_height": until_height
+            }))
         }
         fn reach_checkpoint(
             &self,

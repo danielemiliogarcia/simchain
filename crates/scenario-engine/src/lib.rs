@@ -10,4 +10,7 @@ mod schema;
 
 pub use engine::{run, ScenarioActions, ScenarioControl, ScenarioProgress, ScenarioProgressPhase};
 pub use results::{ScenarioResult, ScenarioStepResult};
-pub use schema::{CheckpointStep, MinerNode, Scenario, Step, BOOTSTRAP_HEIGHT};
+pub use schema::{
+    CheckpointStep, ComponentExpectation, FaucetScenarioOutput, MinerNode, NetworkNode, Scenario,
+    ScenarioComponent, Step, WaitCondition, BOOTSTRAP_HEIGHT,
+};

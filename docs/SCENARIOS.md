@@ -12,10 +12,13 @@ client:
 
 ```bash
 docker compose up -d --build
+cargo run -p simchainctl -- scenario validate scenarios/reorg-during-sync.yml
+cargo run -p simchainctl -- scenario explain scenarios/reorg-during-sync.yml
 cargo run -p simchainctl -- scenario run scenarios/reorg-during-sync.yml \
   --result results/reorg.json
 ```
 
+`scenario validate` and `scenario explain` parse the file locally without uploading it.
 `scenario run` uploads the file, streams new events, waits for the terminal state, and
 uses stable automation exit codes. The optional result artifact contains the complete
 terminal job, checkpoint summaries, and persisted event history.
@@ -23,11 +26,10 @@ terminal job, checkpoint summaries, and persisted event history.
 Every scenario waits for node1 to reach bootstrap height 204 before step 1. Pre-bootstrap
 history mutation remains unsupported because bootstrap funding stages use fixed heights.
 
-Scenarios do not own Docker lifecycle or global runtime retuning. Start a fresh chain
-with `./scripts/fresh-chain.sh`, change runtime policy with `simchainctl config set`,
-and use standalone control-plane jobs for faucet funding or timed degradation. For an
-end-to-end tour that combines those outer operations with a valid scenario file, see
-`./scripts/run-fresh-chain-tour.sh` and `../scenarios/fresh-chain-tour.yml`.
+Scenarios cover hot control-plane actions: runtime retuning, config assertions, faucet
+funding, manual mining, spam bursts, reorgs, partitions, timed degradation, and
+checkpoints. They still do not own Docker lifecycle or chain-volume deletion. Start from
+a fresh chain outside the control plane when the test requires one, then run the scenario.
 
 ## Schema
 
@@ -55,6 +57,46 @@ steps:
     txs: 100
     outputs_per_tx: 25
 
+  - type: set_config
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      SPAM_FILL_BLOCK_RATIO: 4
+      FALLBACK_FEE: 0.002
+
+  - type: assert_config
+    effective: true
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      SPAM_FILL_BLOCK_RATIO: 4
+      FALLBACK_FEE: 0.002
+
+  - type: wait_until
+    timeout_secs: 120
+    condition:
+      kind: component
+      component: spam
+      status: active
+
+  - type: assert_height
+    at_least: 205
+
+  - type: assert_component
+    component: mining
+    reachable: true
+    effective_state: running
+
+  - type: faucet
+    source: auto
+    wait_confirmed: true
+    timeout_secs: 900
+    outputs:
+      - address_env: FUND_ADD_1
+        amount: 1btc
+      - address: bcrt1q...
+        amount: 25000000sat
+
   - type: checkpoint
     name: mempool_loaded
     timeout_secs: 600
@@ -62,11 +104,25 @@ steps:
   - type: reorg
     depth: 2
     empty: false
+    node: node3
+    adds_new_txs: 0
+    double_spend_pct: 0
 
   - type: partition
     node: btc-simnet-node3
     main_blocks: 3
     isolated_blocks: 4
+
+  - type: degrade
+    node: node2
+    delay_ms: 500
+    loss_pct: 1
+    seconds: 60
+
+  - type: degrade
+    node: node2
+    delay_ms: 500
+    until_height: 260
 
   - type: resume_mining
 ```
@@ -74,12 +130,38 @@ steps:
 Validation rules:
 
 - `wait_height.height` is at least 204.
+- `wait_until.timeout_secs` is positive. Supported conditions are `height_at_least`,
+  `mempool_txs_at_least`, `mempool_txs_at_most`, and `component`.
+- `assert_height` requires at least one of `equals`, `at_least`, or `at_most`;
+  `equals` cannot be combined with the range fields.
+- `assert_component` and `wait_until.kind: component` support `mining`, `spam`,
+  `network-agent-node1`, `network-agent-node2`, and `network-agent-node3`. Expectations
+  may check `reachable`, `status`, `phase`, `desired_state`, `effective_state`,
+  `effective_generation`, `observed_height_at_least`, `active_lease_count`, and
+  `cycle_phase`.
 - `sleep.secs`, `mine.blocks`, `reorg.depth`, `spam_burst.txs`, and both partition
   block counts are positive.
 - Miner nodes are `btc-simnet-node2` or `btc-simnet-node3`.
 - `spam_burst.outputs_per_tx` may be zero. Zero uses sequential `sendtoaddress`; a
   positive value uses `sendmany` with that many 546-sat outputs.
+- `set_config.settings` is a partial runtime desired-state patch using the same keys as
+  `simchainctl config set`. Values may be strings, numbers, booleans, or null/empty reset
+  values.
+- `assert_config.settings` checks durable desired values, and with `effective: true`
+  (the default) also checks that the mining/spam workers expose the expected effective
+  policy at the current desired generation.
+- `reorg.node` defaults to `node3`. `adds_new_txs` and `double_spend_pct` expose the
+  same optional organic/double-spend knobs as `simchainctl reorg start`.
+- `faucet.outputs` accepts either `address` or `address_env` plus an `amount`. Amounts
+  may be decimal BTC (`1`, `0.25`, `1btc`) or integer satoshis with a `sat` suffix.
+  `simchainctl scenario` and the standalone scenario submitter resolve `address_env`
+  from the client process before upload; raw API submissions resolve it in the control
+  plane process. `wait_confirmed: true` waits until the transfer confirms before
+  continuing.
 - Partition branch lengths differ so the winner is deterministic.
+- `degrade.node` is `node1`, `node2`, or `node3`; `delay_ms` or `loss_pct` must be
+  positive. Use exactly one duration: `seconds` from 1 through 86400, or
+  `until_height` at least 204.
 - Checkpoint names are non-empty, URL-safe, at most 100 bytes, and unique in one file.
 - Checkpoints pause by default. A pausing checkpoint requires a positive `timeout_secs`;
   `pause: false` records a durable milestone and continues immediately.
@@ -115,12 +197,15 @@ release the checkpoint, or the checkpoint timeout will fail the job and trigger 
 
 ## Action and cleanup behavior
 
-Height waits, manual mining, and wallet bursts use Bitcoin RPC directly. Mining pause and
-resume use an expiring job-owned worker lease. Reorg steps use both mining and spam leases,
-the reusable reorg executor, and strict node1 witness convergence. Partition steps lease
-the namespace-local target network agent, block P2P ingress and egress, mine both branches,
-heal, and witness the deterministic winner before worker leases can resume. There is only
-one public backend: the control plane.
+Height waits, manual mining, wallet bursts, and faucet funding use Bitcoin RPC directly.
+Runtime config steps use the same validation, worker apply, verification, persistence,
+and rollback path as the dashboard and CLI. Mining pause and resume use an expiring
+job-owned worker lease. Reorg steps use both mining and spam leases, the reusable reorg
+executor, and strict node1 witness convergence. Partition steps lease the namespace-local
+target network agent, block P2P ingress and egress, mine both branches, heal, and witness
+the deterministic winner before worker leases can resume. Degrade steps lease a target
+network agent, apply bounded `netem`, then release it. There is only one public backend:
+the control plane.
 
 Execution stops at the first failed step. Cleanup releases only resources the scenario
 acquired, reports cleanup errors separately from the primary failure, and retains the
@@ -136,5 +221,6 @@ before another mutation may begin.
 - `partition-node3.yml` builds unequal branches across a temporary partition.
 - `ci-checkpoint.yml` holds a deterministic mempool state for external assertions.
 - `tutorial-one-block.yml` pauses background mining, manually mines one block, then resumes.
-- `fresh-chain-tour.yml` performs the scenario-owned part of the full tour: empty reorg,
-  organic partition reorg, another split, and height waits.
+- `fresh-chain-tour.yml` performs the full hot-control tour after an externally fresh
+  chain start: retune, faucet funding, config assertion, empty reorg, organic partition
+  reorg, another split, timed degradation, and final fee-floor change.

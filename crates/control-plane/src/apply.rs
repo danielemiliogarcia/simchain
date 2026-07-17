@@ -1,7 +1,9 @@
 //! Durable desired-state transaction: validate, apply to resident workers,
 //! verify, persist, and restore the previous runtime policy on failure.
 
+use crate::backend::{ChainBackend, MiningControlBackend, SpamControlBackend};
 use crate::control_state;
+use crate::control_state::{ControlState, ControlStateStore};
 use crate::service::{
     config_error_details, validate_input, ErrorCode, ErrorDetail, RollbackReport, ServiceError,
 };
@@ -10,6 +12,7 @@ pub use simchain_common::control_api::{ApplyReport, ConfigPatchRequest as ApplyR
 use simchain_common::internal_api::{MiningWorkerStatus, SpamWorkerStatus, WorkerPhase};
 use simchain_common::live_tuning::{self, LiveTuning, MiningTuning, ServiceScope, SpamTuning};
 use std::collections::BTreeMap;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 const STABILIZE_POLLS: u32 = 4;
@@ -21,23 +24,57 @@ struct RuntimeSnapshot {
     spam: SpamWorkerStatus,
 }
 
+pub struct ApplyContext<'a> {
+    pub apply_lock: &'a Mutex<()>,
+    pub control_store: &'a ControlStateStore,
+    pub control_state: &'a RwLock<ControlState>,
+    pub chain: &'a dyn ChainBackend,
+    pub mining: &'a dyn MiningControlBackend,
+    pub spam: &'a dyn SpamControlBackend,
+}
+
+impl<'a> ApplyContext<'a> {
+    pub fn from_app(app: &'a AppState) -> Self {
+        Self {
+            apply_lock: app.apply_lock.as_ref(),
+            control_store: &app.control_store,
+            control_state: app.control_state.as_ref(),
+            chain: app.chain.as_ref(),
+            mining: app.mining.as_ref(),
+            spam: app.spam.as_ref(),
+        }
+    }
+}
+
 pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, ServiceError> {
-    let Ok(_process_guard) = app.apply_lock.try_lock() else {
+    let context = ApplyContext::from_app(app);
+    apply_with_context(&context, request, |request| {
+        app.jobs
+            .ensure_idle()
+            .map_err(crate::service::job_manager_error)?;
+        if request.settings.contains_key("FALLBACK_FEE") && app.jobs.has_pending_faucet() {
+            return Err(ServiceError::new(
+                ErrorCode::FaucetDeliveryPending,
+                "FALLBACK_FEE cannot change while a faucet transfer is armed",
+            ));
+        }
+        Ok(())
+    })
+}
+
+pub fn apply_with_context(
+    context: &ApplyContext<'_>,
+    request: ApplyRequest,
+    preflight: impl FnOnce(&ApplyRequest) -> Result<(), ServiceError>,
+) -> Result<ApplyReport, ServiceError> {
+    let Ok(_process_guard) = context.apply_lock.try_lock() else {
         return Err(ServiceError::new(
             ErrorCode::ApplyInProgress,
             "another apply is already in progress",
         ));
     };
-    app.jobs
-        .ensure_idle()
-        .map_err(crate::service::job_manager_error)?;
-    if request.settings.contains_key("FALLBACK_FEE") && app.jobs.has_pending_faucet() {
-        return Err(ServiceError::new(
-            ErrorCode::FaucetDeliveryPending,
-            "FALLBACK_FEE cannot change while a faucet transfer is armed",
-        ));
-    }
-    let _file_guard = app
+    preflight(&request)?;
+    let _file_guard = context
         .control_store
         .try_apply_lock()
         .map_err(|error| {
@@ -53,13 +90,13 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
             )
         })?;
 
-    let state_before = app.control_store.load_current().map_err(|error| {
+    let state_before = context.control_store.load_current().map_err(|error| {
         ServiceError::new(
             ErrorCode::Internal,
             format!("cannot reload durable desired state: {error}"),
         )
     })?;
-    *app.control_state.write().expect("control state lock") = state_before.clone();
+    *context.control_state.write().expect("control state lock") = state_before.clone();
     if let Some(base_generation) = request.base_generation {
         if base_generation != state_before.generation {
             return Err(ServiceError::new(
@@ -79,7 +116,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     let (tuning, mut warnings) = parse_merged_tuning(&source)?;
 
     if proposed.contains_key("FALLBACK_FEE") {
-        validate_dynamic_fee(app, tuning.spam.fallback_fee)?;
+        validate_dynamic_fee(context, tuning.spam.fallback_fee)?;
     }
 
     let desired = tuning
@@ -88,7 +125,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
         .map(|(key, value)| (key.to_string(), value))
         .collect::<BTreeMap<_, _>>();
     let next_state = control_state::successful_apply(&state_before, desired);
-    let runtime_before = runtime_snapshot(app)?;
+    let runtime_before = runtime_snapshot(context)?;
     let scopes = scopes_needing_apply(&runtime_before, &tuning, next_state.generation);
 
     if state_before.desired == next_state.desired && scopes.is_empty() {
@@ -101,16 +138,16 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
         });
     }
 
-    let node1_reachable_before = app.chain.node1_height().is_ok();
+    let node1_reachable_before = context.chain.node1_height().is_ok();
     let mut logs = Vec::new();
     let mut attempted = Vec::new();
     for scope in &scopes {
         attempted.push(*scope);
         let result = match scope {
-            ServiceScope::MiningController => app
+            ServiceScope::MiningController => context
                 .mining
                 .set_policy(next_state.generation, tuning.mining.clone()),
-            ServiceScope::Spammer => app
+            ServiceScope::Spammer => context
                 .spam
                 .set_policy(next_state.generation, tuning.spam.clone()),
         };
@@ -122,7 +159,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
                 ack.phase.as_str()
             )),
             Err(error) => {
-                let rollback = rollback_runtime(app, &attempted, &runtime_before, &mut logs);
+                let rollback = rollback_runtime(context, &attempted, &runtime_before, &mut logs);
                 let code = if rollback.runtime_restored {
                     ErrorCode::ComponentUnavailable
                 } else {
@@ -139,13 +176,13 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
     }
 
     if let Err(reason) = verify_runtime(
-        app,
+        context,
         &tuning,
         next_state.generation,
         &scopes,
         node1_reachable_before,
     ) {
-        let rollback = rollback_runtime(app, &attempted, &runtime_before, &mut logs);
+        let rollback = rollback_runtime(context, &attempted, &runtime_before, &mut logs);
         let code = if rollback.runtime_restored {
             ErrorCode::ComponentUnavailable
         } else {
@@ -160,8 +197,8 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
         logs.push("worker policy verification passed".to_string());
     }
 
-    if let Err(error) = app.control_store.save(&next_state) {
-        let rollback = rollback_runtime(app, &attempted, &runtime_before, &mut logs);
+    if let Err(error) = context.control_store.save(&next_state) {
+        let rollback = rollback_runtime(context, &attempted, &runtime_before, &mut logs);
         let code = if rollback.runtime_restored {
             ErrorCode::Internal
         } else {
@@ -174,7 +211,7 @@ pub fn apply(app: &AppState, request: ApplyRequest) -> Result<ApplyReport, Servi
         service_error.rollback = Some(rollback);
         return Err(service_error);
     }
-    *app.control_state.write().expect("control state lock") = next_state.clone();
+    *context.control_state.write().expect("control state lock") = next_state.clone();
     logs.push(format!(
         "persisted desired configuration generation {}",
         next_state.generation
@@ -223,8 +260,8 @@ fn validate_patch(
     }
 }
 
-fn validate_dynamic_fee(app: &AppState, fallback_fee: f64) -> Result<(), ServiceError> {
-    let required = app.chain.spam_min_fee().map_err(|error| {
+fn validate_dynamic_fee(context: &ApplyContext<'_>, fallback_fee: f64) -> Result<(), ServiceError> {
+    let required = context.chain.spam_min_fee().map_err(|error| {
         ServiceError::new(
             ErrorCode::RpcUnavailable,
             format!("cannot validate FALLBACK_FEE against the running nodes: {error}"),
@@ -244,14 +281,14 @@ fn validate_dynamic_fee(app: &AppState, fallback_fee: f64) -> Result<(), Service
     Ok(())
 }
 
-fn runtime_snapshot(app: &AppState) -> Result<RuntimeSnapshot, ServiceError> {
-    let mining = app.mining.status().map_err(|error| {
+fn runtime_snapshot(context: &ApplyContext<'_>) -> Result<RuntimeSnapshot, ServiceError> {
+    let mining = context.mining.status().map_err(|error| {
         ServiceError::new(
             ErrorCode::ComponentUnavailable,
             format!("mining worker is unavailable: {error}"),
         )
     })?;
-    let spam = app.spam.status().map_err(|error| {
+    let spam = context.spam.status().map_err(|error| {
         ServiceError::new(
             ErrorCode::ComponentUnavailable,
             format!("spam worker is unavailable: {error}"),
@@ -277,7 +314,7 @@ fn scopes_needing_apply(
 }
 
 fn verify_runtime(
-    app: &AppState,
+    context: &ApplyContext<'_>,
     desired: &LiveTuning,
     generation: u64,
     scopes: &[ServiceScope],
@@ -286,17 +323,17 @@ fn verify_runtime(
     for poll in 0..STABILIZE_POLLS {
         // Start after one full interval so four polls cover an approximately
         // eight-second post-acknowledgement stabilization window.
-        app.chain.wait(POLL_INTERVAL);
+        context.chain.wait(POLL_INTERVAL);
         let last = poll + 1 == STABILIZE_POLLS;
         let mut errors = Vec::new();
         for scope in scopes {
             let result = match scope {
-                ServiceScope::MiningController => app
+                ServiceScope::MiningController => context
                     .mining
                     .status()
                     .map_err(|error| error.to_string())
                     .and_then(|status| verify_mining(&status, desired, generation)),
-                ServiceScope::Spammer => app
+                ServiceScope::Spammer => context
                     .spam
                     .status()
                     .map_err(|error| error.to_string())
@@ -307,7 +344,7 @@ fn verify_runtime(
             }
         }
         if errors.is_empty() && last {
-            if node1_reachable_before && app.chain.node1_height().is_err() {
+            if node1_reachable_before && context.chain.node1_height().is_err() {
                 return Err("node1 RPC became unreachable after the apply".to_string());
             }
             return Ok(());
@@ -372,7 +409,7 @@ fn verify_spam(
 }
 
 fn rollback_runtime(
-    app: &AppState,
+    context: &ApplyContext<'_>,
     scopes: &[ServiceScope],
     before: &RuntimeSnapshot,
     logs: &mut Vec<String>,
@@ -380,11 +417,11 @@ fn rollback_runtime(
     let mut messages = Vec::new();
     for scope in scopes {
         let result = match scope {
-            ServiceScope::MiningController => app.mining.restore_policy(
+            ServiceScope::MiningController => context.mining.restore_policy(
                 before.mining.effective_generation,
                 before.mining.policy.clone(),
             ),
-            ServiceScope::Spammer => app
+            ServiceScope::Spammer => context
                 .spam
                 .restore_policy(before.spam.effective_generation, before.spam.policy.clone()),
         };
@@ -400,7 +437,7 @@ fn rollback_runtime(
         }
     }
 
-    let verified = verify_rollback(app, scopes, before).map_or_else(
+    let verified = verify_rollback(context, scopes, before).map_or_else(
         |error| {
             messages.push(error);
             false
@@ -420,7 +457,7 @@ fn rollback_runtime(
 }
 
 fn verify_rollback(
-    app: &AppState,
+    context: &ApplyContext<'_>,
     scopes: &[ServiceScope],
     before: &RuntimeSnapshot,
 ) -> Result<(), String> {
@@ -429,14 +466,14 @@ fn verify_rollback(
         let mut errors = Vec::new();
         for scope in scopes {
             match scope {
-                ServiceScope::MiningController => match app.mining.status() {
+                ServiceScope::MiningController => match context.mining.status() {
                     Ok(status)
                         if status.effective_generation == before.mining.effective_generation
                             && status.policy == before.mining.policy => {}
                     Ok(_) => errors.push("mining rollback policy has not converged".to_string()),
                     Err(error) => errors.push(format!("mining rollback status failed: {error}")),
                 },
-                ServiceScope::Spammer => match app.spam.status() {
+                ServiceScope::Spammer => match context.spam.status() {
                     Ok(status)
                         if status.effective_generation == before.spam.effective_generation
                             && status.policy == before.spam.policy => {}
@@ -451,7 +488,7 @@ fn verify_rollback(
         if !errors.is_empty() && last {
             return Err(errors.join("; "));
         }
-        app.chain.wait(POLL_INTERVAL);
+        context.chain.wait(POLL_INTERVAL);
     }
     unreachable!("the stabilization loop always returns")
 }

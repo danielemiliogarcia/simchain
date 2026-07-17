@@ -149,7 +149,7 @@ pub struct AppState {
     pub spam: Arc<dyn SpamControlBackend>,
     pub network: Arc<dyn NetworkControlBackend>,
     pub jobs: Arc<JobManager>,
-    pub control_state: RwLock<ControlState>,
+    pub control_state: Arc<RwLock<ControlState>>,
     pub control_store: ControlStateStore,
     pub status: RwLock<StatusSnapshot>,
     /// Held for the process lifetime: job coordination is deliberately
@@ -157,7 +157,7 @@ pub struct AppState {
     pub _instance_guard: File,
     /// Serializes applies within this process; the on-disk flock serializes
     /// across processes.
-    pub apply_lock: Mutex<()>,
+    pub apply_lock: Arc<Mutex<()>>,
 }
 
 pub type SharedState = Arc<AppState>;

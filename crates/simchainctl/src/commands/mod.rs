@@ -416,6 +416,10 @@ pub struct ScenarioArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ScenarioCommand {
+    /// Parse and validate a scenario file without uploading it.
+    Validate(ScenarioValidateArgs),
+    /// Show the ordered steps in a scenario file without uploading it.
+    Explain(ScenarioExplainArgs),
     /// Upload a scenario and return immediately with its job ID.
     Start(ScenarioStartArgs),
     /// Upload a scenario and wait for its terminal result.
@@ -424,6 +428,24 @@ pub enum ScenarioCommand {
     Wait(ScenarioWaitArgs),
     /// Release a reached pausing checkpoint using its current generation.
     Release(ScenarioReleaseArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ScenarioValidateArgs {
+    /// Scenario YAML file.
+    pub file: PathBuf,
+    /// Emit a stable JSON validation summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ScenarioExplainArgs {
+    /// Scenario YAML file.
+    pub file: PathBuf,
+    /// Emit a stable JSON step summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -627,6 +649,31 @@ mod tests {
             jobs.command,
             Command::Jobs(JobsArgs {
                 command: JobsCommand::Watch(JobWatchArgs { json: true, .. })
+            })
+        ));
+
+        let scenario =
+            Cli::try_parse_from(["simchainctl", "scenario", "validate", "scenarios/ci.yml"])
+                .expect("scenario validate");
+        assert!(matches!(
+            scenario.command,
+            Command::Scenario(ScenarioArgs {
+                command: ScenarioCommand::Validate(ScenarioValidateArgs { json: false, .. })
+            })
+        ));
+
+        let scenario = Cli::try_parse_from([
+            "simchainctl",
+            "scenario",
+            "explain",
+            "scenarios/ci.yml",
+            "--json",
+        ])
+        .expect("scenario explain");
+        assert!(matches!(
+            scenario.command,
+            Command::Scenario(ScenarioArgs {
+                command: ScenarioCommand::Explain(ScenarioExplainArgs { json: true, .. })
             })
         ));
 

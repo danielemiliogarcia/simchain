@@ -15,7 +15,9 @@ use simchain_common::control_api::{
     SpamBurstJobRequest,
 };
 use simchain_common::internal_api::DesiredState;
+use simchain_scenario_engine::{Scenario, Step};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::process::ExitCode;
 
 pub const EXIT_SUCCESS: u8 = 0;
@@ -245,6 +247,14 @@ fn run(cli: Cli) -> Result<(), ClientError> {
             }
         }
         Command::Scenario(args) => match args.command {
+            ScenarioCommand::Validate(args) => {
+                let scenario = load_scenario(&args.file)?;
+                print_scenario_validation(&scenario, args.json)?;
+            }
+            ScenarioCommand::Explain(args) => {
+                let scenario = load_scenario(&args.file)?;
+                print_scenario_explain(&scenario, args.json)?;
+            }
             ScenarioCommand::Start(args) => {
                 let yaml = read_scenario(&args.file)?;
                 let response = client.start_scenario(yaml, args.idempotency_key.as_deref())?;
@@ -421,13 +431,192 @@ fn ensure_faucet_delivery_succeeded(
     }
 }
 
-fn read_scenario(path: &std::path::Path) -> Result<String, ClientError> {
+fn read_scenario_file(path: &std::path::Path) -> Result<String, ClientError> {
     std::fs::read_to_string(path).map_err(|error| {
         ClientError::Local(format!(
             "cannot read scenario file {}: {error}",
             path.display()
         ))
     })
+}
+
+fn load_scenario(path: &std::path::Path) -> Result<Scenario, ClientError> {
+    let contents = read_scenario_file(path)?;
+    Scenario::parse(&contents).map_err(|error| {
+        ClientError::Local(format!(
+            "invalid scenario file {}: {error:#}",
+            path.display()
+        ))
+    })
+}
+
+fn read_scenario(path: &std::path::Path) -> Result<String, ClientError> {
+    let contents = read_scenario_file(path)?;
+    Scenario::resolve_env_addresses_yaml(&contents).map_err(|error| {
+        ClientError::Local(format!(
+            "invalid scenario file {}: {error:#}",
+            path.display()
+        ))
+    })
+}
+
+fn print_scenario_validation(scenario: &Scenario, json: bool) -> Result<(), ClientError> {
+    if json {
+        let summary = serde_json::json!({
+            "valid": true,
+            "version": scenario.version,
+            "steps": scenario.steps.len()
+        });
+        let mut out = std::io::stdout().lock();
+        serde_json::to_writer_pretty(&mut out, &summary)
+            .map_err(|error| ClientError::Output(error.to_string()))?;
+        writeln!(out)?;
+        return Ok(());
+    }
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "valid scenario: version {}, {} steps",
+        scenario.version,
+        scenario.steps.len()
+    )?;
+    Ok(())
+}
+
+fn print_scenario_explain(scenario: &Scenario, json: bool) -> Result<(), ClientError> {
+    if json {
+        let steps = scenario
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                serde_json::json!({
+                    "index": index + 1,
+                    "kind": step.kind(),
+                    "description": describe_step(step),
+                    "step": step
+                })
+            })
+            .collect::<Vec<_>>();
+        let summary = serde_json::json!({
+            "version": scenario.version,
+            "step_count": scenario.steps.len(),
+            "steps": steps
+        });
+        let mut out = std::io::stdout().lock();
+        serde_json::to_writer_pretty(&mut out, &summary)
+            .map_err(|error| ClientError::Output(error.to_string()))?;
+        writeln!(out)?;
+        return Ok(());
+    }
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "scenario: version {}, {} steps",
+        scenario.version,
+        scenario.steps.len()
+    )?;
+    for (index, step) in scenario.steps.iter().enumerate() {
+        writeln!(out, "{}. {}", index + 1, describe_step(step))?;
+    }
+    Ok(())
+}
+
+fn describe_step(step: &Step) -> String {
+    match step {
+        Step::WaitHeight { height } => format!("wait_height until height {height}"),
+        Step::WaitUntil {
+            condition,
+            timeout_secs,
+        } => format!("wait_until {} for up to {timeout_secs}s", condition.kind()),
+        Step::AssertHeight {
+            equals,
+            at_least,
+            at_most,
+        } => {
+            let mut parts = Vec::new();
+            if let Some(height) = equals {
+                parts.push(format!("equals {height}"));
+            }
+            if let Some(height) = at_least {
+                parts.push(format!("at least {height}"));
+            }
+            if let Some(height) = at_most {
+                parts.push(format!("at most {height}"));
+            }
+            format!("assert_height {}", parts.join(", "))
+        }
+        Step::AssertComponent { expected } => {
+            format!("assert_component {}", expected.component)
+        }
+        Step::Sleep { secs } => format!("sleep {secs}s"),
+        Step::PauseMining => "pause_mining".to_string(),
+        Step::ResumeMining => "resume_mining".to_string(),
+        Step::Mine { node, blocks } => format!("mine {blocks} block(s) on {node}"),
+        Step::Reorg {
+            depth,
+            empty,
+            node,
+            adds_new_txs,
+            double_spend_pct,
+        } => format!(
+            "reorg depth {depth} on {} empty={empty} adds_new_txs={adds_new_txs} double_spend_pct={double_spend_pct}",
+            node.short_name()
+        ),
+        Step::SpamBurst {
+            node,
+            txs,
+            outputs_per_tx,
+        } => format!(
+            "spam_burst {txs} tx(s) on {node} with {outputs_per_tx} output(s) per tx"
+        ),
+        Step::SetConfig { settings } => format!("set_config {} setting(s)", settings.len()),
+        Step::AssertConfig {
+            settings,
+            effective,
+        } => format!(
+            "assert_config {} setting(s), effective={effective}",
+            settings.len()
+        ),
+        Step::Faucet {
+            outputs,
+            wait_confirmed,
+            timeout_secs,
+            ..
+        } => format!(
+            "faucet {} output(s), wait_confirmed={wait_confirmed}, timeout={timeout_secs}s",
+            outputs.len()
+        ),
+        Step::Partition {
+            node,
+            main_blocks,
+            isolated_blocks,
+        } => format!(
+            "partition {node}: main {main_blocks} block(s), isolated {isolated_blocks} block(s)"
+        ),
+        Step::Degrade {
+            node,
+            delay_ms,
+            loss_pct,
+            seconds,
+            until_height,
+        } => {
+            let duration = seconds
+                .map(|seconds| format!("{seconds}s"))
+                .or_else(|| until_height.map(|height| format!("until height {height}")))
+                .unwrap_or_else(|| "without duration".to_string());
+            format!("degrade {node}: delay={delay_ms}ms loss={loss_pct}% {duration}")
+        }
+        Step::Checkpoint { checkpoint } => format!(
+            "checkpoint {} pause={} timeout={}",
+            checkpoint.name,
+            checkpoint.pause,
+            checkpoint
+                .timeout_secs
+                .map(|timeout| format!("{timeout}s"))
+                .unwrap_or_else(|| "none".to_string())
+        ),
+    }
 }
 
 fn scenario_node(node: &str) -> Result<&'static str, ClientError> {

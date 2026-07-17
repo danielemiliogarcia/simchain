@@ -837,12 +837,18 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
     let control_state = store
         .load_or_initialize(ControlState::default().desired)
         .expect("control state");
+    let control_state = Arc::new(RwLock::new(control_state));
+    let apply_lock = Arc::new(Mutex::new(()));
     let jobs = JobManager::open(
         &state_dir,
         JobDependencies {
             mining: backend.clone(),
             spam: backend.clone(),
             network: backend.clone(),
+            chain: backend.clone(),
+            control_store: store.clone(),
+            control_state: control_state.clone(),
+            apply_lock: apply_lock.clone(),
             reorg: Arc::new(MockReorgExecutor),
             scenario: backend.clone(),
             network_actions: backend.clone(),
@@ -883,10 +889,10 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
         spam: backend.clone(),
         network: backend,
         jobs,
-        control_state: RwLock::new(control_state),
+        control_state,
         control_store: store,
         status: RwLock::new(StatusSnapshot::default()),
         _instance_guard: instance_guard,
-        apply_lock: Mutex::new(()),
+        apply_lock,
     }
 }

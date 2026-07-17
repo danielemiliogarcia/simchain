@@ -24,6 +24,8 @@ fn main() -> anyhow::Result<()> {
             config.scenario_file.display()
         )
     })?;
+    let yaml = simchain_scenario_engine::Scenario::resolve_env_addresses_yaml(&yaml)
+        .with_context(|| format!("invalid scenario file {}", config.scenario_file.display()))?;
     let created: JobCreatedResponse = post_json(
         &config,
         &format!("{API_PREFIX}/jobs/scenario"),
