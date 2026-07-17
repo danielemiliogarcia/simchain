@@ -570,6 +570,12 @@ services:
       CORE_RPC_PORT: "18443"
       CORE_RPC_USERNAME: ${BTC_RPC_USER:-foo}
       CORE_RPC_PASSWORD: ${BTC_RPC_PASS:-rpcpassword}
+      NODE2_RPC_HOST: "btc-simnet-node2"
+      NODE2_RPC_PORT: "18443"
+      NODE2_WALLET_NAME: ${NODE2_WALLET_NAME:-node2}
+      NODE3_RPC_HOST: "btc-simnet-node3"
+      NODE3_RPC_PORT: "18443"
+      NODE3_WALLET_NAME: ${NODE3_WALLET_NAME:-node3}
       DATABASE_ENABLED: "true"
       DATABASE_HOST: "mempool-db"
       DATABASE_DATABASE: "mempool"
@@ -577,6 +583,8 @@ services:
       DATABASE_PASSWORD: ${MEMPOOL_DB_PASS:-mempool}
       STATISTICS_ENABLED: "true"
     depends_on:
+      btc-simnet-mining-controller:
+        condition: service_started
       mempool-db:
         condition: service_healthy
       electrs:
@@ -584,7 +592,15 @@ services:
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 5s
-    command: "./wait-for-it.sh mempool-db:3306 --timeout=720 --strict -- ./start.sh"
+    volumes:
+      - ./docker/mempool-pool-seeder.js:/patch/mempool-pool-seeder.js:ro
+    command: >
+      ./wait-for-it.sh mempool-db:3306 --timeout=720 --strict --
+      bash -lc 'cd /backend;
+      ./start.sh & server_pid=$$!;
+      cd /backend/package;
+      node /patch/mempool-pool-seeder.js &
+      wait "$$server_pid"'
     networks:
       - btc-simnet-control
 
