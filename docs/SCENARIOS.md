@@ -79,6 +79,12 @@ steps:
       component: spam
       status: active
 
+  - type: wait_tx
+    txid_env: TARGET_TXID
+    state: confirmed
+    confirmations: 2
+    timeout_secs: 600
+
   - type: assert_height
     at_least: 205
 
@@ -130,8 +136,17 @@ steps:
 Validation rules:
 
 - `wait_height.height` is at least 204.
-- `wait_until.timeout_secs` is positive. Supported conditions are `height_at_least`,
-  `mempool_txs_at_least`, `mempool_txs_at_most`, and `component`.
+- `wait_until.timeout_secs` is positive and defaults to 900. Supported conditions are
+  `height_at_least` with `height`, `mempool_txs_at_least` with `count`,
+  `mempool_txs_at_most` with `count`, and `component`.
+- `wait_tx` waits for a user-supplied transaction without indexing or tagging all
+  transactions. Use exactly one of `txid` or `txid_env`. Supported states are `seen`,
+  `mempool`, `confirmed`, and `missing`; `state` defaults to `confirmed`.
+  `confirmations` is only valid with `state: confirmed` and defaults to `1`;
+  `timeout_secs` defaults to 900. Quote literal txids in YAML because all-digit hex
+  strings can otherwise be parsed as numbers. This is useful for tests such as waiting
+  until `TARGET_TXID` has two confirmations, then running an empty reorg deep enough to
+  orphan it, then waiting for `state: mempool`.
 - `assert_height` requires at least one of `equals`, `at_least`, or `at_most`;
   `equals` cannot be combined with the range fields.
 - `assert_component` and `wait_until.kind: component` support `mining`, `spam`,
@@ -152,16 +167,17 @@ Validation rules:
   policy at the current desired generation.
 - `reorg.node` defaults to `node3`. `adds_new_txs` and `double_spend_pct` expose the
   same optional organic/double-spend knobs as `simchainctl reorg start`.
-- `faucet.outputs` accepts either `address` or `address_env` plus an `amount`. Amounts
-  may be decimal BTC (`1`, `0.25`, `1btc`) or integer satoshis with a `sat` suffix.
-  `simchainctl scenario` and the standalone scenario submitter resolve `address_env`
-  from the client process before upload; raw API submissions resolve it in the control
-  plane process. `wait_confirmed: true` waits until the transfer confirms before
-  continuing.
+- `faucet.source` defaults to `auto` and also accepts `node2` or `node3`.
+  `faucet.outputs` accepts 1 through 100 entries, each with either `address` or
+  `address_env` plus an `amount`. Amounts may be decimal BTC (`1`, `0.25`, `1btc`) or
+  integer satoshis with a `sat` suffix. `simchainctl scenario` and the standalone
+  scenario submitter resolve `address_env` from the client process before upload; raw
+  API submissions resolve it in the control plane process. `wait_confirmed: true`
+  waits until the transfer confirms before continuing.
 - Partition branch lengths differ so the winner is deterministic.
 - `degrade.node` is `node1`, `node2`, or `node3`; `delay_ms` or `loss_pct` must be
-  positive. Use exactly one duration: `seconds` from 1 through 86400, or
-  `until_height` at least 204.
+  positive. `delay_ms` is capped at 600000 and `loss_pct` must be 0 through 100. Use
+  exactly one duration: `seconds` from 1 through 86400, or `until_height` at least 204.
 - Checkpoint names are non-empty, URL-safe, at most 100 bytes, and unique in one file.
 - Checkpoints pause by default. A pausing checkpoint requires a positive `timeout_secs`;
   `pause: false` records a durable milestone and continues immediately.
@@ -172,6 +188,13 @@ On checkpoint arrival, the server durably records a unique generation and a full
 chain/mining/spam summary before exposing the reached state. A pausing checkpoint then
 waits for a matching release, cooperative abort, or its declared timeout. Release is
 idempotent for the same generation; stale generations return a conflict.
+
+Use checkpoints when an external test harness or human should decide when the scenario
+continues. For example, a scenario can pause at `ready_for_reorg`, let mining and spam
+continue, and then run a prewritten reorg only after the caller releases the checkpoint.
+Use `wait_tx` when the scenario itself should make that decision from a txid and a target
+state or confirmation count. In both flows, the application under test only needs to
+broadcast normal regtest transactions; Simchain-specific control stays outside that code.
 
 The shipped [ci-checkpoint.yml](../scenarios/ci-checkpoint.yml) supports the intended CI
 barrier flow:

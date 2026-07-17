@@ -1,6 +1,6 @@
 use crate::{
     CheckpointStep, ComponentExpectation, FaucetScenarioOutput, MinerNode, NetworkNode, Scenario,
-    ScenarioResult, ScenarioStepResult, Step, WaitCondition,
+    ScenarioResult, ScenarioStepResult, Step, WaitCondition, WaitTxStep,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -40,6 +40,7 @@ pub trait ScenarioActions: Send + Sync {
         timeout_secs: u64,
         control: &dyn ScenarioControl,
     ) -> anyhow::Result<Value>;
+    fn wait_tx(&self, wait: &WaitTxStep, control: &dyn ScenarioControl) -> anyhow::Result<Value>;
     fn spam_burst(
         &self,
         node: MinerNode,
@@ -255,6 +256,7 @@ fn execute_step(
             condition,
             timeout_secs,
         } => actions.wait_until(condition, *timeout_secs, control),
+        Step::WaitTx { wait } => actions.wait_tx(wait, control),
         Step::AssertHeight {
             equals,
             at_least,
@@ -424,6 +426,14 @@ mod tests {
             _: &dyn ScenarioControl,
         ) -> anyhow::Result<Value> {
             Ok(json!({"condition": condition.kind(), "timeout_secs": timeout_secs}))
+        }
+        fn wait_tx(&self, wait: &WaitTxStep, _: &dyn ScenarioControl) -> anyhow::Result<Value> {
+            Ok(json!({
+                "txid": wait.txid.as_deref().unwrap_or(""),
+                "state": wait.state.as_str(),
+                "confirmations": wait.expected_confirmations(),
+                "timeout_secs": wait.timeout_secs
+            }))
         }
         fn spam_burst(
             &self,

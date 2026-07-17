@@ -365,6 +365,27 @@ impl ScenarioActionBackend for MockBackend {
         }))
     }
 
+    fn wait_tx(
+        &self,
+        txid: &str,
+        state: simchain_scenario_engine::TxWaitState,
+        confirmations: u64,
+        timeout_secs: u64,
+        control: &dyn simchain_scenario_engine::ScenarioControl,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "txid": txid,
+            "target_state": state.as_str(),
+            "target_confirmations": confirmations,
+            "timeout_secs": timeout_secs,
+            "aborted": control.abort_requested(),
+            "observation": {
+                "state": state.as_str(),
+                "confirmations": confirmations
+            }
+        }))
+    }
+
     fn live_summary(&self) -> anyhow::Result<serde_json::Value> {
         Ok(serde_json::json!({
             "height": 204,

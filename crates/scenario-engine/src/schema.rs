@@ -25,6 +25,10 @@ pub enum Step {
         #[serde(default = "default_wait_until_timeout_secs")]
         timeout_secs: u64,
     },
+    WaitTx {
+        #[serde(flatten)]
+        wait: WaitTxStep,
+    },
     AssertHeight {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         equals: Option<u64>,
@@ -141,6 +145,7 @@ impl Step {
         match self {
             Self::WaitHeight { .. } => "wait_height",
             Self::WaitUntil { .. } => "wait_until",
+            Self::WaitTx { .. } => "wait_tx",
             Self::AssertHeight { .. } => "assert_height",
             Self::AssertComponent { .. } => "assert_component",
             Self::Sleep { .. } => "sleep",
@@ -155,6 +160,58 @@ impl Step {
             Self::Partition { .. } => "partition",
             Self::Degrade { .. } => "degrade",
             Self::Checkpoint { .. } => "checkpoint",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxWaitState {
+    Seen,
+    Mempool,
+    Confirmed,
+    Missing,
+}
+
+impl TxWaitState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Seen => "seen",
+            Self::Mempool => "mempool",
+            Self::Confirmed => "confirmed",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+fn default_tx_wait_state() -> TxWaitState {
+    TxWaitState::Confirmed
+}
+
+fn default_wait_tx_timeout_secs() -> u64 {
+    900
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitTxStep {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txid_env: Option<String>,
+    #[serde(default = "default_tx_wait_state")]
+    pub state: TxWaitState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmations: Option<u64>,
+    #[serde(default = "default_wait_tx_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl WaitTxStep {
+    pub fn expected_confirmations(&self) -> u64 {
+        match self.state {
+            TxWaitState::Confirmed => self.confirmations.unwrap_or(1),
+            TxWaitState::Seen | TxWaitState::Mempool | TxWaitState::Missing => 0,
         }
     }
 }
@@ -371,6 +428,7 @@ impl Scenario {
                     Some("timeout_secs must be positive".to_string())
                 }
                 Step::WaitUntil { condition, .. } => validate_wait_condition(condition),
+                Step::WaitTx { wait } => validate_wait_tx(wait),
                 Step::AssertHeight {
                     equals,
                     at_least,
@@ -511,10 +569,89 @@ impl Scenario {
         self.validate()
     }
 
+    pub fn resolve_env_values(&mut self) -> Result<()> {
+        for step in &mut self.steps {
+            match step {
+                Step::Faucet { outputs, .. } => {
+                    for output in outputs {
+                        let Some(env) = output.address_env.take() else {
+                            continue;
+                        };
+                        let address = std::env::var(&env)
+                            .with_context(|| format!("environment variable {env} is not set"))?;
+                        let address = address.trim().to_string();
+                        if address.is_empty() {
+                            bail!("environment variable {env} is empty");
+                        }
+                        output.address = Some(address);
+                    }
+                }
+                Step::WaitTx { wait } => {
+                    let Some(env) = wait.txid_env.take() else {
+                        continue;
+                    };
+                    let txid = std::env::var(&env)
+                        .with_context(|| format!("environment variable {env} is not set"))?;
+                    let txid = txid.trim().to_string();
+                    if txid.is_empty() {
+                        bail!("environment variable {env} is empty");
+                    }
+                    wait.txid = Some(txid);
+                }
+                _ => {}
+            }
+        }
+        self.validate()
+    }
+
+    pub fn resolve_env_values_yaml(contents: &str) -> Result<String> {
+        let mut scenario = Self::parse(contents)?;
+        scenario.resolve_env_values()?;
+        serde_yaml::to_string(&scenario).context("failed to serialize resolved scenario")
+    }
+
     pub fn resolve_env_addresses_yaml(contents: &str) -> Result<String> {
         let mut scenario = Self::parse(contents)?;
-        scenario.resolve_env_addresses()?;
+        scenario.resolve_env_values()?;
         serde_yaml::to_string(&scenario).context("failed to serialize resolved scenario")
+    }
+}
+
+fn validate_wait_tx(wait: &WaitTxStep) -> Option<String> {
+    let has_txid = wait
+        .txid
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_env = wait
+        .txid_env
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if has_txid == has_env {
+        return Some("exactly one of txid or txid_env is required".to_string());
+    }
+    if let Some(txid) = wait.txid.as_deref() {
+        let txid = txid.trim();
+        if txid.len() != 64 || !txid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Some("txid must be 64 hexadecimal characters".to_string());
+        }
+    }
+    if let Some(env) = wait.txid_env.as_deref() {
+        if !env
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_'))
+        {
+            return Some("txid_env must be a simple environment variable name".to_string());
+        }
+    }
+    if wait.timeout_secs == 0 {
+        return Some("timeout_secs must be positive".to_string());
+    }
+    match (wait.state, wait.confirmations) {
+        (TxWaitState::Confirmed, Some(0)) => Some("confirmations must be positive".to_string()),
+        (TxWaitState::Seen | TxWaitState::Mempool | TxWaitState::Missing, Some(_)) => {
+            Some("confirmations can only be used with state: confirmed".to_string())
+        }
+        _ => None,
     }
 }
 
@@ -640,6 +777,10 @@ steps:
       kind: component
       component: spam
       status: active
+  - type: wait_tx
+    txid: "1111111111111111111111111111111111111111111111111111111111111111"
+    confirmations: 2
+    timeout_secs: 120
   - type: assert_height
     at_least: 260
   - type: assert_component
@@ -665,6 +806,7 @@ steps:
             [
                 "wait_height",
                 "wait_until",
+                "wait_tx",
                 "assert_height",
                 "assert_component",
                 "pause_mining",
@@ -672,6 +814,51 @@ steps:
                 "reorg"
             ]
         );
+    }
+
+    #[test]
+    fn parses_wait_tx_and_resolves_txid_env() {
+        let scenario = parse(
+            r#"
+version: 1
+steps:
+  - type: wait_tx
+    txid_env: SIMCHAIN_TEST_TXID
+    state: mempool
+    timeout_secs: 60
+"#,
+        )
+        .expect("valid wait_tx");
+        let Step::WaitTx { wait } = &scenario.steps[0] else {
+            panic!("wait_tx step");
+        };
+        assert_eq!(wait.state, TxWaitState::Mempool);
+        assert_eq!(wait.expected_confirmations(), 0);
+
+        std::env::set_var(
+            "SIMCHAIN_TEST_TXID",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        );
+        let resolved = Scenario::resolve_env_values_yaml(
+            r#"
+version: 1
+steps:
+  - type: wait_tx
+    txid_env: SIMCHAIN_TEST_TXID
+"#,
+        )
+        .expect("resolved wait_tx");
+        let resolved_scenario = Scenario::parse(&resolved).expect("resolved scenario parses");
+        let Step::WaitTx { wait } = &resolved_scenario.steps[0] else {
+            panic!("resolved wait_tx step");
+        };
+        assert_eq!(
+            wait.txid.as_deref(),
+            Some("2222222222222222222222222222222222222222222222222222222222222222")
+        );
+        assert!(wait.txid_env.is_none());
+        assert!(!resolved.contains("txid_env"));
+        std::env::remove_var("SIMCHAIN_TEST_TXID");
     }
 
     #[test]
@@ -766,6 +953,13 @@ steps:
             "version: 1\nsteps:\n  - type: degrade\n    node: node2\n    delay_ms: 1\n",
             "version: 1\nsteps:\n  - type: degrade\n    node: node2\n    delay_ms: 1\n    seconds: 1\n    until_height: 260\n",
             "version: 1\nsteps:\n  - type: wait_until\n    condition:\n      kind: component\n      component: spam\n",
+            "version: 1\nsteps:\n  - type: wait_tx\n    timeout_secs: 1\n",
+            "version: 1\nsteps:\n  - type: wait_tx\n    txid: abc\n",
+            "version: 1\nsteps:\n  - type: wait_tx\n    txid_env: TX/ID\n",
+            "version: 1\nsteps:\n  - type: wait_tx\n    txid: \"1111111111111111111111111111111111111111111111111111111111111111\"\n    txid_env: TARGET_TXID\n",
+            "version: 1\nsteps:\n  - type: wait_tx\n    txid: \"1111111111111111111111111111111111111111111111111111111111111111\"\n    timeout_secs: 0\n",
+            "version: 1\nsteps:\n  - type: wait_tx\n    txid: \"1111111111111111111111111111111111111111111111111111111111111111\"\n    confirmations: 0\n",
+            "version: 1\nsteps:\n  - type: wait_tx\n    txid: \"1111111111111111111111111111111111111111111111111111111111111111\"\n    state: mempool\n    confirmations: 1\n",
             "version: 1\nsteps:\n  - type: assert_height\n",
             "version: 1\nsteps:\n  - type: assert_height\n    equals: 210\n    at_least: 204\n",
             "version: 1\nsteps:\n  - type: assert_component\n    component: spam\n",

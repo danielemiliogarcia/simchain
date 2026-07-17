@@ -36,7 +36,7 @@ use simchain_reorg::{ReorgObserver, ReorgPhase, ReorgProgress};
 use simchain_scenario_engine::{
     CheckpointStep, ComponentExpectation, FaucetScenarioOutput, MinerNode, NetworkNode, Scenario,
     ScenarioActions, ScenarioComponent, ScenarioControl, ScenarioProgress, ScenarioProgressPhase,
-    Step, WaitCondition,
+    Step, WaitCondition, WaitTxStep,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
@@ -4273,6 +4273,20 @@ impl JobScenarioActions {
             .collect()
     }
 
+    fn resolve_wait_txid(&self, wait: &WaitTxStep) -> anyhow::Result<String> {
+        let txid = match (&wait.txid, &wait.txid_env) {
+            (Some(txid), None) => txid.trim().to_string(),
+            (None, Some(env)) => std::env::var(env)
+                .map(|value| value.trim().to_string())
+                .map_err(|_| {
+                    anyhow::anyhow!("environment variable {env} is not set for wait_tx txid")
+                })?,
+            _ => anyhow::bail!("exactly one of txid or txid_env is required"),
+        };
+        anyhow::ensure!(!txid.is_empty(), "wait_tx txid must not be empty");
+        Ok(txid)
+    }
+
     fn wait_faucet_confirmation(
         &self,
         txid: &str,
@@ -4804,6 +4818,17 @@ impl ScenarioActions for JobScenarioActions {
             }
             thread::sleep(Duration::from_millis(500));
         }
+    }
+
+    fn wait_tx(&self, wait: &WaitTxStep, control: &dyn ScenarioControl) -> anyhow::Result<Value> {
+        let txid = self.resolve_wait_txid(wait)?;
+        self.manager.scenario.wait_tx(
+            &txid,
+            wait.state,
+            wait.expected_confirmations(),
+            wait.timeout_secs,
+            control,
+        )
     }
 
     fn spam_burst(
@@ -6411,6 +6436,10 @@ version: 1
 steps:
   - type: wait_height
     height: 204
+  - type: wait_tx
+    txid: "1111111111111111111111111111111111111111111111111111111111111111"
+    state: confirmed
+    confirmations: 2
   - type: pause_mining
   - type: mine
     node: btc-simnet-node2

@@ -452,7 +452,7 @@ fn load_scenario(path: &std::path::Path) -> Result<Scenario, ClientError> {
 
 fn read_scenario(path: &std::path::Path) -> Result<String, ClientError> {
     let contents = read_scenario_file(path)?;
-    Scenario::resolve_env_addresses_yaml(&contents).map_err(|error| {
+    Scenario::resolve_env_values_yaml(&contents).map_err(|error| {
         ClientError::Local(format!(
             "invalid scenario file {}: {error:#}",
             path.display()
@@ -529,6 +529,24 @@ fn describe_step(step: &Step) -> String {
             condition,
             timeout_secs,
         } => format!("wait_until {} for up to {timeout_secs}s", condition.kind()),
+        Step::WaitTx { wait } => {
+            let target = wait
+                .txid
+                .as_deref()
+                .or(wait.txid_env.as_deref())
+                .unwrap_or("<missing>");
+            let confirmations = if wait.state == simchain_scenario_engine::TxWaitState::Confirmed {
+                format!(", confirmations={}", wait.expected_confirmations())
+            } else {
+                String::new()
+            };
+            format!(
+                "wait_tx {target} until {}{} for up to {}s",
+                wait.state.as_str(),
+                confirmations,
+                wait.timeout_secs
+            )
+        }
         Step::AssertHeight {
             equals,
             at_least,

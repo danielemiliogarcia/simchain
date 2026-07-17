@@ -12,5 +12,5 @@ pub use engine::{run, ScenarioActions, ScenarioControl, ScenarioProgress, Scenar
 pub use results::{ScenarioResult, ScenarioStepResult};
 pub use schema::{
     CheckpointStep, ComponentExpectation, FaucetScenarioOutput, MinerNode, NetworkNode, Scenario,
-    ScenarioComponent, Step, WaitCondition, BOOTSTRAP_HEIGHT,
+    ScenarioComponent, Step, TxWaitState, WaitCondition, WaitTxStep, BOOTSTRAP_HEIGHT,
 };

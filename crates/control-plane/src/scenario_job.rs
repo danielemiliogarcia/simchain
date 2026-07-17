@@ -5,14 +5,15 @@
 use crate::backend::{MiningControlBackend, SpamControlBackend};
 use crate::state::ControlPlaneConfig;
 use anyhow::{Context, Result};
-use bitcoincore_rpc::bitcoin::Amount;
+use bitcoincore_rpc::bitcoin::{Amount, Txid};
 use bitcoincore_rpc::RpcApi;
 use serde_json::{json, Value};
 use simchain_common::config::{
     parse_rpc_url, RpcUrl, DEFAULT_NODE2_WALLET_NAME, DEFAULT_NODE3_WALLET_NAME,
 };
 use simchain_common::{burn_address, create_client, create_wallet_client, require_regtest_address};
-use simchain_scenario_engine::{MinerNode, ScenarioControl};
+use simchain_scenario_engine::{MinerNode, ScenarioControl, TxWaitState};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,6 +29,14 @@ pub trait ScenarioActionBackend: Send + Sync {
         node: MinerNode,
         txs: u64,
         outputs_per_tx: u64,
+        control: &dyn ScenarioControl,
+    ) -> Result<Value>;
+    fn wait_tx(
+        &self,
+        txid: &str,
+        state: TxWaitState,
+        confirmations: u64,
+        timeout_secs: u64,
         control: &dyn ScenarioControl,
     ) -> Result<Value>;
     fn live_summary(&self) -> Result<Value>;
@@ -191,6 +200,51 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
         }))
     }
 
+    fn wait_tx(
+        &self,
+        txid: &str,
+        state: TxWaitState,
+        confirmations: u64,
+        timeout_secs: u64,
+        control: &dyn ScenarioControl,
+    ) -> Result<Value> {
+        let txid = Txid::from_str(txid).context("invalid txid")?;
+        let client = create_client(&self.node1_url)?;
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let started = Instant::now();
+        loop {
+            let observed = observe_tx(&client, &txid)?;
+            if tx_wait_satisfied(&observed, state, confirmations) || control.abort_requested() {
+                let mut result = json!({
+                    "txid": txid.to_string(),
+                    "target_state": state.as_str(),
+                    "timeout_secs": timeout_secs,
+                    "observation": observed,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "aborted": control.abort_requested()
+                });
+                if state == TxWaitState::Confirmed {
+                    result["target_confirmations"] = json!(confirmations);
+                }
+                return Ok(result);
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out after {timeout_secs}s waiting for tx {} to become {}{}; last observed: {}",
+                    txid,
+                    state.as_str(),
+                    if state == TxWaitState::Confirmed {
+                        format!(" with at least {confirmations} confirmation(s)")
+                    } else {
+                        String::new()
+                    },
+                    observed
+                );
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     fn live_summary(&self) -> Result<Value> {
         let node = create_client(&self.node1_url)?;
         let mempool = node.get_mempool_info()?;
@@ -208,10 +262,96 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
     }
 }
 
+fn observe_tx(client: &bitcoincore_rpc::Client, txid: &Txid) -> Result<Value> {
+    let info = match client.get_raw_transaction_info(txid, None) {
+        Ok(info) => info,
+        Err(bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::error::Error::Rpc(
+            error,
+        ))) if error.code == -5 => {
+            return Ok(json!({
+                "state": TxWaitState::Missing.as_str(),
+                "in_mempool": false,
+                "confirmations": 0
+            }));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let confirmations = info.confirmations.unwrap_or(0);
+    let Some(block_hash) = info.blockhash else {
+        return Ok(json!({
+            "state": TxWaitState::Mempool.as_str(),
+            "in_mempool": true,
+            "confirmations": confirmations
+        }));
+    };
+    if confirmations == 0 {
+        return Ok(json!({
+            "state": TxWaitState::Seen.as_str(),
+            "in_mempool": false,
+            "confirmations": 0,
+            "block_hash": block_hash.to_string()
+        }));
+    }
+    let header = client.get_block_header_info(&block_hash)?;
+    Ok(json!({
+        "state": TxWaitState::Confirmed.as_str(),
+        "in_mempool": false,
+        "confirmations": confirmations,
+        "block_hash": block_hash.to_string(),
+        "height": header.height
+    }))
+}
+
+fn tx_wait_satisfied(observed: &Value, state: TxWaitState, confirmations: u64) -> bool {
+    let observed_state = observed.get("state").and_then(Value::as_str);
+    match state {
+        TxWaitState::Seen => {
+            observed_state.is_some_and(|state| state != TxWaitState::Missing.as_str())
+        }
+        TxWaitState::Mempool => observed_state == Some(TxWaitState::Mempool.as_str()),
+        TxWaitState::Missing => observed_state == Some(TxWaitState::Missing.as_str()),
+        TxWaitState::Confirmed => {
+            observed_state == Some(TxWaitState::Confirmed.as_str())
+                && observed
+                    .get("confirmations")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|actual| actual >= confirmations)
+        }
+    }
+}
+
 fn non_empty_env(key: &str, default: &str) -> String {
     std::env::var(key)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tx_wait_state_matching_is_explicit() {
+        let missing = json!({"state": "missing", "confirmations": 0});
+        let mempool = json!({"state": "mempool", "confirmations": 0});
+        let confirmed_one = json!({"state": "confirmed", "confirmations": 1});
+        let confirmed_two = json!({"state": "confirmed", "confirmations": 2});
+
+        assert!(tx_wait_satisfied(&mempool, TxWaitState::Seen, 0));
+        assert!(tx_wait_satisfied(&confirmed_one, TxWaitState::Seen, 0));
+        assert!(!tx_wait_satisfied(&missing, TxWaitState::Seen, 0));
+
+        assert!(tx_wait_satisfied(&mempool, TxWaitState::Mempool, 0));
+        assert!(!tx_wait_satisfied(&confirmed_one, TxWaitState::Mempool, 0));
+
+        assert!(tx_wait_satisfied(&confirmed_two, TxWaitState::Confirmed, 2));
+        assert!(!tx_wait_satisfied(
+            &confirmed_one,
+            TxWaitState::Confirmed,
+            2
+        ));
+        assert!(tx_wait_satisfied(&missing, TxWaitState::Missing, 0));
+    }
 }
