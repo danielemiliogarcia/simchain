@@ -14,7 +14,7 @@ use crate::faucet_store::{FaucetStore, StoredFaucetTransfer};
 use crate::job_store::JobStore;
 use crate::network_job::NetworkActionBackend;
 use crate::reorg_job::{ReorgExecution, ReorgExecutor, ReorgRecoveryContext};
-use crate::scenario_job::ScenarioActionBackend;
+use crate::scenario_job::{ScenarioActionBackend, SpamBurstTarget};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use simchain_common::control_api::{
@@ -2092,11 +2092,13 @@ impl JobManager {
             return;
         }
         self.set_running(&job_id, "waiting_for_bootstrap");
+        let burst_targets = spam_burst_targets(&scenario);
         let actions = JobScenarioActions {
             manager: self.clone(),
             job_id: job_id.clone(),
             abort: abort.clone(),
             use_raw_tx_spam,
+            burst_targets: burst_targets.clone(),
             runtime: Arc::new(Mutex::new(ScenarioRuntime::default())),
         };
         let renewer = match OwnedLeaseRenewer::start_for_scenario(
@@ -2133,13 +2135,14 @@ impl JobManager {
                 // Fund the raw burst engines up front, while mining still
                 // runs: funding needs confirmations, and scenarios may pause
                 // mining before their first burst step.
-                let burst_nodes = spam_burst_nodes(&scenario);
-                if burst_nodes.is_empty() || abort.load(Ordering::Acquire) {
+                let targets =
+                    coalesced_spam_burst_targets(burst_targets.iter().map(|target| target.target));
+                if targets.is_empty() || abort.load(Ordering::Acquire) {
                     return Ok(());
                 }
                 self.set_phase(&job_id, "funding_spam_burst_engines");
                 self.scenario
-                    .prepare_spam_burst(&burst_nodes, &actions)
+                    .prepare_spam_burst(&targets, &actions)
                     .map(|_| ())
                     .map_err(|error| {
                         anyhow::anyhow!("fund the scenario spam burst engines: {error:#}")
@@ -4227,8 +4230,15 @@ struct ScenarioRuntime {
     mining_lease: Option<JobLease>,
     spam_lease: Option<JobLease>,
     network_leases: Vec<JobLease>,
+    current_step_index: usize,
     mining_paused_by_step: bool,
     chain_changed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IndexedSpamBurstTarget {
+    step_index: usize,
+    target: SpamBurstTarget,
 }
 
 struct JobScenarioActions {
@@ -4236,6 +4246,7 @@ struct JobScenarioActions {
     job_id: String,
     abort: Arc<AtomicBool>,
     use_raw_tx_spam: bool,
+    burst_targets: Vec<IndexedSpamBurstTarget>,
     runtime: Arc<Mutex<ScenarioRuntime>>,
 }
 
@@ -4341,6 +4352,37 @@ impl JobScenarioActions {
         runtime
             .network_leases
             .retain(|lease| lease.lease_id != lease_id);
+    }
+
+    fn remaining_spam_burst_targets(&self) -> Vec<SpamBurstTarget> {
+        let current_step_index = self
+            .runtime
+            .lock()
+            .expect("scenario runtime lock")
+            .current_step_index;
+        coalesced_spam_burst_targets(
+            self.burst_targets
+                .iter()
+                .filter(|target| target.step_index > current_step_index)
+                .map(|target| target.target),
+        )
+    }
+
+    fn prepare_remaining_spam_bursts(
+        &self,
+        phase: &str,
+        control: &dyn ScenarioControl,
+    ) -> anyhow::Result<Option<Value>> {
+        let targets = self.remaining_spam_burst_targets();
+        if targets.is_empty() || control.abort_requested() {
+            return Ok(None);
+        }
+        self.manager.set_phase(&self.job_id, phase);
+        self.manager
+            .scenario
+            .prepare_spam_burst(&targets, control)
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("fund the scenario spam burst engines: {error:#}"))
     }
 
     fn resolve_faucet_outputs(
@@ -4763,6 +4805,12 @@ impl JobScenarioActions {
 
 impl ScenarioControl for JobScenarioActions {
     fn observe(&self, progress: ScenarioProgress) {
+        if progress.phase == ScenarioProgressPhase::StepStarted {
+            self.runtime
+                .lock()
+                .expect("scenario runtime lock")
+                .current_step_index = progress.step_index;
+        }
         self.manager
             .record_scenario_progress(&self.job_id, &progress);
     }
@@ -4940,6 +4988,7 @@ impl ScenarioActions for JobScenarioActions {
 
     fn set_config(&self, settings: &BTreeMap<String, String>) -> anyhow::Result<Value> {
         let context = self.apply_context();
+        let touches_spam = settings_touch_spam(settings);
         let report = apply_with_context(
             &context,
             ApplyRequest {
@@ -4957,7 +5006,15 @@ impl ScenarioActions for JobScenarioActions {
             },
         )
         .map_err(|error| anyhow::anyhow!("config apply failed: {}", error.message))?;
-        serde_json::to_value(report).map_err(Into::into)
+        let mut value = serde_json::to_value(report)?;
+        if touches_spam {
+            if let Some(preparation) =
+                self.prepare_remaining_spam_bursts("refunding_spam_burst_engines", self)?
+            {
+                value["spam_burst_preparation"] = preparation;
+            }
+        }
+        Ok(value)
     }
 
     fn assert_config(
@@ -5497,20 +5554,51 @@ impl From<FaucetRunError> for anyhow::Error {
     }
 }
 
-/// Miner nodes targeted by the scenario's spam_burst steps, deduplicated in
-/// a stable order.
-fn spam_burst_nodes(scenario: &Scenario) -> Vec<MinerNode> {
-    let mut nodes: Vec<MinerNode> = scenario
+/// Scenario spam bursts with their 1-based step index. The index lets a
+/// runtime `set_config` reprepare only bursts that are still ahead of it.
+fn spam_burst_targets(scenario: &Scenario) -> Vec<IndexedSpamBurstTarget> {
+    scenario
         .steps
         .iter()
-        .filter_map(|step| match step {
-            Step::SpamBurst { node, .. } => Some(*node),
+        .enumerate()
+        .filter_map(|(zero_index, step)| match step {
+            Step::SpamBurst {
+                node,
+                outputs_per_tx,
+                ..
+            } => Some(IndexedSpamBurstTarget {
+                step_index: zero_index + 1,
+                target: SpamBurstTarget {
+                    node: *node,
+                    outputs_per_tx: *outputs_per_tx,
+                },
+            }),
             _ => None,
         })
-        .collect();
-    nodes.sort_by_key(|node| node.short_name());
-    nodes.dedup();
-    nodes
+        .collect()
+}
+
+/// Collapse burst steps to one preparation per miner node, keeping the widest
+/// requested burn-output shape because that is the most expensive shape to fund.
+fn coalesced_spam_burst_targets(
+    targets: impl IntoIterator<Item = SpamBurstTarget>,
+) -> Vec<SpamBurstTarget> {
+    let mut by_node: BTreeMap<&'static str, SpamBurstTarget> = BTreeMap::new();
+    for target in targets {
+        by_node
+            .entry(target.node.short_name())
+            .and_modify(|existing| {
+                existing.outputs_per_tx = existing.outputs_per_tx.max(target.outputs_per_tx);
+            })
+            .or_insert(target);
+    }
+    by_node.into_values().collect()
+}
+
+fn settings_touch_spam(settings: &BTreeMap<String, String>) -> bool {
+    settings.keys().any(|key| {
+        live_tuning::spec(key.as_str()).is_some_and(|spec| spec.scope == ServiceScope::Spammer)
+    })
 }
 
 fn normalize_faucet_request(
@@ -6647,6 +6735,139 @@ steps:
             manager.get(&created.job_id).expect("job").summary.state,
             JobState::Succeeded
         );
+    }
+
+    #[test]
+    fn scenario_spam_burst_preparation_is_shape_aware_and_policy_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(BlockingExecutor::new());
+        let (backend, manager) = manager(dir.path(), executor);
+        let created = manager
+            .start_scenario(
+                r#"
+version: 1
+steps:
+  - type: spam_burst
+    node: node3
+    txs: 1
+    outputs_per_tx: 30
+  - type: set_config
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+  - type: set_config
+    settings:
+      SPAM_FEE: 0.0002
+  - type: pause_mining
+  - type: spam_burst
+    node: node2
+    txs: 2
+    outputs_per_tx: 25
+  - type: spam_burst
+    node: node2
+    txs: 1
+    outputs_per_tx: 5
+  - type: spam_burst
+    node: node3
+    txs: 1
+    outputs_per_tx: 7
+  - type: resume_mining
+"#
+                .to_string(),
+                None,
+                true,
+            )
+            .expect("start scenario");
+        wait_until(|| {
+            manager
+                .get(&created.job_id)
+                .expect("job")
+                .summary
+                .state
+                .is_terminal()
+        });
+        assert_eq!(
+            manager.get(&created.job_id).expect("job").summary.state,
+            JobState::Succeeded
+        );
+
+        let preparations = backend.spam_burst_preparations();
+        assert_eq!(preparations.len(), 2);
+        assert_eq!(
+            preparations[0],
+            vec![
+                SpamBurstTarget {
+                    node: MinerNode::Node2,
+                    outputs_per_tx: 25,
+                },
+                SpamBurstTarget {
+                    node: MinerNode::Node3,
+                    outputs_per_tx: 30,
+                },
+            ]
+        );
+        assert_eq!(
+            preparations[1],
+            vec![
+                SpamBurstTarget {
+                    node: MinerNode::Node2,
+                    outputs_per_tx: 25,
+                },
+                SpamBurstTarget {
+                    node: MinerNode::Node3,
+                    outputs_per_tx: 7,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn spam_burst_target_helpers_coalesce_by_node_and_detect_spam_settings() {
+        let scenario = Scenario {
+            version: 1,
+            steps: vec![
+                Step::SpamBurst {
+                    node: MinerNode::Node2,
+                    txs: 1,
+                    outputs_per_tx: 3,
+                },
+                Step::SetConfig {
+                    settings: BTreeMap::from([("SPAM_FEE".to_string(), "0.0002".to_string())]),
+                },
+                Step::SpamBurst {
+                    node: MinerNode::Node2,
+                    txs: 1,
+                    outputs_per_tx: 25,
+                },
+                Step::SpamBurst {
+                    node: MinerNode::Node3,
+                    txs: 1,
+                    outputs_per_tx: 7,
+                },
+            ],
+        };
+        let targets = spam_burst_targets(&scenario);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(
+            coalesced_spam_burst_targets(targets.iter().map(|target| target.target)),
+            vec![
+                SpamBurstTarget {
+                    node: MinerNode::Node2,
+                    outputs_per_tx: 25,
+                },
+                SpamBurstTarget {
+                    node: MinerNode::Node3,
+                    outputs_per_tx: 7,
+                },
+            ]
+        );
+        assert!(settings_touch_spam(&BTreeMap::from([(
+            "SPAM_FEE".to_string(),
+            "0.0002".to_string()
+        )])));
+        assert!(!settings_touch_spam(&BTreeMap::from([(
+            "BLOCK_INTERVAL_MODE".to_string(),
+            "fixed".to_string()
+        )])));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::faucet_job::{
 use crate::jobs::{FaucetSettings, JobDependencies, JobManager};
 use crate::network_job::{ChainSnapshot, NetworkActionBackend};
 use crate::reorg_job::{ReorgExecution, ReorgExecutor, ReorgRecoveryContext};
-use crate::scenario_job::ScenarioActionBackend;
+use crate::scenario_job::{ScenarioActionBackend, SpamBurstTarget};
 use crate::state::{AppState, ControlPlaneConfig, MINING_COMPONENT, SPAM_COMPONENT};
 use crate::status::StatusSnapshot;
 use simchain_common::control_api::{FaucetOutput, FaucetSourceNode, FAUCET_PRIORITY_DELTA_SATS};
@@ -80,6 +80,7 @@ pub struct MockWorld {
     pub network_generations: HashMap<String, u64>,
     pub network_acquire_response_fail_times: u32,
     pub policy_calls: Vec<(String, u64)>,
+    pub spam_burst_preparations: Vec<Vec<SpamBurstTarget>>,
 }
 
 pub struct MockBackend {
@@ -119,6 +120,7 @@ impl MockBackend {
                 network_generations: HashMap::new(),
                 network_acquire_response_fail_times: 0,
                 policy_calls: Vec::new(),
+                spam_burst_preparations: Vec::new(),
             }),
         }
     }
@@ -164,6 +166,14 @@ impl MockBackend {
 
     pub fn policy_calls(&self) -> Vec<(String, u64)> {
         self.world.lock().expect("world lock").policy_calls.clone()
+    }
+
+    pub fn spam_burst_preparations(&self) -> Vec<Vec<SpamBurstTarget>> {
+        self.world
+            .lock()
+            .expect("world lock")
+            .spam_burst_preparations
+            .clone()
     }
 }
 
@@ -352,11 +362,19 @@ impl ScenarioActionBackend for MockBackend {
 
     fn prepare_spam_burst(
         &self,
-        nodes: &[simchain_scenario_engine::MinerNode],
+        targets: &[SpamBurstTarget],
         control: &dyn simchain_scenario_engine::ScenarioControl,
     ) -> anyhow::Result<serde_json::Value> {
+        self.world
+            .lock()
+            .expect("world lock")
+            .spam_burst_preparations
+            .push(targets.to_vec());
         Ok(serde_json::json!({
-            "prepared": nodes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "prepared": targets.iter().map(|target| serde_json::json!({
+                "node": target.node.to_string(),
+                "outputs_per_transaction": target.outputs_per_tx
+            })).collect::<Vec<_>>(),
             "aborted": control.abort_requested()
         }))
     }

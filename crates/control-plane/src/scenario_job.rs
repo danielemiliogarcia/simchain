@@ -23,15 +23,22 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_SCENARIO_TIMEOUT_SECS: u64 = 1_800;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpamBurstTarget {
+    pub node: MinerNode,
+    pub outputs_per_tx: u64,
+}
+
 pub trait ScenarioActionBackend: Send + Sync {
     fn wait_height(&self, height: u64, control: &dyn ScenarioControl) -> Result<Value>;
     fn mine(&self, node: MinerNode, blocks: u64) -> Result<Value>;
-    /// Fund the raw burst engines for `nodes` so later `spam_burst` steps can
+    /// Fund the raw burst engines for `targets` so later `spam_burst` steps can
     /// run without block production (funding needs confirmations, bursts do
-    /// not). Called before the scenario's steps, while mining still runs.
+    /// not). Called before the scenario's steps, and again after spam policy
+    /// changes that affect later bursts.
     fn prepare_spam_burst(
         &self,
-        nodes: &[MinerNode],
+        targets: &[SpamBurstTarget],
         control: &dyn ScenarioControl,
     ) -> Result<Value>;
     fn spam_burst(
@@ -210,25 +217,51 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
 
     fn prepare_spam_burst(
         &self,
-        nodes: &[MinerNode],
+        targets: &[SpamBurstTarget],
         control: &dyn ScenarioControl,
     ) -> Result<Value> {
         let policy = self.burst_policy()?;
         let branches = policy.fanout_utxos.max(1);
+        let deadline = Instant::now() + self.timeout;
         let mut prepared = Vec::new();
-        for node in nodes {
-            self.with_burst_engine(*node, policy.fee_rate_sat_vb(), |engine| {
-                engine.set_burst_shape(policy.fee_rate_sat_vb(), 0);
-                let checkpoint = |_: &str| !control.abort_requested();
-                anyhow::ensure!(
-                    engine.ensure_branches(branches, &checkpoint),
-                    "interrupted while funding the scenario burst engine for {node}"
-                );
+        for target in targets {
+            self.with_burst_engine(target.node, policy.fee_rate_sat_vb(), |engine| {
+                engine.set_burst_shape(policy.fee_rate_sat_vb(), target.outputs_per_tx);
+                let checkpoint =
+                    |_: &str| !control.abort_requested() && Instant::now() < deadline;
+                if !engine.ensure_branches(branches, &checkpoint) {
+                    let usable = engine.usable_branches_for_current_shape();
+                    if control.abort_requested() {
+                        anyhow::bail!(
+                            "interrupted while funding the scenario burst engine for {}",
+                            target.node
+                        );
+                    }
+                    if Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "timed out after {}s funding the scenario burst engine for {}",
+                            self.timeout.as_secs(),
+                            target.node
+                        );
+                    }
+                    anyhow::bail!(
+                        "scenario burst engine for {} has only {usable}/{branches} confirmed usable branches for outputs_per_tx={}",
+                        target.node,
+                        target.outputs_per_tx
+                    );
+                }
                 Ok(())
             })?;
-            prepared.push(node.to_string());
+            prepared.push(json!({
+                "node": target.node.to_string(),
+                "outputs_per_transaction": target.outputs_per_tx
+            }));
         }
-        Ok(json!({"prepared": prepared, "branches": branches}))
+        Ok(json!({
+            "prepared": prepared,
+            "branches": branches,
+            "timeout_secs": self.timeout.as_secs()
+        }))
     }
 
     fn spam_burst(
@@ -242,7 +275,31 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
         let fanout = policy.fanout_utxos.max(1);
         self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
             engine.set_burst_shape(policy.fee_rate_sat_vb(), outputs_per_tx);
-            let checkpoint = |_: &str| !control.abort_requested();
+            let deadline = Instant::now() + self.timeout;
+            let checkpoint = |_: &str| !control.abort_requested() && Instant::now() < deadline;
+            let needed_branches = txs.min(fanout).max(1);
+            if !engine.ensure_branches(needed_branches, &checkpoint) {
+                let usable = engine.usable_branches_for_current_shape();
+                if control.abort_requested() {
+                    return Ok(json!({
+                        "node": node.to_string(),
+                        "requested_transactions": txs,
+                        "accepted_transactions": 0,
+                        "outputs_per_transaction": outputs_per_tx,
+                        "engine": "raw",
+                        "aborted": true
+                    }));
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out after {}s preparing raw scenario burst for {node}",
+                        self.timeout.as_secs()
+                    );
+                }
+                anyhow::bail!(
+                    "raw scenario burst for {node} is not funded: {usable}/{needed_branches} confirmed usable branches"
+                );
+            }
             let mut txids = engine.output_round(txs, fanout, false, 0, &checkpoint);
             if (txids.len() as u64) < txs && !control.abort_requested() {
                 // A chain mutation between steps (reorg, partition) may have
@@ -253,6 +310,21 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
                     .context("reconcile the scenario burst engine mid-burst")?;
                 let remaining = txs - txids.len() as u64;
                 txids.extend(engine.output_round(remaining, fanout, false, 0, &checkpoint));
+            }
+            if (txids.len() as u64) < txs && !control.abort_requested() {
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out after {}s submitting raw scenario burst for {node}: accepted {}/{}",
+                        self.timeout.as_secs(),
+                        txids.len(),
+                        txs
+                    );
+                }
+                anyhow::bail!(
+                    "raw scenario burst for {node} accepted only {}/{} transactions",
+                    txids.len(),
+                    txs
+                );
             }
             Ok(json!({
                 "node": node.to_string(),

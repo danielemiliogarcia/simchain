@@ -18,7 +18,11 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use simchain_common::control_api::{
+    ConfigResponse, FaucetStatusResponse, FaucetTransfer, JobDetail, JobEventsResponse,
+    JobListResponse, StatusResponse,
+};
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -44,6 +48,7 @@ pub fn router(app: SharedState) -> Router {
             get(config_handler).patch(config_patch_handler),
         )
         .route("/api/v1/config/schema", get(schema_handler))
+        .route("/api/v1/dashboard", get(dashboard_handler))
         .route("/api/v1/mining/state", put(mining_state_handler))
         .route("/api/v1/spam/state", put(spam_state_handler))
         .route("/api/v1/events", get(global_events_handler))
@@ -217,6 +222,158 @@ async fn ready_handler(State(app): State<SharedState>) -> Response {
 
 async fn status_handler(State(app): State<SharedState>) -> Response {
     Json(status(&app)).into_response()
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct DashboardQuery {
+    #[serde(default)]
+    tab: DashboardTab,
+    #[serde(default)]
+    selected_job_id: Option<String>,
+    #[serde(default)]
+    events_after: u64,
+    #[serde(default = "default_dashboard_event_limit")]
+    event_limit: usize,
+    #[serde(default)]
+    selected_faucet_txid: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum DashboardTab {
+    #[default]
+    All,
+    Overview,
+    Control,
+    Faucet,
+}
+
+fn default_dashboard_event_limit() -> usize {
+    200
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DashboardResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_job_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<StatusResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config: Option<ConfigResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    faucet: Option<FaucetStatusResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_faucet_transfer: Option<FaucetTransfer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jobs: Option<JobListResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_job: Option<JobDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_job_events: Option<JobEventsResponse>,
+}
+
+async fn dashboard_handler(
+    State(app): State<SharedState>,
+    query: Result<Query<DashboardQuery>, QueryRejection>,
+) -> Response {
+    let query = match query.map(|Query(query)| query) {
+        Ok(query) => query,
+        Err(rejection) => {
+            return error_response(&ServiceError::new(
+                ErrorCode::ValidationFailed,
+                format!("invalid dashboard query: {rejection}"),
+            ));
+        }
+    };
+    let worker = app.clone();
+    match tokio::task::spawn_blocking(move || dashboard_snapshot(&worker, query)).await {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&ServiceError::new(
+            ErrorCode::Internal,
+            format!("control-plane worker task failed: {error}"),
+        )),
+    }
+}
+
+fn dashboard_snapshot(
+    app: &SharedState,
+    query: DashboardQuery,
+) -> Result<DashboardResponse, ServiceError> {
+    let tab = query.tab;
+    let active_job_id = app.jobs.active_summary().map(|job| job.id);
+    let status = match tab {
+        DashboardTab::All | DashboardTab::Overview | DashboardTab::Control => Some(status(app)),
+        DashboardTab::Faucet => None,
+    };
+    let config = match tab {
+        DashboardTab::All | DashboardTab::Control => Some(config(app)?),
+        DashboardTab::Overview | DashboardTab::Faucet => None,
+    };
+    let faucet = match tab {
+        DashboardTab::All | DashboardTab::Faucet => Some(faucet_status(app)),
+        DashboardTab::Overview | DashboardTab::Control => None,
+    };
+    let jobs = match tab {
+        DashboardTab::All | DashboardTab::Control => Some(list_jobs(app)),
+        DashboardTab::Overview | DashboardTab::Faucet => None,
+    };
+    let selected_faucet_transfer = match (tab, query.selected_faucet_txid.as_deref()) {
+        (DashboardTab::All | DashboardTab::Faucet, Some(txid)) => {
+            match faucet_transfer(app, txid) {
+                Ok(transfer) => Some(transfer),
+                Err(error) if error.code == ErrorCode::JobNotFound => None,
+                Err(error) => return Err(error),
+            }
+        }
+        _ => None,
+    };
+    let include_selected_job = matches!(
+        tab,
+        DashboardTab::All | DashboardTab::Control | DashboardTab::Faucet
+    );
+    let selected_job_id = if include_selected_job {
+        active_job_id
+            .as_deref()
+            .or(query.selected_job_id.as_deref())
+            .or_else(|| {
+                jobs.as_ref()
+                    .and_then(|jobs| jobs.jobs.first().map(|job| job.id.as_str()))
+            })
+    } else {
+        None
+    };
+    let selected_job = match selected_job_id {
+        Some(job_id) => match get_job(app, job_id) {
+            Ok(job) => Some(job),
+            Err(error) if error.code == ErrorCode::JobNotFound => None,
+            Err(error) => return Err(error),
+        },
+        None => None,
+    };
+    let selected_job_events = match (tab, selected_job.as_ref()) {
+        (DashboardTab::All | DashboardTab::Control, Some(job)) => match job_events(
+            app,
+            Some(&job.summary.id),
+            query.events_after,
+            query.event_limit,
+        ) {
+            Ok(events) => Some(events),
+            Err(error) if error.code == ErrorCode::JobNotFound => None,
+            Err(error) => return Err(error),
+        },
+        _ => None,
+    };
+    Ok(DashboardResponse {
+        active_job_id,
+        status,
+        config,
+        faucet,
+        selected_faucet_transfer,
+        jobs,
+        selected_job,
+        selected_job_events,
+    })
 }
 
 async fn schema_handler() -> Response {
@@ -993,6 +1150,38 @@ mod tests {
 
         let (status, _) = send(&fx.router, get("/api/v1/status")).await;
         assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send(&fx.router, get("/api/v1/dashboard")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["config"]["generation"], 0);
+        assert!(body["jobs"]["jobs"].is_array());
+        assert!(body["faucet"]["wallets"].is_array());
+    }
+
+    #[tokio::test]
+    async fn dashboard_route_filters_payload_by_tab() {
+        let fx = fixture(None);
+
+        let (status, body) = send(&fx.router, get("/api/v1/dashboard?tab=overview")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["status"].is_object());
+        assert!(body["config"].is_null());
+        assert!(body["jobs"].is_null());
+        assert!(body["faucet"].is_null());
+
+        let (status, body) = send(&fx.router, get("/api/v1/dashboard?tab=control")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["status"].is_object());
+        assert_eq!(body["config"]["generation"], 0);
+        assert!(body["jobs"]["jobs"].is_array());
+        assert!(body["faucet"].is_null());
+
+        let (status, body) = send(&fx.router, get("/api/v1/dashboard?tab=faucet")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["faucet"]["wallets"].is_array());
+        assert!(body["status"].is_null());
+        assert!(body["config"].is_null());
+        assert!(body["jobs"].is_null());
     }
 
     #[tokio::test]

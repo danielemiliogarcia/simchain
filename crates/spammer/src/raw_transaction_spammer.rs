@@ -613,14 +613,25 @@ impl RawSpammer {
         Ok(())
     }
 
-    /// Make sure `branches` confirmed, usable branch UTXOs exist, pulling and
-    /// confirming a wallet funding transaction and fan-out if needed. Blocks
-    /// on confirmations, so it needs block production to make progress on a
-    /// broke engine; call it while mining runs (the control plane calls this
-    /// before scenarios that burst under paused mining). Returns false when
-    /// interrupted through the checkpoint.
+    /// Number of confirmed branches that can pay one transaction with the
+    /// current fee rate and burn-output shape.
+    pub fn usable_branches_for_current_shape(&self) -> u64 {
+        self.usable_branches(self.per_tx_required())
+    }
+
+    /// Make sure `branches` confirmed, usable branch UTXOs exist for the
+    /// current fee rate and burn-output shape, pulling and confirming a wallet
+    /// funding transaction and fan-out if needed. Blocks on confirmations, so
+    /// it needs block production to make progress on a broke engine; call it
+    /// while mining runs. Returns false when interrupted or when the background
+    /// spammer's normal "defer until later" path still leaves the requested
+    /// confirmed branches unavailable.
     pub fn ensure_branches(&mut self, branches: u64, checkpoint: &impl Fn(&str) -> bool) -> bool {
-        self.ensure_funds(branches, branches, checkpoint)
+        let branches = branches.max(1);
+        if !self.ensure_funds(branches, branches, checkpoint) {
+            return false;
+        }
+        self.usable_branches_for_current_shape() >= branches
     }
 
     /// Retarget the OUTPUT-mode burn shape and fee rate for the next round,

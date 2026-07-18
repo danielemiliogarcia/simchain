@@ -13,11 +13,12 @@ let fieldErrors = new Map(); // key -> latest client/server validation message
 let applying = false;
 let latestStatus = null;
 let latestJobs = null;
+let latestActiveJobId = null;
 let selectedJobId = null;
 let selectedJob = null;
 let selectedJobEvents = [];
 let selectedJobEventAfter = 0;
-let jobsRefreshing = false;
+let renderedJobEventCount = 0;
 let startingJob = false;
 let startingScenario = false;
 const startingAction = { mine: false, burst: false, partition: false, degrade: false };
@@ -29,6 +30,14 @@ let selectedFaucetTxid = null;
 let selectedFaucetTransfer = null;
 const releasingCheckpoints = new Set();
 const changingComponentState = { mining: false, spam: false };
+let dashboardRefreshing = false;
+let dashboardRefreshQueued = false;
+let dashboardRefreshForceQueued = false;
+let dashboardPollTimer = null;
+const dashboardRenderCache = new Map();
+const DASHBOARD_ACTIVE_POLL_MS = 1000;
+const DASHBOARD_IDLE_POLL_MS = 5000;
+let activeDashboardTab = "overview";
 
 const GROUP_TITLES = {
   "mining": "Mining",
@@ -55,9 +64,90 @@ async function api(path, options) {
   return { ok: response.ok, status: response.status, body };
 }
 
+function snapshotKey(value) {
+  return JSON.stringify(value ?? null);
+}
+
+function snapshotSectionChanged(name, value, force = false) {
+  const key = snapshotKey(value);
+  if (!force && dashboardRenderCache.get(name) === key) return false;
+  dashboardRenderCache.set(name, key);
+  return true;
+}
+
+function clearDashboardSection(name) {
+  dashboardRenderCache.delete(name);
+}
+
+function projectConfigForForm(config) {
+  if (!config) return null;
+  return {
+    generation: config.generation,
+    desired: config.desired,
+    desired_valid: config.desired_valid,
+    desired_errors: config.desired_errors || [],
+    warnings: config.warnings || [],
+    effective: config.effective,
+    pending_apply: config.pending_apply || [],
+  };
+}
+
+function fmtDurationCoarse(seconds) {
+  if (seconds == null || !Number.isFinite(seconds)) return null;
+  if (seconds < 60) return "<1m";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+function visibleComponentState(component) {
+  if (!component) return null;
+  return {
+    reachable: component.reachable,
+    status: component.status,
+    phase: component.phase || null,
+    effective_generation: component.effective_generation ?? null,
+    uptime: fmtDurationCoarse(component.uptime_secs),
+    last_error: component.last_error || null,
+    desired_state: component.desired_state || null,
+    effective_state: component.effective_state || null,
+    observed_height: component.observed_height ?? null,
+    next_scheduled_attempt_ms: component.next_scheduled_attempt_ms ?? null,
+    active_lease_count: component.active_lease_count ?? null,
+    cycle_phase: component.cycle_phase || null,
+    accepted_transactions: component.accepted_transactions ?? null,
+    last_cycle_duration_ms: component.last_cycle_duration_ms ?? null,
+    reconciliation_pending: component.reconciliation_pending || false,
+  };
+}
+
+function projectStatusForDashboard(status) {
+  if (!status) return null;
+  return {
+    height: status.height ?? null,
+    best_hash: status.best_hash || null,
+    mempool: status.mempool || null,
+    recent_blocks: status.recent_blocks || [],
+    cadence: status.cadence || null,
+    components: Object.fromEntries(
+      Object.entries(status.components || {}).map(([name, component]) =>
+        [name, visibleComponentState(component)]
+      )
+    ),
+    active_operation: status.active_operation || null,
+    impairments: status.impairments || [],
+    explorer: status.explorer || null,
+    last_error: status.last_error || null,
+    rpc_error: status.rpc_error || null,
+    component_error: status.component_error || null,
+    slow_error: status.slow_error || null,
+  };
+}
+
 function activeMutationId() {
-  return (latestJobs && latestJobs.active_job_id) ||
-    (latestStatus && latestStatus.active_operation && latestStatus.active_operation.job_id) || null;
+  return latestActiveJobId;
 }
 
 function mutationBlockedMessage() {
@@ -71,6 +161,8 @@ const DASHBOARD_TABS = ["overview", "control", "faucet"];
 
 function selectTab(tab, updateHash = true) {
   if (!DASHBOARD_TABS.includes(tab)) tab = "overview";
+  const changed = activeDashboardTab !== tab;
+  activeDashboardTab = tab;
   for (const name of DASHBOARD_TABS) {
     const selected = name === tab;
     const button = $(`#tab-${name}`);
@@ -81,6 +173,9 @@ function selectTab(tab, updateHash = true) {
   }
   if (updateHash && location.hash !== `#${tab}`) {
     history.replaceState(null, "", `#${tab}`);
+  }
+  if (changed && schema) {
+    refreshDashboard({ force: true }).catch((error) => console.error(error));
   }
 }
 
@@ -156,139 +251,225 @@ function renderExplorer(explorer) {
   container.title = (explorer && explorer.error) || "";
 }
 
-function renderStatus(s) {
-  latestStatus = s;
+function renderConnectionStatus(s) {
   const stale = !s.last_updated_ms || (Date.now() - s.last_updated_ms) > 8000;
   const conn = $("#conn");
   conn.textContent = stale ? (s.last_error ? `stale: ${s.last_error}` : "stale / RPC unavailable")
                            : `live · height ${s.height ?? "?"}${s.last_error ? ` · warning: ${s.last_error}` : ""}`;
   conn.className = "conn " + (stale || s.last_error ? "stale" : "ok");
+}
 
-  const cadence = s.cadence ? `${s.cadence.mean_secs.toFixed(1)}s (n=${s.cadence.samples})` : "–";
-  const mp = s.mempool;
-  const lastBlock = (s.recent_blocks || [])[0];
-  $("#tiles").innerHTML =
-    tile("height", s.height ?? "–") +
-    tile("cadence", cadence) +
-    tile("mempool txs", mp ? mp.tx_count : "–") +
-    tile("mempool size", mp ? fmtBytes(mp.vbytes) + " vB" : "–") +
-    tile("best hash", s.best_hash ? s.best_hash.slice(0, 12) + "…" : "–") +
-    tile("last block size", lastBlock ? fmtBytes(lastBlock.size_bytes) : "–") +
-    tile("last block weight", lastBlock ? fmtNumber(lastBlock.weight) + " WU" : "–");
-  renderExplorer(s.explorer);
+function statusTileSnapshot(s) {
+  const lastBlock = (s.recent_blocks || [])[0] || null;
+  const mempool = s.mempool ? {
+    tx_count: s.mempool.tx_count,
+    vbytes: s.mempool.vbytes,
+  } : null;
+  return {
+    height: s.height ?? null,
+    cadence: s.cadence || null,
+    mempool,
+    best_hash: s.best_hash || null,
+    last_block_size: lastBlock ? lastBlock.size_bytes : null,
+    last_block_weight: lastBlock ? lastBlock.weight : null,
+  };
+}
 
-  const blockBody = $("#blocks tbody");
-  blockBody.replaceChildren();
-  for (const block of s.recent_blocks || []) {
-    const row = blockBody.insertRow();
-    const height = row.insertCell();
-    const blockUrl = explorerBlockUrl(s.explorer, block.hash);
-    if (blockUrl) {
-      const link = document.createElement("a");
-      link.href = blockUrl;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      link.textContent = String(block.height);
-      height.append(link);
+function statusServicesSnapshot(s) {
+  return Object.fromEntries(
+    Object.entries(s.components || {}).map(([name, component]) => [name, {
+      reachable: component.reachable,
+      status: component.status,
+      phase: component.phase || null,
+      effective_generation: component.effective_generation ?? null,
+      uptime: fmtDurationCoarse(component.uptime_secs),
+      last_error: component.last_error || null,
+      observed_height: component.observed_height ?? null,
+      active_lease_count: component.active_lease_count ?? null,
+      cycle_phase: component.cycle_phase || null,
+      last_cycle_duration_ms: component.last_cycle_duration_ms ?? null,
+      reconciliation_pending: component.reconciliation_pending || false,
+    }])
+  );
+}
+
+function statusBlocksSnapshot(s) {
+  return {
+    recent_blocks: (s.recent_blocks || []).map((block) => ({
+      height: block.height,
+      hash: block.hash,
+      delta_secs: block.delta_secs ?? null,
+      tx_count: block.tx_count,
+      size_bytes: block.size_bytes,
+      weight: block.weight,
+    })),
+    explorer_url: s.explorer ? s.explorer.url : null,
+    explorer_reachable: s.explorer ? s.explorer.reachable : null,
+  };
+}
+
+function statusControlsSnapshot(s) {
+  return {
+    active: activeMutationId(),
+    mining: visibleComponentState((s.components || {}).mining),
+    spam: visibleComponentState((s.components || {}).spam),
+    changing_mining: changingComponentState.mining,
+    changing_spam: changingComponentState.spam,
+  };
+}
+
+function statusNetworkSnapshot(s) {
+  return {
+    impairments: s.impairments || [],
+    unavailable_agents: Object.entries(s.components || {})
+      .filter(([name, component]) => name.startsWith("network-agent-") && !component.reachable)
+      .map(([name]) => name.replace("network-agent-", "")),
+  };
+}
+
+function renderStatus(s, options = {}) {
+  latestStatus = s;
+  const force = options.force === true;
+  renderConnectionStatus(s);
+
+  if (snapshotSectionChanged("status_tiles", statusTileSnapshot(s), force)) {
+    const cadence = s.cadence ? `${s.cadence.mean_secs.toFixed(1)}s (n=${s.cadence.samples})` : "–";
+    const mp = s.mempool;
+    const lastBlock = (s.recent_blocks || [])[0];
+    $("#tiles").innerHTML =
+      tile("height", s.height ?? "–") +
+      tile("cadence", cadence) +
+      tile("mempool txs", mp ? mp.tx_count : "–") +
+      tile("mempool size", mp ? fmtBytes(mp.vbytes) + " vB" : "–") +
+      tile("best hash", s.best_hash ? s.best_hash.slice(0, 12) + "…" : "–") +
+      tile("last block size", lastBlock ? fmtBytes(lastBlock.size_bytes) : "–") +
+      tile("last block weight", lastBlock ? fmtNumber(lastBlock.weight) + " WU" : "–");
+  }
+  if (snapshotSectionChanged("status_explorer", s.explorer || null, force)) {
+    renderExplorer(s.explorer);
+  }
+
+  if (snapshotSectionChanged("status_blocks", statusBlocksSnapshot(s), force)) {
+    const blockBody = $("#blocks tbody");
+    blockBody.replaceChildren();
+    for (const block of s.recent_blocks || []) {
+      const row = blockBody.insertRow();
+      const height = row.insertCell();
+      const blockUrl = explorerBlockUrl(s.explorer, block.hash);
+      if (blockUrl) {
+        const link = document.createElement("a");
+        link.href = blockUrl;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = String(block.height);
+        height.append(link);
+      } else {
+        height.textContent = String(block.height);
+      }
+      for (const value of [
+        block.hash ? block.hash.slice(0, 10) + "…" : "–",
+        block.delta_secs == null ? "–" : Math.max(0, block.delta_secs) + "s",
+        block.tx_count,
+        fmtBytes(block.size_bytes),
+        block.weight,
+      ]) {
+        const cell = row.insertCell();
+        cell.textContent = String(value);
+      }
+    }
+    if (blockBody.rows.length === 0) {
+      const cell = blockBody.insertRow().insertCell();
+      cell.colSpan = 6;
+      cell.textContent = "no blocks yet";
+    }
+  }
+
+  if (snapshotSectionChanged("status_services", statusServicesSnapshot(s), force)) {
+    const services = $("#services");
+    services.replaceChildren();
+    for (const [name, component] of Object.entries(s.components || {})) {
+      const row = document.createElement("div");
+      row.className = "svc";
+      const dot = document.createElement("span");
+      const warning = component.reachable && component.last_error;
+      dot.className = "dot " + (!component.reachable ? "err" : warning ? "warn" : "ok");
+      const text = document.createElement("span");
+      const details = [];
+      if (component.effective_generation != null) details.push(`gen ${component.effective_generation}`);
+      const uptime = fmtDurationCoarse(component.uptime_secs);
+      if (uptime) details.push(`up ${uptime}`);
+      if (component.observed_height != null) details.push(`height ${component.observed_height}`);
+      if (component.active_lease_count) details.push(`${component.active_lease_count} lease(s)`);
+      if (component.cycle_phase) details.push(`cycle ${component.cycle_phase}`);
+      if (name === "spam" && component.last_cycle_duration_ms != null) {
+        details.push(`last cycle ${fmtSeconds(component.last_cycle_duration_ms / 1000)}`);
+      }
+      if (component.reconciliation_pending) details.push("reconciliation pending");
+      text.textContent = `${name} · ${component.phase || component.status}` +
+        (details.length ? ` · ${details.join(" · ")}` : "") +
+        (component.last_error ? ` · ${component.last_error}` : "");
+      row.append(dot, text);
+      services.append(row);
+    }
+  }
+
+  if (snapshotSectionChanged("status_controls", statusControlsSnapshot(s), force)) {
+    const mining = (s.components || {}).mining;
+    const miningState = $("#mining-state");
+    const pause = $("#mining-pause");
+    const resume = $("#mining-resume");
+    if (!mining || !mining.reachable) {
+      miningState.textContent = mining && mining.last_error
+        ? `mining worker unreachable: ${mining.last_error}` : "mining worker unavailable";
+      pause.disabled = true;
+      resume.disabled = true;
     } else {
-      height.textContent = String(block.height);
+      const desired = mining.desired_state || "unknown";
+      const effective = mining.effective_state || "unknown";
+      const next = mining.next_scheduled_attempt_ms == null
+        ? "" : ` · next attempt ${new Date(mining.next_scheduled_attempt_ms).toLocaleTimeString()}`;
+      const leases = mining.active_lease_count ? ` · ${mining.active_lease_count} job lease(s)` : "";
+      miningState.textContent = `desired ${desired} · effective ${effective} · phase ${mining.phase || mining.status}${next}${leases}`;
+      pause.disabled = changingComponentState.mining || desired === "paused" || activeMutationId() != null;
+      resume.disabled = changingComponentState.mining || desired === "running" || activeMutationId() != null;
     }
-    for (const value of [
-      block.hash ? block.hash.slice(0, 10) + "…" : "–",
-      block.delta_secs == null ? "–" : Math.max(0, block.delta_secs) + "s",
-      block.tx_count,
-      fmtBytes(block.size_bytes),
-      block.weight,
-    ]) {
-      const cell = row.insertCell();
-      cell.textContent = String(value);
+
+    const spam = (s.components || {}).spam;
+    const spamState = $("#spam-state");
+    const spamPause = $("#spam-pause");
+    const spamResume = $("#spam-resume");
+    if (!spam || !spam.reachable) {
+      spamState.textContent = spam && spam.last_error
+        ? `spam worker unreachable: ${spam.last_error}` : "spam worker unavailable";
+      spamPause.disabled = true;
+      spamResume.disabled = true;
+    } else {
+      const desired = spam.desired_state || "unknown";
+      const effective = spam.effective_state || "unknown";
+      const cycle = spam.cycle_phase ? ` · cycle ${spam.cycle_phase}` : "";
+      const accepted = spam.accepted_transactions == null
+        ? "" : ` · accepted ${spam.accepted_transactions}`;
+      const lastCycle = spam.last_cycle_duration_ms == null
+        ? "" : ` · last cycle ${fmtSeconds(spam.last_cycle_duration_ms / 1000)}`;
+      const leases = spam.active_lease_count ? ` · ${spam.active_lease_count} job lease(s)` : "";
+      spamState.textContent = `desired ${desired} · effective ${effective} · phase ${spam.phase || spam.status}${cycle}${accepted}${lastCycle}${leases}`;
+      spamPause.disabled = changingComponentState.spam || desired === "paused" || activeMutationId() != null;
+      spamResume.disabled = changingComponentState.spam || desired === "running" || activeMutationId() != null;
     }
-  }
-  if (blockBody.rows.length === 0) {
-    const cell = blockBody.insertRow().insertCell();
-    cell.colSpan = 6;
-    cell.textContent = "no blocks yet";
   }
 
-  const services = $("#services");
-  services.replaceChildren();
-  for (const [name, component] of Object.entries(s.components || {})) {
-    const row = document.createElement("div");
-    row.className = "svc";
-    const dot = document.createElement("span");
-    const warning = component.reachable && component.last_error;
-    dot.className = "dot " + (!component.reachable ? "err" : warning ? "warn" : "ok");
-    const text = document.createElement("span");
-    const details = [];
-    if (component.effective_generation != null) details.push(`gen ${component.effective_generation}`);
-    if (component.uptime_secs != null) details.push(`up ${component.uptime_secs}s`);
-    if (component.observed_height != null) details.push(`height ${component.observed_height}`);
-    if (component.active_lease_count) details.push(`${component.active_lease_count} lease(s)`);
-    if (component.cycle_phase) details.push(`cycle ${component.cycle_phase}`);
-    if (name === "spam" && component.last_cycle_duration_ms != null) {
-      details.push(`last cycle ${fmtSeconds(component.last_cycle_duration_ms / 1000)}`);
-    }
-    if (component.reconciliation_pending) details.push("reconciliation pending");
-    text.textContent = `${name} · ${component.phase || component.status}` +
-      (details.length ? ` · ${details.join(" · ")}` : "") +
-      (component.last_error ? ` · ${component.last_error}` : "");
-    row.append(dot, text);
-    services.append(row);
+  if (snapshotSectionChanged("status_network", statusNetworkSnapshot(s), force)) {
+    const impairments = s.impairments || [];
+    const unavailableAgents = Object.entries(s.components || {})
+      .filter(([name, component]) => name.startsWith("network-agent-") && !component.reachable)
+      .map(([name]) => name.replace("network-agent-", ""));
+    const networkDetails = impairments.map((item) =>
+      `${item.node}: ${item.kind} · owner ${item.owner_job_id}`);
+    if (unavailableAgents.length) networkDetails.push(`agents unreachable: ${unavailableAgents.join(", ")}`);
+    $("#network-status").textContent = networkDetails.length === 0
+      ? "all P2P links clear"
+      : networkDetails.join(" · ");
   }
-
-  const mining = (s.components || {}).mining;
-  const miningState = $("#mining-state");
-  const pause = $("#mining-pause");
-  const resume = $("#mining-resume");
-  if (!mining || !mining.reachable) {
-    miningState.textContent = mining && mining.last_error
-      ? `mining worker unreachable: ${mining.last_error}` : "mining worker unavailable";
-    pause.disabled = true;
-    resume.disabled = true;
-  } else {
-    const desired = mining.desired_state || "unknown";
-    const effective = mining.effective_state || "unknown";
-    const next = mining.next_scheduled_attempt_ms == null
-      ? "" : ` · next attempt ${new Date(mining.next_scheduled_attempt_ms).toLocaleTimeString()}`;
-    const leases = mining.active_lease_count ? ` · ${mining.active_lease_count} job lease(s)` : "";
-    miningState.textContent = `desired ${desired} · effective ${effective} · phase ${mining.phase || mining.status}${next}${leases}`;
-    pause.disabled = changingComponentState.mining || desired === "paused" || activeMutationId() != null;
-    resume.disabled = changingComponentState.mining || desired === "running" || activeMutationId() != null;
-  }
-
-  const spam = (s.components || {}).spam;
-  const spamState = $("#spam-state");
-  const spamPause = $("#spam-pause");
-  const spamResume = $("#spam-resume");
-  if (!spam || !spam.reachable) {
-    spamState.textContent = spam && spam.last_error
-      ? `spam worker unreachable: ${spam.last_error}` : "spam worker unavailable";
-    spamPause.disabled = true;
-    spamResume.disabled = true;
-  } else {
-    const desired = spam.desired_state || "unknown";
-    const effective = spam.effective_state || "unknown";
-    const cycle = spam.cycle_phase ? ` · cycle ${spam.cycle_phase}` : "";
-    const accepted = spam.accepted_transactions == null
-      ? "" : ` · accepted ${spam.accepted_transactions}`;
-    const lastCycle = spam.last_cycle_duration_ms == null
-      ? "" : ` · last cycle ${fmtSeconds(spam.last_cycle_duration_ms / 1000)}`;
-    const leases = spam.active_lease_count ? ` · ${spam.active_lease_count} job lease(s)` : "";
-    spamState.textContent = `desired ${desired} · effective ${effective} · phase ${spam.phase || spam.status}${cycle}${accepted}${lastCycle}${leases}`;
-    spamPause.disabled = changingComponentState.spam || desired === "paused" || activeMutationId() != null;
-    spamResume.disabled = changingComponentState.spam || desired === "running" || activeMutationId() != null;
-  }
-  const impairments = s.impairments || [];
-  const unavailableAgents = Object.entries(s.components || {})
-    .filter(([name, component]) => name.startsWith("network-agent-") && !component.reachable)
-    .map(([name]) => name.replace("network-agent-", ""));
-  const networkDetails = impairments.map((item) =>
-    `${item.node}: ${item.kind} · owner ${item.owner_job_id}`);
-  if (unavailableAgents.length) networkDetails.push(`agents unreachable: ${unavailableAgents.join(", ")}`);
-  $("#network-status").textContent = networkDetails.length === 0
-    ? "all P2P links clear"
-    : networkDetails.join(" · ");
-  refreshForm();
 }
 
 /* ---------------------------------------------------------------- settings */
@@ -493,16 +674,189 @@ function refreshForm() {
   }));
 }
 
-async function refreshState() {
-  const { ok, body } = await api("/api/v1/config");
-  if (!ok || !body) return;
-  lastState = body;
-  refreshForm();
+function buildDashboardRequest() {
+  const params = new URLSearchParams();
+  params.set("tab", activeDashboardTab);
+  if ((activeDashboardTab === "control" || activeDashboardTab === "faucet") && selectedJobId) {
+    params.set("selected_job_id", selectedJobId);
+  }
+  if (activeDashboardTab === "control" && selectedJobId && selectedJobEventAfter > 0) {
+    params.set("events_after", String(selectedJobEventAfter));
+  }
+  if (activeDashboardTab === "control") params.set("event_limit", "200");
+  if (activeDashboardTab === "faucet" && selectedFaucetTxid) {
+    params.set("selected_faucet_txid", selectedFaucetTxid);
+  }
+  const query = params.toString();
+  return {
+    url: "/api/v1/dashboard" + (query ? `?${query}` : ""),
+    tab: activeDashboardTab,
+    selectedJobId,
+    selectedFaucetTxid,
+  };
 }
 
-async function refreshStatus() {
-  const { ok, body } = await api("/api/v1/status");
-  if (ok && body) renderStatus(body);
+function preferredSelectedJobId(jobs, selectedJobPayload) {
+  if (!jobs) return selectedJobPayload ? selectedJobPayload.id : selectedJobId;
+  if (jobs.active_job_id) return jobs.active_job_id;
+  if (selectedJobPayload) return selectedJobPayload.id;
+  const ids = new Set((jobs.jobs || []).map((job) => job.id));
+  if (selectedJobId && ids.has(selectedJobId)) return selectedJobId;
+  return (jobs.jobs && jobs.jobs.length > 0) ? jobs.jobs[0].id : null;
+}
+
+function applySelectedJobEvents(eventsPayload) {
+  if (!eventsPayload) return false;
+  selectedJobEvents.push(...(eventsPayload.events || []));
+  selectedJobEventAfter = Math.max(selectedJobEventAfter, eventsPayload.next_sequence || 0);
+  return (eventsPayload.events || []).length > 0;
+}
+
+function applyDashboardSnapshot(body, options = {}) {
+  if (!body) return;
+  const force = options.force === true;
+  const request = options.request || {};
+  const previousActive = activeMutationId();
+  latestActiveJobId = body.active_job_id || null;
+  let needsFormRefresh = false;
+  let jobsRendered = false;
+  let statusRendered = false;
+  let faucetRendered = false;
+  let selectedJobNeedsRender = false;
+  let selectedJobResetEvents = false;
+
+  if (body.config && snapshotSectionChanged("config", projectConfigForForm(body.config), force)) {
+    if (!applying) {
+      lastState = body.config;
+      needsFormRefresh = true;
+    }
+  }
+
+  let jobsNeedRender = false;
+  if (body.jobs && snapshotSectionChanged("jobs", body.jobs, force)) {
+    jobsNeedRender = true;
+  }
+  if (body.jobs) {
+    latestJobs = body.jobs;
+    const nextSelectedJobId = preferredSelectedJobId(body.jobs, body.selected_job);
+    if (selectedJobId !== nextSelectedJobId) {
+      selectedJobId = nextSelectedJobId;
+      selectedJob = null;
+      selectedJobEvents = [];
+      selectedJobEventAfter = 0;
+      renderedJobEventCount = 0;
+      clearDashboardSection("selected_job");
+      clearDashboardSection("selected_job_events");
+      jobsNeedRender = true;
+      selectedJobNeedsRender = true;
+      selectedJobResetEvents = true;
+    }
+    if (!selectedJobId && !selectedJob) selectedJobNeedsRender = true;
+  }
+
+  if (body.status) {
+    latestStatus = body.status;
+    renderConnectionStatus(body.status);
+    if (snapshotSectionChanged("status", projectStatusForDashboard(body.status), force)) {
+      renderStatus(body.status, { force });
+      statusRendered = true;
+    }
+  }
+
+  if (body.faucet && snapshotSectionChanged("faucet", body.faucet, force)) {
+    renderFaucetStatus(body.faucet);
+    faucetRendered = true;
+  }
+
+  if (request.selectedFaucetTxid) {
+    const transfer = Object.prototype.hasOwnProperty.call(body, "selected_faucet_transfer")
+      ? body.selected_faucet_transfer : null;
+    if (snapshotSectionChanged("selected_faucet_transfer", transfer, force)) {
+      selectedFaucetTransfer = transfer;
+      renderFaucetTransfer();
+      if (selectedFaucetTransfer && selectedFaucetTransfer.delivery_state === "confirmed") {
+        $("#faucet-progress").hidden = true;
+      }
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, "selected_job") &&
+      snapshotSectionChanged("selected_job", body.selected_job, force)) {
+    selectedJob = body.selected_job || null;
+    selectedJobNeedsRender = true;
+  }
+  if (body.selected_job_events &&
+      snapshotSectionChanged("selected_job_events", body.selected_job_events, force)) {
+    if (applySelectedJobEvents(body.selected_job_events)) renderJobEvents();
+  }
+
+  if (jobsNeedRender) {
+    renderJobs();
+    jobsRendered = true;
+  }
+  if (selectedJobNeedsRender) {
+    const needsEventPlaceholder = renderedJobEventCount === 0 && selectedJobEvents.length === 0;
+    renderSelectedJob({
+      renderEvents: selectedJobResetEvents || needsEventPlaceholder,
+      resetEvents: selectedJobResetEvents,
+    });
+  }
+
+  const nextActive = activeMutationId();
+  if (previousActive !== nextActive) {
+    if (!statusRendered && latestStatus) renderStatus(latestStatus);
+    if (!jobsRendered) renderJobs();
+    if (!faucetRendered) renderFaucetControls();
+    needsFormRefresh = true;
+  }
+  if (needsFormRefresh && !applying) refreshForm();
+}
+
+function dashboardPollDelay() {
+  const activeJob = activeMutationId() != null;
+  const selectedJobRunning = selectedJob && !isTerminalJob(selectedJob.state);
+  const pendingLocalAction = applying || startingJob || startingScenario || abortingJob ||
+    faucetSubmitting || Object.values(startingAction).some(Boolean) ||
+    releasingCheckpoints.size > 0 || changingComponentState.mining || changingComponentState.spam;
+  const pendingFaucet = faucetStatus && faucetStatus.pending_transfer;
+  return (activeJob || selectedJobRunning || pendingLocalAction || pendingFaucet)
+    ? DASHBOARD_ACTIVE_POLL_MS : DASHBOARD_IDLE_POLL_MS;
+}
+
+function scheduleDashboardPoll(delay = dashboardPollDelay()) {
+  if (dashboardPollTimer != null) clearTimeout(dashboardPollTimer);
+  dashboardPollTimer = setTimeout(() => {
+    refreshDashboard().catch((error) => console.error(error));
+  }, delay);
+}
+
+async function refreshDashboard(options = {}) {
+  if (dashboardRefreshing) {
+    dashboardRefreshQueued = true;
+    dashboardRefreshForceQueued = dashboardRefreshForceQueued || options.force === true;
+    return;
+  }
+  dashboardRefreshing = true;
+  if (dashboardPollTimer != null) {
+    clearTimeout(dashboardPollTimer);
+    dashboardPollTimer = null;
+  }
+  const request = buildDashboardRequest();
+  try {
+    const { ok, body } = await api(request.url);
+    if (ok && body) applyDashboardSnapshot(body, { ...options, request });
+  } finally {
+    dashboardRefreshing = false;
+  }
+  const queued = dashboardRefreshQueued;
+  const queuedForce = dashboardRefreshForceQueued;
+  dashboardRefreshQueued = false;
+  dashboardRefreshForceQueued = false;
+  if (queued) {
+    await refreshDashboard({ force: queuedForce, reschedule: options.reschedule });
+  } else if (options.reschedule !== false) {
+    scheduleDashboardPoll();
+  }
 }
 
 async function setComponentState(component, state) {
@@ -537,8 +891,7 @@ async function setComponentState(component, state) {
     result.className = "action-result err";
   } finally {
     changingComponentState[component] = false;
-    await refreshStatus();
-    await refreshState();
+    await refreshDashboard({ force: true });
   }
 }
 
@@ -797,21 +1150,6 @@ function renderFaucetJob(job) {
   renderFaucetTransfer();
 }
 
-async function refreshFaucet() {
-  const { ok, body } = await api("/api/v1/faucet");
-  if (ok && body) renderFaucetStatus(body);
-  if (selectedFaucetTxid) {
-    const response = await api(`/api/v1/faucet/transfers/${encodeURIComponent(selectedFaucetTxid)}`);
-    if (response.ok && response.body) {
-      selectedFaucetTransfer = response.body;
-      renderFaucetTransfer();
-      if (selectedFaucetTransfer.delivery_state === "confirmed") {
-        $("#faucet-progress").hidden = true;
-      }
-    }
-  }
-}
-
 function faucetIdempotencyKey() {
   let key = sessionStorage.getItem(FAUCET_IDEMPOTENCY_STORAGE_KEY);
   if (!key) {
@@ -866,20 +1204,19 @@ async function submitFaucet(event) {
     }
     sessionStorage.removeItem(FAUCET_IDEMPOTENCY_STORAGE_KEY);
     result.textContent = `${body.reused ? "Reused" : "Started"} ${body.job_id}`;
-    await selectJob(body.job_id);
+    selectJobLocally(body.job_id);
   } catch (error) {
     result.textContent = error.message || String(error);
     result.className = "action-result err";
   } finally {
     faucetSubmitting = false;
     renderFaucetControls();
-    await refreshFaucet();
-    await refreshJobs();
+    await refreshDashboard({ force: true });
   }
 }
 
 function renderJobs() {
-  const active = latestJobs && latestJobs.active_job_id;
+  const active = activeMutationId();
   const lock = $("#mutation-lock");
   lock.textContent = active
     ? `mutation coordinator held by ${active}; incompatible controls are disabled`
@@ -929,7 +1266,6 @@ function renderJobs() {
       action.append(button);
     }
   }
-  refreshForm();
   if (latestStatus) renderStatusControlsOnly();
 }
 
@@ -940,7 +1276,8 @@ function renderStatusControlsOnly() {
   }
 }
 
-function renderSelectedJob() {
+function renderSelectedJob(options = {}) {
+  const renderEvents = options.renderEvents !== false;
   const detail = $("#job-detail");
   const abort = $("#job-abort");
   const download = $("#job-download");
@@ -974,10 +1311,20 @@ function renderSelectedJob() {
 
   renderCheckpoints();
   renderFaucetJob(selectedJob);
+  if (renderEvents) renderJobEvents({ reset: options.resetEvents === true });
+}
 
+function renderJobEvents(options = {}) {
   const events = $("#job-events");
-  events.replaceChildren();
-  for (const event of selectedJobEvents) {
+  if (options.reset || renderedJobEventCount > selectedJobEvents.length) {
+    events.replaceChildren();
+    renderedJobEventCount = 0;
+  }
+  if (renderedJobEventCount === 0 && events.firstElementChild &&
+      events.firstElementChild.classList.contains("muted")) {
+    events.replaceChildren();
+  }
+  for (const event of selectedJobEvents.slice(renderedJobEventCount)) {
     const item = document.createElement("li");
     const heading = document.createElement("span");
     heading.className = "event-heading";
@@ -987,7 +1334,9 @@ function renderSelectedJob() {
     item.append(heading, message);
     events.append(item);
   }
+  renderedJobEventCount = selectedJobEvents.length;
   if (selectedJobId && selectedJobEvents.length === 0) {
+    events.replaceChildren();
     const item = document.createElement("li");
     item.className = "muted";
     item.textContent = "waiting for progress events…";
@@ -1029,57 +1378,23 @@ function renderCheckpoints() {
   }
 }
 
-async function selectJob(jobId) {
+function selectJobLocally(jobId) {
   if (selectedJobId !== jobId) {
     selectedJobId = jobId;
     selectedJob = null;
     selectedJobEvents = [];
     selectedJobEventAfter = 0;
+    renderedJobEventCount = 0;
+    clearDashboardSection("selected_job");
+    clearDashboardSection("selected_job_events");
     renderJobs();
-    renderSelectedJob();
+    renderSelectedJob({ resetEvents: true });
   }
-  await refreshSelectedJob();
 }
 
-async function refreshSelectedJob() {
-  const jobId = selectedJobId;
-  if (!jobId) {
-    renderSelectedJob();
-    return;
-  }
-  const [detailResponse, eventResponse] = await Promise.all([
-    api(`/api/v1/jobs/${encodeURIComponent(jobId)}`),
-    api(`/api/v1/jobs/${encodeURIComponent(jobId)}/events?after=${selectedJobEventAfter}&limit=200`),
-  ]);
-  if (jobId !== selectedJobId) return;
-  if (detailResponse.ok) selectedJob = detailResponse.body;
-  if (eventResponse.ok) {
-    selectedJobEvents.push(...eventResponse.body.events);
-    selectedJobEventAfter = Math.max(selectedJobEventAfter, eventResponse.body.next_sequence);
-  }
-  renderSelectedJob();
-}
-
-async function refreshJobs() {
-  if (jobsRefreshing) return;
-  jobsRefreshing = true;
-  try {
-    const { ok, body } = await api("/api/v1/jobs");
-    if (!ok || !body) return;
-    latestJobs = body;
-    if (body.active_job_id && selectedJobId !== body.active_job_id) {
-      selectedJobId = body.active_job_id;
-      selectedJob = null;
-      selectedJobEvents = [];
-      selectedJobEventAfter = 0;
-    } else if (!selectedJobId && body.jobs.length > 0) {
-      selectedJobId = body.jobs[0].id;
-    }
-    renderJobs();
-    await refreshSelectedJob();
-  } finally {
-    jobsRefreshing = false;
-  }
+async function selectJob(jobId) {
+  selectJobLocally(jobId);
+  await refreshDashboard({ force: true });
 }
 
 function browserIdempotencyKey() {
@@ -1117,14 +1432,13 @@ async function startReorg(event) {
     if (!ok) throw new Error((body && body.error && body.error.message) || "reorg request failed");
     result.textContent = `${body.reused ? "Reused" : "Started"} ${body.job_id}`;
     result.className = "action-result";
-    await selectJob(body.job_id);
+    selectJobLocally(body.job_id);
   } catch (error) {
     result.textContent = String(error);
     result.className = "action-result err";
   } finally {
     startingJob = false;
-    await refreshJobs();
-    await refreshStatus();
+    await refreshDashboard({ force: true });
   }
 }
 
@@ -1148,14 +1462,13 @@ async function startScenario(event) {
     });
     if (!ok) throw new Error((body && body.error && body.error.message) || "scenario request failed");
     result.textContent = `${body.reused ? "Reused" : "Started"} ${body.job_id}`;
-    await selectJob(body.job_id);
+    selectJobLocally(body.job_id);
   } catch (error) {
     result.textContent = String(error);
     result.className = "action-result err";
   } finally {
     startingScenario = false;
-    await refreshJobs();
-    await refreshStatus();
+    await refreshDashboard({ force: true });
   }
 }
 
@@ -1189,14 +1502,13 @@ async function startBoundedAction(event, action) {
     });
     if (!ok) throw new Error((body && body.error && body.error.message) || `${path} request failed`);
     result.textContent = `${body.reused ? "Reused" : "Started"} ${body.job_id}`;
-    await selectJob(body.job_id);
+    selectJobLocally(body.job_id);
   } catch (error) {
     result.textContent = String(error);
     result.className = "action-result err";
   } finally {
     startingAction[action] = false;
-    await refreshJobs();
-    await refreshStatus();
+    await refreshDashboard({ force: true });
   }
 }
 
@@ -1231,14 +1543,13 @@ async function startNetworkAction(event, action) {
     });
     if (!ok) throw new Error((body && body.error && body.error.message) || `${action} request failed`);
     result.textContent = `${body.reused ? "Reused" : "Started"} ${body.job_id}`;
-    await selectJob(body.job_id);
+    selectJobLocally(body.job_id);
   } catch (error) {
     result.textContent = String(error);
     result.className = "action-result err";
   } finally {
     startingAction[action] = false;
-    await refreshJobs();
-    await refreshStatus();
+    await refreshDashboard({ force: true });
   }
 }
 
@@ -1266,7 +1577,7 @@ async function releaseCheckpoint(checkpoint) {
     result.className = "action-result err";
   } finally {
     releasingCheckpoints.delete(checkpoint.name);
-    await refreshJobs();
+    await refreshDashboard({ force: true });
   }
 }
 
@@ -1299,7 +1610,7 @@ async function abortSelectedJob() {
     result.className = "action-result err";
   } finally {
     abortingJob = false;
-    await refreshJobs();
+    await refreshDashboard({ force: true });
   }
 }
 
@@ -1352,7 +1663,7 @@ async function doApply() {
   } finally {
     applying = false;
     button.textContent = "Apply";
-    await refreshState();
+    await refreshDashboard({ force: true });
   }
 }
 
@@ -1363,11 +1674,8 @@ async function init() {
   const { body } = await api("/api/v1/config/schema");
   schema = body;
   buildForm();
-  await refreshState();
-  await refreshStatus();
   addFaucetOutput();
-  await refreshFaucet();
-  await refreshJobs();
+  await refreshDashboard({ force: true, reschedule: false });
   $("#apply").addEventListener("click", doApply);
   $("#reset").addEventListener("click", () => { dirty.clear(); fieldErrors.clear(); refreshForm(); });
   $("#mining-pause").addEventListener("click", () => setComponentState("mining", "paused"));
@@ -1398,10 +1706,7 @@ async function init() {
   $("#faucet-add-output").addEventListener("click", () => addFaucetOutput("", "1"));
   $("#faucet-source").addEventListener("change", renderFaucetControls);
   $("#faucet-confirm").addEventListener("click", submitFaucet);
-  setInterval(refreshStatus, 2000);
-  setInterval(refreshFaucet, 2000);
-  setInterval(() => { if (!applying) refreshState(); }, 4000);
-  setInterval(refreshJobs, 1000);
+  scheduleDashboardPoll();
 }
 
 init();
