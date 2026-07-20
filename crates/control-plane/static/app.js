@@ -1231,7 +1231,7 @@ function renderJobs() {
   scenarioStart.textContent = startingScenario ? "Starting…" : "Start scenario";
   for (const [action, formId, buttonId, label] of [
     ["mine", "mine-form", "mine-start", "Mine"],
-    ["burst", "burst-form", "burst-start", "Create burst"],
+    ["burst", "burst-form", "burst-start", "Create data burst"],
     ["partition", "partition-form", "partition-start", "Start partition"],
     ["degrade", "degrade-form", "degrade-start", "Start degradation"],
   ]) {
@@ -1486,9 +1486,9 @@ async function startBoundedAction(event, action) {
   } : {
     node: $("#burst-node").value,
     txs: Number($("#burst-txs").value),
-    outputs_per_tx: Number($("#burst-outputs").value),
+    data_bytes: Number($("#burst-data-bytes").value),
   };
-  result.textContent = `Submitting ${isMine ? "mine" : "spam burst"} job…`;
+  result.textContent = `Submitting ${isMine ? "mine" : "data spam burst"} job…`;
   result.className = "action-result";
   try {
     const { ok, body } = await api(`/api/v1/jobs/${path}`, {

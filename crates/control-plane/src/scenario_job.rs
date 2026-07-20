@@ -48,6 +48,13 @@ pub trait ScenarioActionBackend: Send + Sync {
         outputs_per_tx: u64,
         control: &dyn ScenarioControl,
     ) -> Result<Value>;
+    fn data_spam_burst(
+        &self,
+        node: MinerNode,
+        txs: u64,
+        data_bytes: u64,
+        control: &dyn ScenarioControl,
+    ) -> Result<Value>;
     fn wait_tx(
         &self,
         txid: &str,
@@ -332,6 +339,95 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
                 "accepted_transactions": txids.len() as u64,
                 "outputs_per_transaction": outputs_per_tx,
                 "engine": "raw",
+                "aborted": control.abort_requested()
+            }))
+        })
+    }
+
+    fn data_spam_burst(
+        &self,
+        node: MinerNode,
+        txs: u64,
+        data_bytes: u64,
+        control: &dyn ScenarioControl,
+    ) -> Result<Value> {
+        let policy = self.burst_policy()?;
+        let fanout = policy.fanout_utxos.max(1);
+        self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
+            engine.set_burst_data_shape(policy.fee_rate_sat_vb(), data_bytes);
+            let deadline = Instant::now() + self.timeout;
+            let checkpoint = |_: &str| !control.abort_requested() && Instant::now() < deadline;
+            let needed_branches = txs.min(fanout).max(1);
+            if !engine.ensure_branches(needed_branches, &checkpoint) {
+                let usable = engine.usable_branches_for_current_shape();
+                if control.abort_requested() {
+                    return Ok(json!({
+                        "node": node.to_string(),
+                        "requested_transactions": txs,
+                        "accepted_transactions": 0,
+                        "data_bytes": data_bytes,
+                        "engine": "raw",
+                        "shape": "op_return",
+                        "aborted": true
+                    }));
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out after {}s preparing raw data burst for {node}",
+                        self.timeout.as_secs()
+                    );
+                }
+                anyhow::bail!(
+                    "raw data burst for {node} is not funded: {usable}/{needed_branches} confirmed usable branches"
+                );
+            }
+            let (mut txids, mut offered_vbytes) = engine.data_round(
+                txs,
+                fanout,
+                data_bytes,
+                false,
+                0,
+                &checkpoint,
+            );
+            if (txids.len() as u64) < txs && !control.abort_requested() {
+                engine
+                    .reconcile()
+                    .context("reconcile the scenario burst engine mid-data-burst")?;
+                let remaining = txs - txids.len() as u64;
+                let (more, more_vbytes) = engine.data_round(
+                    remaining,
+                    fanout,
+                    data_bytes,
+                    false,
+                    0,
+                    &checkpoint,
+                );
+                txids.extend(more);
+                offered_vbytes += more_vbytes;
+            }
+            if (txids.len() as u64) < txs && !control.abort_requested() {
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out after {}s submitting raw data burst for {node}: accepted {}/{}",
+                        self.timeout.as_secs(),
+                        txids.len(),
+                        txs
+                    );
+                }
+                anyhow::bail!(
+                    "raw data burst for {node} accepted only {}/{} transactions",
+                    txids.len(),
+                    txs
+                );
+            }
+            Ok(json!({
+                "node": node.to_string(),
+                "requested_transactions": txs,
+                "accepted_transactions": txids.len() as u64,
+                "data_bytes": data_bytes,
+                "offered_vbytes": offered_vbytes,
+                "engine": "raw",
+                "shape": "op_return",
                 "aborted": control.abort_requested()
             }))
         })

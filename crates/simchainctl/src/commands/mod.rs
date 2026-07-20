@@ -153,7 +153,7 @@ pub enum SpamCommand {
     Pause,
     /// Resume spam unless disabled by policy or held by a job-owned lease.
     Resume,
-    /// Submit a bounded wallet transaction burst.
+    /// Submit a bounded raw transaction burst.
     Burst(SpamBurstArgs),
 }
 
@@ -188,6 +188,10 @@ pub struct SpamBurstArgs {
     /// single-output transactions.
     #[arg(long, default_value_t = 0)]
     pub outputs_per_tx: u64,
+    /// Fixed OP_RETURN payload bytes per raw transaction. When set, this
+    /// selects DATA mode and ignores --outputs-per-tx.
+    #[arg(long)]
+    pub data_bytes: Option<u64>,
     /// Wait for the server-side action to finish.
     #[arg(long)]
     pub wait: bool,
@@ -746,6 +750,27 @@ mod tests {
                 command: SpamCommand::Burst(SpamBurstArgs {
                     txs: 10,
                     outputs_per_tx: 4,
+                    ..
+                })
+            })
+        ));
+
+        let data_burst = Cli::try_parse_from([
+            "simchainctl",
+            "spam",
+            "burst",
+            "--txs",
+            "10",
+            "--data-bytes",
+            "512",
+        ])
+        .expect("data spam burst");
+        assert!(matches!(
+            data_burst.command,
+            Command::Spam(SpamArgs {
+                command: SpamCommand::Burst(SpamBurstArgs {
+                    txs: 10,
+                    data_bytes: Some(512),
                     ..
                 })
             })

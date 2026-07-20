@@ -639,6 +639,8 @@ impl RawSpammer {
     /// state) across differently-shaped bursts.
     pub fn set_burst_shape(&mut self, fee_rate_sat_vb: f64, sendmany_outputs: u64) {
         self.fee_rate_sat_vb = fee_rate_sat_vb;
+        self.data_min = 0;
+        self.data_max = 0;
         self.burn_scripts = if sendmany_outputs == 0 {
             vec![burn::burn_address(0).script_pubkey()]
         } else {
@@ -646,6 +648,13 @@ impl RawSpammer {
                 .map(|i| burn::burn_address(i).script_pubkey())
                 .collect()
         };
+    }
+
+    /// Retarget the burst engine to fixed-size OP_RETURN DATA transactions.
+    pub fn set_burst_data_shape(&mut self, fee_rate_sat_vb: f64, data_bytes: u64) {
+        self.fee_rate_sat_vb = fee_rate_sat_vb;
+        self.data_min = data_bytes as usize;
+        self.data_max = data_bytes as usize;
     }
 
     // Rebuild the data-branch UTXO set from the chain.
@@ -1402,6 +1411,73 @@ impl RawSpammer {
             self.bump_spam_txs(&sent, replaces, checkpoint);
         }
         txids
+    }
+
+    // DATA burst: send a fixed number of OP_RETURN txs of the selected payload
+    // size. This is the manual/scenario counterpart to hybrid_round's
+    // block-filling data loop.
+    pub fn data_round(
+        &mut self,
+        txs: u64,
+        fanout: u64,
+        data_bytes: u64,
+        replaceable: bool,
+        replaces: u64,
+        checkpoint: &impl Fn(&str) -> bool,
+    ) -> (Vec<Txid>, u64) {
+        if fanout > 0 && !self.ensure_funds(txs.min(fanout), fanout, checkpoint) {
+            return (Vec::new(), 0);
+        }
+
+        tracing::info!(
+            "{} => Raw-spamming {txs} OP_RETURN data txs of {data_bytes} byte(s)",
+            self.label
+        );
+
+        let mut txids = Vec::new();
+        let mut sent = Vec::new();
+        let mut added = 0u64;
+        let mut first_error: Option<String> = None;
+        let mut consecutive_failures = 0;
+        let shape = SpamShape::Data(data_bytes as usize);
+        while (txids.len() as u64) < txs {
+            if self.utxos.is_empty()
+                || consecutive_failures >= self.utxos.len()
+                || !checkpoint("raw_data_burst_before_submit")
+            {
+                break;
+            }
+            match self.send_shape(shape.clone(), replaceable) {
+                Ok(s) => {
+                    added += self.shape_vsize(&s.shape);
+                    txids.push(s.txid);
+                    sent.push(s);
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e.to_string());
+                    }
+                    consecutive_failures += 1;
+                }
+            }
+            if !checkpoint("raw_data_burst_after_submit") {
+                break;
+            }
+        }
+        if (txids.len() as u64) < txs {
+            let detail = first_error
+                .map(|e| format!(", first error: {e}"))
+                .unwrap_or_else(|| ", branch pool exhausted".to_string());
+            tracing::warn!(
+                "only {}/{txs} raw data spam txs accepted{detail}",
+                txids.len()
+            );
+        }
+        if replaceable {
+            self.bump_spam_txs(&sent, replaces, checkpoint);
+        }
+        (txids, added)
     }
 
     // DATA/HYBRID mode: send `small_txs` minimum-size P2WPKH txs (cosmetic

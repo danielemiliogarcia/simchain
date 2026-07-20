@@ -89,10 +89,10 @@
           <label>Transactions
             <input id="burst-txs" type="number" min="1" value="100" required>
           </label>
-          <label>Outputs / tx
-            <input id="burst-outputs" type="number" min="0" value="25" required>
+          <label>OP_RETURN bytes
+            <input id="burst-data-bytes" type="number" min="1" max="98000" value="90000" required>
           </label>
-          <button id="burst-start" type="submit">Create burst</button>
+          <button id="burst-start" type="submit">Create data burst</button>
           <div id="burst-action-result" class="action-result"></div>
         </form>
       </div>

@@ -98,6 +98,7 @@ fn run(cli: Cli) -> Result<(), ClientError> {
                         node: node.to_string(),
                         txs: args.txs,
                         outputs_per_tx: args.outputs_per_tx,
+                        data_bytes: args.data_bytes,
                     },
                     args.idempotency_key.as_deref(),
                 )?;

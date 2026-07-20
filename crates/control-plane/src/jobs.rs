@@ -31,7 +31,7 @@ use simchain_common::internal_api::{
     LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest, NetworkImpairment,
     NetworkLeaseReleaseRequest, NetworkLeaseRequest, PauseLease,
 };
-use simchain_common::live_tuning::{self, ServiceScope};
+use simchain_common::live_tuning::{self, ServiceScope, MAX_DATA_BYTES};
 use simchain_reorg::{ReorgObserver, ReorgPhase, ReorgProgress};
 use simchain_scenario_engine::{
     CheckpointStep, ComponentExpectation, FaucetScenarioOutput, MinerNode, NetworkNode, Scenario,
@@ -970,6 +970,7 @@ impl JobManager {
                         node,
                         request.txs,
                         request.outputs_per_tx,
+                        request.data_bytes,
                         abort,
                     )
                 }));
@@ -2315,6 +2316,7 @@ impl JobManager {
         node: MinerNode,
         txs: u64,
         outputs_per_tx: u64,
+        data_bytes: Option<u64>,
         abort: Arc<AtomicBool>,
     ) {
         if abort.load(Ordering::Acquire) {
@@ -2357,19 +2359,30 @@ impl JobManager {
             return;
         }
         self.set_phase(&job_id, "submitting_spam_burst");
+        let message = match data_bytes {
+            Some(bytes) => {
+                format!(
+                    "submitting {txs} OP_RETURN data transaction(s) from {node} ({bytes} byte payloads)"
+                )
+            }
+            None => format!("submitting {txs} transaction(s) from {node}"),
+        };
         self.emit_best_effort(
             &job_id,
             "action_started",
             "submitting_spam_burst",
-            &format!("submitting {txs} transaction(s) from {node}"),
+            &message,
             None,
         );
         let control = SimpleJobControl {
             abort: abort.clone(),
         };
-        let result = self
-            .scenario
-            .spam_burst(node, txs, outputs_per_tx, &control);
+        let result = match data_bytes {
+            Some(bytes) => self.scenario.data_spam_burst(node, txs, bytes, &control),
+            None => self
+                .scenario
+                .spam_burst(node, txs, outputs_per_tx, &control),
+        };
         let stop_error = renewer.stop().err().map(|error| error.to_string());
         let cleanup = self.cleanup_leases(&job_id, &[lease], false, stop_error);
         match result {
@@ -5771,6 +5784,20 @@ fn normalize_spam_burst_request(
             "txs must be positive",
         ));
     }
+    if let Some(data_bytes) = request.data_bytes {
+        if data_bytes == 0 {
+            return Err(JobManagerError::new(
+                ErrorCode::ValidationFailed,
+                "data_bytes must be positive",
+            ));
+        }
+        if data_bytes > MAX_DATA_BYTES {
+            return Err(JobManagerError::new(
+                ErrorCode::ValidationFailed,
+                format!("data_bytes must not exceed {MAX_DATA_BYTES}"),
+            ));
+        }
+    }
     Ok((request, node))
 }
 
@@ -7023,6 +7050,7 @@ steps:
                     node: "node3".to_string(),
                     txs: 3,
                     outputs_per_tx: 2,
+                    data_bytes: None,
                 },
                 None,
             )
@@ -7215,6 +7243,7 @@ steps:
                     node: "node2".to_string(),
                     txs: 0,
                     outputs_per_tx: 0,
+                    data_bytes: None,
                 },
                 None,
             )

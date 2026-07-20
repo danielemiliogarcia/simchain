@@ -1602,7 +1602,7 @@ steps:
             &fx.router,
             post_action(
                 "spam-burst",
-                serde_json::json!({"node": "node3", "txs": 3, "outputs_per_tx": 2}),
+                serde_json::json!({"node": "node3", "txs": 3, "data_bytes": 512}),
                 Some("test-token"),
                 None,
             ),
@@ -1616,6 +1616,8 @@ steps:
             if job["state"] == "succeeded" {
                 assert_eq!(job["kind"], "spam_burst");
                 assert_eq!(job["result"]["accepted_transactions"], 3);
+                assert_eq!(job["result"]["data_bytes"], 512);
+                assert_eq!(job["result"]["shape"], "op_return");
                 break;
             }
             assert!(tokio::time::Instant::now() < deadline);

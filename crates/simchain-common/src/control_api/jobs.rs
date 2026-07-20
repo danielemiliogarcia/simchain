@@ -102,6 +102,8 @@ pub struct SpamBurstJobRequest {
     pub txs: u64,
     #[serde(default)]
     pub outputs_per_tx: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
