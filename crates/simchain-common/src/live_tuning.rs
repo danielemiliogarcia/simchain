@@ -953,7 +953,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::MiningController,
         control: ControlKind::Integer,
         optional: true,
-        help: "Seed for stochastic timing and miner selection (reproducible runs); empty = random.",
+        help: "Unsigned 64-bit decimal seed for reproducible stochastic timing and miner selection. Example: 42; valid range: 0 to 18446744073709551615. Empty = generate a random seed.",
         warning: None,
     },
     SettingSpec {

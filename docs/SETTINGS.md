@@ -179,7 +179,7 @@ wider spread of fee rates with real competition inside a block is a proposed fea
 | `BLOCK_INTERVAL_MIN_SECS` | `10` | Poisson lower clamp in seconds; fractional values are accepted. Set empty for zero. Validated but does not affect fixed mode. |
 | `BLOCK_INTERVAL_MAX_SECS` | `20` | Poisson upper clamp in seconds; fractional values are accepted. Set empty for unbounded. Must be greater than zero and no lower than `BLOCK_INTERVAL_MIN_SECS`. Validated but does not affect fixed mode. |
 | `MINER_WEIGHTS` | _(empty)_ | Empty means strict node2/node3 alternation. Set two relative non-negative integer weights such as `70,30` to draw a miner independently for every block; `0,100` and `100,0` are valid. `50,50` is random selection, not alternation. |
-| `MINING_RNG_SEED` | _(empty)_ | Optional `u64` seed for reproducible Poisson intervals and weighted miner picks. When omitted, the controller derives a seed from system time and logs it. It is parsed but has no behavioral effect while both stochastic modes are off. |
+| `MINING_RNG_SEED` | _(empty)_ | Optional unsigned 64-bit decimal seed for reproducible Poisson intervals and weighted miner picks. Example: `MINING_RNG_SEED=42` (valid range `0` to `18446744073709551615`). When omitted, the controller derives a seed from system time and logs it. It is parsed but has no behavioral effect while both stochastic modes are off. |
 | `NODE2_WALLET_NAME` | `node2` | Wallet created on node2 by the controller, used by the spammer, and propagated to the control plane as a faucet treasury. |
 | `NODE3_WALLET_NAME` | `node3` | Wallet created on node3 by the controller, used by the spammer, and propagated to the control plane as a faucet treasury. |
 

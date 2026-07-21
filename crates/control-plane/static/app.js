@@ -522,9 +522,20 @@ function renderStatus(s, options = {}) {
         details.push(`last cycle ${fmtSeconds(component.last_cycle_duration_ms / 1000)}`);
       }
       if (component.reconciliation_pending) details.push("reconciliation pending");
-      text.textContent = `${name} · ${component.phase || component.status}` +
-        (details.length ? ` · ${details.join(" · ")}` : "") +
-        (component.last_error ? ` · ${component.last_error}` : "");
+      if (component.reachable) {
+        text.textContent = `${name} · ${component.phase || component.status}` +
+          (details.length ? ` · ${details.join(" · ")}` : "") +
+          (component.last_error ? ` · ${component.last_error}` : "");
+      } else {
+        const lastKnown = [];
+        if (component.phase && component.phase !== "unreachable") {
+          lastKnown.push(`phase ${component.phase}`);
+        }
+        lastKnown.push(...details);
+        text.textContent = `${name} · unreachable` +
+          (lastKnown.length ? ` · last known: ${lastKnown.join(" · ")}` : "") +
+          (component.last_error ? ` · ${component.last_error}` : "");
+      }
       row.append(dot, text);
       services.append(row);
     }
@@ -602,6 +613,15 @@ function effectiveValueFor(spec) {
   const svc = lastState.effective[spec.component];
   if (!svc || !svc.reachable || !svc.values) return null;
   return svc.values[spec.key] ?? "";
+}
+
+function unavailableSettingComponents() {
+  if (!schema || !lastState) return new Set();
+  const components = new Set(schema.settings.map((spec) => spec.component));
+  return new Set([...components].filter((component) => {
+    const effective = lastState.effective[component];
+    return !effective || !effective.reachable;
+  }));
 }
 
 function buildForm() {
@@ -722,6 +742,7 @@ function onEdit(key, value) {
 function refreshForm() {
   if (!schema || !lastState) return;
   const values = desiredValues();
+  const unavailableComponents = unavailableSettingComponents();
   for (const spec of schema.settings) {
     const field = document.querySelector(`.field[data-key="${spec.key}"]`);
     if (!field) continue;
@@ -732,10 +753,15 @@ function refreshForm() {
     }
     field.classList.toggle("dirty", isDirty);
 
-    const reason = ignoredReason(spec.key, values);
-    field.classList.toggle("ignored", reason != null);
+    const componentUnavailable = unavailableComponents.has(spec.component);
+    const ignored = ignoredReason(spec.key, values);
+    const reason = componentUnavailable
+      ? `${spec.component} worker unavailable; setting temporarily disabled`
+      : ignored;
+    field.classList.toggle("ignored", ignored != null);
+    field.classList.toggle("unavailable", componentUnavailable);
     field.title = reason || "";
-    input.disabled = activeMutationId() != null ||
+    input.disabled = componentUnavailable || activeMutationId() != null ||
       (spec.key === "SPAM_FANOUT_UTXOS" && values.get("SPAM_FANOUT_AUTO") === "true");
 
     const validationEl = field.querySelector(".field-error");
@@ -747,8 +773,10 @@ function refreshForm() {
     const runningEl = field.querySelector(".running");
     const effective = effectiveValueFor(spec);
     if (effective == null) {
-      runningEl.textContent = "effective: –";
-      runningEl.className = "running";
+      runningEl.textContent = componentUnavailable
+        ? `effective: ${spec.component} unavailable`
+        : "effective: –";
+      runningEl.className = "running" + (componentUnavailable ? " unavailable" : "");
     } else {
       runningEl.textContent = "effective: " + (effective === "" ? "(unset)" : effective);
       const differs = (lastState.desired[spec.key] ?? "") !== effective;
@@ -767,12 +795,16 @@ function refreshForm() {
     const mode = edited ? edited.apply_mode.replaceAll("_", " ") : "pending reconciliation";
     return `${component} (${mode})`;
   });
-  $("#impact").textContent = impacted.size
+  const impact = impacted.size
     ? "pending apply: " + impacts.join(", ")
     : "desired and effective configuration match";
+  $("#impact").textContent = unavailableComponents.size
+    ? `${impact} · apply waits for ${[...unavailableComponents].join(", ")} recovery`
+    : impact;
   const invalid = [...document.querySelectorAll("#form input, #form select")]
     .some((input) => !input.checkValidity()) || fieldErrors.size > 0;
   $("#apply").disabled = applying || activeMutationId() != null || invalid ||
+    unavailableComponents.size > 0 ||
     (dirty.size === 0 && impacted.size === 0);
 
   const errors = [];
@@ -892,6 +924,8 @@ function applyDashboardSnapshot(body, options = {}) {
     if (snapshotSectionChanged("status", projectStatusForDashboard(body.status), force)) {
       renderStatus(body.status, { force });
       statusRendered = true;
+      jobsNeedRender = true;
+      renderFaucetControls();
     }
   }
 
@@ -1168,12 +1202,16 @@ function collectFaucetRequest() {
 function renderFaucetControls() {
   const count = $("#faucet-outputs") ? $("#faucet-outputs").children.length : 0;
   if (!count) return;
+  const unavailable = missingComponents(["mining", "spam", "node2", "node3"]);
   $("#faucet-add-output").disabled = count >= 100 || faucetSubmitting;
   for (const button of document.querySelectorAll(".faucet-remove-output")) {
     button.disabled = count === 1 || faucetSubmitting;
   }
   $("#faucet-review").disabled = faucetSubmitting || !faucetStatus || !faucetStatus.available ||
-    faucetStatus.pending_transfer != null || activeMutationId() != null;
+    faucetStatus.pending_transfer != null || activeMutationId() != null || unavailable.length > 0;
+  $("#faucet-review").title = unavailable.length
+    ? `Unavailable while ${unavailable.join(", ")} ${unavailable.length === 1 ? "is" : "are"} unreachable`
+    : "";
   $("#faucet-review").textContent = faucetSubmitting ? "Submitting…" : "Review transaction";
 }
 
@@ -1362,7 +1400,11 @@ function renderJobs() {
   lock.className = "mutation-lock" + (active ? " busy" : "");
 
   const start = $("#reorg-start");
-  start.disabled = startingJob || active != null || !$("#reorg-form").checkValidity();
+  const reorgUnavailable = actionDependencyReason("reorg");
+  start.disabled = startingJob || active != null || !$("#reorg-form").checkValidity() ||
+    reorgUnavailable !== "";
+  start.title = reorgUnavailable;
+  setActionDependencyMessage("reorg", reorgUnavailable);
   start.textContent = startingJob ? "Starting…" : "Start reorg";
   const scenarioStart = $("#scenario-start");
   scenarioStart.disabled = startingScenario || active != null || !$("#scenario-form").checkValidity();
@@ -1374,7 +1416,11 @@ function renderJobs() {
     ["degrade", "degrade-form", "degrade-start", "Start degradation"],
   ]) {
     const button = $("#" + buttonId);
-    button.disabled = startingAction[action] || active != null || !$("#" + formId).checkValidity();
+    const unavailable = actionDependencyReason(action);
+    button.disabled = startingAction[action] || active != null ||
+      !$("#" + formId).checkValidity() || unavailable !== "";
+    button.title = unavailable;
+    setActionDependencyMessage(action, unavailable);
     button.textContent = startingAction[action] ? "Starting…" : label;
   }
 
@@ -1405,6 +1451,57 @@ function renderJobs() {
     }
   }
   if (latestStatus) renderStatusControlsOnly();
+}
+
+function missingComponents(names) {
+  if (!latestStatus) return [];
+  const components = latestStatus.components || {};
+  return [...new Set(names)].filter((name) => !components[name] || !components[name].reachable);
+}
+
+function actionDependencies(action) {
+  switch (action) {
+    case "mine":
+      return ["mining", $("#mine-node").value];
+    case "burst":
+      return ["spam", $("#burst-node").value];
+    case "reorg":
+      return ["mining", "spam", "node1", $("#reorg-node").value];
+    case "partition": {
+      const node = $("#partition-node").value;
+      return ["mining", "spam", "node1", "node2", "node3", `network-agent-${node}`];
+    }
+    case "degrade":
+      return [`network-agent-${$("#degrade-node").value}`];
+    default:
+      return [];
+  }
+}
+
+function actionDependencyReason(action) {
+  const unavailable = missingComponents(actionDependencies(action));
+  if (unavailable.length === 0) return "";
+  return `Unavailable while ${unavailable.join(", ")} ${unavailable.length === 1 ? "is" : "are"} unreachable`;
+}
+
+function setActionDependencyMessage(action, message) {
+  const result = $(`#${action}-action-result`);
+  if (!result) return;
+  if (message) {
+    if (result.dataset.dependencyBlocked !== "true") {
+      result.dataset.previousText = result.textContent;
+      result.dataset.previousClass = result.className;
+    }
+    result.dataset.dependencyBlocked = "true";
+    result.textContent = message;
+    result.className = "action-result err";
+  } else if (result.dataset.dependencyBlocked === "true") {
+    result.textContent = result.dataset.previousText || "";
+    result.className = result.dataset.previousClass || "action-result";
+    delete result.dataset.dependencyBlocked;
+    delete result.dataset.previousText;
+    delete result.dataset.previousClass;
+  }
 }
 
 function renderStatusControlsOnly() {

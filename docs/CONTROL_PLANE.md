@@ -47,6 +47,12 @@ until the coordinator is idle and be submitted again.
 The dashboard is the browser surface for the same operations exposed by the API and CLI:
 status, live mining/spam retuning, manual worker pause/resume, durable jobs, faucet
 funding, and local mempool.space health/linking when the `mempool` profile is active.
+If a mining or spam worker is unreachable, its settings and manual state controls are
+temporarily disabled and Apply waits for worker recovery. Unsaved field edits are
+preserved, and the controls re-enable automatically after a successful status poll.
+Bounded-action buttons are also disabled when one of their required workers, Bitcoin
+nodes, or network agents is unreachable; the dashboard names the missing dependency.
+Scenario submission remains available because dependencies are determined by its YAML.
 
 Configuration applies never touch node chain state, and mixed mining/spam applies roll
 back transactionally if a worker cannot accept or verify the new generation. Mining

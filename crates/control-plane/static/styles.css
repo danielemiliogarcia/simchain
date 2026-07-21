@@ -384,6 +384,8 @@ button.small { padding: 0.15rem 0.45rem; font-size: 0.7rem; }
 .field.invalid input, .field.invalid select { border-color: var(--err); }
 .field.dirty label::after { content: " ●"; color: var(--dirty); }
 .field.ignored { opacity: 0.45; }
+.field.unavailable { opacity: 0.55; }
+.field.unavailable .running { color: var(--err); }
 .field .running { font-size: 0.72rem; color: var(--dim); overflow-wrap: anywhere; }
 .field .running.differs { color: var(--warn); }
 .fieldwarn { grid-column: 1 / -1; color: var(--warn); font-size: 0.74rem; padding-left: 0.2rem; }
