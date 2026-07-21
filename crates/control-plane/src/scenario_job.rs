@@ -12,7 +12,8 @@ use simchain_common::config::{
     parse_rpc_url, RpcUrl, DEFAULT_NODE2_WALLET_NAME, DEFAULT_NODE3_WALLET_NAME,
 };
 use simchain_common::{
-    create_client, create_jsonrpc_client, create_wallet_client, require_regtest_address,
+    create_client, create_jsonrpc_client, create_wallet_client, get_or_create_mining_address,
+    mining_address_label,
 };
 use simchain_scenario_engine::{MinerNode, ScenarioControl, TxWaitState};
 use simchain_spammer::raw_transaction_spammer::RawSpammer;
@@ -206,17 +207,17 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
         let (rpc_url, wallet_name) = self.target(node);
         let wallet = create_wallet_client(rpc_url, wallet_name)?;
         let client = create_client(rpc_url)?;
-        let address = require_regtest_address(
-            wallet
-                .get_new_address(None, None)
-                .context("get fresh mining address")?,
-        )?;
+        let label = mining_address_label(wallet_name);
+        let address = get_or_create_mining_address(&wallet, wallet_name)
+            .context("get stable labeled mining address")?;
         let hashes = client
             .generate_to_address(blocks, &address)
             .with_context(|| format!("mine {blocks} blocks on {node}"))?;
         Ok(json!({
             "node": node.to_string(),
             "blocks": blocks,
+            "coinbase_address": address.to_string(),
+            "mining_label": label,
             "first_hash": hashes.first().map(ToString::to_string),
             "last_hash": hashes.last().map(ToString::to_string)
         }))

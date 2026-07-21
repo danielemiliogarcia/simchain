@@ -18,7 +18,9 @@ pub mod live_tuning;
 mod logging;
 mod rpc;
 
-pub use address::require_regtest_address;
+pub use address::{
+    get_or_create_mining_address, mining_address_label, require_regtest_address, MiningAddressError,
+};
 pub use amount::parse_btc_sats;
 pub use burn::burn_address;
 pub use config::{CommonConfig, ConfigError, RpcUrl};
