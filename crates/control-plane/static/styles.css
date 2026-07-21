@@ -28,6 +28,16 @@ h1 { font-size: 1.1rem; margin: 0; }
 h1 span { color: var(--accent); }
 h2 { font-size: 1rem; margin: 0 0 0.6rem; color: var(--accent); }
 h3 { font-size: 0.85rem; margin: 0.8rem 0 0.35rem; color: var(--dim); }
+.header-status { display: flex; align-items: center; justify-content: flex-end; gap: 0.8rem; min-width: 0; }
+.poll-control { display: flex; align-items: center; gap: 0.35rem; color: var(--dim); font-size: 0.76rem; white-space: nowrap; }
+.poll-control select {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+  padding: 0.2rem 0.45rem;
+}
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .section-heading h2 { margin-bottom: 0.6rem; }
 .explorer-status { display: flex; align-items: center; gap: 0.45rem; color: var(--dim); font-size: 0.76rem; margin-bottom: 0.6rem; }

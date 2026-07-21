@@ -36,7 +36,11 @@ let dashboardRefreshForceQueued = false;
 let dashboardPollTimer = null;
 const dashboardRenderCache = new Map();
 const DASHBOARD_ACTIVE_POLL_MS = 1000;
-const DASHBOARD_IDLE_POLL_MS = 5000;
+const DEFAULT_DASHBOARD_IDLE_POLL_MS = 10000;
+const DASHBOARD_IDLE_POLL_OPTIONS = [5000, 10000, 30000, 60000];
+const DASHBOARD_IDLE_POLL_STORAGE_KEY = "simchain-dashboard-idle-poll-ms";
+const MAX_SELECTED_JOB_EVENTS = 1000;
+let dashboardIdlePollMs = loadDashboardIdlePollMs();
 let activeDashboardTab = "overview";
 
 const GROUP_TITLES = {
@@ -77,6 +81,23 @@ function snapshotSectionChanged(name, value, force = false) {
 
 function clearDashboardSection(name) {
   dashboardRenderCache.delete(name);
+}
+
+function loadDashboardIdlePollMs() {
+  try {
+    const stored = Number(localStorage.getItem(DASHBOARD_IDLE_POLL_STORAGE_KEY));
+    if (DASHBOARD_IDLE_POLL_OPTIONS.includes(stored)) return stored;
+  } catch (_) {}
+  return DEFAULT_DASHBOARD_IDLE_POLL_MS;
+}
+
+function setDashboardIdlePollMs(milliseconds) {
+  dashboardIdlePollMs = DASHBOARD_IDLE_POLL_OPTIONS.includes(milliseconds)
+    ? milliseconds
+    : DEFAULT_DASHBOARD_IDLE_POLL_MS;
+  try {
+    localStorage.setItem(DASHBOARD_IDLE_POLL_STORAGE_KEY, String(dashboardIdlePollMs));
+  } catch (_) {}
 }
 
 function projectConfigForForm(config) {
@@ -705,11 +726,24 @@ function preferredSelectedJobId(jobs, selectedJobPayload) {
   return (jobs.jobs && jobs.jobs.length > 0) ? jobs.jobs[0].id : null;
 }
 
+function trimSelectedJobEvents() {
+  const trim = selectedJobEvents.length - MAX_SELECTED_JOB_EVENTS;
+  if (trim <= 0) return;
+  selectedJobEvents.splice(0, trim);
+  renderedJobEventCount = Math.max(0, renderedJobEventCount - trim);
+  const events = $("#job-events");
+  for (let i = 0; i < trim && events.firstElementChild; i += 1) {
+    events.firstElementChild.remove();
+  }
+}
+
 function applySelectedJobEvents(eventsPayload) {
   if (!eventsPayload) return false;
-  selectedJobEvents.push(...(eventsPayload.events || []));
+  const events = eventsPayload.events || [];
+  selectedJobEvents.push(...events);
+  trimSelectedJobEvents();
   selectedJobEventAfter = Math.max(selectedJobEventAfter, eventsPayload.next_sequence || 0);
-  return (eventsPayload.events || []).length > 0;
+  return events.length > 0;
 }
 
 function applyDashboardSnapshot(body, options = {}) {
@@ -820,11 +854,15 @@ function dashboardPollDelay() {
     releasingCheckpoints.size > 0 || changingComponentState.mining || changingComponentState.spam;
   const pendingFaucet = faucetStatus && faucetStatus.pending_transfer;
   return (activeJob || selectedJobRunning || pendingLocalAction || pendingFaucet)
-    ? DASHBOARD_ACTIVE_POLL_MS : DASHBOARD_IDLE_POLL_MS;
+    ? DASHBOARD_ACTIVE_POLL_MS : dashboardIdlePollMs;
 }
 
 function scheduleDashboardPoll(delay = dashboardPollDelay()) {
   if (dashboardPollTimer != null) clearTimeout(dashboardPollTimer);
+  if (document.hidden) {
+    dashboardPollTimer = null;
+    return;
+  }
   dashboardPollTimer = setTimeout(() => {
     refreshDashboard().catch((error) => console.error(error));
   }, delay);
@@ -1231,7 +1269,7 @@ function renderJobs() {
   scenarioStart.textContent = startingScenario ? "Starting…" : "Start scenario";
   for (const [action, formId, buttonId, label] of [
     ["mine", "mine-form", "mine-start", "Mine"],
-    ["burst", "burst-form", "burst-start", "Create data burst"],
+    ["burst", "burst-form", "burst-start", "Create tx burst"],
     ["partition", "partition-form", "partition-start", "Start partition"],
     ["degrade", "degrade-form", "degrade-start", "Start degradation"],
   ]) {
@@ -1488,7 +1526,7 @@ async function startBoundedAction(event, action) {
     txs: Number($("#burst-txs").value),
     data_bytes: Number($("#burst-data-bytes").value),
   };
-  result.textContent = `Submitting ${isMine ? "mine" : "data spam burst"} job…`;
+  result.textContent = `Submitting ${isMine ? "mine" : "tx burst"} job…`;
   result.className = "action-result";
   try {
     const { ok, body } = await api(`/api/v1/jobs/${path}`, {
@@ -1676,6 +1714,13 @@ async function init() {
   buildForm();
   addFaucetOutput();
   await refreshDashboard({ force: true, reschedule: false });
+  const pollInterval = $("#poll-interval");
+  pollInterval.value = String(dashboardIdlePollMs);
+  pollInterval.addEventListener("change", () => {
+    setDashboardIdlePollMs(Number(pollInterval.value));
+    pollInterval.value = String(dashboardIdlePollMs);
+    scheduleDashboardPoll();
+  });
   $("#apply").addEventListener("click", doApply);
   $("#reset").addEventListener("click", () => { dirty.clear(); fieldErrors.clear(); refreshForm(); });
   $("#mining-pause").addEventListener("click", () => setComponentState("mining", "paused"));
@@ -1706,6 +1751,14 @@ async function init() {
   $("#faucet-add-output").addEventListener("click", () => addFaucetOutput("", "1"));
   $("#faucet-source").addEventListener("change", renderFaucetControls);
   $("#faucet-confirm").addEventListener("click", submitFaucet);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      if (dashboardPollTimer != null) clearTimeout(dashboardPollTimer);
+      dashboardPollTimer = null;
+    } else {
+      refreshDashboard({ force: true }).catch((error) => console.error(error));
+    }
+  });
   scheduleDashboardPoll();
 }
 

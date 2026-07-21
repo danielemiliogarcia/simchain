@@ -24,6 +24,24 @@ The control-plane image is intentionally narrow: it contains no Docker CLI, has 
 Docker socket, drops all capabilities, uses a read-only root filesystem, and mounts only
 its named state volume.
 
+## Mutation coordinator
+
+Dashboard, CLI, MCP, and direct HTTP clients all submit mutation jobs to the same
+control-plane coordinator. At most one mutation job runs at a time. If a reorg,
+scenario, manual mine, spam burst, partition, degradation, or faucet job already owns
+the coordinator, a second incompatible request is rejected; it is not queued for later
+execution. The dashboard shows the active job banner and disables conflicting controls,
+while CLI/API/MCP callers receive the same busy/error response from the backend.
+
+This is deliberate: queued chain mutations can become stale or unsafe after the active
+job changes height, mempool contents, worker leases, faucet state, or network
+impairments. For repeatable multi-step execution, put the ordered actions in one
+scenario YAML and submit it as a single durable scenario job.
+
+Idempotency keys are for retries, not queuing. Reusing the same key with the same
+normalized request returns the existing accepted job; a different request must wait
+until the coordinator is idle and be submitted again.
+
 ## Dashboard
 
 The dashboard is the browser surface for the same operations exposed by the API and CLI:

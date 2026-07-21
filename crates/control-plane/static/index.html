@@ -10,7 +10,17 @@
   <script>window.CONTROL_PLANE_TOKEN = __CONTROL_PLANE_TOKEN_JSON__;</script>
   <header>
     <h1>simchain <span>control plane</span></h1>
-    <div id="conn" class="conn">connecting…</div>
+    <div class="header-status">
+      <label class="poll-control">Poll
+        <select id="poll-interval">
+          <option value="5000">5s</option>
+          <option value="10000">10s</option>
+          <option value="30000">30s</option>
+          <option value="60000">60s</option>
+        </select>
+      </label>
+      <div id="conn" class="conn">connecting…</div>
+    </div>
   </header>
 
   <main>
@@ -92,7 +102,7 @@
           <label>OP_RETURN bytes
             <input id="burst-data-bytes" type="number" min="1" max="98000" value="90000" required>
           </label>
-          <button id="burst-start" type="submit">Create data burst</button>
+          <button id="burst-start" type="submit">Create tx burst</button>
           <div id="burst-action-result" class="action-result"></div>
         </form>
       </div>
