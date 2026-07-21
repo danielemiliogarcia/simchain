@@ -169,8 +169,9 @@ Validation rules:
 - `assert_config.settings` checks durable desired values, and with `effective: true`
   (the default) also checks that the mining/spam workers expose the expected effective
   policy at the current desired generation.
-- `reorg.node` defaults to `node3`. `adds_new_txs` and `double_spend_pct` expose the
-  same optional organic/double-spend knobs as `simchainctl reorg start`.
+- `reorg.node` defaults to `node3`. `adds_new_txs` prioritizes fresh wallet
+  transactions into replacement blocks; `double_spend_pct` exposes the optional
+  permanent-drop conflict path. Both match `simchainctl reorg start`.
 - `faucet.source` defaults to `auto` and also accepts `node2` or `node3`.
   `faucet.outputs` accepts 1 through 100 entries, each with either `address` or
   `address_env` plus an `amount`. Amounts may be decimal BTC (`1`, `0.25`, `1btc`) or

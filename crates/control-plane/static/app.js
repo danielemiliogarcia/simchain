@@ -42,6 +42,8 @@ const DASHBOARD_IDLE_POLL_STORAGE_KEY = "simchain-dashboard-idle-poll-ms";
 const MAX_SELECTED_JOB_EVENTS = 1000;
 let dashboardIdlePollMs = loadDashboardIdlePollMs();
 let activeDashboardTab = "overview";
+let openHelpPopover = null;
+let helpPopoverSeq = 0;
 
 const GROUP_TITLES = {
   "mining": "Mining",
@@ -208,6 +210,100 @@ function initTabs() {
     selectTab(location.hash.slice(1), false)
   );
   selectTab(location.hash.slice(1), false);
+}
+
+function labelTitleHost(label) {
+  let title = label.querySelector(":scope > .label-title");
+  if (title) return title;
+
+  const textNode = Array.from(label.childNodes)
+    .find((node) => node.nodeType === Node.TEXT_NODE && node.textContent.trim());
+  title = document.createElement("span");
+  title.className = "label-title";
+  title.textContent = textNode ? textNode.textContent.trim() : "";
+  if (textNode) {
+    label.replaceChild(title, textNode);
+  } else {
+    label.prepend(title);
+  }
+  return title;
+}
+
+function closeHelpPopover() {
+  if (!openHelpPopover) return;
+  openHelpPopover.button.setAttribute("aria-expanded", "false");
+  openHelpPopover.popover.hidden = true;
+  openHelpPopover = null;
+}
+
+function positionHelpPopover(button, popover) {
+  const gutter = 8;
+  const gap = 6;
+  const viewportWidth = document.documentElement.clientWidth;
+  const viewportHeight = document.documentElement.clientHeight;
+  const buttonRect = button.getBoundingClientRect();
+  const popoverRect = popover.getBoundingClientRect();
+  const left = Math.min(
+    Math.max(gutter, buttonRect.left),
+    Math.max(gutter, viewportWidth - popoverRect.width - gutter)
+  );
+  const below = buttonRect.bottom + gap;
+  const above = buttonRect.top - popoverRect.height - gap;
+  const top = below + popoverRect.height <= viewportHeight - gutter
+    ? below
+    : Math.max(gutter, above);
+  popover.style.left = `${Math.round(left)}px`;
+  popover.style.top = `${Math.round(top)}px`;
+}
+
+function attachHelpButton(target, helpText) {
+  const text = String(helpText || "").trim();
+  if (!text || target.dataset.helpAttached === "true") return;
+  target.dataset.helpAttached = "true";
+
+  const host = target.tagName === "LABEL" ? labelTitleHost(target) : target;
+  host.classList.add("help-host");
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "help-button";
+  button.textContent = "?";
+  button.setAttribute("aria-label", "Show help");
+  button.setAttribute("aria-expanded", "false");
+
+  const popover = document.createElement("span");
+  popover.id = `help-popover-${++helpPopoverSeq}`;
+  popover.className = "help-popover";
+  popover.hidden = true;
+  popover.textContent = text;
+  button.setAttribute("aria-controls", popover.id);
+
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const wasOpen = !popover.hidden;
+    closeHelpPopover();
+    if (!wasOpen) {
+      popover.hidden = false;
+      positionHelpPopover(button, popover);
+      button.setAttribute("aria-expanded", "true");
+      openHelpPopover = { button, popover };
+    }
+  });
+  popover.addEventListener("click", (event) => event.stopPropagation());
+  host.append(" ", button, popover);
+}
+
+function initHelp() {
+  for (const target of document.querySelectorAll("[data-help]")) {
+    attachHelpButton(target, target.dataset.help);
+  }
+  document.addEventListener("click", closeHelpPopover);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeHelpPopover();
+  });
+  document.addEventListener("scroll", closeHelpPopover, true);
+  window.addEventListener("resize", closeHelpPopover);
 }
 
 /* ------------------------------------------------------------------ status */
@@ -529,8 +625,11 @@ function buildForm() {
       field.dataset.key = spec.key;
 
       const label = document.createElement("label");
-      label.textContent = spec.key;
-      label.title = spec.help;
+      const labelTitle = document.createElement("span");
+      labelTitle.className = "label-title";
+      labelTitle.textContent = spec.key;
+      label.append(labelTitle);
+      attachHelpButton(label, spec.help);
 
       let input;
       if (spec.control === "toggle") {
@@ -595,8 +694,11 @@ function buildBootField(boot) {
   field.dataset.bootKey = boot.key;
 
   const label = document.createElement("label");
-  label.textContent = boot.key;
-  label.title = boot.help;
+  const labelTitle = document.createElement("span");
+  labelTitle.className = "label-title";
+  labelTitle.textContent = boot.key;
+  label.append(labelTitle);
+  attachHelpButton(label, boot.help);
 
   const value = document.createElement("div");
   value.className = "bootvalue";
@@ -606,11 +708,7 @@ function buildBootField(boot) {
   note.className = "running";
   note.textContent = boot.note || "read-only";
 
-  const help = document.createElement("div");
-  help.className = "boothelp";
-  help.textContent = boot.help;
-
-  field.append(label, value, note, help);
+  field.append(label, value, note);
   return field;
 }
 
@@ -885,15 +983,15 @@ async function refreshDashboard(options = {}) {
     if (ok && body) applyDashboardSnapshot(body, { ...options, request });
   } finally {
     dashboardRefreshing = false;
-  }
-  const queued = dashboardRefreshQueued;
-  const queuedForce = dashboardRefreshForceQueued;
-  dashboardRefreshQueued = false;
-  dashboardRefreshForceQueued = false;
-  if (queued) {
-    await refreshDashboard({ force: queuedForce, reschedule: options.reschedule });
-  } else if (options.reschedule !== false) {
-    scheduleDashboardPoll();
+    const queued = dashboardRefreshQueued;
+    const queuedForce = dashboardRefreshForceQueued;
+    dashboardRefreshQueued = false;
+    dashboardRefreshForceQueued = false;
+    if (queued) {
+      await refreshDashboard({ force: queuedForce, reschedule: options.reschedule });
+    } else if (options.reschedule !== false) {
+      scheduleDashboardPoll();
+    }
   }
 }
 
@@ -990,6 +1088,7 @@ function addFaucetOutput(address = "", amount = "1") {
 
   const addressLabel = document.createElement("label");
   addressLabel.textContent = "Regtest address";
+  attachHelpButton(addressLabel, "Destination regtest address that receives faucet funds. Example: paste a bcrt1 address from the wallet or service you want to fund.");
   const addressInput = document.createElement("input");
   addressInput.type = "text";
   addressInput.autocomplete = "off";
@@ -1001,6 +1100,7 @@ function addFaucetOutput(address = "", amount = "1") {
 
   const amountLabel = document.createElement("label");
   amountLabel.textContent = "Amount (BTC)";
+  attachHelpButton(amountLabel, "BTC amount for this destination. Example: 0.5 sends 0.5 BTC; values may use up to 8 decimal places.");
   const amountInput = document.createElement("input");
   amountInput.type = "text";
   amountInput.inputMode = "decimal";
@@ -1713,6 +1813,7 @@ async function init() {
   schema = body;
   buildForm();
   addFaucetOutput();
+  initHelp();
   await refreshDashboard({ force: true, reschedule: false });
   const pollInterval = $("#poll-interval");
   pollInterval.value = String(dashboardIdlePollMs);

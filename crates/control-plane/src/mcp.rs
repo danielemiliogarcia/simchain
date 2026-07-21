@@ -108,7 +108,7 @@ pub struct StartReorgParams {
     /// Replacement-chain miner: `node2` or `node3`.
     #[serde(default = "default_reorg_node")]
     pub node: String,
-    /// Fresh wallet transactions to add to a non-empty replacement.
+    /// Fresh wallet transactions to prioritize into non-empty replacement blocks.
     #[serde(default)]
     pub adds_new_txs: u64,
     /// Percentage of eligible orphaned wallet transactions to conflict.

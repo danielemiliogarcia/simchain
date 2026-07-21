@@ -21,7 +21,7 @@ Arguments:
 
 Environment:
   REORG_NODE                  Replacement-chain miner, default node3.
-  REORG_ADDS_NEW_TXS          Extra fresh txs for non-empty replacement blocks.
+  REORG_ADDS_NEW_TXS          Fresh txs prioritized into non-empty replacement blocks.
   REORG_DOUBLE_SPEND_PCT      Percentage of eligible orphaned txs to conflict.
   SIMCHAIN_CONTROL_URL        Control-plane URL for simchainctl.
   SIMCHAIN_CONTROL_TOKEN      Control-plane bearer token for simchainctl.

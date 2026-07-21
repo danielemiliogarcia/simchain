@@ -3,17 +3,21 @@
 use crate::{
     chain::{
         balanced_weight_budget, branch_to_orphan, last_blocks, live_mempool_weighted, mine_exact,
-        pack_by_weight, print_blocks, weight_prefix_len, BlockTx, BLOCK_WEIGHT_BUDGET,
+        pack_prioritized_by_weight, print_blocks, weight_prefix_len, BlockTx, BLOCK_WEIGHT_BUDGET,
     },
     double_spend::{build_plan, DoubleSpendPlan},
     wallet::inject_transactions,
 };
 use anyhow::Context;
-use bitcoincore_rpc::{bitcoin::Address, Client, RpcApi};
+use bitcoincore_rpc::{
+    bitcoin::{Address, Txid},
+    Client, RpcApi,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use simchain_common::{config::RpcUrl, create_client};
 use std::{
+    collections::HashSet,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -29,6 +33,10 @@ pub struct ReorgRequest {
 impl ReorgRequest {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.depth > 0, "reorg depth must be at least 1");
+        anyhow::ensure!(
+            self.adds_new_txs <= 10_000,
+            "adds_new_txs must not exceed 10000"
+        );
         anyhow::ensure!(
             self.double_spend_pct <= 100,
             "double_spend_pct must be between 0 and 100"
@@ -64,6 +72,7 @@ pub enum ReorgPhase {
     WaitingForTimestamp,
     Invalidating,
     Invalidated,
+    InjectingTransactions,
     MiningReplacement,
     WaitingForWitness,
     Converged,
@@ -82,6 +91,7 @@ impl ReorgPhase {
             Self::WaitingForTimestamp => "waiting_for_timestamp",
             Self::Invalidating => "invalidating",
             Self::Invalidated => "invalidated",
+            Self::InjectingTransactions => "injecting_transactions",
             Self::MiningReplacement => "mining_replacement",
             Self::WaitingForWitness => "waiting_for_witness",
             Self::Converged => "converged",
@@ -125,6 +135,9 @@ pub struct ReorgResult {
     pub new_tip_hash: String,
     pub target_height: Option<u64>,
     pub returned_transactions: usize,
+    pub requested_new_transactions: u64,
+    pub created_new_transactions: u64,
+    pub mined_new_transactions: u64,
     pub replacement_blocks: u64,
     pub extra_blocks: u64,
     pub network_converged: bool,
@@ -196,6 +209,9 @@ fn run_with_clients(
             new_tip_hash: old_tip_hash,
             target_height: None,
             returned_transactions: 0,
+            requested_new_transactions: request.adds_new_txs,
+            created_new_transactions: 0,
+            mined_new_transactions: 0,
             replacement_blocks: 0,
             extra_blocks: 0,
             network_converged: false,
@@ -261,6 +277,8 @@ fn run_with_clients(
     emit_deferred_abort(observer);
 
     let blocks_to_mine = request.depth + 1;
+    let mut injected_txids = Vec::new();
+    let mut injection_shortfall = None;
     let plan: Option<DoubleSpendPlan> = if request.empty {
         if request.double_spend_pct > 0 {
             tracing::info!(
@@ -295,13 +313,39 @@ fn run_with_clients(
             plan.log_selection(target.use_raw_tx_spam);
         }
         if request.adds_new_txs > 0 {
-            inject_transactions(
+            emit(
+                observer,
+                ReorgPhase::InjectingTransactions,
+                format!(
+                    "creating {} fresh replacement-chain transaction(s)",
+                    request.adds_new_txs
+                ),
+                Some(json!({"requested_transactions": request.adds_new_txs})),
+            );
+            let injection = inject_transactions(
                 node,
                 request.adds_new_txs,
                 &target.rpc_url,
                 &target.wallet_name,
             );
+            injected_txids = injection.txids;
+            injection_shortfall = injection.shortfall;
+            emit(
+                observer,
+                ReorgPhase::InjectingTransactions,
+                format!(
+                    "created {}/{} fresh replacement-chain transaction(s)",
+                    injected_txids.len(),
+                    request.adds_new_txs
+                ),
+                Some(json!({
+                    "requested_transactions": request.adds_new_txs,
+                    "created_transactions": injected_txids.len(),
+                    "shortfall": injection_shortfall.as_deref()
+                })),
+            );
         }
+        let priority_txids: HashSet<_> = injected_txids.iter().copied().collect();
 
         let mut pending = plan.raw_conflicts();
         for index in 0..blocks_to_mine {
@@ -317,11 +361,21 @@ fn run_with_clients(
             let conflict_count = weight_prefix_len(&conflict_weights, budget);
             let conflicts: Vec<(String, u64)> = pending.drain(..conflict_count).collect();
             let conflict_weight: u64 = conflicts.iter().map(|(_, weight)| *weight).sum();
-            let packed = pack_by_weight(&mempool, budget.saturating_sub(conflict_weight));
-            let mempool_weight: u64 = mempool[..packed.len()]
+            let packed = pack_prioritized_by_weight(
+                &mempool,
+                &priority_txids,
+                budget.saturating_sub(conflict_weight),
+            );
+            let packed_set: HashSet<_> = packed.iter().copied().collect();
+            let mempool_weight: u64 = mempool
                 .iter()
+                .filter(|transaction| packed_set.contains(&transaction.txid))
                 .map(|transaction| transaction.weight)
                 .sum();
+            let priority_count = packed
+                .iter()
+                .filter(|txid| priority_txids.contains(*txid))
+                .count();
             emit(
                 observer,
                 ReorgPhase::MiningReplacement,
@@ -330,6 +384,7 @@ fn run_with_clients(
                     "index": index + 1,
                     "total": blocks_to_mine,
                     "conflicts": conflicts.len(),
+                    "priority_transactions": priority_count,
                     "mempool_transactions": packed.len(),
                     "selected_weight": conflict_weight + mempool_weight,
                     "target_weight": budget
@@ -373,6 +428,37 @@ fn run_with_clients(
 
     let new_tip_height = node.get_block_count()?;
     let new_tip_hash = node.get_best_block_hash()?.to_string();
+    let created_new_transactions = injected_txids.len() as u64;
+    let mined_new_transactions = if injected_txids.is_empty() {
+        0
+    } else {
+        let winning_txids = active_chain_txids(node, target_height, new_tip_height)?;
+        injected_txids
+            .iter()
+            .filter(|txid| winning_txids.contains(*txid))
+            .count() as u64
+    };
+    if !request.empty && request.adds_new_txs > 0 {
+        emit(
+            observer,
+            ReorgPhase::MiningReplacement,
+            format!(
+                "verified {mined_new_transactions}/{} requested fresh transaction(s) on the winning chain",
+                request.adds_new_txs
+            ),
+            Some(json!({
+                "requested_transactions": request.adds_new_txs,
+                "created_transactions": created_new_transactions,
+                "mined_transactions": mined_new_transactions
+            })),
+        );
+        verify_new_transaction_requirement(
+            request.adds_new_txs,
+            created_new_transactions,
+            mined_new_transactions,
+            injection_shortfall.as_deref(),
+        )?;
+    }
     let aborted = observer.abort_requested();
     emit(
         observer,
@@ -386,6 +472,9 @@ fn run_with_clients(
             "height": new_tip_height,
             "hash": new_tip_hash,
             "network_converged": network_converged,
+            "requested_new_transactions": request.adds_new_txs,
+            "created_new_transactions": created_new_transactions,
+            "mined_new_transactions": mined_new_transactions,
             "abort_requested": aborted
         })),
     );
@@ -396,6 +485,9 @@ fn run_with_clients(
         new_tip_hash,
         target_height: Some(target_height),
         returned_transactions: returned,
+        requested_new_transactions: request.adds_new_txs,
+        created_new_transactions,
+        mined_new_transactions,
         replacement_blocks: blocks_to_mine + extra_blocks,
         extra_blocks,
         network_converged,
@@ -484,6 +576,9 @@ fn aborted_before_mutation(
         new_tip_hash: node.get_best_block_hash()?.to_string(),
         target_height: Some(target_height),
         returned_transactions: 0,
+        requested_new_transactions: 0,
+        created_new_transactions: 0,
+        mined_new_transactions: 0,
         replacement_blocks: 0,
         extra_blocks: 0,
         network_converged: false,
@@ -497,6 +592,36 @@ fn aborted_before_mutation(
         Some(json!({"height": result.new_tip_height, "abort_requested": true})),
     );
     Ok(result)
+}
+
+fn active_chain_txids(
+    node: &Client,
+    first_height: u64,
+    last_height: u64,
+) -> Result<HashSet<Txid>, bitcoincore_rpc::Error> {
+    let mut txids = HashSet::new();
+    for height in first_height..=last_height {
+        let hash = node.get_block_hash(height)?;
+        txids.extend(node.get_block_info(&hash)?.tx.into_iter().skip(1));
+    }
+    Ok(txids)
+}
+
+fn verify_new_transaction_requirement(
+    requested: u64,
+    created: u64,
+    mined: u64,
+    injection_shortfall: Option<&str>,
+) -> anyhow::Result<()> {
+    if created == requested && mined == requested {
+        return Ok(());
+    }
+    let detail = injection_shortfall
+        .map(|reason| format!("; injection error: {reason}"))
+        .unwrap_or_default();
+    anyhow::bail!(
+        "replacement-chain transaction requirement was not met: requested {requested}, created {created}, mined {mined}{detail}"
+    )
 }
 
 fn emit_deferred_abort(observer: &dyn ReorgObserver) {
@@ -545,10 +670,39 @@ mod tests {
         .validate()
         .is_err());
         assert!(ReorgRequest {
+            adds_new_txs: 10_001,
+            ..valid.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(ReorgRequest {
             double_spend_pct: 101,
             ..valid
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn new_transaction_requirement_needs_every_requested_tx_on_chain() {
+        assert!(verify_new_transaction_requirement(20, 20, 20, None).is_ok());
+
+        let injection = verify_new_transaction_requirement(
+            20,
+            7,
+            7,
+            Some("wallet exhausted its confirmed inputs"),
+        )
+        .expect_err("an injection shortfall must fail");
+        assert!(injection
+            .to_string()
+            .contains("requested 20, created 7, mined 7"));
+        assert!(injection.to_string().contains("wallet exhausted"));
+
+        let mining = verify_new_transaction_requirement(20, 20, 19, None)
+            .expect_err("an inclusion shortfall must fail");
+        assert!(mining
+            .to_string()
+            .contains("requested 20, created 20, mined 19"));
     }
 }

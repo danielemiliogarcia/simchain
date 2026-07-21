@@ -6,7 +6,7 @@ use bitcoincore_rpc::{
     Client, RpcApi,
 };
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Consensus cap on block weight. A block whose transactions push past this is
 /// rejected with `bad-blk-length`, so replacement blocks are packed below it.
@@ -99,10 +99,11 @@ pub fn print_blocks(blocks: &[(u64, String, usize)]) {
 
 /// One mempool transaction with the block weight it contributes. Ordered
 /// parents-first by the list it lives in.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct MempoolTx {
     pub txid: Txid,
     pub weight: u64,
+    pub depends: Vec<Txid>,
 }
 
 /// Mempool transactions with their weights, ordered parents-first (ascending
@@ -118,7 +119,7 @@ pub fn live_mempool_weighted(
     node: &Client,
     excluded: &HashSet<Txid>,
 ) -> Result<Vec<MempoolTx>, bitcoincore_rpc::Error> {
-    let mut entries: Vec<(u64, Txid, u64)> = node
+    let mut entries: Vec<(u64, Txid, u64, Vec<Txid>)> = node
         .get_raw_mempool_verbose()?
         .into_iter()
         .filter(|(txid, _)| !excluded.contains(txid))
@@ -126,7 +127,7 @@ pub fn live_mempool_weighted(
             // `weight` is present on Core >= 0.19; fall back to vsize*4 (an
             // upper bound, safe for budgeting) if an older node omits it.
             let weight = entry.weight.unwrap_or(entry.vsize * 4);
-            (entry.ancestor_count, txid, weight)
+            (entry.ancestor_count, txid, weight, entry.depends)
         })
         .collect();
     // Parents-first; txid tiebreak makes ties deterministic (the verbose
@@ -134,7 +135,11 @@ pub fn live_mempool_weighted(
     entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     Ok(entries
         .into_iter()
-        .map(|(_, txid, weight)| MempoolTx { txid, weight })
+        .map(|(_, txid, weight, depends)| MempoolTx {
+            txid,
+            weight,
+            depends,
+        })
         .collect())
 }
 
@@ -187,6 +192,77 @@ pub fn pack_by_weight(mempool: &[MempoolTx], budget: u64) -> Vec<Txid> {
     let weights: Vec<u64> = mempool.iter().map(|tx| tx.weight).collect();
     let n = weight_prefix_len(&weights, budget);
     mempool[..n].iter().map(|tx| tx.txid).collect()
+}
+
+/// Spend block budget on selected txids first, then fill the remaining budget
+/// from the ordinary parents-first mempool order. If a priority tx has
+/// unconfirmed mempool ancestors, those ancestors are selected with it so the
+/// final explicit `generateblock` list remains topologically valid.
+pub fn pack_prioritized_by_weight(
+    mempool: &[MempoolTx],
+    priority: &HashSet<Txid>,
+    budget: u64,
+) -> Vec<Txid> {
+    if priority.is_empty() {
+        return pack_by_weight(mempool, budget);
+    }
+
+    let by_txid: HashMap<Txid, usize> = mempool
+        .iter()
+        .enumerate()
+        .map(|(index, tx)| (tx.txid, index))
+        .collect();
+    let mut selected = BTreeSet::new();
+    let mut used = 0u64;
+
+    for tx in mempool.iter().filter(|tx| priority.contains(&tx.txid)) {
+        let mut closure = BTreeSet::new();
+        collect_mempool_ancestors(tx.txid, mempool, &by_txid, &mut closure);
+        let added_weight = closure
+            .iter()
+            .copied()
+            .filter(|index| !selected.contains(index))
+            .map(|index| mempool[index].weight)
+            .fold(0u64, |sum, weight| sum.saturating_add(weight));
+        if used.saturating_add(added_weight) <= budget {
+            selected.extend(closure);
+            used += added_weight;
+        }
+    }
+
+    for (index, tx) in mempool.iter().enumerate() {
+        if selected.contains(&index) {
+            continue;
+        }
+        if used.saturating_add(tx.weight) > budget {
+            break;
+        }
+        selected.insert(index);
+        used += tx.weight;
+    }
+
+    selected
+        .into_iter()
+        .map(|index| mempool[index].txid)
+        .collect()
+}
+
+fn collect_mempool_ancestors(
+    txid: Txid,
+    mempool: &[MempoolTx],
+    by_txid: &HashMap<Txid, usize>,
+    selected: &mut BTreeSet<usize>,
+) {
+    let Some(index) = by_txid.get(&txid).copied() else {
+        return;
+    };
+    if selected.contains(&index) {
+        return;
+    }
+    for parent in &mempool[index].depends {
+        collect_mempool_ancestors(*parent, mempool, by_txid, selected);
+    }
+    selected.insert(index);
 }
 
 /// Issue one `generateblock` with an explicit item list. Returns `Ok(())` on
@@ -319,6 +395,18 @@ mod tests {
         MempoolTx {
             txid: Txid::from_byte_array([n; 32]),
             weight,
+            depends: Vec::new(),
+        }
+    }
+
+    fn mtx_dep(n: u8, weight: u64, depends: &[u8]) -> MempoolTx {
+        MempoolTx {
+            txid: Txid::from_byte_array([n; 32]),
+            weight,
+            depends: depends
+                .iter()
+                .map(|parent| Txid::from_byte_array([*parent; 32]))
+                .collect(),
         }
     }
 
@@ -349,6 +437,39 @@ mod tests {
         let mempool = vec![mtx(1, 400), mtx(2, 400)];
         let chosen = pack_by_weight(&mempool, BLOCK_WEIGHT_BUDGET);
         assert_eq!(chosen.len(), 2);
+    }
+
+    #[test]
+    fn pack_prioritized_by_weight_prefers_injected_over_earlier_backlog() {
+        let mempool = vec![mtx(1, 400), mtx(2, 200), mtx(3, 200)];
+        let priority = HashSet::from([mempool[1].txid]);
+
+        let chosen = pack_prioritized_by_weight(&mempool, &priority, 500);
+
+        assert_eq!(chosen, vec![mempool[1].txid]);
+    }
+
+    #[test]
+    fn pack_prioritized_by_weight_includes_unconfirmed_ancestors() {
+        let mempool = vec![mtx(1, 300), mtx_dep(2, 200, &[1]), mtx(3, 200)];
+        let priority = HashSet::from([mempool[1].txid]);
+
+        let chosen = pack_prioritized_by_weight(&mempool, &priority, 500);
+
+        assert_eq!(chosen, vec![mempool[0].txid, mempool[1].txid]);
+    }
+
+    #[test]
+    fn pack_prioritized_by_weight_fills_remaining_capacity() {
+        let mempool = vec![mtx(1, 100), mtx(2, 200), mtx(3, 100)];
+        let priority = HashSet::from([mempool[1].txid]);
+
+        let chosen = pack_prioritized_by_weight(&mempool, &priority, 400);
+
+        assert_eq!(
+            chosen,
+            vec![mempool[0].txid, mempool[1].txid, mempool[2].txid]
+        );
     }
 
     #[test]

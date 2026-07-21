@@ -119,8 +119,14 @@ ordinary replacement chain is still mined and the reason is logged.
 
 `REORG_DOUBLE_SPEND_PCT` is ignored in `empty` mode, because that mode mines no
 transactions. Transactions created through `REORG_ADDS_NEW_TXS` are injected after
-invalidation and therefore are not double-spend candidates during that same run.
-Witness-based chain adoption and mining-controller behavior are unaffected.
+invalidation and then prioritized into the explicit replacement-block transaction
+lists before ordinary returned mempool transactions fill the remaining space. They
+are not double-spend candidates during that same run. Witness-based chain adoption
+and mining-controller behavior are unaffected. The result reports requested,
+created, and mined fresh-transaction counts. A non-empty reorg fails after restoring
+a safe converged chain if any requested fresh transaction could not be created or is
+missing from the winning chain; it never silently reports a partial request as
+successful.
 
 ## Continuous Reorgs
 

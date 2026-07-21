@@ -28,6 +28,57 @@ h1 { font-size: 1.1rem; margin: 0; }
 h1 span { color: var(--accent); }
 h2 { font-size: 1rem; margin: 0 0 0.6rem; color: var(--accent); }
 h3 { font-size: 0.85rem; margin: 0.8rem 0 0.35rem; color: var(--dim); }
+.help-host { position: relative; }
+.label-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-width: 0;
+}
+.help-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1rem;
+  height: 1rem;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--dim);
+  font-size: 0.68rem;
+  line-height: 1;
+  vertical-align: middle;
+}
+.help-button:hover, .help-button[aria-expanded="true"] {
+  background: rgba(242, 169, 0, 0.08);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.help-popover {
+  position: fixed;
+  z-index: 30;
+  top: 0;
+  left: 0;
+  width: min(22rem, calc(100vw - 1rem));
+  max-height: calc(100vh - 1rem);
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  box-shadow: 0 0.8rem 2rem rgba(0, 0, 0, 0.35);
+  font-size: 0.72rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 1.4;
+  overflow: auto;
+  overflow-wrap: break-word;
+  text-align: left;
+  text-transform: none;
+  white-space: normal;
+}
+.help-popover[hidden] { display: none; }
 .header-status { display: flex; align-items: center; justify-content: flex-end; gap: 0.8rem; min-width: 0; }
 .poll-control { display: flex; align-items: center; gap: 0.35rem; color: var(--dim); font-size: 0.76rem; white-space: nowrap; }
 .poll-control select {

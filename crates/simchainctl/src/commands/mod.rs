@@ -273,7 +273,7 @@ pub struct ReorgStartArgs {
     /// Node that builds the replacement chain.
     #[arg(long, default_value = "node3")]
     pub node: String,
-    /// Fresh wallet transactions to add to a non-empty replacement.
+    /// Fresh wallet transactions to prioritize into non-empty replacement blocks.
     #[arg(long, default_value_t = 0)]
     pub adds_new_txs: u64,
     /// Percentage of eligible orphaned wallet transactions to conflict.
