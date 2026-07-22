@@ -26,6 +26,7 @@ let abortingJob = false;
 let faucetStatus = null;
 let faucetSubmitting = false;
 let reviewedFaucetRequest = null;
+let submittedFaucetJobId = null;
 let selectedFaucetTxid = null;
 let selectedFaucetTransfer = null;
 const releasingCheckpoints = new Set();
@@ -1011,6 +1012,9 @@ function applyDashboardSnapshot(body, options = {}) {
     selectedJob = body.selected_job || null;
     selectedJobNeedsRender = true;
   }
+  if (body.jobs || Object.prototype.hasOwnProperty.call(body, "selected_job")) {
+    reconcileSubmittedFaucetJob(body.jobs, body.selected_job);
+  }
   if (body.selected_job_events &&
       snapshotSectionChanged("selected_job_events", body.selected_job_events, force)) {
     if (applySelectedJobEvents(body.selected_job_events)) renderJobEvents();
@@ -1326,6 +1330,24 @@ function addFaucetOutput(address = "", amount = "1") {
   renderFaucetControls();
 }
 
+function resetFaucetForm() {
+  $("#faucet-outputs").replaceChildren();
+  $("#faucet-source").value = "auto";
+  reviewedFaucetRequest = null;
+  addFaucetOutput();
+}
+
+function reconcileSubmittedFaucetJob(jobs, selectedJobPayload = null) {
+  if (!submittedFaucetJobId) return;
+  const selected = selectedJobPayload && selectedJobPayload.id === submittedFaucetJobId
+    ? selectedJobPayload : null;
+  const job = selected || ((jobs && jobs.jobs) || [])
+    .find((candidate) => candidate.id === submittedFaucetJobId);
+  if (!job || !isTerminalJob(job.state)) return;
+  if (job.state === "succeeded") resetFaucetForm();
+  submittedFaucetJobId = null;
+}
+
 function collectFaucetRequest() {
   const outputs = [];
   const seen = new Set();
@@ -1371,8 +1393,9 @@ function renderFaucetControls() {
   for (const button of document.querySelectorAll(".faucet-remove-output")) {
     button.disabled = count === 1 || faucetSubmitting;
   }
-  $("#faucet-review").disabled = faucetSubmitting || !faucetStatus || !faucetStatus.available ||
-    faucetStatus.pending_transfer != null || activeMutationId() != null || unavailable.length > 0;
+  $("#faucet-review").disabled = faucetSubmitting || submittedFaucetJobId != null ||
+    !faucetStatus || !faucetStatus.available || faucetStatus.pending_transfer != null ||
+    activeMutationId() != null || unavailable.length > 0;
   $("#faucet-review").title = unavailable.length
     ? `Unavailable while ${unavailable.join(", ")} ${unavailable.length === 1 ? "is" : "are"} unreachable`
     : "";
@@ -1517,7 +1540,7 @@ function reviewFaucet(event) {
 
 async function submitFaucet(event) {
   event.preventDefault();
-  if (!reviewedFaucetRequest || faucetSubmitting) return;
+  if (!reviewedFaucetRequest || faucetSubmitting || submittedFaucetJobId != null) return;
   $("#faucet-confirm-dialog").close();
   faucetSubmitting = true;
   renderFaucetControls();
@@ -1544,6 +1567,7 @@ async function submitFaucet(event) {
     }
     sessionStorage.removeItem(FAUCET_IDEMPOTENCY_STORAGE_KEY);
     result.textContent = `${body.reused ? "Reused" : "Started"} ${body.job_id}`;
+    submittedFaucetJobId = body.job_id;
     selectJobLocally(body.job_id);
   } catch (error) {
     result.textContent = error.message || String(error);

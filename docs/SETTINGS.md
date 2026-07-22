@@ -142,6 +142,24 @@ under the raw engine they come out of the engine's own funds, which it pulled fr
 the miner wallets in the first place (and pulls again when its pool drains). Either
 way, only the 546-sat burn outputs really leave the loop.
 
+`SPAM_FEE` is denominated in BTC/kvB, so decimal-place mistakes are expensive:
+`0.0001` is 10 sat/vB, `0.001` is 100 sat/vB, and `0.1` is 10,000 sat/vB. A valid
+feerate is not necessarily affordable for the raw engine. Its branch reserve scales
+with the largest DATA transaction fee and the number of branches required by the fill
+ratio. For example, a 90,000-byte DATA transaction costs about 9 BTC at `0.1`; each
+branch reserves enough for 16 such transactions, or about 144 BTC. Ratio 4 auto-fanout
+targets 60 branches per miner, requiring roughly 8,650 BTC per miner before other
+working capital.
+
+If the current fee, payload size, and fanout exceed available mature funds, spammer
+status becomes `capacity_degraded`. Provisioning continues, but it cannot restore the
+requested capacity until `SPAM_FEE`, `SPAM_TX_DATA_MAX_BYTES`, or the required fanout
+is reduced, or more mature funds become available. Excessive fees also consume the
+miner wallets' spendable treasury: their faucet availability can fall to zero below
+`FAUCET_RESERVE_BTC`. Most paid fees eventually return as 100-block-immature mining
+rewards, but they are unavailable to both spam provisioning and the faucet while
+immature.
+
 **When the floor leaks: packing granularity.** Block assembly walks the mempool by
 descending feerate, and when the next spam tx does not fit the space left in the
 block it keeps scanning down the ladder for anything that does. A tiny transaction
@@ -205,7 +223,7 @@ long fixed interval while `.env` keeps the default bounds.
 | Variable | Default | Description |
 |---|---|---|
 | `ENABLE_SPAM` | `true` | Spam transactions after each block so blocks are not empty. |
-| `SPAM_FEE` | `0.0001` | The spam fee floor and the simnet's live price level (BTC/kvB): floor fills pay this rate, DATA/HYBRID bulk spam pays a tiny premium, and scenario bursts price from it too. Live-retunable in place at a safe transaction boundary; keep it ≥ `MIN_RELAY_TX_FEE`. Distinct from the boot-only node flag `FALLBACK_FEE`. |
+| `SPAM_FEE` | `0.0001` | The spam fee floor and the simnet's live price level (BTC/kvB): `0.0001` = 10 sat/vB, `0.001` = 100 sat/vB, and `0.1` = 10,000 sat/vB. Floor fills pay this rate, DATA/HYBRID bulk spam pays a tiny premium, and scenario bursts price from it too. Live-retunable in place at a safe transaction boundary; keep it ≥ `MIN_RELAY_TX_FEE`. A fee too high for the configured payload and fanout causes `capacity_degraded` and can drain spendable faucet reserves until mined fees mature. Distinct from the boot-only node flag `FALLBACK_FEE`. |
 | `USE_RAW_TX_SPAM` | `true` (pinned) | **Pinned to the raw engine, shown read-only in the dashboard**: the spammer holds its own keys, tracks its own UTXO set in memory, signs every tx locally and submits with `sendrawtransaction`. The node wallets are bypassed, so the send rate stays flat forever (no wallet fatigue). Floor-fill txs pay exactly `SPAM_FEE`; DATA/HYBRID bulk spam pays a tiny premium so miners drain bulk first and keep floor fills for residual gaps; rare refill fan-outs pay above the floor so they confirm under saturation. The node-wallet engine (`false`) is **deprecated and no longer selectable**: it put coin-selection and signing load on the miner nodes, which we deliberately keep light so they can mine blocks, and its throughput degraded as wallet history grew (see [Full blocks](#full-blocks)). A legacy `.env` setting `false` is ignored with a warning. |
 | `SPAM_FIXED_TXS_PER_BLOCK` | `100` | Fixed tx count for the **OUTPUT** spam modes (sequential/batch) and the wallet engine — the number a block explorer shows per block (plus coinbase) until blocks are full; excess waits in the mempool. Split across the miner nodes for you. **Ignored in DATA/HYBRID mode**, where the fill is driven by `SPAM_FILL_BLOCK_RATIO`. The standalone spammer still accepts the deprecated boot aliases `SPAM_TXS_PER_BLOCK` and `SPAM_PER_MINER_PER_BLOCK` (× 2); they are not runtime-managed keys. |
 | `SPAM_SENDMANY_OUTPUTS` | `0` | OUTPUT-mode fatness. `0`: sequential — one tx with a single burn output at a time, p2p-like arrival. `N > 0`: batch — each spam tx carries N burn outputs (exchange-payout-shaped). Ignored in DATA/HYBRID mode. |

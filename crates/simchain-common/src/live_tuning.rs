@@ -989,7 +989,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Decimal,
         optional: false,
-        help: "Spam fee floor in BTC/kvB (0.0001 = 10 sat/vB). Floor fills pay exactly this; bulk spam pays a small premium. Sets the simulated market price users must outbid under congestion. Applies in place at a safe transaction boundary while preserving tracked funds.",
+        help: "Spam fee floor in BTC/kvB: 0.0001 = 10 sat/vB, 0.001 = 100 sat/vB, and 0.1 = 10,000 sat/vB. Floor fills pay exactly this; bulk spam pays a small premium. Higher fees also multiply the BTC needed by every raw-engine branch. For example, with 90,000-byte DATA transactions, 0.1 needs about 144 BTC per branch and about 8,650 BTC per miner at the ratio-4 auto-fanout target. An unaffordable combination of fee, payload size, and fanout causes capacity_degraded: provisioning keeps trying but cannot recover until demand is reduced or more mature funds are available. It can also drain spendable miner treasuries below the faucet reserve, making faucet capacity zero until funds recover or mined fees mature. Applies in place at a safe transaction boundary while preserving tracked funds.",
         warning: None,
     },
     SettingSpec {

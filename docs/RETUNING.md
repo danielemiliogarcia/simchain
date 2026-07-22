@@ -115,3 +115,9 @@ appears in the dashboard as a read-only label. The live fee floor is the separat
 `SPAM_FEE` changes the raw engine's transaction shape in place at a safe boundary
 without touching the running nodes or discarding tracked transaction state.
 A legacy `.env` that sets only `FALLBACK_FEE` still seeds `SPAM_FEE` at first boot.
+The value is BTC/kvB (`0.001` = 100 sat/vB). Raising it also raises the capital needed
+by every DATA branch; an unaffordable fee, payload, and fanout combination reports
+`capacity_degraded` and cannot provision its way back to the requested capacity.
+It can also consume spendable miner treasury below `FAUCET_RESERVE_BTC`, leaving no
+faucet availability until the setting is reduced, funds are added, or mined fees
+complete their 100-block maturity.

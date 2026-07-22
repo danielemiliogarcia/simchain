@@ -631,6 +631,9 @@ mod tests {
             .find(|s| s.key == "SPAM_FEE")
             .expect("SPAM_FEE in schema");
         assert!(fee.warning.is_none(), "SPAM_FEE needs no warning banner");
+        assert!(fee.help.contains("0.1 = 10,000 sat/vB"));
+        assert!(fee.help.contains("capacity_degraded"));
+        assert!(fee.help.contains("faucet reserve"));
         assert_eq!(fee.component, SPAM_COMPONENT);
         let boot_fee = view
             .boot_settings
