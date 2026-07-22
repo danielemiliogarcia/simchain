@@ -182,13 +182,13 @@ may still confirm. Always inspect that transfer before issuing a replacement pay
 Get UTXOs:
 
 ```bash
-docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword scantxoutset start '["addr(bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr)"]'
+docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword scantxoutset start '["addr(bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk)"]'
 ```
 
 Get total balance:
 
 ```bash
-docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword scantxoutset start '["addr(bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr)"]' | jq '[.unspents[].amount] | add'
+docker exec btc-simnet-node3 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcpassword scantxoutset start '["addr(bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk)"]' | jq '[.unspents[].amount] | add'
 ```
 
 ## Snapshots

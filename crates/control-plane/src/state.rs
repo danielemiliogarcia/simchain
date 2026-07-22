@@ -9,6 +9,7 @@ use crate::backend::{
 use crate::control_state::{ControlState, ControlStateStore};
 use crate::jobs::JobManager;
 use crate::status::StatusSnapshot;
+use bitcoincore_rpc::bitcoin::{address::NetworkUnchecked, Address};
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -35,6 +36,7 @@ pub struct ControlPlaneConfig {
     pub internal_token: String,
     pub explorer_url: String,
     pub explorer_probe_url: String,
+    pub user_address: String,
     pub node2_wallet_name: String,
     pub node3_wallet_name: String,
     pub faucet_wallet_reserve_sats: u64,
@@ -90,6 +92,14 @@ impl ControlPlaneConfig {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| explorer_url.clone());
         ensure_http_url("MEMPOOL_WEB_INTERNAL_URL", &explorer_probe_url)?;
+        let user_address = non_empty_env(
+            "USER_ADDRESS",
+            "bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk",
+        )?;
+        let user_address = user_address
+            .parse::<Address<NetworkUnchecked>>()
+            .map_err(|error| anyhow::anyhow!("invalid USER_ADDRESS: {error}"))?;
+        let user_address = simchain_common::require_regtest_address(user_address)?.to_string();
         let node2_wallet_name = non_empty_env("NODE2_WALLET_NAME", "node2")?;
         let node3_wallet_name = non_empty_env("NODE3_WALLET_NAME", "node3")?;
         let faucet_wallet_reserve_sats = exact_btc_env("FAUCET_WALLET_RESERVE_BTC", "600")?;
@@ -112,6 +122,7 @@ impl ControlPlaneConfig {
             internal_token,
             explorer_url,
             explorer_probe_url,
+            user_address,
             node2_wallet_name,
             node3_wallet_name,
             faucet_wallet_reserve_sats,

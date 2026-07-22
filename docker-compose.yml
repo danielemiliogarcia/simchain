@@ -284,7 +284,7 @@ services:
     networks:
       - btc-simnet-control
     environment:
-      - USER_ADDRESS=${USER_ADDRESS:-bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr}
+      - USER_ADDRESS=${USER_ADDRESS:-bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk}
       - BLOCK_INTERVAL_MEAN_SECS=${BLOCK_INTERVAL_MEAN_SECS:-15}
       - BLOCK_INTERVAL_MODE=${BLOCK_INTERVAL_MODE:-poisson}
       # `-` (not `:-`) preserves an explicitly empty value, which means an
@@ -378,6 +378,7 @@ services:
       - NODE1_RPC_URL=${NODE1_RPC_URL:-http://btc-simnet-node1:18443}
       - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
       - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
+      - USER_ADDRESS=${USER_ADDRESS:-bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk}
 
   # ---------------------------------------------------------------------------
   # Reorg simulator (profile: reorg), one-shot by default, dies when done.

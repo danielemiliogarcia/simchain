@@ -173,6 +173,8 @@ td:first-child, th:first-child { text-align: left; }
 .faucet-wallets > div { border: 1px solid var(--line); border-radius: 5px; padding: 0.4rem 0.5rem; }
 .faucet-wallets strong, .faucet-wallets span { display: block; }
 .faucet-wallets span { color: var(--dim); font-size: 0.7rem; overflow-wrap: anywhere; }
+#user-address-card a { color: var(--accent); display: block; overflow-wrap: anywhere; }
+#user-address-card .hint { margin: 0.4rem 0 0; }
 .faucet-form-heading { display: flex; justify-content: space-between; align-items: center; }
 .faucet-form-heading h3 { margin-top: 0; }
 .faucet-outputs { display: grid; gap: 0.4rem; }

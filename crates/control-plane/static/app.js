@@ -988,6 +988,12 @@ function applyDashboardSnapshot(body, options = {}) {
     faucetRendered = true;
   }
 
+  if (Object.prototype.hasOwnProperty.call(body, "user_address")) {
+    const address = $("#user-funding-address");
+    address.textContent = `${body.user_address.address} ↗`;
+    address.href = body.user_address.explorer_url;
+  }
+
   if (request.selectedFaucetTxid) {
     const transfer = Object.prototype.hasOwnProperty.call(body, "selected_faucet_transfer")
       ? body.selected_faucet_transfer : null;

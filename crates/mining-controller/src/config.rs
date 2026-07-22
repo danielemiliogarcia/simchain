@@ -129,7 +129,7 @@ fn parse_control_listen_addr() -> Result<SocketAddr, ConfigError> {
 fn parse_user_address() -> Result<Address, ConfigError> {
     let value = string_or(
         "USER_ADDRESS",
-        "bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr",
+        "bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk",
     );
     let parsed = value
         .parse::<Address<NetworkUnchecked>>()

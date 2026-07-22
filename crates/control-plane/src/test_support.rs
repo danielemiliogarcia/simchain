@@ -947,6 +947,7 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
             internal_token: "test-internal-token".to_string(),
             explorer_url: "http://127.0.0.1:1080".to_string(),
             explorer_probe_url: "http://mempool-web:8080".to_string(),
+            user_address: "bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk".to_string(),
             node2_wallet_name: "node2".to_string(),
             node3_wallet_name: "node3".to_string(),
             faucet_wallet_reserve_sats: 60_000_000_000,

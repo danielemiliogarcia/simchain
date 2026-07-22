@@ -265,11 +265,19 @@ struct DashboardResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     selected_faucet_transfer: Option<FaucetTransfer>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    user_address: Option<UserAddressLink>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     jobs: Option<JobListResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     selected_job: Option<JobDetail>,
     #[serde(skip_serializing_if = "Option::is_none")]
     selected_job_events: Option<JobEventsResponse>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UserAddressLink {
+    address: String,
+    explorer_url: String,
 }
 
 async fn dashboard_handler(
@@ -328,6 +336,15 @@ fn dashboard_snapshot(
         }
         _ => None,
     };
+    let user_address =
+        matches!(tab, DashboardTab::All | DashboardTab::Faucet).then(|| UserAddressLink {
+            address: app.config.user_address.clone(),
+            explorer_url: format!(
+                "{}/address/{}",
+                app.config.explorer_url.trim_end_matches('/'),
+                app.config.user_address
+            ),
+        });
     let include_selected_job = matches!(
         tab,
         DashboardTab::All | DashboardTab::Control | DashboardTab::Faucet
@@ -370,6 +387,7 @@ fn dashboard_snapshot(
         config,
         faucet,
         selected_faucet_transfer,
+        user_address,
         jobs,
         selected_job,
         selected_job_events,
@@ -1179,6 +1197,14 @@ mod tests {
         let (status, body) = send(&fx.router, get("/api/v1/dashboard?tab=faucet")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["faucet"]["wallets"].is_array());
+        assert_eq!(
+            body["user_address"]["address"],
+            "bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk"
+        );
+        assert_eq!(
+            body["user_address"]["explorer_url"],
+            "http://127.0.0.1:1080/address/bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk"
+        );
         assert!(body["status"].is_null());
         assert!(body["config"].is_null());
         assert!(body["jobs"].is_null());
