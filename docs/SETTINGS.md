@@ -218,6 +218,39 @@ after changing the mean, so the controller refuses to start. Fixed mode skips th
 (it ignores the bounds entirely), which is why the full-block recipes below can set a
 long fixed interval while `.env` keeps the default bounds.
 
+### Coinbase subsidy and halving
+
+Every block's coinbase reward is set by Bitcoin Core's compiled-in `nSubsidyHalvingInterval`
+consensus constant, **not** a simchain setting — it is not in `.env`, not control-plane-managed,
+and cannot be retuned. Mainnet, testnet, and signet use `210000`; regtest hardcodes `150`
+([`chainparams.cpp`](https://github.com/bitcoin/bitcoin/blob/master/src/kernel/chainparams.cpp),
+`CRegTestParams`). Every 150 blocks the reward halves from a 50 BTC genesis subsidy, and
+Bitcoin Core computes it with an integer right-shift (`50 * COIN >> halvings`) rather than
+floating-point division, so it reaches exactly **0 sat at height 4950** (the 33rd halving) —
+150 blocks earlier than the naive "halves forever" intuition would suggest, because shifting
+an integer to zero happens before the `halvings >= 64` mainnet-style cutoff would ever bite:
+
+| Height | Halvings | Subsidy |
+|---|---|---|
+| 0–149 | 0 | 50 BTC |
+| 150–299 | 1 | 25 BTC |
+| 900–1049 | 6 | 0.78125 BTC |
+| 3450–3599 | 23 | 596 sat |
+| 4800–4949 | 32 | 1 sat |
+| 4950+ | 33 | **0 sat, permanently** |
+
+This matters for the faucet: node2/node3 are funded only by coinbase (the deterministic
+bootstrap through height 204, then continuous mining — see [faucet-plan.md](faucet-plan.md)
+and the treasury note under [Simchain control plane](#simchain-control-plane) below), and spam
+fees paid to those same blocks return as coinbase too. Past height 4950 neither source adds
+anything new: mining continues (spam still confirms, fees still get paid), but every future
+coinbase output is 0 sat, so the miner treasuries stop growing and only draw down as the
+faucet and spam provisioning spend from what already matured. At the default
+`BLOCK_INTERVAL_MEAN_SECS=15`, height 4950 arrives roughly (4950 − 204) × 15 s ≈ 19.8 hours
+after bootstrap. There is no way to raise or reset this from simchain — the fix on a
+long-running simnet is restarting the chain (fresh regtest genesis) or provisioning generously
+enough up front that the simnet's test lifetime never needs treasury growth past that point.
+
 ## Spammer
 
 | Variable | Default | Description |
@@ -462,6 +495,12 @@ priority delta on each miner. The virtual delta is intentionally not configurabl
 affects local block selection only and is neither paid nor transferred. Faucet limits
 are parsed as decimal strings without floating-point arithmetic and require a control
 plane restart to change.
+
+The treasuries behind `FAUCET_WALLET_RESERVE_BTC` grow only from coinbase, and regtest's
+block subsidy hits exactly 0 sat at height 4950 — see
+[Coinbase subsidy and halving](#coinbase-subsidy-and-halving). A long-running simnet stops
+gaining new treasury funds at that point; faucet requests keep working only against what
+already matured.
 
 Control-plane-managed runtime settings (durable desired values live only in the
 control-state volume after initialization):

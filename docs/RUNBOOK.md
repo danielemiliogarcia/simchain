@@ -163,7 +163,9 @@ cargo run -p simchainctl -- faucet transfer TXID --watch
 For `insufficient_faucet_funds`, inspect `faucet status`. Reduce the request, choose the
 other source treasury, or lower `FAUCET_WALLET_RESERVE_BTC` and restart the control
 plane only if the test's reserve policy permits it. Do not refill by weakening relay or
-mempool policy.
+mempool policy. On a long-running simnet past regtest height 4950, this can also mean the
+block subsidy has permanently reached 0 sat and the treasuries are no longer regaining
+funds from mining — see [Coinbase subsidy and halving](SETTINGS.md#coinbase-subsidy-and-halving).
 
 For `faucet_delivery_pending`, inspect the pending txid and both miner mempools, then
 mine a block or let normal mining continue. The control-plane delivery guard repairs a

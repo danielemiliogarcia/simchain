@@ -54,6 +54,8 @@ a non-mining full node as the user endpoint, non-empty blocks, and user-controll
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
 limitations and future enhancements, and a section for parked features.
 
+### Chaos monkey mode
+
 ## Parked features
 
 Designed but deliberately not built. Each entry records why it is parked and what would

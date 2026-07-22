@@ -96,24 +96,6 @@ steps:
       SPAM_FILL_BLOCK_RATIO: 9
       SPAM_FEE:  0.01
 
-  - type: wait_n_blocks
-    n: 2
-
-  - type: set_config
-    settings:
-      BLOCK_INTERVAL_MODE: fixed
-      BLOCK_INTERVAL_MEAN_SECS: 10
-      SPAM_FILL_BLOCK_RATIO: 11
-      SPAM_FEE:  0.1
-
-  - type: assert_config
-    effective: true
-    settings:
-      BLOCK_INTERVAL_MODE: fixed
-      BLOCK_INTERVAL_MEAN_SECS: 10
-      SPAM_FILL_BLOCK_RATIO: 11
-      SPAM_FEE:  0.1
-
   # provide time to watch the rainbow
   - type: wait_n_blocks
     n: 6
