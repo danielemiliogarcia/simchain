@@ -2,7 +2,7 @@
 
 ## Project Objective
 
-The objective of this project is to be a tool that helps the user write blockchain regtest tests in such a way that the code later needs only minimal modifications (or only configuration, in the best case) to switch to testnet or mainnet.
+The objective of this project is to be a tool that helps the user write blockchain regtest tests in such a way that the code later needs only minimal modifications (or only configuration, in the best case) to switch to testnet or mainnet.  It sits between regtest suites and testnet testing to help closing this gap, tha is usually painful for developers.
 
 ## Network Components
 

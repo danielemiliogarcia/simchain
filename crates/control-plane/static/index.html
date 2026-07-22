@@ -249,6 +249,38 @@ steps:
       <div id="faucet-progress" class="faucet-progress" hidden></div>
       <div id="faucet-transfer" class="faucet-transfer muted">no faucet transfer selected</div>
     </section>
+    <section class="card" id="regtest-wallet-card">
+      <div class="section-heading">
+        <h2>Regtest test wallet</h2>
+        <span class="faucet-badge">PUBLIC TEST KEYS · REGTEST ONLY</span>
+      </div>
+      <p class="hint">Deterministic BIP84 native SegWit addresses derived from a well-known
+        BIP39 test mnemonic at <code>m/84'/1'/0'/0/index</code>.</p>
+      <div class="test-key-warning"><strong>Never use this mnemonic or any derived key on
+        mainnet, testnet, signet, or for assets of value.</strong> It is public and embedded
+        in this dashboard.</div>
+      <div class="mnemonic-row">
+        <span class="credential-label">Mnemonic</span>
+        <code id="regtest-mnemonic" class="credential-value secret-value"></code>
+        <button id="regtest-mnemonic-reveal" class="small secondary" type="button"
+          aria-pressed="false">Show</button>
+        <button id="regtest-mnemonic-copy" class="small secondary" type="button">Copy</button>
+      </div>
+      <div id="regtest-copy-status" class="copy-status" role="status" aria-live="polite"></div>
+      <div class="table-scroll regtest-keys-scroll">
+        <table class="regtest-keys-table">
+          <thead>
+            <tr><th>Path</th><th>Address</th><th>Private key</th></tr>
+          </thead>
+          <tbody id="regtest-keys"></tbody>
+        </table>
+      </div>
+      <p class="regtest-key-links">Generate or inspect additional disposable test keys with
+        <a href="https://gist.github.com/danielemiliogarcia/ce462aba8859c09b4dcb85aa32fbae9c"
+          target="_blank" rel="noopener noreferrer">the Rust BIP39 key generator ↗</a>
+        or <a href="https://iancoleman.io/bip39/" target="_blank"
+          rel="noopener noreferrer">Ian Coleman's BIP39 tool ↗</a>.</p>
+    </section>
     </section>
   </main>
 

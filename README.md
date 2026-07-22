@@ -18,11 +18,17 @@ For detailed component descriptions, see [INTRO.md](./docs/INTRO.md).
 
 BTC Simchain is intended to give application developers a disposable blockchain on
 which they can fund addresses, broadcast real Bitcoin transactions, observe mempool and
-confirmation behavior, and test how wallets, indexers, payment systems, and other
-integrations react to fee pressure, replacements, propagation faults, and reorgs.
-"Mainnet-like" in this repository refers to those application-facing behaviors, while
-still allowing developers to configure Bitcoin policy for the behavior their test
-requires.
+confirmation behavior, and test how wallets, indexers, payment systems, transaction
+accelerators, and other integrations react to fee pressure, replacements, propagation
+faults, and reorgs. "Mainnet-like" in this repository refers to those application-facing
+behaviors, while still allowing developers to configure Bitcoin policy for the behavior
+their test requires.
+
+It does not replace regtest suites that drive mining and wallets directly from test
+code, nor does it replace testnet testing. It sits between the two: regtest-fast and
+controlled, but with mining decoupled from the code under test and transactions
+broadcast raw instead of wallet-controlled, closer to a real third-party node —
+catching integration flaws that would otherwise only surface on testnet.
 
 It is **not** intended to validate:
 

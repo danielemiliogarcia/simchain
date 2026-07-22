@@ -211,6 +211,53 @@ td:first-child, th:first-child { text-align: left; }
 .faucet-transfer-error { color: var(--err); }
 .transfer-confirmed { border-left-color: var(--ok); }
 .transfer-delivery_failed, .transfer-aborted_after_submission { border-left-color: var(--err); }
+.test-key-warning {
+  background: rgba(210, 153, 34, 0.08);
+  border: 1px solid var(--warn);
+  border-radius: 5px;
+  color: var(--warn);
+  font-size: 0.76rem;
+  margin-bottom: 0.7rem;
+  padding: 0.45rem 0.55rem;
+}
+.mnemonic-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: 0.45rem;
+  align-items: center;
+}
+.credential-label { color: var(--dim); font-size: 0.72rem; }
+.credential-value {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.secret-value { color: var(--dim); }
+.secret-value.revealed { color: var(--text); }
+.copy-status { color: var(--ok); font-size: 0.7rem; min-height: 1rem; margin-top: 0.25rem; }
+.copy-status.err { color: var(--err); }
+.regtest-keys-scroll { margin-top: 0.35rem; }
+.regtest-keys-table { min-width: 54rem; table-layout: fixed; }
+.regtest-keys-table th:nth-child(1) { width: 10rem; }
+.regtest-keys-table th:nth-child(2) { width: 22rem; }
+.regtest-keys-table th:nth-child(3) { width: 22rem; }
+.regtest-keys-table th, .regtest-keys-table td { text-align: left; vertical-align: middle; }
+.regtest-keys-table td { padding-bottom: 0.3rem; padding-top: 0.3rem; }
+.regtest-keys-table td:first-child { white-space: nowrap; }
+.regtest-key-cell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.35rem;
+  align-items: center;
+}
+.regtest-private-cell { grid-template-columns: minmax(0, 1fr) auto auto; }
+.regtest-key-cell code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mnemonic-row button, .regtest-key-cell button { min-width: 4.2rem; }
+.regtest-key-links { color: var(--dim); font-size: 0.72rem; margin: 0.65rem 0 0; }
+.regtest-key-links a { color: var(--accent); text-decoration: none; }
+.regtest-key-links a:hover { text-decoration: underline; }
 dialog {
   width: min(38rem, calc(100vw - 2rem));
   background: var(--card);
@@ -447,5 +494,7 @@ button:disabled { opacity: 0.5; cursor: default; }
   .split, .bounded-actions, .faucet-wallets { grid-template-columns: 1fr; }
   .faucet-output-row { grid-template-columns: 1fr; }
   .faucet-remove-output { justify-self: start; }
+  .mnemonic-row { grid-template-columns: 1fr auto auto; }
+  .mnemonic-row .credential-label { grid-column: 1 / -1; }
   .section-heading { align-items: flex-start; flex-direction: column; gap: 0.2rem; }
 }

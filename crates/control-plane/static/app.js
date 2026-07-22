@@ -51,6 +51,22 @@ const GROUP_TITLES = {
   "spam-advanced": "Spam advanced",
 };
 
+const REGTEST_TEST_MNEMONIC =
+  "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+const REGTEST_TEST_KEYS = Object.freeze([
+  ["m/84'/1'/0'/0/0", "bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk", "cTGhosGriPpuGA586jemcuH9pE9spwUmneMBmYYzrQEbY92DJrbo"],
+  ["m/84'/1'/0'/0/1", "bcrt1qd7spv5q28348xl4myc8zmh983w5jx32cs707jh", "cQFUndrpAyMaE3HAsjMCXiT94MzfsABCREat1x7Qe3Mtq9KihD4V"],
+  ["m/84'/1'/0'/0/2", "bcrt1qxdyjf6h5d6qxap4n2dap97q4j5ps6ua8jkxz0z", "cRe5KDj3rcZJAtZVmWe3G2rdGdXyKCjVbWBVDXqSg2WHq1qq6MNe"],
+  ["m/84'/1'/0'/0/3", "bcrt1qynpgs6wap6h9uvy7j0xlesew2w82qn039tzepj", "cVeaVbQmeiwkYUqoWcmGJMHLppY8N1DtZqQ8tFUchhJZa6AKSMXd"],
+  ["m/84'/1'/0'/0/4", "bcrt1q677973lw0w796gttpy52f296jqaaksz0kadvlr", "cVUnp4ArCgWBBNCnat7YeeCsoZPag3cKHhxYp9YLhfKS96MjLKzm"],
+  ["m/84'/1'/0'/0/5", "bcrt1qr7scvm07ta0ldzlrmk7rnmc9lk356yarcts3za", "cVcKpznDBkA83HeX6beHD7D6EJ1XRkcP8mrHpnmMUzkgJwtTkppp"],
+  ["m/84'/1'/0'/0/6", "bcrt1q4e9q5taxnsvc6m0uxv6h75mkzvnkxeqk6l90u2", "cNmkULcPZC4gXGVJTGNzNnw1Me1QpeEVnxY8qGBpKNwvaR5er4e1"],
+  ["m/84'/1'/0'/0/7", "bcrt1qfsryn6hh2yhpxpp7m9dh54x89wettyfkhat7dd", "cVSKaLPiLMG5BDzsJDXSqqAzJedGjJTCVTdEKM8eZ65Pdo5v3UYY"],
+  ["m/84'/1'/0'/0/8", "bcrt1qk9ca9jh7a2muk2venu26qsc2an5cvnwpmze5gq", "cTb6dS7GbsvRQdypGVmExBRV1bJq8Pn4fyx1SSdViksVLxnkKtPG"],
+  ["m/84'/1'/0'/0/9", "bcrt1ql483wsftk62xvt4k5w608h2w9yy2nrnmskm03v", "cS1TKTLUB8i1BWhZax6M3AxfrjNUQzAKq2UVUz82mN4GP99r85FY"],
+  ["m/84'/1'/0'/0/10", "bcrt1qz62u6t0px5tpyplrxuh2zyw6ycejyt9j0w3j4s", "cNUeAibgrGsMhZP9FUiihbfwNvnC8JLkaiwyzgwXSGseHXJvm4LA"],
+]);
+
 function dependencyIgnoredReason(key, values) {
   const spamEnabled = values.get("ENABLE_SPAM") === "true";
   const spamSetting = key.startsWith("SPAM_") || key === "ENABLE_SPAM_REPLACES";
@@ -1129,6 +1145,110 @@ const FAUCET_PHASES = {
   armed_for_next_block: "Mining restored — waiting for next block",
 };
 
+function setSecretVisibility(element, button, value, revealed) {
+  element.textContent = revealed ? value : "******************";
+  element.classList.toggle("revealed", revealed);
+  button.textContent = revealed ? "Hide" : "Show";
+  button.setAttribute("aria-pressed", revealed ? "true" : "false");
+}
+
+async function writeClipboard(value) {
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch (_) {
+      // Sandboxed or permission-restricted browsers may expose the API but
+      // reject it. Fall through to the selection-based local copy path.
+    }
+  }
+  const fallback = document.createElement("textarea");
+  fallback.value = value;
+  fallback.setAttribute("readonly", "");
+  fallback.style.position = "fixed";
+  fallback.style.opacity = "0";
+  document.body.append(fallback);
+  fallback.select();
+  const copied = document.execCommand("copy");
+  fallback.remove();
+  if (!copied) throw new Error("browser rejected clipboard access");
+}
+
+async function copyRegtestCredential(value, label, button) {
+  const status = $("#regtest-copy-status");
+  const original = button.textContent;
+  try {
+    await writeClipboard(value);
+    status.textContent = `${label} copied`;
+    status.className = "copy-status";
+    button.textContent = "Copied";
+  } catch (error) {
+    status.textContent = `Could not copy ${label}: ${error.message || error}`;
+    status.className = "copy-status err";
+  }
+  window.setTimeout(() => {
+    button.textContent = original;
+    if (status.textContent.includes(label)) status.textContent = "";
+  }, 1800);
+}
+
+function regtestCredentialCell(value, label, secret = false) {
+  const cell = document.createElement("div");
+  cell.className = `regtest-key-cell${secret ? " regtest-private-cell" : ""}`;
+  const code = document.createElement("code");
+  code.className = `credential-value${secret ? " secret-value" : ""}`;
+  if (!secret) {
+    code.textContent = value;
+    code.title = value;
+  }
+  if (secret) {
+    const reveal = document.createElement("button");
+    reveal.type = "button";
+    reveal.className = "small secondary";
+    reveal.setAttribute("aria-label", `Reveal ${label}`);
+    reveal.addEventListener("click", () => {
+      const revealed = reveal.getAttribute("aria-pressed") !== "true";
+      setSecretVisibility(code, reveal, value, revealed);
+    });
+    setSecretVisibility(code, reveal, value, false);
+    cell.append(code, reveal);
+  } else {
+    cell.append(code);
+  }
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "small secondary";
+  copy.textContent = "Copy";
+  copy.setAttribute("aria-label", `Copy ${label}`);
+  copy.addEventListener("click", () => copyRegtestCredential(value, label, copy));
+  cell.append(copy);
+  return cell;
+}
+
+function initRegtestWallet() {
+  const mnemonic = $("#regtest-mnemonic");
+  const reveal = $("#regtest-mnemonic-reveal");
+  setSecretVisibility(mnemonic, reveal, REGTEST_TEST_MNEMONIC, false);
+  reveal.addEventListener("click", () => {
+    const revealed = reveal.getAttribute("aria-pressed") !== "true";
+    setSecretVisibility(mnemonic, reveal, REGTEST_TEST_MNEMONIC, revealed);
+  });
+  $("#regtest-mnemonic-copy").addEventListener("click", (event) =>
+    copyRegtestCredential(REGTEST_TEST_MNEMONIC, "mnemonic", event.currentTarget)
+  );
+
+  const body = $("#regtest-keys");
+  for (const [path, address, privateKey] of REGTEST_TEST_KEYS) {
+    const row = body.insertRow();
+    const pathCell = row.insertCell();
+    const pathCode = document.createElement("code");
+    pathCode.textContent = path;
+    pathCell.append(pathCode);
+    row.insertCell().append(regtestCredentialCell(address, `${path} address`));
+    row.insertCell().append(regtestCredentialCell(privateKey, `${path} private key`, true));
+  }
+}
+
 function satsToBtc(sats) {
   const value = BigInt(sats || 0);
   const whole = value / 100000000n;
@@ -1944,6 +2064,7 @@ async function doApply() {
 
 async function init() {
   initTabs();
+  initRegtestWallet();
   const { body } = await api("/api/v1/config/schema");
   schema = body;
   buildForm();
