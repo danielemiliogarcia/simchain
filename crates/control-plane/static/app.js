@@ -51,11 +51,23 @@ const GROUP_TITLES = {
   "spam-advanced": "Spam advanced",
 };
 
+function dependencyIgnoredReason(key, values) {
+  const spamEnabled = values.get("ENABLE_SPAM") === "true";
+  const spamSetting = key.startsWith("SPAM_") || key === "ENABLE_SPAM_REPLACES";
+  const fanoutAuto = values.get("SPAM_FANOUT_AUTO") === "true";
+  const spamReplaces = values.get("ENABLE_SPAM_REPLACES") === "true";
+  if (spamSetting && !spamEnabled) return "ignored: ENABLE_SPAM=false";
+  if (key === "SPAM_FANOUT_UTXOS" && fanoutAuto) return "ignored: SPAM_FANOUT_AUTO=true";
+  if (key === "SPAM_REPLACES_PER_MINER_PER_BLOCK" && !spamReplaces)
+    return "ignored: ENABLE_SPAM_REPLACES=false";
+  return null;
+}
+
 /* UI-only relevance rules: fields ignored by the current desired policy. */
 function ignoredReason(key, values) {
+  const dependencyReason = dependencyIgnoredReason(key, values);
+  if (dependencyReason) return dependencyReason;
   const dataMode = Number(values.get("SPAM_TX_DATA_MAX_BYTES") || "0") > 0;
-  const fanoutAuto = values.get("SPAM_FANOUT_AUTO") === "true";
-  if (key === "SPAM_FANOUT_UTXOS" && fanoutAuto) return "ignored: SPAM_FANOUT_AUTO=true";
   if ((key === "SPAM_FIXED_TXS_PER_BLOCK" || key === "SPAM_SENDMANY_OUTPUTS") && dataMode)
     return "ignored in DATA/HYBRID mode (SPAM_TX_DATA_MAX_BYTES > 0)";
   if ((key === "SPAM_TX_DATA_MIN_BYTES" || key === "SPAM_SMALL_TXS_PER_BLOCK" ||
@@ -762,7 +774,7 @@ function refreshForm() {
     field.classList.toggle("unavailable", componentUnavailable);
     field.title = reason || "";
     input.disabled = componentUnavailable || activeMutationId() != null ||
-      (spec.key === "SPAM_FANOUT_UTXOS" && values.get("SPAM_FANOUT_AUTO") === "true");
+      dependencyIgnoredReason(spec.key, values) != null;
 
     const validationEl = field.querySelector(".field-error");
     let validation = fieldErrors.get(spec.key) || "";
@@ -1228,7 +1240,7 @@ function renderFaucetStatus(status) {
   for (const wallet of status.wallets || []) {
     const item = document.createElement("div");
     const title = document.createElement("strong");
-    title.textContent = `${wallet.source} · ${wallet.wallet_name}`;
+    title.textContent = `Node: ${wallet.source} · Wallet: ${wallet.wallet_name}`;
     const balance = document.createElement("span");
     balance.textContent = wallet.error
       ? wallet.error

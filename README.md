@@ -14,6 +14,32 @@ Three P2P-connected nodes, rotating miners, non-mining user endpoint, non-empty 
 
 For detailed component descriptions, see [INTRO.md](./docs/INTRO.md).
 
+## Scope and non-goals
+
+BTC Simchain is intended to give application developers a disposable blockchain on
+which they can fund addresses, broadcast real Bitcoin transactions, observe mempool and
+confirmation behavior, and test how wallets, indexers, payment systems, and other
+integrations react to fee pressure, replacements, propagation faults, and reorgs.
+"Mainnet-like" in this repository refers to those application-facing behaviors, while
+still allowing developers to configure Bitcoin policy for the behavior their test
+requires.
+
+It is **not** intended to validate:
+
+- Bitcoin consensus implementations, consensus-rule changes, or fork-choice security.
+- Miner software, pool protocols, hashpower security, or mining economics.
+- Network-scale decentralization, topology, or propagation characteristics.
+- Signet behavior. This is regtest and does not implement Signet's block-signing
+  challenge.
+
+The topology deliberately uses only three Bitcoin Core nodes and centrally controlled
+regtest mining so it remains practical on a developer machine. Bitcoin Core still
+enforces regtest consensus rules, and Simchain can create real competing branches or
+administratively force reorgs, but those facilities exist to test an application's
+reaction to chain events. They do not turn this small, controlled network into a
+consensus or miner testbed, and results should not be interpreted as Signet, testnet, or
+mainnet network behavior.
+
 ## Features
 
 - **Mainnet-like network shape.** Three Bitcoin Core nodes form a full P2P mesh;

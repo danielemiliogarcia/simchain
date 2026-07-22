@@ -118,15 +118,18 @@ dependent descendants are gone. A zero-eligible result does not fail the reorg: 
 ordinary replacement chain is still mined and the reason is logged.
 
 `REORG_DOUBLE_SPEND_PCT` is ignored in `empty` mode, because that mode mines no
-transactions. Transactions created through `REORG_ADDS_NEW_TXS` are injected after
-invalidation and then prioritized into the explicit replacement-block transaction
-lists before ordinary returned mempool transactions fill the remaining space. They
-are not double-spend candidates during that same run. Witness-based chain adoption
-and mining-controller behavior are unaffected. The result reports requested,
-created, and mined fresh-transaction counts. A non-empty reorg fails after restoring
-a safe converged chain if any requested fresh transaction could not be created or is
-missing from the winning chain; it never silently reports a partial request as
-successful.
+transactions. DATA/HYBRID raw spam contributes no eligible transactions because its
+keys live outside the node wallet. Eligibility can still be nonzero when the orphaned
+window contains a node-wallet payment, a faucet transaction funded by that miner
+wallet, or `REORG_ADDS_NEW_TXS` transactions mined by an earlier reorg. Transactions
+created through `REORG_ADDS_NEW_TXS` are injected after invalidation and then
+prioritized into the explicit replacement-block transaction lists before ordinary
+returned mempool transactions fill the remaining space, so they are not double-spend
+candidates during that same run. Witness-based chain adoption and mining-controller
+behavior are unaffected. The result reports requested, created, and mined
+fresh-transaction counts. A non-empty reorg fails after restoring a safe converged
+chain if any requested fresh transaction could not be created or is missing from the
+winning chain; it never silently reports a partial request as successful.
 
 ## Continuous Reorgs
 

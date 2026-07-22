@@ -903,7 +903,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::MiningController,
         control: ControlKind::Choice(&["poisson", "fixed"]),
         optional: false,
-        help: "Block interval distribution: poisson (exponential, mainnet-like) or fixed (always the mean).",
+        help: "Block interval distribution: poisson (exponential, mainnet-like) or fixed (always the mean). Use poisson to test variable confirmation latency; use fixed for a predictable mining cadence.",
         warning: None,
     },
     SettingSpec {
@@ -913,7 +913,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::MiningController,
         control: ControlKind::Integer,
         optional: false,
-        help: "Mean seconds between blocks (positive integer).",
+        help: "Mean seconds between blocks (positive integer). Controls simulation speed and expected confirmation latency.",
         warning: None,
     },
     SettingSpec {
@@ -923,7 +923,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::MiningController,
         control: ControlKind::Decimal,
         optional: true,
-        help: "Lower clamp on the sampled interval in seconds; empty = unbounded.",
+        help: "Lower clamp on poisson-sampled intervals; empty = unbounded and fixed mode ignores it. Prevents unusually fast consecutive blocks in bounded demonstrations.",
         warning: None,
     },
     SettingSpec {
@@ -933,7 +933,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::MiningController,
         control: ControlKind::Decimal,
         optional: true,
-        help: "Upper clamp on the sampled interval in seconds; empty = unbounded.",
+        help: "Upper clamp on poisson-sampled intervals; empty = unbounded and fixed mode ignores it. Prevents a long poisson tail from stalling a short test run.",
         warning: None,
     },
     SettingSpec {
@@ -943,7 +943,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::MiningController,
         control: ControlKind::Text,
         optional: true,
-        help: "Relative node2,node3 hashrates, e.g. 70,30; empty = strict alternation.",
+        help: "Relative node2,node3 hashrates, e.g. 70,30; empty = strict alternation. Models unequal miner hashpower and biases which miner produces each block.",
         warning: None,
     },
     SettingSpec {
@@ -963,7 +963,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Toggle,
         optional: false,
-        help: "Enable spam generation. When false the worker remains resident in its disabled phase and can be re-enabled without restart.",
+        help: "Enable spam generation. When false the worker remains resident in its disabled phase and can be re-enabled without restart. Controls whether mined blocks carry background transaction load. Other spam settings are ignored and disabled while false.",
         warning: None,
     },
     SettingSpec {
@@ -973,7 +973,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Decimal,
         optional: false,
-        help: "Spam fee floor in BTC/kvB (0.0001 = 10 sat/vB). Floor fills pay exactly this; bulk spam pays a small premium. Applies at a safe engine-rebuild boundary.",
+        help: "Spam fee floor in BTC/kvB (0.0001 = 10 sat/vB). Floor fills pay exactly this; bulk spam pays a small premium. Sets the simulated market price users must outbid under congestion. Applies at a safe engine-rebuild boundary.",
         warning: None,
     },
     SettingSpec {
@@ -983,7 +983,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Decimal,
         optional: false,
-        help: "DATA/HYBRID fill target in blocks of mempool weight: 0.5 = half-full blocks, 2 = full + backlog.",
+        help: "DATA/HYBRID fill target in blocks of mempool weight: 0.5 = half-full blocks, 2 = full + backlog. Controls block fullness and how much pending traffic remains visible after a block.",
         warning: None,
     },
     SettingSpec {
@@ -993,7 +993,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Integer,
         optional: false,
-        help: "Biggest OP_RETURN payload for DATA/HYBRID fill; 0 switches to the legacy OUTPUT mode.",
+        help: "Biggest OP_RETURN payload for DATA/HYBRID fill; 0 switches to the legacy OUTPUT mode. Larger payloads fill blocks with fewer transactions without growing the spendable UTXO set.",
         warning: None,
     },
     SettingSpec {
@@ -1003,7 +1003,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Integer,
         optional: false,
-        help: "Smallest OP_RETURN payload; sizes spread log-uniformly between min and max.",
+        help: "Smallest OP_RETURN payload; sizes spread log-uniformly between min and max. Controls visible transaction-size diversity; a lower minimum produces more small transactions.",
         warning: None,
     },
     SettingSpec {
@@ -1013,7 +1013,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Integer,
         optional: false,
-        help: "Extra minimum-size floor-priced txs per block on top of the data fill; 0 = none.",
+        help: "Extra minimum-size floor-priced txs per block on top of the data fill; 0 = none. Controls how realistic the transaction-size mixture looks.",
         warning: None,
     },
     SettingSpec {
@@ -1023,7 +1023,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Integer,
         optional: false,
-        help: "Standing floor-priced ~110-vB self-transfers kept in the mempool (airtight fee floor); 0 = off.",
+        help: "Standing floor-priced ~110-vB self-transfers kept in the mempool (airtight fee floor); 0 = off. When blocks are full, prevents cheap transactions from slipping through residual gaps.",
         warning: None,
     },
     SettingSpec {
@@ -1033,7 +1033,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Integer,
         optional: false,
-        help: "Fixed tx count for OUTPUT modes and the wallet engine; ignored in DATA/HYBRID mode.",
+        help: "Fixed tx count for OUTPUT modes and the wallet engine; ignored in DATA/HYBRID mode. Controls visible transaction count and node workload when using OUTPUT mode.",
         warning: None,
     },
     SettingSpec {
@@ -1043,7 +1043,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Integer,
         optional: false,
-        help: "OUTPUT-mode fatness: 0 = sequential txs, N = batches of N burn outputs per tx.",
+        help: "OUTPUT-mode fatness: 0 = sequential txs, N = batches of N burn outputs per tx. Higher values model payout batches and fill block weight with fewer transaction IDs, at greater UTXO cost.",
         warning: None,
     },
     SettingSpec {
@@ -1053,7 +1053,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Toggle,
         optional: false,
-        help: "Auto-size the branch pool from the fill ratio; false = use SPAM_FANOUT_UTXOS.",
+        help: "Auto-size the branch pool from the fill ratio; false = use SPAM_FANOUT_UTXOS. Ensures the spammer has enough independent chains to sustain the requested mempool depth.",
         warning: None,
     },
     SettingSpec {
@@ -1063,7 +1063,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Integer,
         optional: false,
-        help: "Manual branch-pool size; must cover the fill ratio (>= ratio x10, min 12) when auto is off.",
+        help: "Manual branch-pool size; must cover the fill ratio (>= ratio x10, min 12) when auto is off. Independent branches bypass unconfirmed-chain limits; deeper backlogs require more branches.",
         warning: None,
     },
     SettingSpec {
@@ -1073,7 +1073,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Toggle,
         optional: false,
-        help: "Fee-bump (RBF) a fraction of the just-sent spam so the mempool carries real BIP125 replacements.",
+        help: "Fee-bump (RBF) a fraction of the just-sent spam so the mempool carries real BIP125 replacements. Exercises replacement handling in explorers, wallets, and transaction monitors.",
         warning: None,
     },
     SettingSpec {
@@ -1083,7 +1083,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Integer,
         optional: false,
-        help: "How many of each miner's spam txs get fee-bumped per block when RBF traffic is enabled.",
+        help: "How many of each miner's spam txs get fee-bumped per block when RBF traffic is enabled. Controls replacement-event density and downstream processing load. Ignored while ENABLE_SPAM_REPLACES=false.",
         warning: None,
     },
 ];

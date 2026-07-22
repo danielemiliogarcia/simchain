@@ -121,7 +121,7 @@
         <label data-help="Fresh wallet transactions to prioritize into replacement blocks. Example: 100 creates 100 new transactions first, then old returned mempool transactions fill the remaining block space.">New transactions
           <input id="reorg-adds" type="number" min="0" max="10000" value="0" required>
         </label>
-        <label data-help="Percent of eligible old wallet-spam transactions to replace with conflicting spends in the replacement branch. Example: 50 attempts conflicts for half of eligible transactions; use 0 for normal reorgs. Raw OP_RETURN burst transactions usually are not eligible.">Double spend %
+        <label data-help="Percent of eligible wallet-owned transactions in the blocks being replaced that will be replaced by conflicting spends. Example: 50 replaces half of eligible transactions; use 0 for a normal reorg. DATA/HYBRID raw spam contributes no eligible transactions, but wallet payments, faucet transactions, and New transactions mined by an earlier reorg can be eligible. New transactions created by this same reorg are too late to be candidates.">Double spend %
           <input id="reorg-double-spend" type="number" min="0" max="100" value="0" required>
         </label>
         <label class="check-field" data-help="Mine replacement blocks without deliberately adding transactions. Example: use this to test a reorg that changes block ancestry but carries little mempool traffic.">
