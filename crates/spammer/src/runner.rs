@@ -10,6 +10,7 @@ use crate::{
 use anyhow::Context;
 use bitcoincore_rpc::{bitcoin::Address, Client, RpcApi};
 use serde_json::json;
+use simchain_common::internal_api::{SpamCapacityState, SpamCapacityStatus};
 use simchain_common::live_tuning::SpamTuning;
 use simchain_common::{create_client, create_jsonrpc_client, create_wallet_client};
 use std::{thread, time::Duration};
@@ -135,6 +136,55 @@ impl SpamEngine {
         }
     }
 
+    fn apply_policy(&mut self, policy: &SpamTuning) -> anyhow::Result<()> {
+        match self {
+            Self::Raw { node2, node3 } if policy.use_raw => {
+                let prepared = RawSpammer::prepare_policy(policy);
+                node2.apply_prepared_policy(&prepared);
+                node3.apply_prepared_policy(&prepared);
+                Ok(())
+            }
+            Self::Wallet { .. } if !policy.use_raw => {
+                anyhow::bail!("the deprecated wallet engine cannot be hot-retuned")
+            }
+            _ => anyhow::bail!("installed spam engine does not match requested policy"),
+        }
+    }
+
+    fn capacity(&self, policy: &SpamTuning) -> Option<SpamCapacityStatus> {
+        let Self::Raw { node2, node3 } = self else {
+            return None;
+        };
+        let left = node2.capacity();
+        let right = node3.capacity();
+        let usable = left.usable_branches.min(right.usable_branches);
+        let (required, target) = if policy.data_max_bytes > 0 {
+            (policy.minimum_data_fanout(), policy.desired_data_fanout())
+        } else {
+            let (left_share, right_share) = SpamConfig::fixed_shares(policy);
+            (
+                left_share.max(right_share).min(policy.fanout_utxos.max(1)),
+                policy.fanout_utxos.max(1),
+            )
+        };
+        let provisioning = left.branch_provisioning || right.branch_provisioning;
+        let state = if usable < required {
+            SpamCapacityState::CapacityDegraded
+        } else if provisioning || usable < target {
+            SpamCapacityState::Provisioning
+        } else {
+            SpamCapacityState::Ready
+        };
+        Some(SpamCapacityStatus {
+            state,
+            usable_branches_per_miner: usable,
+            required_branches_per_miner: required,
+            target_branches_per_miner: target,
+            branch_provisioning: provisioning,
+            floor_pool_provisioning: left.floor_pool_provisioning || right.floor_pool_provisioning,
+        })
+    }
+
     fn run_cycle(
         &mut self,
         node1: &Client,
@@ -180,7 +230,10 @@ pub fn run() -> anyhow::Result<()> {
     )?;
     let node1 = create_client(&config.node1_url).context("build node1 client")?;
     let mut engine: Option<SpamEngine> = None;
+    let mut engine_has_initialized = false;
     let mut spammed_at_height = 0u64;
+    let mut catch_up_request = None;
+    let mut last_cycle_policy: Option<SpamTuning> = None;
 
     loop {
         match control.safe_point() {
@@ -188,6 +241,11 @@ pub fn run() -> anyhow::Result<()> {
                 match SpamEngine::build(config, &policy, None, false) {
                     Ok(new_engine) => {
                         engine = Some(new_engine);
+                        if engine_has_initialized {
+                            control.record_recovery("engine reconstructed after loss");
+                        }
+                        engine_has_initialized = true;
+                        report_capacity(&control, engine.as_ref(), &policy);
                         control.complete_initialization(Ok(()));
                     }
                     Err(failure) => {
@@ -198,12 +256,12 @@ pub fn run() -> anyhow::Result<()> {
                 }
             }
             SafePointAction::ApplyPolicy {
-                policy, rebuild, ..
+                generation,
+                policy,
+                impact,
             } => {
-                let result = if !policy.enabled {
-                    engine = None;
-                    Ok(())
-                } else if rebuild || engine.is_none() {
+                let result = if impact.engine_changed || (policy.enabled && engine.is_none()) {
+                    let engine_was_missing = engine.is_none();
                     let previous_fee = Some(configured_fee(&control));
                     let previous_uses_wallet_fee =
                         matches!(engine.as_ref(), Some(SpamEngine::Wallet { .. }));
@@ -211,6 +269,10 @@ pub fn run() -> anyhow::Result<()> {
                     {
                         Ok(new_engine) => {
                             engine = Some(new_engine);
+                            if engine_was_missing && engine_has_initialized {
+                                control.record_recovery("engine reconstructed after loss");
+                            }
+                            engine_has_initialized = true;
                             Ok(())
                         }
                         Err(failure) => {
@@ -223,13 +285,25 @@ pub fn run() -> anyhow::Result<()> {
                             Err(failure.error)
                         }
                     }
+                } else if let Some(engine) = engine.as_mut() {
+                    engine.apply_policy(&policy)
                 } else {
                     Ok(())
                 };
+                let applied = result.is_ok();
                 if let Err(error) = &result {
-                    tracing::warn!("spam policy engine rebuild rejected: {error}");
+                    tracing::warn!("spam policy apply rejected: {error}");
                 }
                 control.complete_policy(result, engine.is_some());
+                if applied {
+                    catch_up_request = impact.needs_immediate_cycle.then_some(CatchUpRequest {
+                        generation,
+                        height: spammed_at_height,
+                    });
+                }
+                if applied {
+                    report_capacity(&control, engine.as_ref(), &policy);
+                }
             }
             SafePointAction::Reconcile => {
                 let result = engine
@@ -244,6 +318,7 @@ pub fn run() -> anyhow::Result<()> {
                     tracing::warn!("spam reconciliation failed: {error}");
                 }
                 control.complete_reconciliation(result);
+                report_capacity(&control, engine.as_ref(), &control.status().policy);
                 if control.status().reconciliation_pending {
                     thread::sleep(Duration::from_millis(500));
                 }
@@ -257,15 +332,39 @@ pub fn run() -> anyhow::Result<()> {
                         continue;
                     }
                 };
-                if current_height > spammed_at_height
+                let cycle_kind = cycle_kind(
+                    current_height,
+                    spammed_at_height,
+                    catch_up_request,
+                    generation,
+                );
+                if catch_up_superseded(
+                    catch_up_request,
+                    generation,
+                    current_height,
+                    spammed_at_height,
+                ) {
+                    catch_up_request = None;
+                }
+                if cycle_kind != CycleKind::NotDue
                     && control.begin_cycle(generation, current_height)
                 {
+                    if cycle_kind == CycleKind::CatchUp {
+                        catch_up_request = None;
+                    }
                     spammed_at_height = current_height;
+                    let cycle_policy = if cycle_kind == CycleKind::CatchUp {
+                        catch_up_policy(&policy, last_cycle_policy.as_ref())
+                    } else {
+                        policy.clone()
+                    };
                     let cycle_start = std::time::Instant::now();
                     let result = engine
                         .as_mut()
                         .ok_or_else(|| anyhow::anyhow!("spam engine is unavailable"))
-                        .and_then(|engine| engine.run_cycle(&node1, &policy, generation, &control));
+                        .and_then(|engine| {
+                            engine.run_cycle(&node1, &cycle_policy, generation, &control)
+                        });
                     let accepted = match result {
                         Ok(accepted) => accepted,
                         Err(error) => {
@@ -276,6 +375,8 @@ pub fn run() -> anyhow::Result<()> {
                     };
                     let cycle_duration = cycle_start.elapsed();
                     control.finish_cycle(current_height, accepted, cycle_duration);
+                    last_cycle_policy = Some(policy.clone());
+                    report_capacity(&control, engine.as_ref(), &policy);
                     tracing::info!(
                         "Spam cycle done in {:.1}s ({accepted} txs accepted)",
                         cycle_duration.as_secs_f32()
@@ -289,6 +390,78 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
     }
+}
+
+fn report_capacity(control: &SpamControl, engine: Option<&SpamEngine>, policy: &SpamTuning) {
+    if let Some(capacity) = engine.and_then(|engine| engine.capacity(policy)) {
+        control.report_capacity(capacity);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CatchUpRequest {
+    generation: u64,
+    height: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CycleKind {
+    NotDue,
+    Normal,
+    CatchUp,
+}
+
+fn cycle_kind(
+    current_height: u64,
+    spammed_at_height: u64,
+    catch_up: Option<CatchUpRequest>,
+    generation: u64,
+) -> CycleKind {
+    if current_height > spammed_at_height {
+        CycleKind::Normal
+    } else if current_height == spammed_at_height
+        && catch_up.is_some_and(|request| {
+            request.generation == generation && request.height == current_height
+        })
+    {
+        CycleKind::CatchUp
+    } else {
+        CycleKind::NotDue
+    }
+}
+
+fn catch_up_superseded(
+    catch_up: Option<CatchUpRequest>,
+    generation: u64,
+    current_height: u64,
+    spammed_at_height: u64,
+) -> bool {
+    catch_up.is_some_and(|request| {
+        request.generation != generation
+            || request.height != current_height
+            || current_height != spammed_at_height
+    })
+}
+
+fn catch_up_policy(next: &SpamTuning, previous: Option<&SpamTuning>) -> SpamTuning {
+    let Some(previous) = previous else {
+        return next.clone();
+    };
+    let mut policy = next.clone();
+    match (previous.data_max_bytes > 0, next.data_max_bytes > 0) {
+        (false, false) => {
+            policy.fixed_txs_per_block = next
+                .fixed_txs_per_block
+                .saturating_sub(previous.fixed_txs_per_block);
+        }
+        (true, true) => {
+            policy.small_txs_per_block = next
+                .small_txs_per_block
+                .saturating_sub(previous.small_txs_per_block);
+        }
+        _ => {}
+    }
+    policy
 }
 
 fn configured_fee(control: &SpamControl) -> f64 {
@@ -354,11 +527,24 @@ fn set_wallet_fees(
     }
 }
 
-fn effective_fanout(policy: &SpamTuning) -> u64 {
-    if policy.fanout_auto {
-        std::cmp::max(12, (policy.fill_block_ratio * 15.0).ceil() as u64)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FanoutCapacity {
+    minimum: u64,
+    target: u64,
+}
+
+fn data_fanout_capacity(policy: &SpamTuning) -> FanoutCapacity {
+    FanoutCapacity {
+        minimum: policy.minimum_data_fanout(),
+        target: policy.desired_data_fanout(),
+    }
+}
+
+fn effective_floor_pool_txs(policy: &SpamTuning) -> u64 {
+    if policy.fill_block_ratio >= 1.0 {
+        policy.floor_pool_txs
     } else {
-        policy.fanout_utxos
+        0
     }
 }
 
@@ -371,11 +557,15 @@ fn run_raw_data_cycle(
     control: &SpamControl,
 ) -> usize {
     const BLOCK_VSIZE: u64 = 1_000_000;
-    let fanout = effective_fanout(policy);
+    let fanout = data_fanout_capacity(policy);
     let small2 = policy.small_txs_per_block.div_ceil(MINER_COUNT);
     let small3 = policy.small_txs_per_block / MINER_COUNT;
-    let pool2 = policy.floor_pool_txs.div_ceil(MINER_COUNT);
-    let pool3 = policy.floor_pool_txs / MINER_COUNT;
+    // A sub-block ratio intentionally models partial blocks. Maintaining the
+    // standing floor pool there would add up to another block of traffic and
+    // make the configured ratio impossible to observe.
+    let floor_pool_txs = effective_floor_pool_txs(policy);
+    let pool2 = floor_pool_txs.div_ceil(MINER_COUNT);
+    let pool3 = floor_pool_txs / MINER_COUNT;
     let mempool = node1
         .get_mempool_info()
         .map(|info| info.bytes as u64)
@@ -393,28 +583,31 @@ fn run_raw_data_cycle(
     let (accepted2, accepted3) = thread::scope(|scope| {
         let worker2 = scope.spawn(|| {
             let checkpoint = |phase: &str| control.cycle_checkpoint(generation, phase);
-            let fills = node2.floor_round(pool2, &checkpoint);
             let (txids, _) = node2.hybrid_round(
                 deficit2,
                 small2,
-                fanout,
+                (fanout.minimum, fanout.target),
                 policy.enable_replaces,
                 policy.replaces_per_miner,
                 &checkpoint,
             );
+            // Protect block fullness first. A cold floor pool can require
+            // thousands of small RPC submissions, while bulk DATA traffic can
+            // establish the requested multi-block backlog quickly.
+            let fills = node2.floor_round(pool2, &checkpoint);
             fills + txids.len()
         });
         let worker3 = scope.spawn(|| {
             let checkpoint = |phase: &str| control.cycle_checkpoint(generation, phase);
-            let fills = node3.floor_round(pool3, &checkpoint);
             let (txids, _) = node3.hybrid_round(
                 deficit3,
                 small3,
-                fanout,
+                (fanout.minimum, fanout.target),
                 policy.enable_replaces,
                 policy.replaces_per_miner,
                 &checkpoint,
             );
+            let fills = node3.floor_round(pool3, &checkpoint);
             fills + txids.len()
         });
         (
@@ -515,4 +708,93 @@ fn run_wallet_cycle(
         )
     });
     txids2.len() + txids3.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use simchain_common::live_tuning;
+    use std::collections::BTreeMap;
+
+    fn policy() -> SpamTuning {
+        SpamTuning::from_source(&live_tuning::staged_map(&BTreeMap::new()))
+            .expect("default spam policy")
+            .0
+    }
+
+    #[test]
+    fn catch_up_can_run_once_at_the_current_height() {
+        let request = Some(CatchUpRequest {
+            generation: 7,
+            height: 100,
+        });
+        assert_eq!(cycle_kind(100, 100, None, 7), CycleKind::NotDue);
+        assert_eq!(cycle_kind(100, 100, request, 7), CycleKind::CatchUp);
+        assert!(!catch_up_superseded(request, 7, 100, 100));
+        assert_eq!(cycle_kind(101, 100, None, 7), CycleKind::Normal);
+    }
+
+    #[test]
+    fn catch_up_surviving_failed_begin_is_dropped_at_a_new_height() {
+        let request = Some(CatchUpRequest {
+            generation: 7,
+            height: 100,
+        });
+
+        // A same-height begin_cycle rejection leaves the request available for
+        // retry after the concurrent pause or lease clears.
+        assert_eq!(cycle_kind(100, 100, request, 7), CycleKind::CatchUp);
+        assert!(!catch_up_superseded(request, 7, 100, 100));
+
+        // If a block arrives first, the request is stale. The fresh height gets
+        // one full normal cycle and cannot run the old delta on its next poll.
+        assert_eq!(cycle_kind(101, 100, request, 7), CycleKind::Normal);
+        assert!(catch_up_superseded(request, 7, 101, 100));
+        assert_eq!(cycle_kind(101, 101, None, 7), CycleKind::NotDue);
+    }
+
+    #[test]
+    fn modest_ratio_increase_uses_existing_headroom() {
+        let mut changed = policy();
+        changed.fill_block_ratio = 5.0;
+        let capacity = data_fanout_capacity(&changed);
+        assert_eq!(capacity.minimum, 50);
+        assert_eq!(capacity.target, 75);
+        assert!(60 >= capacity.minimum);
+        assert!(60 < capacity.target);
+    }
+
+    #[test]
+    fn partial_fill_ratio_disables_floor_pool_replenishment() {
+        let mut changed = policy();
+        changed.floor_pool_txs = 4_000;
+        changed.fill_block_ratio = 0.5;
+        assert_eq!(effective_floor_pool_txs(&changed), 0);
+
+        changed.fill_block_ratio = 1.0;
+        assert_eq!(effective_floor_pool_txs(&changed), 4_000);
+    }
+
+    #[test]
+    fn same_height_catch_up_uses_count_deltas() {
+        let mut previous = policy();
+        previous.data_max_bytes = 0;
+        previous.data_min_bytes = 0;
+        previous.fixed_txs_per_block = 100;
+        let mut next = previous.clone();
+        next.fixed_txs_per_block = 140;
+        assert_eq!(
+            catch_up_policy(&next, Some(&previous)).fixed_txs_per_block,
+            40
+        );
+
+        previous.data_max_bytes = 1_000;
+        previous.small_txs_per_block = 10;
+        next = previous.clone();
+        next.small_txs_per_block = 25;
+        assert_eq!(
+            catch_up_policy(&next, Some(&previous)).small_txs_per_block,
+            15
+        );
+    }
 }

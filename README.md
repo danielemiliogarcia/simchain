@@ -514,6 +514,41 @@ To reset the chain from scratch, remove the containers **and the chain volumes**
 `docker compose --profile "*" down -v` (a plain `down` keeps the named volumes,
 so the chain resumes on the next `up`).
 
+### BuildKit snapshot export failure
+
+An all-tools rebuild can rarely fail while exporting the three identical network-agent
+images with an error like:
+
+```text
+failed to prepare extraction snapshot ... parent snapshot ... does not exist
+```
+
+This is a Docker/BuildKit snapshot-cache failure during parallel image export, not a
+Rust compilation or Simchain runtime error. If `down -v` already succeeded, do not run
+it again; retry the `up` with serialized Compose work:
+
+```bash
+COMPOSE_PARALLEL_LIMIT=1 \
+docker compose --profile all-tools up -d --force-recreate --build
+```
+
+If the same snapshot error repeats, clear only the builder cache, restart Docker, and
+retry the serialized command:
+
+```bash
+docker builder prune -f
+sudo systemctl restart docker
+```
+
+When Compose also warns that Bake is configured but Buildx is unavailable, install the
+Buildx package for the host distribution. On Ubuntu 24.04:
+
+```bash
+sudo apt update
+sudo apt install docker-buildx
+docker buildx version
+```
+
 ## License
 
 BTC Simchain's source code is licensed under the

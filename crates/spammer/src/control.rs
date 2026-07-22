@@ -2,7 +2,7 @@
 
 use simchain_common::internal_api::{
     CommandAck, DesiredState, LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest, PauseLease,
-    SetSpamPolicyRequest, SetStateRequest, SpamWorkerStatus, WorkerPhase,
+    SetSpamPolicyRequest, SetStateRequest, SpamCapacityStatus, SpamWorkerStatus, WorkerPhase,
 };
 use simchain_common::live_tuning::SpamTuning;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -21,6 +21,16 @@ struct LeaseEntry {
 struct PendingPolicy {
     generation: u64,
     policy: SpamTuning,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SpamPolicyImpact {
+    pub lifecycle_changed: bool,
+    pub shape_changed: bool,
+    pub capacity_changed: bool,
+    pub workload_changed: bool,
+    pub engine_changed: bool,
+    pub needs_immediate_cycle: bool,
 }
 
 struct PolicyFailure {
@@ -44,6 +54,10 @@ struct Inner {
     policy_failure: Option<PolicyFailure>,
     initialization_pending: bool,
     reconciliation_pending: bool,
+    reconciliation_reason: Option<String>,
+    reconciliation_count: u64,
+    last_reconciliation_reason: Option<String>,
+    capacity: Option<SpamCapacityStatus>,
     phase: WorkerPhase,
     observed_height: Option<u64>,
     cycle_phase: Option<String>,
@@ -70,7 +84,7 @@ pub enum SafePointAction {
     ApplyPolicy {
         generation: u64,
         policy: SpamTuning,
-        rebuild: bool,
+        impact: SpamPolicyImpact,
     },
     Reconcile,
     Ready {
@@ -98,6 +112,10 @@ impl SpamControl {
                 policy_failure: None,
                 initialization_pending: enabled,
                 reconciliation_pending: false,
+                reconciliation_reason: None,
+                reconciliation_count: 0,
+                last_reconciliation_reason: None,
+                capacity: None,
                 phase: if enabled {
                     WorkerPhase::Initializing
                 } else {
@@ -235,6 +253,7 @@ impl SpamControl {
         inner.leases.remove(lease_id);
         if request.chain_changed {
             inner.reconciliation_pending = true;
+            inner.reconciliation_reason = Some(format!("chain changed under lease {lease_id}"));
             tracing::info!(lease_id, "spam pause lease released after a chain change");
         }
         self.changed.notify_all();
@@ -294,18 +313,14 @@ impl SpamControl {
         loop {
             expire_leases(&mut inner);
             if let Some(pending) = &inner.pending_policy {
+                let impact = policy_impact(&inner.policy, &pending.policy);
                 let action = SafePointAction::ApplyPolicy {
                     generation: pending.generation,
                     policy: pending.policy.clone(),
-                    rebuild: requires_rebuild(&inner.policy, &pending.policy),
+                    impact,
                 };
                 inner.in_flight = true;
-                inner.phase =
-                    if matches!(&action, SafePointAction::ApplyPolicy { rebuild: true, .. }) {
-                        WorkerPhase::Reconciling
-                    } else {
-                        WorkerPhase::Initializing
-                    };
+                inner.phase = WorkerPhase::Active;
                 inner.cycle_phase = Some("applying_policy".to_string());
                 self.changed.notify_all();
                 return action;
@@ -373,6 +388,19 @@ impl SpamControl {
         self.changed.notify_all();
     }
 
+    pub fn record_recovery(&self, reason: impl Into<String>) {
+        let mut inner = self.inner.lock().expect("spam control lock");
+        inner.reconciliation_count = inner.reconciliation_count.saturating_add(1);
+        inner.last_reconciliation_reason = Some(reason.into());
+        self.changed.notify_all();
+    }
+
+    pub fn report_capacity(&self, capacity: SpamCapacityStatus) {
+        let mut inner = self.inner.lock().expect("spam control lock");
+        inner.capacity = Some(capacity);
+        self.changed.notify_all();
+    }
+
     pub fn complete_policy(&self, result: anyhow::Result<()>, engine_available: bool) {
         let mut inner = self.inner.lock().expect("spam control lock");
         let pending = inner
@@ -418,6 +446,8 @@ impl SpamControl {
         match result {
             Ok(()) => {
                 inner.reconciliation_pending = false;
+                inner.reconciliation_count = inner.reconciliation_count.saturating_add(1);
+                inner.last_reconciliation_reason = inner.reconciliation_reason.take();
                 inner.last_error = None;
                 inner.phase = if pause_requested(&inner) {
                     WorkerPhase::Paused
@@ -468,8 +498,10 @@ impl SpamControl {
         if interrupted {
             inner.phase = if pause_requested(&inner) {
                 WorkerPhase::Pausing
-            } else {
+            } else if inner.reconciliation_pending {
                 WorkerPhase::Reconciling
+            } else {
+                WorkerPhase::Active
             };
         }
         self.changed.notify_all();
@@ -485,9 +517,9 @@ impl SpamControl {
         inner.cycle_phase = None;
         inner.phase = if pause_requested(&inner) {
             WorkerPhase::Paused
-        } else if inner.pending_policy.is_some() || inner.reconciliation_pending {
+        } else if inner.reconciliation_pending {
             WorkerPhase::Reconciling
-        } else if inner.policy.enabled {
+        } else if inner.pending_policy.is_some() || inner.policy.enabled {
             WorkerPhase::Active
         } else {
             WorkerPhase::Disabled
@@ -604,14 +636,45 @@ impl SpamControl {
     }
 }
 
-pub fn requires_rebuild(current: &SpamTuning, next: &SpamTuning) -> bool {
-    next.enabled
-        && (!current.enabled
-            || current.use_raw != next.use_raw
-            || current.spam_fee != next.spam_fee
-            || current.sendmany_outputs != next.sendmany_outputs
-            || current.data_min_bytes != next.data_min_bytes
-            || current.data_max_bytes != next.data_max_bytes)
+pub fn policy_impact(current: &SpamTuning, next: &SpamTuning) -> SpamPolicyImpact {
+    let lifecycle_changed = current.enabled != next.enabled;
+    let engine_changed = current.use_raw != next.use_raw;
+    let shape_changed = engine_changed
+        || current.spam_fee != next.spam_fee
+        || current.sendmany_outputs != next.sendmany_outputs
+        || current.data_min_bytes != next.data_min_bytes
+        || current.data_max_bytes != next.data_max_bytes;
+    let capacity_changed = shape_changed
+        || current.fill_block_ratio != next.fill_block_ratio
+        || current.fanout_auto != next.fanout_auto
+        || current.fanout_utxos != next.fanout_utxos;
+    let workload_changed = current.fixed_txs_per_block != next.fixed_txs_per_block
+        || current.small_txs_per_block != next.small_txs_per_block
+        || current.floor_pool_txs != next.floor_pool_txs
+        || current.fill_block_ratio != next.fill_block_ratio
+        || current.enable_replaces != next.enable_replaces
+        || current.replaces_per_miner != next.replaces_per_miner;
+    let workload_increased = next.fill_block_ratio > current.fill_block_ratio
+        || next.fixed_txs_per_block > current.fixed_txs_per_block
+        || next.small_txs_per_block > current.small_txs_per_block
+        || next.floor_pool_txs > current.floor_pool_txs;
+    // Wake immediately for a capacity-only increase so asynchronous funding or
+    // fanout starts now instead of waiting for the next block. Catch-up policy
+    // suppresses unchanged additive transaction counts.
+    let capacity_increased = next.desired_data_fanout() > current.desired_data_fanout();
+
+    SpamPolicyImpact {
+        lifecycle_changed,
+        shape_changed,
+        capacity_changed,
+        workload_changed,
+        engine_changed,
+        needs_immediate_cycle: next.enabled
+            && ((!current.enabled && lifecycle_changed)
+                || shape_changed
+                || workload_increased
+                || capacity_increased),
+    }
 }
 
 fn validate_lease_request(request: &LeaseRequest) -> anyhow::Result<()> {
@@ -717,6 +780,7 @@ fn expire_leases(inner: &mut Inner) {
         // An expired owner cannot tell us whether it changed the chain. The
         // conservative recovery path is to reconcile before sending again.
         inner.reconciliation_pending = true;
+        inner.reconciliation_reason = Some("pause lease expired".to_string());
     }
 }
 
@@ -755,6 +819,9 @@ fn status_from(inner: &Inner) -> SpamWorkerStatus {
         last_cycle_duration_ms: inner.last_cycle_duration_ms,
         active_leases,
         reconciliation_pending: inner.reconciliation_pending,
+        capacity: inner.capacity.clone(),
+        reconciliation_count: inner.reconciliation_count,
+        last_reconciliation_reason: inner.last_reconciliation_reason.clone(),
         uptime_secs: inner.started.elapsed().as_secs(),
         last_error: inner.last_error.clone(),
     }
@@ -805,6 +872,31 @@ mod tests {
     }
 
     #[test]
+    fn successful_initialization_does_not_count_as_recovery() {
+        let control = SpamControl::new(policy());
+        initialize(&control);
+
+        let status = control.status();
+        assert_eq!(status.reconciliation_count, 0);
+        assert_eq!(status.last_reconciliation_reason, None);
+    }
+
+    #[test]
+    fn reconstructed_engine_counts_as_recovery() {
+        let control = SpamControl::new(policy());
+        initialize(&control);
+
+        control.record_recovery("engine reconstructed after loss");
+
+        let status = control.status();
+        assert_eq!(status.reconciliation_count, 1);
+        assert_eq!(
+            status.last_reconciliation_reason.as_deref(),
+            Some("engine reconstructed after loss")
+        );
+    }
+
+    #[test]
     fn pause_is_acknowledged_after_the_in_flight_cycle_stops() {
         let control = SpamControl::new(policy());
         initialize(&control);
@@ -846,12 +938,20 @@ mod tests {
             SafePointAction::ApplyPolicy {
                 generation: 1,
                 policy: changed.clone(),
-                rebuild: false,
+                impact: SpamPolicyImpact {
+                    capacity_changed: true,
+                    workload_changed: true,
+                    needs_immediate_cycle: true,
+                    ..SpamPolicyImpact::default()
+                },
             }
         );
         control.complete_policy(Ok(()), true);
         apply.join().expect("apply thread").expect("apply");
-        assert_eq!(control.status().policy, changed);
+        let status = control.status();
+        assert_eq!(status.policy, changed);
+        assert_eq!(status.reconciliation_count, 0);
+        assert_eq!(status.last_reconciliation_reason, None);
     }
 
     #[test]
@@ -914,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_rebuild_keeps_the_previous_policy() {
+    fn rejected_hot_apply_keeps_the_previous_policy() {
         let initial = policy();
         let control = SpamControl::new(initial.clone());
         initialize(&control);
@@ -933,7 +1033,14 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         assert!(matches!(
             control.safe_point(),
-            SafePointAction::ApplyPolicy { rebuild: true, .. }
+            SafePointAction::ApplyPolicy {
+                impact: SpamPolicyImpact {
+                    shape_changed: true,
+                    engine_changed: false,
+                    ..
+                },
+                ..
+            }
         ));
         control.complete_policy(Err(anyhow::anyhow!("settxfee rejected")), true);
         let error = apply
@@ -946,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_rebuild_rollback_reinitializes_the_previous_policy() {
+    fn failed_apply_without_an_engine_reinitializes_the_previous_policy() {
         let initial = policy();
         let control = SpamControl::new(initial.clone());
         initialize(&control);
@@ -964,7 +1071,13 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         assert!(matches!(
             control.safe_point(),
-            SafePointAction::ApplyPolicy { rebuild: true, .. }
+            SafePointAction::ApplyPolicy {
+                impact: SpamPolicyImpact {
+                    shape_changed: true,
+                    ..
+                },
+                ..
+            }
         ));
         control.complete_policy(Err(anyhow::anyhow!("wallet rollback failed")), false);
         apply
@@ -1002,6 +1115,12 @@ mod tests {
         assert_eq!(control.safe_point(), SafePointAction::Reconcile);
         assert!(control.status().reconciliation_pending);
         control.complete_reconciliation(Ok(()));
+        let status = control.status();
+        assert_eq!(status.reconciliation_count, 1);
+        assert_eq!(
+            status.last_reconciliation_reason.as_deref(),
+            Some("pause lease expired")
+        );
         assert!(matches!(
             control.safe_point(),
             SafePointAction::Ready { .. }
@@ -1009,20 +1128,103 @@ mod tests {
     }
 
     #[test]
-    fn structural_policy_and_reenable_require_rebuild() {
+    fn policy_impact_classifies_shape_lifecycle_and_workload_changes() {
         let initial = policy();
-        let mut structural = initial.clone();
-        structural.data_max_bytes = 0;
-        structural.data_min_bytes = 0;
-        assert!(requires_rebuild(&initial, &structural));
+        let mut shape = initial.clone();
+        shape.data_max_bytes = 0;
+        shape.data_min_bytes = 0;
+        let impact = policy_impact(&initial, &shape);
+        assert!(impact.shape_changed);
+        assert!(impact.capacity_changed);
+        assert!(impact.needs_immediate_cycle);
+        assert!(!impact.engine_changed);
 
         let mut disabled = initial.clone();
         disabled.enabled = false;
-        assert!(requires_rebuild(&disabled, &initial));
+        let impact = policy_impact(&disabled, &initial);
+        assert!(impact.lifecycle_changed);
+        assert!(impact.needs_immediate_cycle);
+        assert!(!impact.shape_changed);
 
-        let mut hot = initial.clone();
-        hot.fixed_txs_per_block += 1;
-        assert!(!requires_rebuild(&initial, &hot));
+        let mut workload = initial.clone();
+        workload.fixed_txs_per_block += 1;
+        let impact = policy_impact(&initial, &workload);
+        assert!(impact.workload_changed);
+        assert!(impact.needs_immediate_cycle);
+        assert!(!impact.shape_changed);
+
+        let mut reduction = initial.clone();
+        reduction.fill_block_ratio /= 2.0;
+        let impact = policy_impact(&initial, &reduction);
+        assert!(impact.workload_changed);
+        assert!(impact.capacity_changed);
+        assert!(!impact.needs_immediate_cycle);
+    }
+
+    #[test]
+    fn every_policy_field_has_an_explicit_impact() {
+        let initial = policy();
+        type ImpactCase = (&'static str, SpamTuning, fn(SpamPolicyImpact) -> bool);
+        let mut cases: Vec<ImpactCase> = Vec::new();
+
+        let mut changed = initial.clone();
+        changed.enabled = !changed.enabled;
+        cases.push(("enabled", changed, |impact| impact.lifecycle_changed));
+        let mut changed = initial.clone();
+        changed.use_raw = !changed.use_raw;
+        cases.push(("use_raw", changed, |impact| impact.engine_changed));
+        let mut changed = initial.clone();
+        changed.spam_fee *= 2.0;
+        cases.push(("spam_fee", changed, |impact| impact.shape_changed));
+        let mut changed = initial.clone();
+        changed.fixed_txs_per_block += 1;
+        cases.push(("fixed_txs_per_block", changed, |impact| {
+            impact.workload_changed
+        }));
+        let mut changed = initial.clone();
+        changed.sendmany_outputs += 1;
+        cases.push(("sendmany_outputs", changed, |impact| impact.shape_changed));
+        let mut changed = initial.clone();
+        changed.data_max_bytes -= 1;
+        cases.push(("data_max_bytes", changed, |impact| impact.shape_changed));
+        let mut changed = initial.clone();
+        changed.data_min_bytes -= 1;
+        cases.push(("data_min_bytes", changed, |impact| impact.shape_changed));
+        let mut changed = initial.clone();
+        changed.small_txs_per_block += 1;
+        cases.push(("small_txs_per_block", changed, |impact| {
+            impact.workload_changed
+        }));
+        let mut changed = initial.clone();
+        changed.floor_pool_txs += 1;
+        cases.push(("floor_pool_txs", changed, |impact| impact.workload_changed));
+        let mut changed = initial.clone();
+        changed.fill_block_ratio += 1.0;
+        cases.push(("fill_block_ratio", changed, |impact| {
+            impact.workload_changed && impact.capacity_changed
+        }));
+        let mut changed = initial.clone();
+        changed.fanout_auto = !changed.fanout_auto;
+        cases.push(("fanout_auto", changed, |impact| impact.capacity_changed));
+        let mut changed = initial.clone();
+        changed.fanout_utxos += 1;
+        cases.push(("fanout_utxos", changed, |impact| impact.capacity_changed));
+        let mut changed = initial.clone();
+        changed.enable_replaces = !changed.enable_replaces;
+        cases.push(("enable_replaces", changed, |impact| impact.workload_changed));
+        let mut changed = initial.clone();
+        changed.replaces_per_miner += 1;
+        cases.push(("replaces_per_miner", changed, |impact| {
+            impact.workload_changed
+        }));
+
+        for (name, changed, classified) in cases {
+            let impact = policy_impact(&initial, &changed);
+            assert!(
+                classified(impact),
+                "field {name} was misclassified: {impact:?}"
+            );
+        }
     }
 
     #[test]
@@ -1122,7 +1324,11 @@ mod tests {
             SafePointAction::ApplyPolicy {
                 generation: 1,
                 policy: enabled,
-                rebuild: true,
+                impact: SpamPolicyImpact {
+                    lifecycle_changed: true,
+                    needs_immediate_cycle: true,
+                    ..SpamPolicyImpact::default()
+                },
             }
         );
         control.complete_policy(Ok(()), true);

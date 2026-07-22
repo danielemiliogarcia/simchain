@@ -614,6 +614,9 @@ impl SpamControlBackend for MockBackend {
             last_cycle_duration_ms: Some(1_250),
             active_leases: world.spam_leases.values().cloned().collect(),
             reconciliation_pending: false,
+            capacity: None,
+            reconciliation_count: 0,
+            last_reconciliation_reason: None,
             uptime_secs: 1,
             last_error: None,
         })

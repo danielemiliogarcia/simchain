@@ -1,4 +1,4 @@
-use crate::internal_api::{DesiredState, LastMinedBlock, WorkerPhase};
+use crate::internal_api::{DesiredState, LastMinedBlock, SpamCapacityStatus, WorkerPhase};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -69,6 +69,12 @@ pub struct ComponentState {
     pub last_cycle_duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciliation_pending: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spam_capacity: Option<SpamCapacityStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reconciliation_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

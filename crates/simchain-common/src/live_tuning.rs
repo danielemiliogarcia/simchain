@@ -622,6 +622,22 @@ impl SpamTuning {
         Self::RBF_FEE_MULTIPLIER as f64 * (self.fee_rate_sat_vb() + 2.0)
     }
 
+    /// Minimum independent branches per raw engine needed to sustain the
+    /// configured DATA/HYBRID mempool depth without hitting ancestor limits.
+    pub fn minimum_data_fanout(&self) -> u64 {
+        std::cmp::max(12, (self.fill_block_ratio * 10.0).ceil() as u64)
+    }
+
+    /// Preferred branch count per raw engine. Automatic mode carries 50%
+    /// headroom above the minimum; manual mode uses the configured target.
+    pub fn desired_data_fanout(&self) -> u64 {
+        if self.fanout_auto {
+            std::cmp::max(12, (self.fill_block_ratio * 15.0).ceil() as u64)
+        } else {
+            self.fanout_utxos
+        }
+    }
+
     /// Canonical env-string form of every spam-scope managed key.
     pub fn canonical_values(&self) -> BTreeMap<&'static str, String> {
         let mut values = BTreeMap::new();
@@ -963,7 +979,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Toggle,
         optional: false,
-        help: "Enable spam generation. When false the worker remains resident in its disabled phase and can be re-enabled without restart. Controls whether mined blocks carry background transaction load. Other spam settings are ignored and disabled while false.",
+        help: "Enable spam generation. When false the worker and raw engine remain resident, preserving branch and floor-pool state for a fast re-enable. Controls whether mined blocks carry background transaction load. Other spam settings are ignored and disabled while false.",
         warning: None,
     },
     SettingSpec {
@@ -973,7 +989,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Decimal,
         optional: false,
-        help: "Spam fee floor in BTC/kvB (0.0001 = 10 sat/vB). Floor fills pay exactly this; bulk spam pays a small premium. Sets the simulated market price users must outbid under congestion. Applies at a safe engine-rebuild boundary.",
+        help: "Spam fee floor in BTC/kvB (0.0001 = 10 sat/vB). Floor fills pay exactly this; bulk spam pays a small premium. Sets the simulated market price users must outbid under congestion. Applies in place at a safe transaction boundary while preserving tracked funds.",
         warning: None,
     },
     SettingSpec {
@@ -983,7 +999,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Decimal,
         optional: false,
-        help: "DATA/HYBRID fill target in blocks of mempool weight: 0.5 = half-full blocks, 2 = full + backlog. Controls block fullness and how much pending traffic remains visible after a block.",
+        help: "DATA/HYBRID fill target in blocks of mempool weight: 0.5 = half-full blocks, 2 = full + backlog. Controls block fullness and how much pending traffic remains visible after a block. An increase triggers one immediate mempool-deficit catch-up without resetting the engine.",
         warning: None,
     },
     SettingSpec {
@@ -1053,7 +1069,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Toggle,
         optional: false,
-        help: "Auto-size the branch pool from the fill ratio; false = use SPAM_FANOUT_UTXOS. Ensures the spammer has enough independent chains to sustain the requested mempool depth.",
+        help: "Auto-size the branch pool from the fill ratio; false = use SPAM_FANOUT_UTXOS. The minimum is ratio x10 and the preferred target is ratio x15, so existing headroom stays active while extra branches are provisioned in the background.",
         warning: None,
     },
     SettingSpec {
@@ -1063,7 +1079,7 @@ pub const MANAGED_SETTINGS: &[SettingSpec] = &[
         scope: ServiceScope::Spammer,
         control: ControlKind::Integer,
         optional: false,
-        help: "Manual branch-pool size; must cover the fill ratio (>= ratio x10, min 12) when auto is off. Independent branches bypass unconfirmed-chain limits; deeper backlogs require more branches.",
+        help: "Manual preferred branch-pool size; must cover the fill ratio (>= ratio x10, min 12) when auto is off. Independent branches bypass unconfirmed-chain limits; usable branches keep sending while added capacity confirms in the background.",
         warning: None,
     },
     SettingSpec {
@@ -1228,6 +1244,19 @@ mod tests {
             ("SPAM_TX_DATA_MAX_BYTES", "0"),
         ]);
         SpamTuning::from_source(&source).expect("OUTPUT mode skips the fanout minimum");
+    }
+
+    #[test]
+    fn automatic_fanout_separates_minimum_from_headroom() {
+        let (mut tuning, _) = SpamTuning::from_source(&map(&[])).expect("defaults are valid");
+        tuning.fill_block_ratio = 5.0;
+        assert_eq!(tuning.minimum_data_fanout(), 50);
+        assert_eq!(tuning.desired_data_fanout(), 75);
+
+        tuning.fanout_auto = false;
+        tuning.fanout_utxos = 80;
+        assert_eq!(tuning.minimum_data_fanout(), 50);
+        assert_eq!(tuning.desired_data_fanout(), 80);
     }
 
     #[test]

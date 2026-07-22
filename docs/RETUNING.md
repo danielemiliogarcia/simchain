@@ -43,11 +43,35 @@ MCP exposes the same operation as `set_config` at `http://localhost:8090/mcp`.
 - Mining cadence, bounds, weights, and RNG seed apply at a scheduler safe point. The
   interruptible scheduler wakes immediately for a new generation. Changing
   `MINING_RNG_SEED` reinitializes the RNG and alternation state deterministically.
-- Spam target/count changes apply between cooperative cycle boundaries. Fee, engine,
-  data shape, and fanout changes build and reconcile a replacement engine before the
-  old policy is discarded.
-- `ENABLE_SPAM=false` leaves the spam worker resident in `disabled`, so status and live
-  re-enable remain available.
+- Spam settings apply between cooperative transaction or cycle boundaries. Target and
+  count changes recalculate the next workload; fee and data/output shape update the
+  resident raw engines in place while preserving their tracked UTXOs and floor pools.
+- A DATA/HYBRID fill-ratio increase schedules one same-height mempool-deficit catch-up.
+  Fanout uses a minimum capacity of `ratio x 10` and a preferred target of `ratio x 15`,
+  so existing headroom keeps sending while extra branches confirm in the background.
+  A capacity-only target increase also wakes the worker immediately so funding or fanout
+  can be submitted without waiting for another block; unchanged fixed/small transaction
+  counts are suppressed by the catch-up delta. Bulk DATA traffic is submitted before
+  floor-pool maintenance so refilling thousands of small floor transactions cannot delay
+  establishment of the requested backlog. Ratios below `1` intentionally stop
+  replenishing the floor pool so partial-block targets remain observable.
+- `ENABLE_SPAM=false` leaves both the worker and its healthy raw engines resident in
+  `disabled`. Re-enable resumes their state without a scan unless a reorg or another
+  recovery event marked it stale.
+- Full reconciliation is reserved for process startup, snapshot restore, chain mutation,
+  an expired mutation lease, or detected stale outpoints. Dashboard capacity status is
+  separate from the effective policy generation. `branch provisioning` and `floor pool
+  provisioning` explicitly show background work even when capacity is temporarily
+  degraded. The startup scan is initialization and leaves the process-lifetime
+  `recoveries` counter at zero. That counter increments only when a previously healthy
+  engine is reconstructed or dirty runtime state is reconciled.
+
+Confirmed branch outputs that have become too small for the current transaction shape
+remain tracked but are not automatically consolidated. This can leave undersized UTXOs
+on the spammer's dedicated deterministic addresses during very long runs. Automatic
+sweeping would add consolidation traffic and fee pressure not requested by the active
+scenario; startup/reorg reconciliation rediscovers these outputs but deliberately does
+not spend them.
 
 Pause and resume are separate durable desired-state controls:
 
@@ -88,6 +112,6 @@ operational care for node restarts; they are deliberately absent from the live s
 
 `FALLBACK_FEE` is boot-only too: it sets the nodes' wallet estimator fallback and
 appears in the dashboard as a read-only label. The live fee floor is the separate
-`SPAM_FEE` — changing it rebuilds the spam engine at a safe boundary (and repins the
-wallet `paytxfee` in the deprecated wallet mode) without touching the running nodes.
+`SPAM_FEE` changes the raw engine's transaction shape in place at a safe boundary
+without touching the running nodes or discarding tracked transaction state.
 A legacy `.env` that sets only `FALLBACK_FEE` still seeds `SPAM_FEE` at first boot.

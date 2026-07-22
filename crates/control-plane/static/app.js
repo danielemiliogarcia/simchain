@@ -418,6 +418,9 @@ function statusServicesSnapshot(s) {
       cycle_phase: component.cycle_phase || null,
       last_cycle_duration_ms: component.last_cycle_duration_ms ?? null,
       reconciliation_pending: component.reconciliation_pending || false,
+      spam_capacity: component.spam_capacity || null,
+      reconciliation_count: component.reconciliation_count ?? null,
+      last_reconciliation_reason: component.last_reconciliation_reason || null,
     }])
   );
 }
@@ -534,6 +537,16 @@ function renderStatus(s, options = {}) {
         details.push(`last cycle ${fmtSeconds(component.last_cycle_duration_ms / 1000)}`);
       }
       if (component.reconciliation_pending) details.push("reconciliation pending");
+      if (name === "spam" && component.spam_capacity) {
+        const capacity = component.spam_capacity;
+        details.push(`capacity ${capacity.state}`);
+        details.push(`branches ${capacity.usable_branches_per_miner}/${capacity.required_branches_per_miner}/${capacity.target_branches_per_miner}`);
+        if (capacity.branch_provisioning) details.push("branch provisioning");
+        if (capacity.floor_pool_provisioning) details.push("floor pool provisioning");
+      }
+      if (name === "spam" && component.reconciliation_count != null) {
+        details.push(`recoveries ${component.reconciliation_count}`);
+      }
       if (component.reachable) {
         text.textContent = `${name} · ${component.phase || component.status}` +
           (details.length ? ` · ${details.join(" · ")}` : "") +
@@ -636,6 +649,18 @@ function unavailableSettingComponents() {
   }));
 }
 
+function specsInDisplayOrder(specs) {
+  const ordered = [...specs];
+  const meanIndex = ordered.findIndex((spec) => spec.key === "BLOCK_INTERVAL_MEAN_SECS");
+  const minIndex = ordered.findIndex((spec) => spec.key === "BLOCK_INTERVAL_MIN_SECS");
+  if (meanIndex >= 0 && minIndex >= 0) {
+    const [mean] = ordered.splice(meanIndex, 1);
+    const updatedMinIndex = ordered.findIndex((spec) => spec.key === "BLOCK_INTERVAL_MIN_SECS");
+    ordered.splice(updatedMinIndex + 1, 0, mean);
+  }
+  return ordered;
+}
+
 function buildForm() {
   const container = $("#form");
   container.replaceChildren();
@@ -644,7 +669,8 @@ function buildForm() {
     if (!groups.has(spec.group)) groups.set(spec.group, []);
     groups.get(spec.group).push(spec);
   }
-  for (const [group, specs] of groups) {
+  for (const [group, groupedSpecs] of groups) {
+    const specs = specsInDisplayOrder(groupedSpecs);
     const div = document.createElement("div");
     div.className = "group";
     const title = document.createElement("div");

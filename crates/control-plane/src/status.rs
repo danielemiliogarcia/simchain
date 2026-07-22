@@ -238,6 +238,9 @@ fn spam_component(status: SpamWorkerStatus) -> ComponentState {
         accepted_transactions: Some(status.accepted_transactions),
         last_cycle_duration_ms: status.last_cycle_duration_ms,
         reconciliation_pending: Some(status.reconciliation_pending),
+        spam_capacity: status.capacity,
+        reconciliation_count: Some(status.reconciliation_count),
+        last_reconciliation_reason: status.last_reconciliation_reason,
         ..ComponentState::default()
     }
 }

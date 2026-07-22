@@ -41,7 +41,7 @@
 //! Mined fills confirm their change, which becomes fresh pool ammo: the pool
 //! churns 1:1 with zero net UTXO-set growth.
 
-use crate::{burn, error::SpamError, wallet};
+use crate::{burn, error::SpamError};
 use bitcoincore_rpc::{
     bitcoin::{
         absolute::LockTime,
@@ -62,7 +62,7 @@ use bitcoincore_rpc::{
 use serde_json::json;
 use simchain_common::live_tuning::SpamTuning;
 use simchain_common::rpc_retry;
-use std::{collections::HashSet, thread, time::Duration};
+use std::collections::HashSet;
 
 const FLOOR_BATCH_SIZE: usize = 250;
 
@@ -106,6 +106,146 @@ struct Utxo {
     amount: Amount,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoincore_rpc::Auth;
+    use simchain_common::live_tuning;
+    use std::collections::BTreeMap;
+
+    fn rpc_client() -> Client {
+        Client::new("http://127.0.0.1:1", Auth::None).expect("test RPC client")
+    }
+
+    fn json_client() -> JsonClient {
+        let transport = jsonrpc::simple_http::SimpleHttpTransport::builder()
+            .url("http://127.0.0.1:1")
+            .expect("test RPC URL")
+            .build();
+        JsonClient::with_transport(transport)
+    }
+
+    fn policy() -> SpamTuning {
+        SpamTuning::from_source(&live_tuning::staged_map(&BTreeMap::new()))
+            .expect("default spam policy")
+            .0
+    }
+
+    fn utxo(tag: u8, amount: u64) -> Utxo {
+        Utxo {
+            outpoint: OutPoint::new(Txid::from_byte_array([tag; 32]), 0),
+            amount: Amount::from_sat(amount),
+        }
+    }
+
+    #[test]
+    fn applying_shape_policy_preserves_dynamic_engine_state() {
+        let initial = policy();
+        let mut engine = RawSpammer::new(
+            rpc_client(),
+            json_client(),
+            Vec::new(),
+            rpc_client(),
+            "wallet",
+            "test",
+            "Test",
+            initial.fee_rate_sat_vb(),
+            initial.sendmany_outputs,
+            initial.effective_data_min_bytes(),
+            initial.data_max_bytes,
+        );
+        let branch = Utxo {
+            outpoint: OutPoint::new(Txid::all_zeros(), 1),
+            amount: Amount::from_btc(1.0).expect("amount"),
+        };
+        let pool = Utxo {
+            outpoint: OutPoint::new(Txid::all_zeros(), 2),
+            amount: Amount::from_btc(0.5).expect("amount"),
+        };
+        engine.utxos.push(branch);
+        engine.pool_utxos.push(pool);
+        engine.fills_inflight.push(pool);
+        engine.cursor = 7;
+        engine.draw_counter = 42;
+        engine.pool_seen_height = 99;
+
+        let mut changed = initial;
+        changed.spam_fee *= 2.0;
+        changed.sendmany_outputs = 3;
+        changed.data_min_bytes = 100;
+        changed.data_max_bytes = 1_000;
+        let prepared = RawSpammer::prepare_policy(&changed);
+        engine.apply_prepared_policy(&prepared);
+
+        assert_eq!(engine.utxos[0].outpoint, branch.outpoint);
+        assert_eq!(engine.pool_utxos[0].outpoint, pool.outpoint);
+        assert_eq!(engine.fills_inflight[0].outpoint, pool.outpoint);
+        assert_eq!(engine.cursor, 7);
+        assert_eq!(engine.draw_counter, 42);
+        assert_eq!(engine.pool_seen_height, 99);
+        assert_eq!(engine.fee_rate_sat_vb, changed.fee_rate_sat_vb());
+        assert_eq!(engine.burn_scripts.len(), 3);
+        assert_eq!(engine.data_min, 100);
+        assert_eq!(engine.data_max, 1_000);
+    }
+
+    #[test]
+    fn ratio_increase_uses_headroom_while_requesting_background_fanout() {
+        assert_eq!(
+            branch_provisioning_action(60, 50, 75, false, false),
+            BranchProvisioningAction::StartFanout
+        );
+
+        let branches: Vec<Utxo> = (0..60)
+            .map(|index| utxo(index, 10_000 + u64::from(index)))
+            .collect();
+        let candidates = branch_fanout_candidates(&branches, Amount::from_sat(1_000), 50, None);
+        assert_eq!(candidates.len(), 60);
+        assert_eq!(candidates[0], 59);
+    }
+
+    #[test]
+    fn degraded_capacity_funds_without_consuming_an_active_branch() {
+        assert_eq!(
+            branch_provisioning_action(40, 50, 75, false, false),
+            BranchProvisioningAction::StartFunding
+        );
+
+        let mut branches: Vec<Utxo> = (0..40)
+            .map(|index| utxo(index, 10_000 + u64::from(index)))
+            .collect();
+        assert!(branch_fanout_candidates(&branches, Amount::from_sat(1_000), 50, None,).is_empty());
+
+        let funding_seed = utxo(100, 1_000_000);
+        branches.push(funding_seed);
+        assert_eq!(
+            branch_provisioning_action(41, 50, 75, false, true),
+            BranchProvisioningAction::StartFanout
+        );
+        assert_eq!(
+            branch_fanout_candidates(
+                &branches,
+                Amount::from_sat(1_000),
+                50,
+                Some(funding_seed.outpoint),
+            ),
+            vec![40]
+        );
+    }
+
+    #[test]
+    fn minimum_capacity_is_not_spent_to_reach_the_preferred_target() {
+        assert_eq!(
+            branch_provisioning_action(50, 50, 75, false, false),
+            BranchProvisioningAction::StartFunding
+        );
+        let branches: Vec<Utxo> = (0..50)
+            .map(|index| utxo(index, 10_000 + u64::from(index)))
+            .collect();
+        assert!(branch_fanout_candidates(&branches, Amount::from_sat(1_000), 50, None,).is_empty());
+    }
+}
+
 // The three spam-tx shapes the engine builds. The shape is enough to recompute
 // the tx's vsize, fee, non-change value and outputs, so a SentSpam only needs
 // to carry the shape to rebuild the tx for an RBF bump.
@@ -127,6 +267,30 @@ struct SentSpam {
     fee: Amount,
     change: Amount,
     shape: SpamShape,
+}
+
+struct PendingFunding {
+    txid: Txid,
+    output: Option<Utxo>,
+}
+
+struct PendingFanout {
+    outputs: Vec<Utxo>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BranchProvisioningAction {
+    Ready,
+    WaitForFanout,
+    StartFanout,
+    StartFunding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawEngineCapacity {
+    pub usable_branches: u64,
+    pub branch_provisioning: bool,
+    pub floor_pool_provisioning: bool,
 }
 
 pub struct RawSpammer {
@@ -159,6 +323,8 @@ pub struct RawSpammer {
     draw_counter: u64,
     utxos: Vec<Utxo>,
     cursor: usize,
+    branch_funding: Option<PendingFunding>,
+    branch_fanout: Option<PendingFanout>,
     // Floor fill pool: a SECOND deterministic key whose confirmed UTXOs feed
     // the standalone floor fills. Separate from the data branches so the
     // fills never chain off unconfirmed spam change and stay identifiable.
@@ -173,9 +339,19 @@ pub struct RawSpammer {
     // the fill txid for mined-detection, and the amount is ready to move to
     // pool_utxos the moment a block mines it.
     fills_inflight: Vec<Utxo>,
+    pool_funding: Option<PendingFunding>,
+    pool_fanout: Option<PendingFanout>,
     // Last block height whose txs were checked for mined fills, so a cycle
     // that overruns a block interval never misses a mined fill.
     pool_seen_height: u64,
+}
+
+#[derive(Clone)]
+pub struct PreparedRawPolicy {
+    fee_rate_sat_vb: f64,
+    burn_scripts: Vec<ScriptBuf>,
+    data_min: usize,
+    data_max: usize,
 }
 
 // vsize of an OP_RETURN data tx: 1 P2WPKH input (~68 vB incl. witness), 1
@@ -208,7 +384,74 @@ fn op_return_script(n: usize) -> ScriptBuf {
     ScriptBuf::new_op_return(payload)
 }
 
+fn branch_provisioning_action(
+    usable: u64,
+    minimum: u64,
+    target: u64,
+    fanout_pending: bool,
+    confirmed_funding_seed: bool,
+) -> BranchProvisioningAction {
+    if usable >= target {
+        BranchProvisioningAction::Ready
+    } else if fanout_pending {
+        BranchProvisioningAction::WaitForFanout
+    } else if confirmed_funding_seed || usable > minimum {
+        BranchProvisioningAction::StartFanout
+    } else {
+        BranchProvisioningAction::StartFunding
+    }
+}
+
+fn branch_fanout_candidates(
+    utxos: &[Utxo],
+    required: Amount,
+    minimum: u64,
+    preferred_seed: Option<OutPoint>,
+) -> Vec<usize> {
+    let usable = utxos.iter().filter(|utxo| utxo.amount >= required).count() as u64;
+    let preferred = preferred_seed.and_then(|outpoint| {
+        utxos
+            .iter()
+            .position(|utxo| utxo.outpoint == outpoint && utxo.amount >= required)
+    });
+    let mut candidates = Vec::new();
+    if let Some(index) = preferred {
+        candidates.push(index);
+    }
+    if usable > minimum {
+        let mut remaining: Vec<usize> = (0..utxos.len())
+            .filter(|index| Some(*index) != preferred && utxos[*index].amount >= required)
+            .collect();
+        remaining.sort_by_key(|index| std::cmp::Reverse(utxos[*index].amount.to_sat()));
+        candidates.extend(remaining);
+    }
+    candidates
+}
+
 impl RawSpammer {
+    pub fn prepare_policy(policy: &SpamTuning) -> PreparedRawPolicy {
+        let burn_scripts = if policy.sendmany_outputs == 0 {
+            vec![burn::burn_address(0).script_pubkey()]
+        } else {
+            (1..=policy.sendmany_outputs)
+                .map(|i| burn::burn_address(i).script_pubkey())
+                .collect()
+        };
+        PreparedRawPolicy {
+            fee_rate_sat_vb: policy.fee_rate_sat_vb(),
+            burn_scripts,
+            data_min: policy.effective_data_min_bytes() as usize,
+            data_max: policy.data_max_bytes as usize,
+        }
+    }
+
+    pub fn apply_prepared_policy(&mut self, policy: &PreparedRawPolicy) {
+        self.fee_rate_sat_vb = policy.fee_rate_sat_vb;
+        self.burn_scripts.clone_from(&policy.burn_scripts);
+        self.data_min = policy.data_min;
+        self.data_max = policy.data_max;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         node: Client,
@@ -282,12 +525,16 @@ impl RawSpammer {
             draw_counter: 0,
             utxos: Vec::new(),
             cursor: 0,
+            branch_funding: None,
+            branch_fanout: None,
             pool_secret,
             pool_pubkey,
             pool_address,
             pool_script,
             pool_utxos: Vec::new(),
             fills_inflight: Vec::new(),
+            pool_funding: None,
+            pool_fanout: None,
             pool_seen_height: 0,
         }
     }
@@ -589,6 +836,54 @@ impl RawSpammer {
         Ok(utxos)
     }
 
+    fn funding_output(&self, txid: Txid, script: &ScriptBuf) -> Option<Utxo> {
+        self.node
+            .get_raw_transaction(&txid, None)
+            .ok()?
+            .output
+            .into_iter()
+            .enumerate()
+            .find(|(_, output)| &output.script_pubkey == script)
+            .map(|(vout, output)| Utxo {
+                outpoint: OutPoint::new(txid, vout as u32),
+                amount: output.value,
+            })
+    }
+
+    fn funding_confirmed(&self, pending: &PendingFunding) -> bool {
+        self.wallet
+            .get_transaction(&pending.txid, None)
+            .map(|tx| tx.info.confirmations >= 1)
+            .unwrap_or(false)
+    }
+
+    fn funding_alive(&self, pending: &PendingFunding) -> bool {
+        self.wallet
+            .get_transaction(&pending.txid, None)
+            .map(|tx| tx.info.confirmations >= 0)
+            .unwrap_or(false)
+    }
+
+    fn fanout_confirmed(&self, pending: &PendingFanout) -> bool {
+        pending.outputs.first().is_some_and(|output| {
+            matches!(
+                self.node
+                    .get_tx_out(&output.outpoint.txid, output.outpoint.vout, Some(false)),
+                Ok(Some(_))
+            )
+        })
+    }
+
+    fn fanout_alive(&self, pending: &PendingFanout) -> bool {
+        pending.outputs.first().is_some_and(|output| {
+            matches!(
+                self.node
+                    .get_tx_out(&output.outpoint.txid, output.outpoint.vout, Some(true)),
+                Ok(Some(_))
+            )
+        })
+    }
+
     /// Rebuild mutable branch and floor-pool state after a chain mutation or
     /// before atomically installing a replacement engine.
     pub fn reconcile(&mut self) -> anyhow::Result<()> {
@@ -605,10 +900,30 @@ impl RawSpammer {
                 fills_inflight.push(*fill);
             }
         }
+        let branch_funding = self
+            .branch_funding
+            .take()
+            .filter(|pending| self.funding_alive(pending));
+        let branch_fanout = self
+            .branch_fanout
+            .take()
+            .filter(|pending| self.fanout_alive(pending));
+        let pool_funding = self
+            .pool_funding
+            .take()
+            .filter(|pending| self.funding_alive(pending));
+        let pool_fanout = self
+            .pool_fanout
+            .take()
+            .filter(|pending| self.fanout_alive(pending));
         self.utxos = utxos;
         self.cursor = 0;
+        self.branch_funding = branch_funding;
+        self.branch_fanout = branch_fanout;
         self.pool_utxos = pool_utxos;
         self.fills_inflight = fills_inflight;
+        self.pool_funding = pool_funding;
+        self.pool_fanout = pool_fanout;
         self.pool_seen_height = self.node.get_block_count()?;
         Ok(())
     }
@@ -619,13 +934,20 @@ impl RawSpammer {
         self.usable_branches(self.per_tx_required())
     }
 
+    pub fn capacity(&self) -> RawEngineCapacity {
+        RawEngineCapacity {
+            usable_branches: self.usable_branches_for_current_shape(),
+            branch_provisioning: self.branch_funding.is_some() || self.branch_fanout.is_some(),
+            floor_pool_provisioning: self.pool_funding.is_some() || self.pool_fanout.is_some(),
+        }
+    }
+
     /// Make sure `branches` confirmed, usable branch UTXOs exist for the
-    /// current fee rate and burn-output shape, pulling and confirming a wallet
-    /// funding transaction and fan-out if needed. Blocks on confirmations, so
-    /// it needs block production to make progress on a broke engine; call it
-    /// while mining runs. Returns false when interrupted or when the background
-    /// spammer's normal "defer until later" path still leaves the requested
-    /// confirmed branches unavailable.
+    /// current fee rate and burn-output shape, starting wallet funding and
+    /// fan-out when needed. Confirmation progresses between calls, so it needs
+    /// block production to recover a broke engine without blocking the worker.
+    /// Returns false when interrupted or when the requested confirmed branches
+    /// are not available yet.
     pub fn ensure_branches(&mut self, branches: u64, checkpoint: &impl Fn(&str) -> bool) -> bool {
         let branches = branches.max(1);
         if !self.ensure_funds(branches, branches, checkpoint) {
@@ -668,169 +990,182 @@ impl RawSpammer {
         self.pool_utxos = self.scan_address_utxos(&self.pool_address);
     }
 
-    // Keep the engine holding `target` independent branches able to spam.
-    // Cheap in-memory check when healthy (safe every block); on shortage:
-    // resync with the chain, pull a refill from the miner wallet if the total
-    // is low, then consolidate everything (dust remnants included) into one
-    // tx that re-splits into `target` equal branches. Waits for that fan-out
-    // to confirm before returning: an unconfirmed parent caps its descendant
-    // count at 25 (mempool policy), which would strangle the first blocks.
-    fn ensure_funds(&mut self, need: u64, target: u64, checkpoint: &impl Fn(&str) -> bool) -> bool {
-        if !checkpoint("raw_funds_check") {
-            return false;
-        }
-        let required = self.per_tx_required();
-        if self.usable_branches(required) >= need {
-            return true;
-        }
-        self.resync();
-        if !checkpoint("raw_funds_resynced") {
-            return false;
-        }
-        if self.usable_branches(required) >= need {
-            return true;
-        }
-
-        let total: Amount = self.utxos.iter().map(|u| u.amount).sum();
-        let refill_floor = required * (target * BRANCH_MIN_TXS);
-        if total < refill_floor {
-            if !wallet::wait_for_funds_until(&self.wallet, &self.wallet_name, || {
-                checkpoint("raw_waiting_for_funds")
-            }) {
-                return false;
-            }
-            let trusted = rpc_retry("get raw-engine wallet balance", || {
-                self.wallet.get_balances()
-            })
-            .mine
-            .trusted
-            .to_btc();
-            let pull_btc = ((trusted * 0.5).min(FUND_PULL_MAX_BTC) * 1e8).floor() / 1e8;
-            let pull = Amount::from_btc(pull_btc).unwrap();
-            tracing::info!(
-                "{} => Raw engine pulling {pull} from wallet '{}'",
-                self.label,
-                self.wallet_name
-            );
-            let txid = match self.wallet.send_to_address(
-                &self.address,
-                pull,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ) {
-                Ok(txid) => txid,
-                Err(error) => {
-                    tracing::warn!(
-                        "{} => Raw engine funding pull failed ({error}), deferring until the next block",
-                        self.label
-                    );
-                    return true;
+    fn advance_branch_provisioning(&mut self) -> Option<OutPoint> {
+        let mut confirmed_funding_seed = None;
+        if self
+            .branch_funding
+            .as_ref()
+            .is_some_and(|pending| self.funding_confirmed(pending))
+        {
+            let pending = self.branch_funding.take().expect("checked above");
+            match pending.output {
+                Some(output) => {
+                    confirmed_funding_seed = Some(output.outpoint);
+                    self.utxos.push(output);
                 }
-            };
-            let mut continue_work = checkpoint("raw_funding_submitted");
-            while self
-                .wallet
-                .get_transaction(&txid, None)
-                .map(|tx| tx.info.confirmations)
-                .unwrap_or(0)
-                < 1
-            {
-                if !checkpoint("raw_funding_confirmation") {
-                    // Interrupted (pause, policy change, abort): stop waiting
-                    // now. The funding tx stays in the mempool and the next
-                    // resync picks it up once it confirms.
-                    continue_work = false;
-                    break;
-                }
-                thread::sleep(Duration::from_millis(500));
+                None => self.resync(),
             }
-            self.resync();
-            if !continue_work || !checkpoint("raw_funding_confirmed") {
-                return false;
-            }
+            tracing::info!("{} => Raw engine funding confirmed", self.label);
         }
+        if self
+            .branch_fanout
+            .as_ref()
+            .is_some_and(|pending| self.fanout_confirmed(pending))
+        {
+            let pending = self.branch_fanout.take().expect("checked above");
+            self.utxos.extend(pending.outputs);
+            if !self.utxos.is_empty() {
+                self.cursor %= self.utxos.len();
+            }
+            tracing::info!("{} => Background fan-out confirmed", self.label);
+        }
+        confirmed_funding_seed
+    }
 
-        let total: Amount = self.utxos.iter().map(|u| u.amount).sum();
-        if self.utxos.is_empty() {
-            tracing::warn!(
-                "{} => Raw engine has no confirmed funds to fan out yet, deferring",
-                self.label
-            );
-            return true;
+    fn start_branch_funding(&mut self) {
+        if self.branch_funding.is_some() {
+            return;
         }
-        let fee = self.consolidation_fee(self.utxos.len(), target as usize);
-        let per_branch = match total.checked_sub(fee) {
-            Some(split) => split / target,
-            None => Amount::ZERO,
+        let Ok(balances) = self.wallet.get_balances() else {
+            return;
         };
-        if per_branch < required {
-            tracing::warn!(
-                "{} => Raw engine funds too low to split {total} into {target} usable branches, deferring",
-                self.label
-            );
-            return true;
+        let trusted = balances.mine.trusted.to_btc();
+        if trusted < 1.0 {
+            return;
         }
-
+        let pull_btc = ((trusted * 0.5).min(FUND_PULL_MAX_BTC) * 1e8).floor() / 1e8;
+        let pull = Amount::from_btc(pull_btc).expect("rounded BTC amount");
         tracing::info!(
-            "{} => Raw engine splitting {total} into {target} branches of {per_branch}",
-            self.label
+            "{} => Raw engine pulling {pull} from wallet '{}' in the background",
+            self.label,
+            self.wallet_name
         );
-        let outputs: Vec<TxOut> = (0..target)
+        match self
+            .wallet
+            .send_to_address(&self.address, pull, None, None, None, None, None, None)
+        {
+            Ok(txid) => {
+                self.branch_funding = Some(PendingFunding {
+                    txid,
+                    output: self.funding_output(txid, &self.script_pubkey),
+                });
+            }
+            Err(error) => tracing::warn!(
+                "{} => Raw engine funding pull failed ({error}), deferring until the next block",
+                self.label
+            ),
+        }
+    }
+
+    fn start_branch_fanout(
+        &mut self,
+        minimum: u64,
+        target: u64,
+        required: Amount,
+        preferred_seed: Option<OutPoint>,
+    ) -> bool {
+        if self.branch_fanout.is_some() || self.utxos.is_empty() {
+            return false;
+        }
+        let usable = self.usable_branches(required);
+        if usable >= target {
+            return false;
+        }
+        let output_count = target.saturating_sub(usable).saturating_add(1) as usize;
+        let Some(index) = branch_fanout_candidates(&self.utxos, required, minimum, preferred_seed)
+            .into_iter()
+            .find(|index| {
+                matches!(
+                    self.node.get_tx_out(
+                        &self.utxos[*index].outpoint.txid,
+                        self.utxos[*index].outpoint.vout,
+                        Some(false),
+                    ),
+                    Ok(Some(_))
+                )
+            })
+        else {
+            return false;
+        };
+        let input = self.utxos[index];
+        let fee = self.consolidation_fee(1, output_count);
+        let Some(split) = input.amount.checked_sub(fee) else {
+            return false;
+        };
+        let per_branch = split / output_count as u64;
+        if per_branch < required * BRANCH_MIN_TXS {
+            return false;
+        }
+        let outputs = (0..output_count)
             .map(|_| TxOut {
                 value: per_branch,
                 script_pubkey: self.script_pubkey.clone(),
             })
             .collect();
-        let inputs = std::mem::take(&mut self.utxos);
-        if !checkpoint("raw_fanout_submit") {
-            self.utxos = inputs;
+        match self.send_tx(&[input], outputs, false) {
+            Ok(txid) => {
+                self.utxos.remove(index);
+                self.branch_fanout = Some(PendingFanout {
+                    outputs: (0..output_count)
+                        .map(|vout| Utxo {
+                            outpoint: OutPoint::new(txid, vout as u32),
+                            amount: per_branch,
+                        })
+                        .collect(),
+                });
+                if !self.utxos.is_empty() {
+                    self.cursor %= self.utxos.len();
+                }
+                tracing::info!(
+                    "{} => Background fan-out {txid} submitted for {output_count} branches",
+                    self.label
+                );
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "{} => Background fan-out failed ({error}), deferring until the next block",
+                    self.label
+                );
+                false
+            }
+        }
+    }
+
+    // Keep at least `need` independent branches usable while moving toward the
+    // preferred `target`. Expansion is submitted in the background and never
+    // waits for a confirmation in the spam cycle.
+    fn ensure_funds(&mut self, need: u64, target: u64, checkpoint: &impl Fn(&str) -> bool) -> bool {
+        if !checkpoint("raw_funds_check") {
             return false;
         }
-        match self.send_tx(&inputs, outputs, false) {
-            Ok(txid) => {
-                tracing::info!(
-                    "{} => Fan-out tx {txid} sent, waiting for it to confirm...",
-                    self.label
-                );
-                let mut continue_work = checkpoint("raw_fanout_submitted");
-                while !matches!(self.node.get_tx_out(&txid, 0, Some(false)), Ok(Some(_))) {
-                    if !checkpoint("raw_fanout_confirmation") {
-                        // Interrupted: leave the unconfirmed fan-out in the
-                        // mempool; a later resync recovers its outputs.
-                        continue_work = false;
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(500));
-                }
-                if !continue_work {
-                    self.resync();
-                    return false;
-                }
-                self.utxos = (0..target)
-                    .map(|i| Utxo {
-                        outpoint: OutPoint::new(txid, i as u32),
-                        amount: per_branch,
-                    })
-                    .collect();
-                self.cursor = 0;
-                tracing::info!("{} => Fan-out confirmed", self.label);
-                if !continue_work || !checkpoint("raw_fanout_confirmed") {
-                    return false;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "{} => Raw engine fan-out failed ({e}), retrying next block",
-                    self.label
-                );
-                self.resync();
-            }
+        let confirmed_funding_seed = self.advance_branch_provisioning();
+        if self.utxos.is_empty() && self.branch_funding.is_none() && self.branch_fanout.is_none() {
+            self.resync();
         }
-        true
+        let required = self.per_tx_required();
+        let usable = self.usable_branches(required);
+        let total: Amount = self.utxos.iter().map(|u| u.amount).sum();
+        let refill_floor = required * (target * BRANCH_MIN_TXS);
+        if total < refill_floor {
+            self.start_branch_funding();
+        }
+        match branch_provisioning_action(
+            usable,
+            need,
+            target,
+            self.branch_fanout.is_some(),
+            confirmed_funding_seed.is_some(),
+        ) {
+            BranchProvisioningAction::StartFanout => {
+                if !self.start_branch_fanout(need, target, required, confirmed_funding_seed) {
+                    self.start_branch_funding();
+                }
+            }
+            BranchProvisioningAction::StartFunding => self.start_branch_funding(),
+            BranchProvisioningAction::Ready | BranchProvisioningAction::WaitForFanout => {}
+        }
+        usable > 0
     }
 
     // Next branch (round-robin) that can afford one spam tx. Round-robin
@@ -1010,13 +1345,162 @@ impl RawSpammer {
             .count() as u64
     }
 
-    // Keep the floor pool holding enough confirmed ammo to top the standing
-    // fill count back up to `target`. Mirrors ensure_funds: cheap in-memory
-    // check when healthy, then a scantxoutset resync, then a miner-wallet
-    // pull, then a consolidate + fan-out into target + 25% equal UTXOs (the
-    // buffer covers UTXOs locked under in-flight fills). Waits for the fan-out
-    // to confirm before returning: fills must spend CONFIRMED outputs only, or
-    // they stop being standalone and the floor reopens.
+    fn advance_pool_provisioning(&mut self) {
+        if self
+            .pool_funding
+            .as_ref()
+            .is_some_and(|pending| self.funding_confirmed(pending))
+        {
+            let pending = self.pool_funding.take().expect("checked above");
+            match pending.output {
+                Some(output) => self.pool_utxos.push(output),
+                None => self.pool_resync(),
+            }
+            tracing::info!("{} => Floor-pool funding confirmed", self.label);
+        }
+        if self
+            .pool_fanout
+            .as_ref()
+            .is_some_and(|pending| self.fanout_confirmed(pending))
+        {
+            let pending = self.pool_fanout.take().expect("checked above");
+            self.pool_utxos.extend(pending.outputs);
+            tracing::info!("{} => Background floor-pool fan-out confirmed", self.label);
+        }
+    }
+
+    fn start_pool_funding(&mut self) {
+        if self.pool_funding.is_some() {
+            return;
+        }
+        let Ok(balances) = self.wallet.get_balances() else {
+            return;
+        };
+        let trusted = balances.mine.trusted.to_btc();
+        if trusted < 1.0 {
+            return;
+        }
+        let pull_btc = ((trusted * 0.5).min(POOL_PULL_MAX_BTC) * 1e8).floor() / 1e8;
+        let pull = Amount::from_btc(pull_btc).expect("rounded BTC amount");
+        tracing::info!(
+            "{} => Floor pool pulling {pull} from wallet '{}' in the background",
+            self.label,
+            self.wallet_name
+        );
+        match self.wallet.send_to_address(
+            &self.pool_address,
+            pull,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ) {
+            Ok(txid) => {
+                self.pool_funding = Some(PendingFunding {
+                    txid,
+                    output: self.funding_output(txid, &self.pool_script),
+                });
+            }
+            Err(error) => tracing::warn!(
+                "{} => Floor-pool funding pull failed ({error}), deferring until the next block",
+                self.label
+            ),
+        }
+    }
+
+    fn start_pool_fanout(&mut self, seed_count: u64, required: Amount) -> bool {
+        if self.pool_fanout.is_some() || self.pool_utxos.is_empty() {
+            return false;
+        }
+        let usable = self.usable_fill_ammo(required);
+        if usable >= seed_count {
+            return false;
+        }
+        let n_fill = seed_count
+            .saturating_sub(usable)
+            .min(POOL_FANOUT_CHUNK_OUTPUTS as u64) as usize;
+        let per_utxo = required * BRANCH_MIN_TXS;
+        let fill_value = per_utxo * n_fill as u64;
+
+        let mut candidates: Vec<usize> = (0..self.pool_utxos.len()).collect();
+        candidates.sort_by_key(|index| self.pool_utxos[*index].amount.to_sat());
+        let mut selected = Vec::new();
+        let mut input_total = Amount::ZERO;
+        while input_total < fill_value + self.consolidation_fee(selected.len().max(1), n_fill + 1) {
+            let Some(index) = candidates.pop() else {
+                return false;
+            };
+            input_total += self.pool_utxos[index].amount;
+            selected.push(index);
+        }
+        selected.sort_unstable_by(|left, right| right.cmp(left));
+        let inputs: Vec<Utxo> = selected
+            .into_iter()
+            .map(|index| self.pool_utxos.swap_remove(index))
+            .collect();
+        let fee = self.consolidation_fee(inputs.len(), n_fill + 1);
+        let change = input_total
+            .checked_sub(fill_value + fee)
+            .unwrap_or(Amount::ZERO);
+        let include_change = change >= required;
+        let mut outputs: Vec<TxOut> = (0..n_fill)
+            .map(|_| TxOut {
+                value: per_utxo,
+                script_pubkey: self.pool_script.clone(),
+            })
+            .collect();
+        if include_change {
+            outputs.push(TxOut {
+                value: change,
+                script_pubkey: self.pool_script.clone(),
+            });
+        }
+        match self.send_signed(
+            &inputs,
+            outputs,
+            false,
+            &self.pool_script,
+            &self.pool_secret,
+            &self.pool_pubkey,
+        ) {
+            Ok(txid) => {
+                let mut pending_outputs: Vec<Utxo> = (0..n_fill)
+                    .map(|vout| Utxo {
+                        outpoint: OutPoint::new(txid, vout as u32),
+                        amount: per_utxo,
+                    })
+                    .collect();
+                if include_change {
+                    pending_outputs.push(Utxo {
+                        outpoint: OutPoint::new(txid, n_fill as u32),
+                        amount: change,
+                    });
+                }
+                self.pool_fanout = Some(PendingFanout {
+                    outputs: pending_outputs,
+                });
+                tracing::info!(
+                    "{} => Background floor-pool fan-out {txid} submitted for {n_fill} fill outputs",
+                    self.label
+                );
+                true
+            }
+            Err(error) => {
+                self.pool_utxos.extend(inputs);
+                tracing::warn!(
+                    "{} => Floor-pool fan-out failed ({error}), deferring until the next block",
+                    self.label
+                );
+                false
+            }
+        }
+    }
+
+    // Keep enough confirmed floor ammo to top up the standing target. Funding
+    // and fan-out confirmations advance between cycles, leaving existing ammo
+    // available instead of blocking the worker.
     fn ensure_pool_funds(
         &mut self,
         need: u64,
@@ -1026,209 +1510,25 @@ impl RawSpammer {
         if !checkpoint("floor_pool_funds_check") {
             return false;
         }
+        self.advance_pool_provisioning();
+        if self.pool_utxos.is_empty() && self.pool_funding.is_none() && self.pool_fanout.is_none() {
+            self.pool_resync();
+        }
         let required = self.fill_fee() + MIN_CHANGE;
-        if self.usable_fill_ammo(required) >= need {
+        let usable = self.usable_fill_ammo(required);
+        if usable >= need {
             return true;
         }
-        self.pool_resync();
-        if !checkpoint("floor_pool_resynced") {
-            return false;
-        }
-        if self.usable_fill_ammo(required) >= need {
-            return true;
-        }
-
         let seed_count = target + target.div_ceil(4);
         let total: Amount = self.pool_utxos.iter().map(|u| u.amount).sum();
-        let refill_floor = required * seed_count;
+        let refill_floor = required * (seed_count * BRANCH_MIN_TXS);
         if total < refill_floor {
-            if !wallet::wait_for_funds_until(&self.wallet, &self.wallet_name, || {
-                checkpoint("floor_pool_waiting_for_funds")
-            }) {
-                return false;
-            }
-            let trusted = rpc_retry("get floor-pool wallet balance", || {
-                self.wallet.get_balances()
-            })
-            .mine
-            .trusted
-            .to_btc();
-            let pull_btc = ((trusted * 0.5).min(POOL_PULL_MAX_BTC) * 1e8).floor() / 1e8;
-            let pull = Amount::from_btc(pull_btc).unwrap();
-            tracing::info!(
-                "{} => Floor pool pulling {pull} from wallet '{}'",
-                self.label,
-                self.wallet_name
-            );
-            let txid = match self.wallet.send_to_address(
-                &self.pool_address,
-                pull,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ) {
-                Ok(txid) => txid,
-                Err(error) => {
-                    tracing::warn!(
-                        "{} => Floor-pool funding pull failed ({error}), deferring until the next block",
-                        self.label
-                    );
-                    return true;
-                }
-            };
-            let mut continue_work = checkpoint("floor_pool_funding_submitted");
-            while self
-                .wallet
-                .get_transaction(&txid, None)
-                .map(|tx| tx.info.confirmations)
-                .unwrap_or(0)
-                < 1
-            {
-                if !checkpoint("floor_pool_funding_confirmation") {
-                    continue_work = false;
-                }
-                thread::sleep(Duration::from_millis(500));
-            }
-            self.pool_resync();
-            if !continue_work || !checkpoint("floor_pool_funding_confirmed") {
-                return false;
-            }
+            self.start_pool_funding();
         }
-
-        let total: Amount = self.pool_utxos.iter().map(|u| u.amount).sum();
-        if self.pool_utxos.is_empty() {
-            tracing::warn!(
-                "{} => Floor pool has no confirmed funds to fan out yet, deferring",
-                self.label
-            );
-            return true;
+        if self.pool_fanout.is_none() {
+            self.start_pool_fanout(seed_count, required);
         }
-        let fee = self.consolidation_fee(self.pool_utxos.len(), seed_count as usize);
-        let per_utxo = match total.checked_sub(fee) {
-            Some(split) => split / seed_count,
-            None => Amount::ZERO,
-        };
-        if per_utxo < required {
-            tracing::warn!(
-                "{} => Floor pool funds too low to split {total} into {seed_count} usable fill UTXOs, deferring",
-                self.label
-            );
-            return true;
-        }
-
-        tracing::info!(
-            "{} => Floor pool splitting {total} into {seed_count} fill UTXOs of {per_utxo}",
-            self.label
-        );
-        let mut available = std::mem::take(&mut self.pool_utxos);
-        // Spend large pool UTXOs first. During migration from an older pool
-        // there can be thousands of small confirmed UTXOs; consuming those
-        // first can make the fan-out tx itself exceed standard tx size.
-        available.sort_by_key(|u| u.amount.to_sat());
-        let mut fresh = Vec::new();
-        let mut outputs_left = seed_count as usize;
-
-        while outputs_left > 0 {
-            if !checkpoint("floor_pool_fanout_prepare") {
-                self.pool_utxos = available;
-                self.pool_utxos.extend(fresh);
-                return false;
-            }
-            let n_fill = outputs_left.min(POOL_FANOUT_CHUNK_OUTPUTS);
-            let fill_value = per_utxo * n_fill as u64;
-            let mut inputs = Vec::new();
-            let mut input_total = Amount::ZERO;
-            loop {
-                let fee = self.consolidation_fee(inputs.len(), n_fill);
-                if input_total >= fill_value + fee {
-                    break;
-                }
-                let Some(input) = available.pop() else {
-                    tracing::warn!(
-                        "{} => Floor pool ran out of inputs mid fan-out, retrying next block",
-                        self.label
-                    );
-                    available.extend(inputs);
-                    self.pool_utxos = available;
-                    self.pool_utxos.extend(fresh);
-                    return true;
-                };
-                input_total += input.amount;
-                inputs.push(input);
-            }
-
-            let fee_with_change = self.consolidation_fee(inputs.len(), n_fill + 1);
-            let change = input_total
-                .checked_sub(fill_value + fee_with_change)
-                .unwrap_or(Amount::ZERO);
-            let include_change = change >= required;
-            let mut outputs: Vec<TxOut> = (0..n_fill)
-                .map(|_| TxOut {
-                    value: per_utxo,
-                    script_pubkey: self.pool_script.clone(),
-                })
-                .collect();
-            if include_change {
-                outputs.push(TxOut {
-                    value: change,
-                    script_pubkey: self.pool_script.clone(),
-                });
-            }
-
-            match self.send_signed(
-                &inputs,
-                outputs,
-                false,
-                &self.pool_script,
-                &self.pool_secret,
-                &self.pool_pubkey,
-            ) {
-                Ok(txid) => {
-                    tracing::info!(
-                        "{} => Pool fan-out tx {txid} sent ({n_fill} fill outputs), waiting for it to confirm...",
-                        self.label
-                    );
-                    let mut continue_work = checkpoint("floor_pool_fanout_submitted");
-                    while !matches!(self.node.get_tx_out(&txid, 0, Some(false)), Ok(Some(_))) {
-                        if !checkpoint("floor_pool_fanout_confirmation") {
-                            continue_work = false;
-                        }
-                        thread::sleep(Duration::from_millis(500));
-                    }
-                    fresh.extend((0..n_fill).map(|i| Utxo {
-                        outpoint: OutPoint::new(txid, i as u32),
-                        amount: per_utxo,
-                    }));
-                    if include_change {
-                        available.push(Utxo {
-                            outpoint: OutPoint::new(txid, n_fill as u32),
-                            amount: change,
-                        });
-                    }
-                    outputs_left -= n_fill;
-                    if !continue_work || !checkpoint("floor_pool_fanout_confirmed") {
-                        self.pool_utxos = available;
-                        self.pool_utxos.extend(fresh);
-                        return false;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "{} => Floor pool fan-out failed ({e}), retrying next block",
-                        self.label
-                    );
-                    self.pool_resync();
-                    return true;
-                }
-            }
-        }
-        self.pool_utxos = available;
-        self.pool_utxos.extend(fresh);
-        tracing::info!("{} => Pool fan-out confirmed", self.label);
-        true
+        usable > 0
     }
 
     // Keep a standing pool of `target` standalone floor-priced fills sitting
@@ -1491,12 +1791,12 @@ impl RawSpammer {
         &mut self,
         deficit_vsize: u64,
         small_txs: u64,
-        fanout: u64,
+        fanout: (u64, u64),
         replaceable: bool,
         replaces: u64,
         checkpoint: &impl Fn(&str) -> bool,
     ) -> (Vec<Txid>, u64) {
-        if !self.ensure_funds(fanout, fanout, checkpoint) {
+        if !self.ensure_funds(fanout.0, fanout.1, checkpoint) {
             return (Vec::new(), 0);
         }
 
