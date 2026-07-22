@@ -16,6 +16,7 @@ pub trait ScenarioControl: Send + Sync {
 
 pub trait ScenarioActions: Send + Sync {
     fn wait_height(&self, height: u64, control: &dyn ScenarioControl) -> anyhow::Result<Value>;
+    fn wait_n_blocks(&self, n: u64, control: &dyn ScenarioControl) -> anyhow::Result<Value>;
     fn set_mining_paused(&self, paused: bool) -> anyhow::Result<Value>;
     fn mine(&self, node: MinerNode, blocks: u64) -> anyhow::Result<Value>;
     fn run_reorg(
@@ -252,6 +253,7 @@ fn execute_step(
 ) -> anyhow::Result<Value> {
     match step {
         Step::WaitHeight { height } => actions.wait_height(*height, control),
+        Step::WaitNBlocks { n } => actions.wait_n_blocks(*n, control),
         Step::WaitUntil {
             condition,
             timeout_secs,
@@ -385,6 +387,9 @@ mod tests {
     impl ScenarioActions for Fake {
         fn wait_height(&self, height: u64, _: &dyn ScenarioControl) -> anyhow::Result<Value> {
             Ok(json!({"height": height}))
+        }
+        fn wait_n_blocks(&self, n: u64, _: &dyn ScenarioControl) -> anyhow::Result<Value> {
+            Ok(json!({"n": n}))
         }
         fn set_mining_paused(&self, paused: bool) -> anyhow::Result<Value> {
             Ok(json!({"paused": paused}))
@@ -522,6 +527,16 @@ mod tests {
                 "step_completed"
             ]
         );
+    }
+
+    #[test]
+    fn wait_n_blocks_dispatches_to_the_action() {
+        let scenario =
+            Scenario::parse("version: 1\nsteps:\n  - type: wait_n_blocks\n    n: 3\n").unwrap();
+        let fake = Fake::default();
+        let result = run(&scenario, &fake, &fake);
+        assert!(result.success);
+        assert_eq!(result.steps[0].kind, "wait_n_blocks");
     }
 
     #[test]

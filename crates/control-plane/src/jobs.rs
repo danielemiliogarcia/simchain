@@ -4841,6 +4841,10 @@ impl ScenarioActions for JobScenarioActions {
         self.manager.scenario.wait_height(height, control)
     }
 
+    fn wait_n_blocks(&self, n: u64, control: &dyn ScenarioControl) -> anyhow::Result<Value> {
+        self.manager.scenario.wait_n_blocks(n, control)
+    }
+
     fn set_mining_paused(&self, paused: bool) -> anyhow::Result<Value> {
         if paused {
             let acquired = self.ensure_mining_lease("scenario pause_mining step")?;
@@ -6956,6 +6960,30 @@ steps:
             None
         );
         assert!(manager.faucet_status().pending_transfer.is_some());
+    }
+
+    #[test]
+    fn wait_n_blocks_step_runs_inline_under_the_scenario_job() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(BlockingExecutor::new());
+        let (_backend, manager) = manager(dir.path(), executor);
+        let created = manager
+            .start_scenario(
+                "version: 1\nsteps:\n  - type: wait_n_blocks\n    n: 3\n".to_string(),
+                None,
+                true,
+            )
+            .expect("start scenario");
+        wait_until(|| {
+            manager
+                .get(&created.job_id)
+                .expect("job")
+                .summary
+                .state
+                .is_terminal()
+        });
+        let job = manager.get(&created.job_id).expect("job");
+        assert_eq!(job.summary.state, JobState::Succeeded);
     }
 
     #[test]

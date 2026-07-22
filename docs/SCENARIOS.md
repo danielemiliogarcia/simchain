@@ -43,6 +43,9 @@ steps:
   - type: wait_height
     height: 260
 
+  - type: wait_n_blocks
+    n: 10
+
   - type: sleep
     secs: 5
 
@@ -136,6 +139,12 @@ steps:
 Validation rules:
 
 - `wait_height.height` is at least 204.
+- `wait_n_blocks.n` is positive. Unlike `wait_height`, it is relative: it snapshots
+  node1's height when the step starts and waits for that height plus `n`, so the same
+  file behaves the same way on a freshly started chain or one that has been running
+  for hours. Prefer it over `wait_height` whenever the wait is "N more blocks from
+  here" rather than a specific absolute height (for example bootstrap fixtures that
+  must reference height 204 explicitly still want `wait_height`).
 - `wait_until.timeout_secs` is positive and defaults to 900. Supported conditions are
   `height_at_least` with `height`, `mempool_txs_at_least` with `count`,
   `mempool_txs_at_most` with `count`, and `component`.
@@ -252,3 +261,7 @@ before another mutation may begin.
 - `fresh-chain-tour.yml` performs the full hot-control tour after an externally fresh
   chain start: retune, faucet funding, config assertion, empty reorg, organic partition
   reorg, another split, timed degradation, and final fee-floor change.
+- `rainbow.yml` fixes the block interval at 10s and the fill ratio at 10, then uses
+  `wait_n_blocks` to ramp `SPAM_FEE` x10 every block from 1 to 10,000 sat/vB, driving
+  the spammer into `capacity_degraded` and spreading the mempool across every fee-rate
+  color band. Runs unmodified on a fresh stack or an already-running one.

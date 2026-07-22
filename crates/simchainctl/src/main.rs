@@ -526,6 +526,7 @@ fn print_scenario_explain(scenario: &Scenario, json: bool) -> Result<(), ClientE
 fn describe_step(step: &Step) -> String {
     match step {
         Step::WaitHeight { height } => format!("wait_height until height {height}"),
+        Step::WaitNBlocks { n } => format!("wait_n_blocks for {n} more block(s)"),
         Step::WaitUntil {
             condition,
             timeout_secs,

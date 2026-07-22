@@ -32,6 +32,9 @@ pub struct SpamBurstTarget {
 
 pub trait ScenarioActionBackend: Send + Sync {
     fn wait_height(&self, height: u64, control: &dyn ScenarioControl) -> Result<Value>;
+    /// Waits for `n` more blocks than node1 has right now, so callers never
+    /// need to know or compute an absolute target height themselves.
+    fn wait_n_blocks(&self, n: u64, control: &dyn ScenarioControl) -> Result<Value>;
     fn mine(&self, node: MinerNode, blocks: u64) -> Result<Value>;
     /// Fund the raw burst engines for `targets` so later `spam_burst` steps can
     /// run without block production (funding needs confirmations, bursts do
@@ -201,6 +204,20 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
             }
             thread::sleep(Duration::from_millis(500));
         }
+    }
+
+    fn wait_n_blocks(&self, n: u64, control: &dyn ScenarioControl) -> Result<Value> {
+        let client = create_client(&self.node1_url)?;
+        let start_height = client.get_block_count()?;
+        let target = start_height.saturating_add(n);
+        let waited = self.wait_height(target, control)?;
+        Ok(json!({
+            "start_height": start_height,
+            "blocks_requested": n,
+            "target_height": target,
+            "final_height": waited.get("final_height").cloned().unwrap_or(Value::Null),
+            "aborted": waited.get("aborted").cloned().unwrap_or(json!(false))
+        }))
     }
 
     fn mine(&self, node: MinerNode, blocks: u64) -> Result<Value> {

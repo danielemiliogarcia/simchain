@@ -20,6 +20,10 @@ pub enum Step {
     WaitHeight {
         height: u64,
     },
+    #[serde(rename = "wait_n_blocks")]
+    WaitNBlocks {
+        n: u64,
+    },
     WaitUntil {
         condition: WaitCondition,
         #[serde(default = "default_wait_until_timeout_secs")]
@@ -144,6 +148,7 @@ impl Step {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::WaitHeight { .. } => "wait_height",
+            Self::WaitNBlocks { .. } => "wait_n_blocks",
             Self::WaitUntil { .. } => "wait_until",
             Self::WaitTx { .. } => "wait_tx",
             Self::AssertHeight { .. } => "assert_height",
@@ -424,6 +429,7 @@ impl Scenario {
                 Step::WaitHeight { height } if *height < BOOTSTRAP_HEIGHT => {
                     Some(format!("height must be at least {BOOTSTRAP_HEIGHT}"))
                 }
+                Step::WaitNBlocks { n } if *n == 0 => Some("n must be positive".to_string()),
                 Step::WaitUntil { timeout_secs, .. } if *timeout_secs == 0 => {
                     Some("timeout_secs must be positive".to_string())
                 }
@@ -1006,6 +1012,18 @@ steps:
         assert!(parse("version: 2\nsteps: []\n").is_err());
         assert!(parse("version: 1\nsteps:\n  - type: sleep\n    secs: 0\n").is_err());
         assert!(parse("version: 1\nsteps:\n  - type: wait_height\n    height: 203\n").is_err());
+        assert!(parse("version: 1\nsteps:\n  - type: wait_n_blocks\n    n: 0\n").is_err());
+    }
+
+    #[test]
+    fn parses_wait_n_blocks() {
+        let scenario = parse("version: 1\nsteps:\n  - type: wait_n_blocks\n    n: 3\n")
+            .expect("valid wait_n_blocks");
+        let Step::WaitNBlocks { n } = &scenario.steps[0] else {
+            panic!("wait_n_blocks step");
+        };
+        assert_eq!(*n, 3);
+        assert_eq!(scenario.steps[0].kind(), "wait_n_blocks");
     }
 
     #[test]
@@ -1030,6 +1048,7 @@ steps:
             include_str!("../../../scenarios/tutorial-one-block.yml"),
             include_str!("../../../scenarios/fresh-chain-tour.yml"),
             include_str!("../../../scenarios/all-features-live.yml"),
+            include_str!("../../../scenarios/rainbow.yml"),
         ] {
             parse(yaml).unwrap();
         }

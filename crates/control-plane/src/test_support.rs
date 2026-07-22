@@ -348,6 +348,20 @@ impl ScenarioActionBackend for MockBackend {
         }))
     }
 
+    fn wait_n_blocks(
+        &self,
+        n: u64,
+        control: &dyn simchain_scenario_engine::ScenarioControl,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "start_height": 204,
+            "blocks_requested": n,
+            "target_height": 204 + n,
+            "final_height": 204 + n,
+            "aborted": control.abort_requested()
+        }))
+    }
+
     fn mine(
         &self,
         node: simchain_scenario_engine::MinerNode,
