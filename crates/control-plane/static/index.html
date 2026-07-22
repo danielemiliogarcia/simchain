@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>simchain control plane</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <script>window.CONTROL_PLANE_TOKEN = __CONTROL_PLANE_TOKEN_JSON__;</script>
+  <header>
+    <h1>simchain <span>control plane</span></h1>
+    <div class="header-status">
+      <label class="poll-control" data-help="Dashboard refresh interval when there is no active job. Active jobs still refresh every 1s. Example: 30s reduces browser request history during long runs.">Poll
+        <select id="poll-interval">
+          <option value="5000">5s</option>
+          <option value="10000">10s</option>
+          <option value="30000">30s</option>
+          <option value="60000">60s</option>
+        </select>
+      </label>
+      <div id="conn" class="conn">connecting…</div>
+    </div>
+  </header>
+
+  <main>
+    <nav class="dashboard-tabs" role="tablist" aria-label="Dashboard sections">
+      <button id="tab-overview" class="dashboard-tab" type="button" role="tab" aria-selected="true" aria-controls="panel-overview" data-tab="overview">Overview</button>
+      <button id="tab-control" class="dashboard-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-control" data-tab="control">Control</button>
+      <button id="tab-faucet" class="dashboard-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-faucet" data-tab="faucet">Faucet</button>
+    </nav>
+
+    <section id="panel-overview" class="dashboard-panel active" role="tabpanel" aria-labelledby="tab-overview" data-panel="overview">
+    <section class="card" id="chain-card">
+      <div class="section-heading">
+        <h2>Chain</h2>
+        <div id="explorer-status" class="explorer-status">
+          <span class="dot off"></span>
+          <span>mempool.space unavailable</span>
+          <a id="explorer-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Inspect fee rates in mempool.space ↗</a>
+        </div>
+      </div>
+      <div class="tiles" id="tiles"></div>
+      <div class="split">
+        <div>
+          <h3>Recent blocks</h3>
+          <table id="blocks">
+            <thead><tr><th>height</th><th>hash</th><th data-help="Time between this block and the previous block. Example: 20s means this block arrived 20 seconds after the block below it.">Δt</th><th>txs</th><th>size</th><th>weight</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div>
+          <h3>Components</h3>
+          <div id="services" class="services"></div>
+          <div class="component-control">
+            <div id="mining-state" class="component-state">mining control unavailable</div>
+            <div class="component-buttons">
+              <button id="mining-pause" type="button">Pause mining</button>
+              <button id="mining-resume" type="button">Resume mining</button>
+            </div>
+            <div id="mining-action-result" class="action-result"></div>
+          </div>
+          <div class="component-control">
+            <div id="spam-state" class="component-state">spam control unavailable</div>
+            <div class="component-buttons">
+              <button id="spam-pause" type="button">Pause spam</button>
+              <button id="spam-resume" type="button">Resume spam</button>
+            </div>
+            <div id="spam-action-result" class="action-result"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+    </section>
+
+    <section id="panel-control" class="dashboard-panel" role="tabpanel" aria-labelledby="tab-control" data-panel="control" hidden>
+    <section class="card" id="jobs-card">
+      <h2>Jobs and scenarios</h2>
+      <p class="hint">Mutations run as durable server-side jobs. Closing this page does not cancel
+        one; owned worker leases are renewed through execution and cleaned at a safe boundary.</p>
+      <div id="mutation-lock" class="mutation-lock">mutation coordinator is idle</div>
+      <div class="bounded-actions">
+        <form id="mine-form" class="mini-action-form">
+          <h3>Mine blocks</h3>
+          <label data-help="Miner node that will generate the requested block or blocks. Example: node2 mines blocks with node2's stable miner label.">Node
+            <select id="mine-node"><option value="node2">node2</option><option value="node3">node3</option></select>
+          </label>
+          <label data-help="Number of blocks to mine immediately. Example: 1 advances the chain by one height; 3 mines three consecutive blocks.">Blocks
+            <input id="mine-blocks" type="number" min="1" value="1" required>
+          </label>
+          <button id="mine-start" type="submit">Mine</button>
+          <div id="mine-action-result" class="action-result"></div>
+        </form>
+        <form id="burst-form" class="mini-action-form">
+          <h3>Spam burst</h3>
+          <label data-help="Miner node whose raw transaction engine submits the burst. Example: node2 creates transactions from node2's available spam funds.">Node
+            <select id="burst-node"><option value="node2">node2</option><option value="node3">node3</option></select>
+          </label>
+          <label data-help="Number of raw transactions to submit as one durable job. Example: 100 creates 100 OP_RETURN transactions.">Transactions
+            <input id="burst-txs" type="number" min="1" value="100" required>
+          </label>
+          <label data-help="Bytes of arbitrary data placed in each transaction OP_RETURN output. Example: 90000 makes large data transactions that fill blocks faster; maximum is 98000.">OP_RETURN bytes
+            <input id="burst-data-bytes" type="number" min="1" max="98000" value="90000" required>
+          </label>
+          <button id="burst-start" type="submit">Create tx burst</button>
+          <div id="burst-action-result" class="action-result"></div>
+        </form>
+      </div>
+
+      <h3>Reorganization</h3>
+      <form id="reorg-form" class="action-form">
+        <label data-help="Number of recent blocks to roll back before mining the replacement branch. Example: depth 3 rewrites the last 3 blocks.">Depth
+          <input id="reorg-depth" type="number" min="1" max="100" value="3" required>
+        </label>
+        <label data-help="Miner that builds the replacement branch after the rollback. Example: node3 mines the new branch that should become best chain.">Replacement miner
+          <select id="reorg-node">
+            <option value="node3">node3</option>
+            <option value="node2">node2</option>
+          </select>
+        </label>
+        <label data-help="Fresh wallet transactions to prioritize into replacement blocks. Example: 100 creates 100 new transactions first, then old returned mempool transactions fill the remaining block space.">New transactions
+          <input id="reorg-adds" type="number" min="0" max="10000" value="0" required>
+        </label>
+        <label data-help="Percent of eligible wallet-owned transactions in the blocks being replaced that will be replaced by conflicting spends. Example: 50 replaces half of eligible transactions; use 0 for a normal reorg. DATA/HYBRID raw spam contributes no eligible transactions, but wallet payments, faucet transactions, and New transactions mined by an earlier reorg can be eligible. New transactions created by this same reorg are too late to be candidates.">Double spend %
+          <input id="reorg-double-spend" type="number" min="0" max="100" value="0" required>
+        </label>
+        <label class="check-field" data-help="Mine replacement blocks without deliberately adding transactions. Example: use this to test a reorg that changes block ancestry but carries little mempool traffic.">
+          <input id="reorg-empty" type="checkbox">
+          Mine empty replacements
+        </label>
+        <button id="reorg-start" type="submit">Start reorg</button>
+      </form>
+      <div id="reorg-action-result" class="action-result"></div>
+
+      <h3>Network</h3>
+      <div id="network-status" class="component-state">all P2P links clear</div>
+      <div class="bounded-actions">
+        <form id="partition-form" class="mini-action-form">
+          <h3>Hard partition</h3>
+          <label data-help="Miner temporarily cut off from the rest of the P2P network. Example: node3 mines a private side branch while node2 remains on the main side.">Isolated miner
+            <select id="partition-node"><option value="node3">node3</option><option value="node2">node2</option></select>
+          </label>
+          <label data-help="Blocks mined by the non-isolated side while the partition is held. Example: 3 mines three public-side blocks before healing.">Main-side blocks
+            <input id="partition-main-blocks" type="number" min="1" max="100" value="3" required>
+          </label>
+          <label data-help="Blocks mined by the isolated miner while separated. Example: 4 isolated blocks can overtake 3 main-side blocks after the partition heals.">Isolated blocks
+            <input id="partition-isolated-blocks" type="number" min="1" max="100" value="4" required>
+          </label>
+          <button id="partition-start" type="submit">Start partition</button>
+          <div id="partition-action-result" class="action-result"></div>
+        </form>
+        <form id="degrade-form" class="mini-action-form">
+          <h3>Timed degradation</h3>
+          <label data-help="Network agent target for temporary P2P impairment. Example: node3 applies delay or loss to node3's peer links.">Node
+            <select id="degrade-node"><option value="node3">node3</option><option value="node2">node2</option><option value="node1">node1</option></select>
+          </label>
+          <label data-help="One-way P2P packet delay in milliseconds. Example: 500 adds about 500ms of latency to affected traffic.">Delay ms
+            <input id="degrade-delay" type="number" min="0" max="600000" value="500" required>
+          </label>
+          <label data-help="Packet loss percentage for affected P2P traffic. Example: 1 drops about 1 percent of packets; 0 disables loss.">Loss %
+            <input id="degrade-loss" type="number" min="0" max="100" step="any" value="1" required>
+          </label>
+          <label data-help="Lease duration before the impairment is automatically removed. Example: 30 keeps the degradation active for 30 seconds.">Seconds
+            <input id="degrade-seconds" type="number" min="1" max="86400" value="30" required>
+          </label>
+          <button id="degrade-start" type="submit">Start degradation</button>
+          <div id="degrade-action-result" class="action-result"></div>
+        </form>
+      </div>
+
+      <h3>Scenario</h3>
+      <form id="scenario-form" class="scenario-form">
+        <label data-help="YAML job script executed step by step under one durable coordinator job. Example: combine checkpoints, mining, partitions, and reorgs when you want ordered multi-step execution.">Scenario YAML
+          <textarea id="scenario-yaml" rows="10" required>version: 1
+steps:
+  - type: checkpoint
+    name: inspect
+    timeout_secs: 600</textarea>
+        </label>
+        <div class="scenario-actions">
+          <label class="file-label" data-help="Load a local YAML scenario file into the editor. It does not start until you click Start scenario.">Load file
+            <input id="scenario-file" type="file" accept=".yml,.yaml,text/yaml,application/yaml">
+          </label>
+          <button id="scenario-start" type="submit">Start scenario</button>
+        </div>
+      </form>
+      <div id="scenario-action-result" class="action-result"></div>
+
+      <div class="job-heading">
+        <h3>Selected job</h3>
+        <div class="job-heading-actions">
+          <button id="job-download" class="secondary" type="button" hidden>Download result</button>
+          <button id="job-abort" class="danger" type="button" hidden>Request abort</button>
+        </div>
+      </div>
+      <div id="job-detail" class="job-detail muted">no jobs yet</div>
+      <div id="job-checkpoints" class="job-checkpoints"></div>
+      <ol id="job-events" class="job-events"></ol>
+
+      <h3>Recent jobs</h3>
+      <div class="table-scroll">
+        <table id="jobs">
+          <thead><tr><th>job</th><th>kind</th><th>state</th><th>phase</th><th></th></tr></thead>
+          <tbody><tr><td colspan="5">no jobs yet</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card" id="settings-card">
+      <h2>Live retune</h2>
+      <p class="hint">Desired configuration is managed by the control plane; effective values are
+        reported by each component. Both workers apply at safe points; structural spam changes
+        reconcile a replacement engine before becoming effective.</p>
+      <div id="page-errors"></div>
+      <div id="form"></div>
+      <div class="applybar">
+        <span id="impact" class="impact"></span>
+        <button id="reset" type="button">Reset edits</button>
+        <button id="apply" type="button">Apply</button>
+      </div>
+      <pre id="result" class="result" hidden></pre>
+    </section>
+    </section>
+
+    <section id="panel-faucet" class="dashboard-panel" role="tabpanel" aria-labelledby="tab-faucet" data-panel="faucet" hidden>
+    <section class="card" id="faucet-card">
+      <div class="section-heading">
+        <h2>Faucet</h2>
+        <span class="faucet-badge">SYSTEM FAUCET · 0 SAT FEE · MINER-PRIORITIZED</span>
+      </div>
+      <div id="faucet-availability" class="component-state">checking miner treasuries…</div>
+      <div id="faucet-wallets" class="faucet-wallets"></div>
+      <form id="faucet-form">
+        <div class="faucet-form-heading">
+          <h3>Destinations</h3>
+          <button id="faucet-add-output" class="small secondary" type="button">Add destination</button>
+        </div>
+        <div id="faucet-outputs" class="faucet-outputs"></div>
+        <label class="faucet-source" data-help="Treasury wallet used to fund the faucet transaction. Auto chooses a miner wallet with enough mature funds; choose node2 or node3 to force the source.">Source treasury
+          <select id="faucet-source">
+            <option value="auto">Auto (recommended)</option>
+            <option value="node2">node2</option>
+            <option value="node3">node3</option>
+          </select>
+        </label>
+        <button id="faucet-review" type="submit">Review transaction</button>
+      </form>
+      <div id="faucet-action-result" class="action-result"></div>
+      <div id="faucet-progress" class="faucet-progress" hidden></div>
+      <div id="faucet-transfer" class="faucet-transfer muted">no faucet transfer selected</div>
+    </section>
+    <section class="card" id="user-address-card">
+      <h2>Bootstrap user address</h2>
+      <a id="user-funding-address" href="#" target="_blank" rel="noopener noreferrer">
+        checking configured address…
+      </a>
+      <p class="hint">Open this address in mempool.space to inspect its balance and transaction
+        history. Requires the optional <code>mempool</code> or <code>all-tools</code> profile.</p>
+    </section>
+    <section class="card" id="regtest-wallet-card">
+      <div class="section-heading">
+        <h2>Regtest test wallet</h2>
+        <span class="faucet-badge">PUBLIC TEST KEYS · REGTEST ONLY</span>
+      </div>
+      <p class="hint">Deterministic BIP84 native SegWit addresses derived from a well-known
+        BIP39 test mnemonic at <code>m/84'/1'/0'/0/index</code>.</p>
+      <div class="test-key-warning"><strong>Never use this mnemonic or any derived key on
+        mainnet, testnet, signet, or for assets of value.</strong> It is public and embedded
+        in this dashboard.</div>
+      <div class="mnemonic-row">
+        <span class="credential-label">Mnemonic</span>
+        <code id="regtest-mnemonic" class="credential-value secret-value"></code>
+        <button id="regtest-mnemonic-reveal" class="small secondary" type="button"
+          aria-pressed="false">Show</button>
+        <button id="regtest-mnemonic-copy" class="small secondary" type="button">Copy</button>
+      </div>
+      <div id="regtest-copy-status" class="copy-status" role="status" aria-live="polite"></div>
+      <div class="table-scroll regtest-keys-scroll">
+        <table class="regtest-keys-table">
+          <thead>
+            <tr><th>Path</th><th>Address</th><th>Private key</th></tr>
+          </thead>
+          <tbody id="regtest-keys"></tbody>
+        </table>
+      </div>
+      <p class="regtest-key-links">Generate or inspect additional disposable test keys with
+        <a href="https://gist.github.com/danielemiliogarcia/ce462aba8859c09b4dcb85aa32fbae9c"
+          target="_blank" rel="noopener noreferrer">the Rust BIP39 key generator ↗</a>
+        or <a href="https://iancoleman.io/bip39/" target="_blank"
+          rel="noopener noreferrer">Ian Coleman's BIP39 tool ↗</a>.</p>
+    </section>
+    </section>
+  </main>
+
+  <dialog id="faucet-confirm-dialog">
+    <form method="dialog" class="faucet-confirm">
+      <h2>Confirm faucet transaction</h2>
+      <div id="faucet-confirm-summary"></div>
+      <p>This creates a real regtest transaction with a 0 sat fee. Simchain submits it
+        directly to both miners with a local 100 BTC virtual priority delta so their next
+        block includes it. The virtual amount is not paid or transferred. This keeps
+        faucet transactions quick and models a dark-pool/direct-to-miner path, where
+        transactions with different public fee rates can still be included when they
+        reach a miner directly and match that miner's policy.</p>
+      <div class="dialog-actions">
+        <button class="secondary" value="cancel">Cancel</button>
+        <button id="faucet-confirm" value="default">Create transaction</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

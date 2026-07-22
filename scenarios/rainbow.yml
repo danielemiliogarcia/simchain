@@ -1,0 +1,117 @@
+# Relative, not height-pinned: wait_n_blocks waits for N more blocks than
+# node1 has right now, so this runs the same way on a fresh stack or one
+# that's already been running for hours. Fixed 10s blocks + ratio 10 keep a
+# backlog the fee floor can't drain between bumps, ramping SPAM_FEE 1 -> 10
+# -> 100 -> 1,000 -> 10,000 sat/vB one block at a time until the spammer goes
+# capacity_degraded and mempool.space shows the full fee-rate rainbow.
+# cargo run -p simchainctl -- scenario start scenarios/rainbow.yml --id-only
+version: 1
+steps:
+  - type: set_config
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      SPAM_FILL_BLOCK_RATIO: 1
+      SPAM_FEE: 0.00001
+
+  - type: assert_config
+    effective: true
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      SPAM_FILL_BLOCK_RATIO: 1
+      SPAM_FEE: 0.00001
+
+    # clean mempool
+  - type: wait_n_blocks
+    n: 10
+
+  - type: set_config
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      SPAM_FILL_BLOCK_RATIO: 3
+      SPAM_FEE: 0.00001
+
+  - type: assert_config
+    effective: true
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      SPAM_FILL_BLOCK_RATIO: 3
+      SPAM_FEE: 0.00001
+
+
+  - type: wait_n_blocks
+    n: 2
+
+  - type: set_config
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      SPAM_FILL_BLOCK_RATIO: 5
+      SPAM_FEE:  0.0001
+
+  - type: assert_config
+    effective: true
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      SPAM_FILL_BLOCK_RATIO: 5
+      SPAM_FEE:  0.0001
+
+  - type: wait_n_blocks
+    n: 2
+
+  - type: set_config
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      SPAM_FILL_BLOCK_RATIO: 7
+      SPAM_FEE:  0.001
+
+  - type: assert_config
+    effective: true
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      SPAM_FILL_BLOCK_RATIO: 7
+      SPAM_FEE:  0.001
+
+  - type: wait_n_blocks
+    n: 2
+
+  - type: set_config
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      SPAM_FILL_BLOCK_RATIO: 9
+      SPAM_FEE:  0.01
+
+  - type: assert_config
+    effective: true
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 10
+      SPAM_FILL_BLOCK_RATIO: 9
+      SPAM_FEE:  0.01
+
+  # provide time to watch the rainbow
+  - type: wait_n_blocks
+    n: 6
+
+  - type: set_config
+    settings:
+      SPAM_FILL_BLOCK_RATIO: 1
+      SPAM_FEE: 0.00001
+
+  - type: wait_n_blocks
+    n: 2
+
+  - type: assert_config
+    effective: true
+    settings:
+      SPAM_FILL_BLOCK_RATIO: 1
+      SPAM_FEE: 0.00001
+
+

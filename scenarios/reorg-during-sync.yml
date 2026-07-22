@@ -1,0 +1,11 @@
+version: 1
+steps:
+  - type: wait_height
+    height: 205
+
+  - type: reorg
+    depth: 2
+    empty: false
+
+  - type: sleep
+    secs: 2

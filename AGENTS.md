@@ -4,7 +4,7 @@ Guidance for agents and contributors working in this repository.
 
 ## Repository structure
 
-The three Rust tools are members of a single Cargo workspace rooted at the repo top:
+The Rust tools are members of a single Cargo workspace rooted at the repo top:
 
 ```
 Cargo.toml                  # workspace root (members + resolver = "2")
@@ -12,7 +12,7 @@ Cargo.lock                  # committed — binaries want reproducible builds
 .cargo/config.toml          # project-wide cargo aliases
 docker/                     # docker build files and helper scripts
   bitcoin-node.Dockerfile   # local bitcoind image build
-  tools.Dockerfile          # one builder stage, three final targets
+  tools.Dockerfile          # one builder stage, per-tool final targets
   build-bitcoin-image.sh    # local bitcoind image build helper
   entrypoint.sh             # bitcoind container entrypoint
 scripts/                    # host-side helper scripts
@@ -21,8 +21,12 @@ scripts/                    # host-side helper scripts
 crates/
   simchain-common/          # shared helpers (RPC clients, config parsing)
   mining-controller/        # bootstrap + configurable mining
+  network-agent/            # private leased P2P impairment control
   reorg/                    # on-demand chain reorganizations
   spammer/                  # block-filling transaction spam
+  scenario-engine/          # ordered declarative scenario orchestration
+  control-plane/            # dashboard, versioned API, MCP, orchestration
+  simchainctl/              # first-party HTTP client for humans and CI
 ```
 
 `.dockerignore` intentionally remains at the repo root because Docker applies it
@@ -49,9 +53,19 @@ network). Do not add it to any `.gitignore`.
 - `crates/simchain-common` — the one home for helpers shared across tools (RPC client
   construction, config parsing/validation, logging). Put a helper here the moment a
   second tool needs it, rather than copy-pasting.
-- `crates/mining-controller`, `crates/reorg`, `crates/spammer` — the three binaries,
-  each a thin RPC driver over bitcoind. They must imitate mainnet **behavior**; do not
-  add relay/mempool/capacity policy flags that diverge from mainnet.
+- `crates/control-plane` — the single public Simchain backend. Keep HTTP, MCP, CLI, and
+  dashboard adapters over the same domain service layer; never add a second backend.
+  It may call private worker/agent APIs and Bitcoin RPC, but must never gain a Docker
+  socket, Docker CLI, repository bind mount, or process-lifecycle executor.
+- `crates/simchainctl` — a thin control-plane API client. It must not call Docker or
+  Bitcoin RPC directly.
+- `crates/network-agent` — the private namespace-local owner of `tc`/`nft` P2P
+  impairments. Keep it lease/TTL bounded, authenticated, and unreachable from host
+  ports or public networks.
+- `crates/mining-controller`, `crates/reorg`, `crates/spammer`,
+  `crates/scenario-engine` — worker/operation binaries, each a thin RPC driver or orchestrator
+  over bitcoind. They must imitate mainnet **behavior**; do not add
+  relay/mempool/capacity policy flags that diverge from mainnet.
 
 ## Commands
 
@@ -64,6 +78,8 @@ cargo tt            # run tests serially (test --test-threads=1)
 cargo ca            # clippy --all-targets -- -D warnings
 cargo fa            # cargo fmt --all
 cargo fac           # cargo fmt --all --check
+./scripts/check-compose-security.sh  # rendered Compose trust-boundary assertions
+./scripts/check-docker-images.sh     # build targets + inspect control-plane rootfs
 ```
 
 `ba`, `bar`, `tt`, `ttr`, `ca`, `fa`, `fac` are aliases from `.cargo/config.toml`, not
@@ -76,6 +92,8 @@ Before committing, CI-equivalent local check:
 
 ```bash
 cargo ba && cargo ca && cargo fac && cargo tt
+./scripts/check-compose-security.sh
+./scripts/check-docker-images.sh
 ```
 
 CI runs the same jobs on every pull request (`.github/workflows/ci.yml`), but with

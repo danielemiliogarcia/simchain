@@ -21,6 +21,7 @@ use bitcoincore_rpc::{
     Client, RpcApi,
 };
 use serde_json::json;
+use simchain_common::config::RpcUrl;
 use std::collections::{HashMap, HashSet};
 
 /// Below this the replacement's single output would be an unspendable dust
@@ -86,10 +87,10 @@ impl DoubleSpendPlan {
             if use_raw_tx_spam && self.eligible_count == 0 {
                 tracing::warn!(
                     "DOUBLE-SPEND CONFIGURATION MISMATCH: REORG_DOUBLE_SPEND_PCT={} but \
-                     USE_RAW_TX_SPAM=true; raw-engine spam is signed with keys outside the \
-                     reorg wallet, so 0 txs are eligible for permanent replacement. Set \
-                     USE_RAW_TX_SPAM=false to exercise double-spend drops. The reorg will \
-                     continue without permanent drops.",
+                     the spam is raw-engine traffic signed with keys outside the reorg \
+                     wallet, so 0 txs are eligible for permanent replacement. The \
+                     node-wallet engine that produced eligible txs is deprecated and no \
+                     longer selectable. The reorg will continue without permanent drops.",
                     self.configured_pct
                 );
             } else {
@@ -152,7 +153,7 @@ impl DoubleSpendPlan {
         if !self.wallet_resolved {
             "no wallet loaded on the reorg node"
         } else if self.wallet_txs_seen == 0 {
-            "no wallet txs in the orphaned window (wrong spam engine? the default USE_RAW_TX_SPAM=true produces none)"
+            "no wallet txs in the orphaned window (raw-engine spam produces none)"
         } else {
             "all wallet txs in the window were non-root descendants or could not be re-signed"
         }
@@ -198,12 +199,18 @@ pub fn exclusion_set(replacements: &[ReplacementTx]) -> HashSet<Txid> {
 /// the reorg: a tx that cannot be resolved, is not the wallet's, is not a root,
 /// or cannot be re-signed is simply skipped. Returns an empty plan (with a
 /// loggable reason) when `pct == 0` or nothing is eligible.
-pub fn build_plan(node: &Client, branch: &[BranchBlock], pct: u8) -> DoubleSpendPlan {
+pub fn build_plan(
+    node: &Client,
+    branch: &[BranchBlock],
+    pct: u8,
+    rpc_url: &RpcUrl,
+    preferred_wallet: &str,
+) -> DoubleSpendPlan {
     if pct == 0 {
         return DoubleSpendPlan::empty(pct, true, 0, 0);
     }
 
-    let Some((wallet_name, wallet)) = resolve_wallet(node) else {
+    let Some((wallet_name, wallet)) = resolve_wallet(node, rpc_url, preferred_wallet) else {
         return DoubleSpendPlan::empty(pct, false, 0, 0);
     };
 

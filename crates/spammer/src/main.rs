@@ -1,20 +1,13 @@
 //! Simchain transaction spammer entry point.
 
-mod burn;
-mod config;
-mod error;
-mod node_wallet_spammer;
-mod raw_transaction_spammer;
-mod runner;
-mod wallet;
-
-use config::SpamConfig;
 use simchain_common::init_tracing;
+use simchain_spammer::config::SpamConfig;
+use simchain_spammer::runner;
 
 fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
     init_tracing("simchain_spammer=info,info");
-    let _ = SpamConfig::init()?;
+    SpamConfig::init()?;
 
     runner::run()
 }

@@ -1,13 +1,11 @@
 //! Top-level reorg operation: connect to nodes and select once or automatic
-//! operation. The chain-rewrite details live in [`crate::reorg`].
+//! operation. The chain-rewrite details live in the `simchain_reorg` library.
 
-use crate::{
-    config::{ReorgConfig, ReorgMode},
-    reorg,
-};
+use crate::config::{ReorgConfig, ReorgMode};
 use anyhow::Context;
 use bitcoincore_rpc::{Client, RpcApi};
 use simchain_common::{create_client, wait_for_rpc};
+use simchain_reorg::{run_once, NoopObserver, ReorgRequest, ReorgTarget, WitnessTarget};
 use std::{thread, time::Duration};
 
 pub fn run() -> anyhow::Result<()> {
@@ -15,28 +13,22 @@ pub fn run() -> anyhow::Result<()> {
     let node = create_client(&config.rpc_url).context("build reorg node client")?;
     wait_for_rpc(&node, &config.node_name, Duration::from_secs(1));
 
-    // Witness node: another node polled after the reorg to confirm the whole
-    // network adopted the new chain (node1 never mines, ideal witness).
-    // REORG_WITNESS_NODE=none disables the check.
-    let witness_client = match config.witness.as_ref() {
-        Some(witness) => {
-            Some(create_client(&witness.rpc_url).context("build witness node client")?)
-        }
-        None => None,
-    };
-    let witness: Option<(&Client, &str)> = witness_client
-        .as_ref()
-        .zip(config.witness.as_ref())
-        .map(|(client, witness)| (client, witness.name.as_str()));
-
+    let target = target(config);
+    let request = request(config);
     match config.mode {
-        ReorgMode::Once => reorg::run(&node, witness).context("reorg failed"),
-        ReorgMode::Auto => run_automatically(&node, witness),
+        ReorgMode::Once => run_once(&target, &request, &NoopObserver)
+            .context("reorg failed")
+            .map(|_| ()),
+        ReorgMode::Auto => run_automatically(config, &node, &target, &request),
     }
 }
 
-fn run_automatically(node: &Client, witness: Option<(&Client, &str)>) -> anyhow::Result<()> {
-    let config = ReorgConfig::global();
+fn run_automatically(
+    config: &ReorgConfig,
+    node: &Client,
+    target: &ReorgTarget,
+    request: &ReorgRequest,
+) -> anyhow::Result<()> {
     let mut last = node.get_block_count().context("get_block_count failed")?;
     tracing::info!(
         "Auto-reorg mode: every {} blocks, reorg the last {} (current height {last})",
@@ -46,7 +38,7 @@ fn run_automatically(node: &Client, witness: Option<(&Client, &str)>) -> anyhow:
     loop {
         match node.get_block_count() {
             Ok(tip) if tip >= last + config.every => {
-                if let Err(error) = reorg::run(node, witness) {
+                if let Err(error) = run_once(target, request, &NoopObserver) {
                     tracing::error!("Reorg failed: {error}");
                 }
                 last = node.get_block_count().unwrap_or(tip);
@@ -55,5 +47,29 @@ fn run_automatically(node: &Client, witness: Option<(&Client, &str)>) -> anyhow:
             Err(error) => tracing::warn!("RPC error while polling height: {error}"),
         }
         thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn request(config: &ReorgConfig) -> ReorgRequest {
+    ReorgRequest {
+        depth: config.depth,
+        empty: config.empty_mode,
+        adds_new_txs: config.adds_new_txs,
+        double_spend_pct: config.double_spend_pct,
+    }
+}
+
+fn target(config: &ReorgConfig) -> ReorgTarget {
+    ReorgTarget {
+        node_name: config.node_name.clone(),
+        rpc_url: config.rpc_url.clone(),
+        mine_address: config.mine_address.clone(),
+        wallet_name: config.wallet_name.clone(),
+        witness: config.witness.as_ref().map(|witness| WitnessTarget {
+            name: witness.name.clone(),
+            rpc_url: witness.rpc_url.clone(),
+            required: false,
+        }),
+        use_raw_tx_spam: config.use_raw_tx_spam,
     }
 }

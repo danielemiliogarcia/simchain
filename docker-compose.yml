@@ -2,14 +2,12 @@
 # has a working default, so it runs with no .env at all).
 #
 # Profiles:
-#   (none) / "basic"  -> 3 nodes + mining controller + spammer
+#   (none) / "basic"  -> nodes + workers + network agents + control plane
 #   electrs           -> basic + electrs
 #   mempool           -> basic + electrs + mempool.space explorer
 #                        (mempool-web/mempool-api/mempool-db)
 #   all-tools         -> basic + all long-running tools above
 #   reorg             -> reorg simulator (run on demand, see README)
-#   partition         -> one-shot P2P latency/loss helpers
-#                        (intentionally excluded from all-tools)
 #
 # Examples:
 #   docker compose up
@@ -30,11 +28,11 @@ networks:
       config:
         - subnet: 172.30.0.0/24
 
-# Node datadirs persist on named volumes: the chain survives `docker compose
-# down` (the controller detects the height and skips the bootstrap) and can be
-# archived/restored with ./scripts/snapshot.sh. `docker compose down -v` wipes
-# them for a fresh chain. Explicit names (like the container and network names
-# above) keep ./scripts/snapshot.sh independent of the compose project name.
+# Node and control-plane state persist on named volumes: the chain, durable
+# runtime policy, job history, and API token survive `docker compose down`.
+# `docker compose down -v` wipes them for a fresh stack. Explicit names (like
+# the container and network names above) keep helper scripts independent of the
+# compose project name.
 volumes:
   node1-data:
     name: btc-simnet-node1-data
@@ -42,6 +40,8 @@ volumes:
     name: btc-simnet-node2-data
   node3-data:
     name: btc-simnet-node3-data
+  control-state:
+    name: btc-simnet-control-state
 
 services:
   btc-simnet-node1:
@@ -201,6 +201,70 @@ services:
       - -addnode=node1-p2p:18444
       - -addnode=node2-p2p:18444
 
+  # Namespace-local network agents. Each shares exactly one node's network
+  # namespace, has no independent network membership or host port, and drops
+  # every Linux capability except NET_ADMIN. Its authenticated lease expires
+  # to a clear P2P interface if the control plane disappears.
+  btc-simnet-network-agent-node1:
+    build:
+      context: .
+      dockerfile: docker/tools.Dockerfile
+      target: network-agent
+    container_name: btc-simnet-network-agent-node1
+    restart: on-failure
+    network_mode: "service:btc-simnet-node1"
+    cap_drop: ["ALL"]
+    cap_add: ["NET_ADMIN"]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      btc-simnet-node1:
+        condition: service_started
+    environment:
+      - NETWORK_AGENT_NODE=node1
+      - NETWORK_AGENT_LISTEN_ADDR=0.0.0.0:9083
+      - P2P_PROBE_IP=172.30.0.254
+      - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
+
+  btc-simnet-network-agent-node2:
+    build:
+      context: .
+      dockerfile: docker/tools.Dockerfile
+      target: network-agent
+    container_name: btc-simnet-network-agent-node2
+    restart: on-failure
+    network_mode: "service:btc-simnet-node2"
+    cap_drop: ["ALL"]
+    cap_add: ["NET_ADMIN"]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      btc-simnet-node2:
+        condition: service_started
+    environment:
+      - NETWORK_AGENT_NODE=node2
+      - NETWORK_AGENT_LISTEN_ADDR=0.0.0.0:9083
+      - P2P_PROBE_IP=172.30.0.254
+      - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
+
+  btc-simnet-network-agent-node3:
+    build:
+      context: .
+      dockerfile: docker/tools.Dockerfile
+      target: network-agent
+    container_name: btc-simnet-network-agent-node3
+    restart: on-failure
+    network_mode: "service:btc-simnet-node3"
+    cap_drop: ["ALL"]
+    cap_add: ["NET_ADMIN"]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      btc-simnet-node3:
+        condition: service_started
+    environment:
+      - NETWORK_AGENT_NODE=node3
+      - NETWORK_AGENT_LISTEN_ADDR=0.0.0.0:9083
+      - P2P_PROBE_IP=172.30.0.254
+      - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
+
   btc-simnet-mining-controller:
     build:
       context: .
@@ -220,19 +284,27 @@ services:
     networks:
       - btc-simnet-control
     environment:
-      - USER_ADDRESS=${USER_ADDRESS:-bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr}
+      - USER_ADDRESS=${USER_ADDRESS:-bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk}
       - BLOCK_INTERVAL_MEAN_SECS=${BLOCK_INTERVAL_MEAN_SECS:-15}
       - BLOCK_INTERVAL_MODE=${BLOCK_INTERVAL_MODE:-poisson}
-      - BLOCK_INTERVAL_MIN_SECS=${BLOCK_INTERVAL_MIN_SECS:-10}
-      - BLOCK_INTERVAL_MAX_SECS=${BLOCK_INTERVAL_MAX_SECS:-20}
+      # `-` (not `:-`) preserves an explicitly empty value, which means an
+      # unbounded clamp; an unset variable still gets the documented default.
+      - BLOCK_INTERVAL_MIN_SECS=${BLOCK_INTERVAL_MIN_SECS-10}
+      - BLOCK_INTERVAL_MAX_SECS=${BLOCK_INTERVAL_MAX_SECS-20}
       - MINER_WEIGHTS=${MINER_WEIGHTS:-}
       - MINING_RNG_SEED=${MINING_RNG_SEED:-}
+      # Private worker API: joined only to btc-simnet-control and never
+      # published to the host.
+      - MINING_CONTROL_LISTEN_ADDR=0.0.0.0:9081
+      - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
       - NODE2_WALLET_NAME=${NODE2_WALLET_NAME:-node2}
       - NODE3_WALLET_NAME=${NODE3_WALLET_NAME:-node3}
       - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
       - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
+      - FAUCET_WALLET_RESERVE_BTC=${FAUCET_WALLET_RESERVE_BTC:-600}
+      - FAUCET_MAX_REQUEST_BTC=${FAUCET_MAX_REQUEST_BTC:-100}
 
   btc-simnet-spammer:
     build:
@@ -255,12 +327,16 @@ services:
       - btc-simnet-control
     environment:
       - ENABLE_SPAM=${ENABLE_SPAM:-true}
-      # true = raw engine (spammer signs its own txs, immune to wallet
-      # fatigue); false = original node-wallet engine (sendtoaddress/sendmany)
+      # Pinned to the raw engine; the node-wallet engine is deprecated and a
+      # legacy false here is ignored with a warning.
       - USE_RAW_TX_SPAM=${USE_RAW_TX_SPAM:-true}
-      # Floor price level. Floor fills pay exactly this; DATA/HYBRID bulk
-      # spam pays a small premium so floor fills remain residual-gap sealers.
-      - FALLBACK_FEE=${FALLBACK_FEE:-0.0001}
+      # Spam floor price level (BTC/kvB). Floor fills pay exactly this;
+      # DATA/HYBRID bulk spam pays a small premium so floor fills remain
+      # residual-gap sealers. Distinct from the nodes' boot-time -fallbackfee.
+      - SPAM_FEE=${SPAM_FEE:-}
+      # Legacy migration only: when SPAM_FEE is unset, a set FALLBACK_FEE
+      # still seeds the spam fee (the spammer logs a warning to migrate).
+      - FALLBACK_FEE=${FALLBACK_FEE:-}
       # Fixed tx count for OUTPUT modes (sequential/batch) and the wallet
       # engine. Ignored in DATA/HYBRID mode (fill is driven by the ratio below).
       - SPAM_FIXED_TXS_PER_BLOCK=${SPAM_FIXED_TXS_PER_BLOCK:-100}
@@ -291,6 +367,10 @@ services:
       - SPAM_FANOUT_UTXOS=${SPAM_FANOUT_UTXOS:-50}
       - ENABLE_SPAM_REPLACES=${ENABLE_SPAM_REPLACES:-false}
       - SPAM_REPLACES_PER_MINER_PER_BLOCK=${SPAM_REPLACES_PER_MINER_PER_BLOCK:-5}
+      # Private resident-worker API; the process remains available when spam
+      # is disabled and this port is never published to the host.
+      - SPAM_CONTROL_LISTEN_ADDR=0.0.0.0:9082
+      - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
       - NODE2_WALLET_NAME=${NODE2_WALLET_NAME:-node2}
@@ -298,6 +378,7 @@ services:
       - NODE1_RPC_URL=${NODE1_RPC_URL:-http://btc-simnet-node1:18443}
       - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
       - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
+      - USER_ADDRESS=${USER_ADDRESS:-bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk}
 
   # ---------------------------------------------------------------------------
   # Reorg simulator (profile: reorg), one-shot by default, dies when done.
@@ -339,9 +420,9 @@ services:
       - REORG_ADDS_NEW_TXS=${REORG_ADDS_NEW_TXS:-5}
       # Percentage (0-100) of eligible orphaned wallet txs to permanently drop
       # by mining a same-input, different-output conflict into the replacement
-      # chain (0 disables; ignored for `empty` reorgs). Only reorg-node
-      # wallet-engine spam is eligible; with USE_RAW_TX_SPAM=true there may be
-      # nothing to conflict.
+      # chain (0 disables; ignored for `empty` reorgs). Only txs the reorg
+      # node's wallet can re-sign are eligible; raw-engine spam is signed with
+      # external keys, so there is usually nothing to conflict.
       - REORG_DOUBLE_SPEND_PCT=${REORG_DOUBLE_SPEND_PCT:-0}
       # Passed through so the reorg tool can warn when permanent-drop mode is
       # requested against raw-engine spam, whose keys its wallet cannot sign.
@@ -352,6 +433,89 @@ services:
       # Node polled after the reorg to confirm the network adopted the new
       # chain (extra blocks are mined until it does); "none" disables
       - REORG_WITNESS_NODE=${REORG_WITNESS_NODE:-btc-simnet-node1}
+
+  # ---------------------------------------------------------------------------
+  # Simchain control plane (part of ordinary startup).
+  # Browser UI, versioned HTTP API and MCP endpoint on
+  # http://localhost:${CONTROL_PLANE_PORT:-8090}. Mining and spam state and
+  # policy use private worker APIs; mutation jobs use worker/network leases
+  # plus Bitcoin RPC. It has no Docker API and sees only its narrow named
+  # state volume.
+  # ---------------------------------------------------------------------------
+  btc-simnet-control-plane:
+    build:
+      context: .
+      dockerfile: docker/tools.Dockerfile
+      target: control-plane
+    container_name: btc-simnet-control-plane
+    restart: on-failure
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - control-state:/var/lib/simchain-control
+    ports:
+      - "127.0.0.1:${CONTROL_PLANE_PORT:-8090}:8080"
+    depends_on:
+      btc-simnet-node1:
+        condition: service_healthy
+      btc-simnet-network-agent-node1:
+        condition: service_started
+      btc-simnet-network-agent-node2:
+        condition: service_started
+      btc-simnet-network-agent-node3:
+        condition: service_started
+      btc-simnet-mining-controller:
+        condition: service_started
+      btc-simnet-spammer:
+        condition: service_started
+    networks:
+      - btc-simnet-control
+    environment:
+      - SIMCHAIN_CONTROL_STATE_DIR=/var/lib/simchain-control
+      - CONTROL_PLANE_LISTEN_ADDR=0.0.0.0:8080
+      - MINING_CONTROL_URL=http://btc-simnet-mining-controller:9081
+      - SPAM_CONTROL_URL=http://btc-simnet-spammer:9082
+      - NODE1_NETWORK_AGENT_URL=http://btc-simnet-node1:9083
+      - NODE2_NETWORK_AGENT_URL=http://btc-simnet-node2:9083
+      - NODE3_NETWORK_AGENT_URL=http://btc-simnet-node3:9083
+      - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
+      # Optional pre-set API token; the default matches simchainctl's local
+      # fallback and is for localhost development only.
+      - CONTROL_PLANE_API_TOKEN=${CONTROL_PLANE_API_TOKEN:-simchain-control-dev-token}
+      - BTC_RPC_USER=${BTC_RPC_USER:-foo}
+      - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
+      - NODE1_RPC_URL=${NODE1_RPC_URL:-http://btc-simnet-node1:18443}
+      - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
+      - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
+      # Initial runtime policy. After state.json is created, durable desired
+      # state in the narrow mount is authoritative across restarts.
+      - BLOCK_INTERVAL_MEAN_SECS=${BLOCK_INTERVAL_MEAN_SECS:-15}
+      - BLOCK_INTERVAL_MODE=${BLOCK_INTERVAL_MODE:-poisson}
+      - BLOCK_INTERVAL_MIN_SECS=${BLOCK_INTERVAL_MIN_SECS-10}
+      - BLOCK_INTERVAL_MAX_SECS=${BLOCK_INTERVAL_MAX_SECS-20}
+      - MINER_WEIGHTS=${MINER_WEIGHTS:-}
+      - MINING_RNG_SEED=${MINING_RNG_SEED:-}
+      - ENABLE_SPAM=${ENABLE_SPAM:-true}
+      - USE_RAW_TX_SPAM=${USE_RAW_TX_SPAM:-true}
+      - SPAM_FEE=${SPAM_FEE:-}
+      # The nodes' boot-time -fallbackfee, mirrored here for the dashboard's
+      # read-only label and for legacy SPAM_FEE seeding.
+      - FALLBACK_FEE=${FALLBACK_FEE:-0.0001}
+      - SPAM_FIXED_TXS_PER_BLOCK=${SPAM_FIXED_TXS_PER_BLOCK:-100}
+      - SPAM_SENDMANY_OUTPUTS=${SPAM_SENDMANY_OUTPUTS:-0}
+      - SPAM_TX_DATA_MAX_BYTES=${SPAM_TX_DATA_MAX_BYTES:-90000}
+      - SPAM_TX_DATA_MIN_BYTES=${SPAM_TX_DATA_MIN_BYTES:-250}
+      - SPAM_SMALL_TXS_PER_BLOCK=${SPAM_SMALL_TXS_PER_BLOCK:-0}
+      - SPAM_FLOOR_POOL_TXS=${SPAM_FLOOR_POOL_TXS:-4000}
+      - SPAM_FILL_BLOCK_RATIO=${SPAM_FILL_BLOCK_RATIO:-2.0}
+      - SPAM_FANOUT_AUTO=${SPAM_FANOUT_AUTO:-true}
+      - SPAM_FANOUT_UTXOS=${SPAM_FANOUT_UTXOS:-50}
+      - ENABLE_SPAM_REPLACES=${ENABLE_SPAM_REPLACES:-false}
+      - SPAM_REPLACES_PER_MINER_PER_BLOCK=${SPAM_REPLACES_PER_MINER_PER_BLOCK:-5}
+      - MEMPOOL_WEB_PORT=${MEMPOOL_WEB_PORT:-1080}
+      - MEMPOOL_WEB_URL=${MEMPOOL_WEB_URL:-}
+      - MEMPOOL_WEB_INTERNAL_URL=http://mempool-web:8080
 
   # ---------------------------------------------------------------------------
   # Tools: electrs (profiles: electrs, mempool, all-tools)
@@ -412,6 +576,12 @@ services:
       CORE_RPC_PORT: "18443"
       CORE_RPC_USERNAME: ${BTC_RPC_USER:-foo}
       CORE_RPC_PASSWORD: ${BTC_RPC_PASS:-rpcpassword}
+      NODE2_RPC_HOST: "btc-simnet-node2"
+      NODE2_RPC_PORT: "18443"
+      NODE2_WALLET_NAME: ${NODE2_WALLET_NAME:-node2}
+      NODE3_RPC_HOST: "btc-simnet-node3"
+      NODE3_RPC_PORT: "18443"
+      NODE3_WALLET_NAME: ${NODE3_WALLET_NAME:-node3}
       DATABASE_ENABLED: "true"
       DATABASE_HOST: "mempool-db"
       DATABASE_DATABASE: "mempool"
@@ -419,6 +589,8 @@ services:
       DATABASE_PASSWORD: ${MEMPOOL_DB_PASS:-mempool}
       STATISTICS_ENABLED: "true"
     depends_on:
+      btc-simnet-mining-controller:
+        condition: service_started
       mempool-db:
         condition: service_healthy
       electrs:
@@ -426,7 +598,15 @@ services:
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 5s
-    command: "./wait-for-it.sh mempool-db:3306 --timeout=720 --strict -- ./start.sh"
+    volumes:
+      - ./docker/mempool-pool-seeder.js:/patch/mempool-pool-seeder.js:ro
+    command: >
+      ./wait-for-it.sh mempool-db:3306 --timeout=720 --strict --
+      bash -lc 'cd /backend;
+      ./start.sh & server_pid=$$!;
+      cd /backend/package;
+      node /patch/mempool-pool-seeder.js &
+      wait "$$server_pid"'
     networks:
       - btc-simnet-control
 
@@ -448,47 +628,3 @@ services:
     stop_grace_period: 10s
     networks:
       - btc-simnet-control
-
-  # ---------------------------------------------------------------------------
-  # P2P latency/loss helpers (profile: partition), run on demand by netem.sh.
-  # Each helper shares a node's network namespace, but only the short-lived
-  # helper receives NET_ADMIN. No helper joins a network independently.
-  # ---------------------------------------------------------------------------
-  btc-simnet-netem-node1:
-    profiles: ["partition"]
-    build:
-      context: .
-      dockerfile: docker/netem.Dockerfile
-    network_mode: "service:btc-simnet-node1"
-    cap_add: ["NET_ADMIN"]
-    environment:
-      - P2P_PEER_ALIAS=node2-p2p
-    depends_on:
-      btc-simnet-node1:
-        condition: service_started
-
-  btc-simnet-netem-node2:
-    profiles: ["partition"]
-    build:
-      context: .
-      dockerfile: docker/netem.Dockerfile
-    network_mode: "service:btc-simnet-node2"
-    cap_add: ["NET_ADMIN"]
-    environment:
-      - P2P_PEER_ALIAS=node1-p2p
-    depends_on:
-      btc-simnet-node2:
-        condition: service_started
-
-  btc-simnet-netem-node3:
-    profiles: ["partition"]
-    build:
-      context: .
-      dockerfile: docker/netem.Dockerfile
-    network_mode: "service:btc-simnet-node3"
-    cap_add: ["NET_ADMIN"]
-    environment:
-      - P2P_PEER_ALIAS=node1-p2p
-    depends_on:
-      btc-simnet-node3:
-        condition: service_started

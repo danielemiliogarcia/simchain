@@ -68,7 +68,7 @@ BTC_RPC_USER="$(resolve BTC_RPC_USER foo)"
 BTC_RPC_PASS="$(resolve BTC_RPC_PASS rpcpassword)"
 NODE2_WALLET_NAME="$(resolve NODE2_WALLET_NAME node2)"
 NODE3_WALLET_NAME="$(resolve NODE3_WALLET_NAME node3)"
-USER_ADDRESS="$(resolve USER_ADDRESS bcrt1qtmjqjf4t0mcts4jw9hvm54nl2rhjyeclntf3rr)"
+USER_ADDRESS="$(resolve USER_ADDRESS bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk)"
 NODE1_DISABLE_WALLET="$(resolve NODE1_DISABLE_WALLET 1)"
 
 bcli() {

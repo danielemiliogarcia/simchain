@@ -27,6 +27,22 @@ No open findings from the last review remain.
   heterogeneous network (the compose file already declares each node in full to
   allow this)
 
+### Walletless mainnet transaction fixture importer
+
+**Status (2026-07-17): planned/design only** — full design in
+[raw-transaction-fixture-importer-plan.md](raw-transaction-fixture-importer-plan.md).
+
+Import selected mainnet transactions as Simchain-valid raw transaction fixtures without
+using node wallets. The importer would fetch source transactions from a mainnet node,
+preserve useful artifacts such as OP_RETURN data, witness payloads, script shape, value
+layout, and fee/weight profile where possible, replace inputs with Simchain-funded UTXOs,
+rewrite spendable outputs to fixture-owned regtest keys, sign raw transactions, broadcast
+them, and return a manifest mapping source txids to Simchain txids plus the external
+spend authority needed by user tests.
+
+This is not a mainnet fork and cannot preserve original txids after sanitization; it is a
+way to replay interesting transaction artifacts under controlled regtest funds.
+
 
 # Simchain Nice-to-have Features
 
@@ -36,71 +52,12 @@ that allows to defining mining pace, block filling and fee rates.
 It consists on: multiple P2P-connected nodes, rotating miners,
 a non-mining full node as the user endpoint, non-empty blocks, and user-controlled
 parameters (block time, tx per block, reorgs, ...). This document gathers all the known
-limitations and future enhancements, plus two bigger proposed features with their
-rationale and an implementation plan, and a section for parked features.
+limitations and future enhancements, and a section for parked features.
 
-## 1. Declarative scenario engine
+### Chaos monkey mode
 
-**What:** A `scenario.yml` interpreted by a small controller container: an ordered list of
-steps like *"at height 150 reorg 2 blocks"*, *"pause mining 120s"*, *"burst 500 txs"*,
-*"partition node3 for 3 blocks, then heal"*. A `scenario` compose profile runs it.
-
-**Why it's a nice-to-have:** Today reproducing a test case means hand-running
-`bitcoin-cli`/reorg commands in the right order at the right time. A scenario file makes
-chain histories **reproducible and shareable**, a bug report can include the exact
-scenario that triggers it, and downstream projects can pin scenarios in CI ("our indexer
-must survive `reorg-during-sync.yml`"). This turns simchain from an environment into a
-test harness.
-
-**Implementation plan:**
-1. Define a minimal step schema: `at: {height|time}`, `action:
-   {mine, pause_mining, reorg, spam_burst, disconnect, connect}`, `params: {...}`.
-2. Implement an interpreter (Rust to match the repo, or Python for speed of iteration)
-   that polls node1 height and drives the existing pieces over RPC; reuse the
-   `reorg` crate's logic for the reorg action.
-3. Coordinate with the mining controller via a simple flag: either the scenario engine
-   *replaces* it (`MINING_MODE=scenario`), or exposes pause/resume through a tiny control
-   file/HTTP endpoint the controller checks each loop.
-4. Ship 2–3 example scenarios in `scenarios/`; add compose service with
-   `profiles: ["scenario"]` mounting the chosen file.
-
-Effort: the largest item here, but mostly glue around already-existing capabilities.
-
----
-
-## 2. Dashboard / control panel
-
-**What:** A small web UI (one container, compose profile `panel`, localhost-only) that
-shows live chain state (height, block cadence, mempool depth/fees, current settings)
-and lets the user change the tool settings — block cadence, miner weights, fee floor,
-fill ratio, spam mode — and apply them with one click. Applying means rewriting the
-values in `.env` and force-recreating only the affected service(s), i.e. automating
-the manual flow documented in README "Retuning a live chain".
-
-**Why it's a nice-to-have:** Retuning a live chain today means editing `.env` by hand
-and knowing which compose service consumes which variable. That works, but a panel
-makes the knobs discoverable, removes the docker knowledge requirement for teammates
-using the simnet, and turns "try 3 different fee floors" from minutes of shell
-round-trips into seconds. It also gives one place to watch the effect (mempool
-histogram, block fullness) right next to the control that caused it.
-
-**Implementation plan:**
-1. Container with the project's `.env` bind-mounted and access to the Docker API
-   (mounted `docker.sock` + docker CLI with the compose plugin) to run
-   `docker compose up -d --force-recreate <service>`.
-2. Backend (Rust axum to match the stack) that reads current values from `.env` plus
-   defaults, validates edits, writes `.env`, and recreates only the services that
-   consume the changed variables (the variable→service mapping is static, taken from
-   docker-compose.yml).
-3. Status pane fed by node1 RPC: height, last blocks with tx counts, mempool size and
-   fee histogram, observed block interval.
-4. Security: `docker.sock` is root-equivalent on the host, so bind the panel to
-   localhost only and keep it out of the default profile.
-
-Effort: medium (UI plus a thin compose/RPC glue layer; no changes to the existing
-tools).
-
----
+### Rebalance spammer <-> faucet
+see [rebalance-plan.md](rebalance-plan.md)
 
 ## Parked features
 
@@ -133,6 +90,6 @@ reproduce with the "tx per block" knob. Pairs well with the shipped Poisson bloc
 - Build from sources instead of downloading binaries
 
 Multi-platform
-- convert all bash scripts to rust compilable binaries, so its muti platform, or run the scripts indise an sphimeral container connected with networks and volumes?
+- convert all bash scripts to rust compilable binaries, so its muti platform, or run the scripts inside an ephemeral containers connected with networks and volumes?
 - save snapshots in a muti-platform format instead of .tar
 - at snapshots save also mempool-space elctrs data? so we do not loose stale blocks caused by reorgs?

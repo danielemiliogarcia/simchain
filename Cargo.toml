@@ -2,8 +2,12 @@
 members = [
     "crates/simchain-common",
     "crates/mining-controller",
+    "crates/network-agent",
+    "crates/control-plane",
+    "crates/simchainctl",
     "crates/reorg",
     "crates/spammer",
+    "crates/scenario-engine",
 ]
 resolver = "2"
 

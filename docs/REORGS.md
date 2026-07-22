@@ -1,6 +1,15 @@
 # Simulating Reorgs
 
-The reorg simulator (a Rust container using only bitcoind RPC calls) invalidates the last *N* blocks on a miner node and mines *N+1* replacements, so the new chain is strictly longer and **the whole network reorgs to it**. Transactions from the orphaned blocks fall back to the mempool; each replacement block is filled by re-reading the mempool live and mining a slice of it with `generateblock`, like the winning chain of a real reorg, so reorged blocks are not empty. Reading the mempool fresh for each block means an RBF replacement that evicts an orphaned tx mid-reorg (e.g. with `ENABLE_SPAM_REPLACES=true`) is picked up automatically. On top of the returned txs it seeds `REORG_ADDS_NEW_TXS` fresh wallet transactions into the mempool first, modelling a node that received transactions its peers have not yet seen. It prints each block's hash and tx count before/after plus a replaced-blocks summary.
+The reorg engine uses only Bitcoin RPC. It invalidates the last *N* blocks on a miner
+node and mines *N+1* replacements, so the new chain is strictly longer and **the whole
+network reorgs to it**. Transactions from the orphaned blocks fall back to the mempool;
+each replacement block is filled by re-reading the mempool live and mining a slice of
+it with `generateblock`, like the winning chain of a real reorg, so reorged blocks are
+not empty. Reading the mempool fresh for each block means an RBF replacement that evicts
+an orphaned tx mid-reorg (for example, with `ENABLE_SPAM_REPLACES=true`) is picked up
+automatically. On top of the returned txs it can seed fresh wallet transactions,
+modelling a node that received transactions its peers have not yet seen. Results include
+each block's hash and transaction count plus a replaced-blocks summary.
 
 When fresh transactions are injected, the log includes the number created and one
 sample txid. Search that txid in the explorer (or with Bitcoin Core RPC) to verify
@@ -10,15 +19,43 @@ queryable by their old hash (unless the node is pruned or its volumes are delete
 The explorer's height timeline shows only the active chain, so retain the logged old
 hash when you want to inspect a replaced block directly.
 
-## One-Shot Reorg
+## Control-plane reorg job
 
-Pass `empty` to mine **empty** replacement blocks instead (a chaos reorg that leaves the orphaned txs unconfirmed): `./scripts/simulate-reorg.sh 3 empty`. It is a per-run argument, not a setting, so a real reorg and an empty one can be issued against the same running chain.
+The primary operator path is a durable control-plane job. Start the ordinary stack,
+then use the dashboard or the thin HTTP CLI:
 
 ```bash
-./scripts/simulate-reorg.sh 3
-# equivalent to:
+docker compose up -d --build
+cargo run -p simchainctl -- reorg start --depth 3 --wait
+cargo run -p simchainctl -- reorg start --depth 3 --empty --wait
+cargo run -p simchainctl -- jobs list --json
+# Convenience wrapper over the same job API:
+./scripts/simulate-reorg.sh start 3 empty
+```
+
+The server permits one chain-mutating job at a time. Before invalidating history it
+acquires acknowledged pause leases from spam and mining; those leases preserve each
+worker's manual desired state. It holds them through a required node1 convergence
+witness and releases spam first so chain-derived pools reconcile while mining is still
+paused. Job metadata, progress events, primary result/failure, and cleanup outcome are
+reported separately. Closing a client does not cancel the job. `jobs abort` is
+cooperative: before invalidation it stops cleanly, while after invalidation it completes
+the minimum safe rewrite and convergence before cleanup.
+
+For retry-safe automation, HTTP callers can send `Idempotency-Key`; reusing a key with
+the same normalized request returns the original job. A different request with the same
+key is rejected.
+
+## Standalone one-shot tool
+
+The standalone direct-RPC binary/profile is useful for one-off low-level testing. Pass
+`empty` to mine **empty** replacement blocks instead (a chaos reorg that leaves the orphaned txs
+unconfirmed). Unlike the control-plane job, this path does not own worker leases and its
+witness remains best-effort, so normal interactive and CI use should prefer the job API.
+
+```bash
 docker compose run --rm btc-simnet-reorg 3     # depth defaults to REORG_DEPTH (3)
-./scripts/simulate-reorg.sh 3 empty            # chaos: mine empty replacement blocks
+docker compose run --rm btc-simnet-reorg 3 empty  # chaos: mine empty replacements
 ```
 
 ## Permanent Drop (double-spend)
@@ -26,8 +63,10 @@ docker compose run --rm btc-simnet-reorg 3     # depth defaults to REORG_DEPTH (
 By default a reorg re-mines the orphaned transactions with the **same txids**, so a user's transaction only changes block hash/height, it never loses a confirmation. The `empty` mode above models the *temporary* drop (confirmed → 0-conf, re-confirmable). `REORG_DOUBLE_SPEND_PCT=1..100` models the *permanent* drop: for that percentage of the **eligible orphaned wallet txs on the reorg node**, the tool mines a same-input, different-output conflict into the replacement chain, so the originals become permanently invalid and can never re-confirm. This is the outcome exchanges, custody watchers and payment processors must detect: *"my confirmed deposit is gone forever."*
 
 ```bash
-REORG_DOUBLE_SPEND_PCT=100 ./scripts/simulate-reorg.sh 3        # drop all eligible
-REORG_DOUBLE_SPEND_PCT=50  ./scripts/simulate-reorg.sh 3        # drop half, re-mine the rest
+REORG_DOUBLE_SPEND_PCT=100 ./scripts/simulate-reorg.sh start 3  # drop all eligible
+REORG_DOUBLE_SPEND_PCT=50  ./scripts/simulate-reorg.sh start 3  # drop half, re-mine the rest
+# Direct CLI equivalent:
+cargo run -p simchainctl -- reorg start --depth 3 --double-spend-pct 100 --wait
 ```
 
 It logs the configured percentage, the eligible/selected counts, and every `old_txid -> new_txid` pair (with how many descendants each replacement pruned), so the drop is auditable.
@@ -48,13 +87,15 @@ ordered by oldest orphaned block first and then by their original transaction or
 Eligibility is based on whether the configured wallet can sign, not on whether a
 transaction was semantically created as spam.
 
-Only transactions whose keys are available to the reorg wallet qualify. The default
-raw spam engine (`USE_RAW_TX_SPAM=true`) signs with keys that wallet does not hold, so
-stock settings usually produce zero eligible transactions. Set
-`USE_RAW_TX_SPAM=false` to use wallet-engine spam. If the percentage is above zero,
-raw spam is enabled, and the orphaned window has zero eligible transactions, the tool
-emits a highlighted warning explaining the mismatch. Transactions signed by external
-user keys are likewise ineligible; their conflict must be supplied separately.
+Only transactions whose keys are available to the reorg wallet qualify. Raw-engine
+spam signs with keys that wallet does not hold, so stock settings usually produce
+zero eligible transactions — and the node-wallet engine that produced eligible spam
+is deprecated and no longer selectable. If the percentage is above zero and the
+orphaned window has zero eligible transactions, the tool emits a highlighted
+warning explaining the mismatch. Transactions signed by external user keys are
+likewise ineligible; their conflict must be supplied separately. Making
+double-spends work against raw-engine spam is planned (see
+`docs/reorg-double-spend-raw-engine-plan.md`).
 
 ### Why conflicts are mined directly
 
@@ -77,9 +118,18 @@ dependent descendants are gone. A zero-eligible result does not fail the reorg: 
 ordinary replacement chain is still mined and the reason is logged.
 
 `REORG_DOUBLE_SPEND_PCT` is ignored in `empty` mode, because that mode mines no
-transactions. Transactions created through `REORG_ADDS_NEW_TXS` are injected after
-invalidation and therefore are not double-spend candidates during that same run.
-Witness-based chain adoption and mining-controller behavior are unaffected.
+transactions. DATA/HYBRID raw spam contributes no eligible transactions because its
+keys live outside the node wallet. Eligibility can still be nonzero when the orphaned
+window contains a node-wallet payment, a faucet transaction funded by that miner
+wallet, or `REORG_ADDS_NEW_TXS` transactions mined by an earlier reorg. Transactions
+created through `REORG_ADDS_NEW_TXS` are injected after invalidation and then
+prioritized into the explicit replacement-block transaction lists before ordinary
+returned mempool transactions fill the remaining space, so they are not double-spend
+candidates during that same run. Witness-based chain adoption and mining-controller
+behavior are unaffected. The result reports requested, created, and mined
+fresh-transaction counts. A non-empty reorg fails after restoring a safe converged
+chain if any requested fresh transaction could not be created or is missing from the
+winning chain; it never silently reports a partial request as successful.
 
 ## Continuous Reorgs
 

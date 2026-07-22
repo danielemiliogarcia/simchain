@@ -1,0 +1,134 @@
+version: 1
+steps:
+  - type: set_config
+    settings:
+      BLOCK_INTERVAL_MODE: poisson
+      BLOCK_INTERVAL_MEAN_SECS: 15
+      BLOCK_INTERVAL_MIN_SECS: 10
+      BLOCK_INTERVAL_MAX_SECS: 20
+      ENABLE_SPAM: true
+      SPAM_FILL_BLOCK_RATIO: 3
+      SPAM_FEE: 0.0005
+
+  - type: assert_config
+    effective: true
+    settings:
+      BLOCK_INTERVAL_MODE: poisson
+      BLOCK_INTERVAL_MEAN_SECS: 15
+      BLOCK_INTERVAL_MIN_SECS: 10
+      BLOCK_INTERVAL_MAX_SECS: 20
+      ENABLE_SPAM: true
+      SPAM_FILL_BLOCK_RATIO: 3
+      SPAM_FEE: 0.0005
+
+  - type: wait_height
+    height: 204
+
+  - type: wait_until
+    timeout_secs: 60
+    condition:
+      kind: height_at_least
+      height: 204
+
+  - type: wait_until
+    timeout_secs: 60
+    condition:
+      kind: mempool_txs_at_least
+      count: 1
+
+  - type: wait_until
+    timeout_secs: 60
+    condition:
+      kind: mempool_txs_at_most
+      count: 100000
+
+  - type: wait_until
+    timeout_secs: 60
+    condition:
+      kind: component
+      component: spam
+      reachable: true
+      status: active
+
+  - type: assert_height
+    at_least: 204
+
+  - type: assert_component
+    component: mining
+    reachable: true
+    status: running
+    phase: running
+    desired_state: running
+    effective_state: running
+    observed_height_at_least: 204
+
+  - type: assert_component
+    component: network-agent-node2
+    reachable: true
+    status: clear
+    active_lease_count: 0
+
+  - type: sleep
+    secs: 1
+
+  - type: checkpoint
+    name: all_features_ready
+    timeout_secs: 600
+
+  - type: spam_burst
+    node: node2
+    txs: 1
+    outputs_per_tx: 0
+
+  - type: faucet
+    source: auto
+    wait_confirmed: true
+    timeout_secs: 900
+    outputs:
+      - address_env: SCENARIO_ALL_FEATURES_ADDRESS
+        amount: 10000sat
+
+  - type: pause_mining
+
+  - type: mine
+    node: node2
+    blocks: 1
+
+  - type: resume_mining
+
+  - type: reorg
+    depth: 1
+    empty: true
+    node: node3
+
+  - type: reorg
+    depth: 1
+    empty: false
+    node: node3
+    adds_new_txs: 1
+    double_spend_pct: 1
+
+  - type: partition
+    node: node3
+    main_blocks: 3
+    isolated_blocks: 4
+
+  - type: degrade
+    node: node2
+    delay_ms: 50
+    seconds: 2
+
+  - type: degrade
+    node: node3
+    delay_ms: 25
+    until_height: 204
+
+  - type: assert_component
+    component: mining
+    reachable: true
+    effective_state: running
+
+  - type: assert_component
+    component: spam
+    reachable: true
+    effective_state: running

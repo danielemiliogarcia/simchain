@@ -24,6 +24,15 @@ env:
 # resolving fresh versions.
 
 jobs:
+  compose-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate no-socket control boundary
+        run: ./scripts/check-compose-security.sh
+      - name: Build images and inspect control-plane rootfs
+        run: ./scripts/check-docker-images.sh
+
   build-all:
     runs-on: ubuntu-latest
     steps:

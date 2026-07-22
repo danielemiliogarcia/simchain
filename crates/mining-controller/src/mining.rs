@@ -2,11 +2,14 @@
 //! poisson block intervals, with reorg and external-block reporting.
 
 use crate::chain_view::{sync_view, ChainView, REORG_WINDOW};
-use crate::config::MiningConfig;
+use crate::control::{now_ms, IntervalWait, MiningControl};
 use crate::rng::Rng;
 use bitcoincore_rpc::{bitcoin::Address, Client, RpcApi};
+use simchain_common::internal_api::LastMinedBlock;
+use simchain_common::live_tuning::MiningTuning;
 use simchain_common::{rpc_retry, wait_for_height};
-use std::{thread, time::Duration};
+use std::sync::Arc;
+use std::time::Duration;
 
 // Continuous mining loop. The controller remembers the recent chain --
 // heights, hashes, and which blocks it mined itself -- so a reorg (the
@@ -17,20 +20,13 @@ use std::{thread, time::Duration};
 // generate_to_address already does that -- so detection only makes the
 // events visible here; nothing needs to be controlled.
 pub fn run(
-    seed: u64,
+    control: Arc<MiningControl>,
     mut rng: Rng,
     node2: &Client,
     node3: &Client,
     addr2: &Address,
     addr3: &Address,
 ) -> ! {
-    let config = MiningConfig::global();
-    let mean_secs = config.mean_secs;
-    let poisson = config.interval_mode.is_poisson();
-    let interval_bounds = config.interval_bounds;
-    let miner_weights = config.miner_weights;
-    let stochastic = poisson || miner_weights.is_some();
-
     let mut view = ChainView::new();
     let mut last = rpc_retry("get initial mining-loop block count", || {
         node2.get_block_count()
@@ -45,43 +41,33 @@ pub fn run(
         }
     }
 
-    let bounds_description = interval_bounds.description();
-    let interval_description = if poisson {
-        format!("poisson mean={mean_secs}s, bounds={}", bounds_description)
-    } else {
-        format!("fixed {mean_secs}s")
-    };
-    let weights_description = match miner_weights {
-        Some(weights) => format!("{},{} (node2,node3)", weights.node2, weights.node3),
-        None => "alternate".to_string(),
-    };
-    if stochastic {
-        tracing::info!(
-            "Mining config: interval={interval_description}, weights={weights_description}, rng_seed={seed}"
-        );
-    } else {
-        tracing::info!(
-            "Mining config: interval={interval_description}, weights={weights_description}"
-        );
-    }
-
     let mut toggle = true;
+    // Force the scheduler-local RNG/toggle state to be initialized from the
+    // effective policy even when a control-plane reconciliation landed
+    // during bootstrap.
+    let mut observed_generation = u64::MAX;
+    let mut logged_generation = u64::MAX;
     loop {
-        let start_time = std::time::Instant::now();
+        let policy = control.mining_safe_point(&mut rng, &mut toggle, &mut observed_generation);
+        let generation = control.current_generation();
+        if logged_generation != generation {
+            log_policy(&policy, generation, control.status().effective_rng_seed);
+            logged_generation = generation;
+        }
 
-        let target = if poisson {
-            let sampled = rng.next_exp(mean_secs as f64);
-            let target_secs = interval_bounds.apply(sampled);
-            tracing::info!(
-                "TIMING sampled interval {sampled:.2}s, target {target_secs:.2}s (poisson, mean {mean_secs}s, bounds={})",
-                bounds_description
-            );
-            Duration::from_secs_f64(target_secs)
-        } else {
-            Duration::from_secs(mean_secs)
-        };
+        // Preserve the original cadence semantics: generate immediately,
+        // then wait only the unused portion of this sampled interval. RPC and
+        // propagation time therefore count toward block spacing.
+        let interval_started = std::time::Instant::now();
+        let target = next_interval(&policy, &mut rng);
 
-        let pick_node2 = match miner_weights {
+        // Re-enter after sampling. A policy update here resets the RNG and
+        // must resample rather than use an interval from the old generation.
+        let policy = control.mining_safe_point(&mut rng, &mut toggle, &mut observed_generation);
+        if control.current_generation() != generation {
+            continue;
+        }
+        let pick_node2 = match policy.miner_weights {
             Some(weights) => rng.next_below(weights.total) < weights.node2,
             None => toggle,
         };
@@ -95,15 +81,21 @@ pub fn run(
         // externally mined blocks that appeared since the last round.
         last = sync_view(&mut view, miner, last);
 
+        if !control.begin_generate(generation) {
+            continue;
+        }
         let mined = match miner.generate_to_address(1, addr) {
             Ok(mined) => mined,
             Err(error) => {
-                tracing::warn!("{name} => Block generation failed ({error}), retrying next round");
+                let message = format!("{name} block generation failed: {error}");
+                tracing::warn!("{message}; retrying next round");
+                control.record_error(message);
+                control.finish_generate(None, Some(last));
                 // Do not re-issue a timed-out generate: it may have mined a
                 // block. The next sync_view re-derives live chain state. Such
                 // a block is reported as EXTERNAL because its returned hash
                 // was never available for attribution to this controller.
-                thread::sleep(Duration::from_secs(2));
+                let _ = control.wait_interval(Duration::from_secs(2), generation);
                 continue;
             }
         };
@@ -118,12 +110,58 @@ pub fn run(
         view.record(mined_height, hash, true);
         last = last.max(mined_height);
         wait_for_height(other, mined_height, Duration::from_millis(100));
+        control.finish_generate(
+            Some(LastMinedBlock {
+                height: mined_height,
+                hash: hash.to_string(),
+                miner: name.to_string(),
+                mined_at_ms: now_ms(),
+            }),
+            Some(mined_height),
+        );
 
         toggle = !toggle;
-
-        let elapsed = start_time.elapsed();
-        if elapsed < target {
-            thread::sleep(target - elapsed);
+        let elapsed = interval_started.elapsed();
+        if elapsed < target
+            && control.wait_interval(target - elapsed, generation) == IntervalWait::Interrupted
+        {
+            continue;
         }
     }
+}
+
+fn next_interval(policy: &MiningTuning, rng: &mut Rng) -> Duration {
+    if policy.interval_mode.is_poisson() {
+        let sampled = rng.next_exp(policy.mean_secs as f64);
+        let target_secs = policy.interval_bounds.apply(sampled);
+        tracing::info!(
+            "TIMING sampled interval {sampled:.2}s, target {target_secs:.2}s (poisson, mean {}s, bounds={})",
+            policy.mean_secs,
+            policy.interval_bounds.description()
+        );
+        Duration::from_secs_f64(target_secs)
+    } else {
+        Duration::from_secs(policy.mean_secs)
+    }
+}
+
+fn log_policy(policy: &MiningTuning, generation: u64, seed: u64) {
+    let interval = if policy.interval_mode.is_poisson() {
+        format!(
+            "poisson mean={}s, bounds={}",
+            policy.mean_secs,
+            policy.interval_bounds.description()
+        )
+    } else {
+        format!("fixed {}s", policy.mean_secs)
+    };
+    let weights = policy.miner_weights.map_or_else(
+        || "alternate".to_string(),
+        |weights| format!("{},{} (node2,node3)", weights.node2, weights.node3),
+    );
+    tracing::info!(
+        generation,
+        seed,
+        "Mining config: interval={interval}, weights={weights}"
+    );
 }
