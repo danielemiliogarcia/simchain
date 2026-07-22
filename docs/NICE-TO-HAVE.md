@@ -56,6 +56,9 @@ limitations and future enhancements, and a section for parked features.
 
 ### Chaos monkey mode
 
+### Rebalance spammer <-> faucet
+see [rebalance-plan.md](rebalance-plan.md)
+
 ## Parked features
 
 Designed but deliberately not built. Each entry records why it is parked and what would
