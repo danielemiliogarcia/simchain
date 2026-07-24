@@ -244,6 +244,14 @@ mod tests {
             .collect();
         assert!(branch_fanout_candidates(&branches, Amount::from_sat(1_000), 50, None,).is_empty());
     }
+
+    #[test]
+    fn surplus_capacity_is_never_rebalanced_down() {
+        assert_eq!(
+            branch_provisioning_action(100, 50, 75, false, false),
+            BranchProvisioningAction::Ready
+        );
+    }
 }
 
 // The three spam-tx shapes the engine builds. The shape is enough to recompute

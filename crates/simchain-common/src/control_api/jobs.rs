@@ -10,6 +10,7 @@ pub enum JobKind {
     Partition,
     Degrade,
     Mine,
+    SpamPrepare,
     SpamBurst,
 }
 
@@ -22,6 +23,7 @@ impl JobKind {
             Self::Partition => "partition",
             Self::Degrade => "degrade",
             Self::Mine => "mine",
+            Self::SpamPrepare => "spam_prepare",
             Self::SpamBurst => "spam_burst",
         }
     }
@@ -111,6 +113,8 @@ pub struct PartitionJobRequest {
     pub node: String,
     pub main_blocks: u64,
     pub isolated_blocks: u64,
+    #[serde(default)]
+    pub heal_delay_secs: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -262,7 +266,18 @@ fn is_false(value: &bool) -> bool {
 pub struct JobListResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_job_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_jobs: Vec<ActiveJobSummary>,
     pub jobs: Vec<JobSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActiveJobSummary {
+    pub job_id: String,
+    pub kind: JobKind,
+    pub lane: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

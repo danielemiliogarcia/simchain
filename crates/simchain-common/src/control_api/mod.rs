@@ -19,11 +19,11 @@ pub use faucet::{
     FAUCET_MAX_TX_VBYTES, FAUCET_PRIORITY_DELTA_SATS, FAUCET_PRIORITY_DOMINANCE_FACTOR,
 };
 pub use jobs::{
-    AbortJobResponse, CheckpointState, CleanupState, DegradeJobRequest, JobCheckpoint,
-    JobCheckpointResponse, JobCleanup, JobCreatedResponse, JobDetail, JobEvent, JobEventsResponse,
-    JobFailure, JobKind, JobLease, JobListResponse, JobState, JobSummary, MineJobRequest,
-    PartitionJobRequest, ReleaseCheckpointRequest, ReorgJobRequest, ScenarioJobRequest,
-    ScenarioStepStatus, SpamBurstJobRequest,
+    AbortJobResponse, ActiveJobSummary, CheckpointState, CleanupState, DegradeJobRequest,
+    JobCheckpoint, JobCheckpointResponse, JobCleanup, JobCreatedResponse, JobDetail, JobEvent,
+    JobEventsResponse, JobFailure, JobKind, JobLease, JobListResponse, JobState, JobSummary,
+    MineJobRequest, PartitionJobRequest, ReleaseCheckpointRequest, ReorgJobRequest,
+    ScenarioJobRequest, ScenarioStepStatus, SpamBurstJobRequest,
 };
 pub use status::{
     BlockSummary, Cadence, ComponentControlResponse, ComponentState, ExplorerStatus, FeeBucket,

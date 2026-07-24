@@ -408,6 +408,30 @@ impl ScenarioActionBackend for MockBackend {
         }))
     }
 
+    fn prepare_manual_spam_burst(
+        &self,
+        node: simchain_scenario_engine::MinerNode,
+        txs: u64,
+        outputs_per_tx: u64,
+        data_bytes: Option<u64>,
+        control: &dyn simchain_scenario_engine::ScenarioControl,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "node": node.to_string(),
+            "shape": data_bytes.map_or_else(
+                || format!("outputs:{outputs_per_tx}"),
+                |bytes| format!("op_return:{bytes}")
+            ),
+            "requested_transactions": txs,
+            "required_branches": txs,
+            "initial_branches": 0,
+            "prepared_branches": txs,
+            "mined_confirmation_blocks": 2,
+            "ready": true,
+            "aborted": control.abort_requested()
+        }))
+    }
+
     fn data_spam_burst(
         &self,
         node: simchain_scenario_engine::MinerNode,

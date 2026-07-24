@@ -234,12 +234,18 @@ pub fn status(app: &AppState) -> StatusSnapshot {
     if let Some(spam) = status.components.get_mut(SPAM_COMPONENT) {
         spam.desired_state = Some(control.spam_state);
     }
-    status.active_operation = app.jobs.active_summary().map(|job| OperationSummary {
-        job_id: job.id,
-        kind: job.kind.as_str().to_string(),
-        state: job.state.as_str().to_string(),
-        phase: job.phase,
-    });
+    status.active_operations = app
+        .jobs
+        .active_summaries()
+        .into_iter()
+        .map(|job| OperationSummary {
+            job_id: job.id,
+            kind: job.kind.as_str().to_string(),
+            state: job.state.as_str().to_string(),
+            phase: job.phase,
+        })
+        .collect();
+    status.active_operation = status.active_operations.first().cloned();
     status
 }
 
@@ -297,21 +303,8 @@ pub fn start_scenario(
     yaml: String,
     idempotency_key: Option<String>,
 ) -> Result<JobCreatedResponse, ServiceError> {
-    let Ok(_guard) = app.apply_lock.try_lock() else {
-        return Err(ServiceError::new(
-            ErrorCode::ApplyInProgress,
-            "another desired-state mutation is already in progress",
-        ));
-    };
-    let desired = load_durable_control_state(app)?.desired;
-    let (tuning, _) = LiveTuning::from_source(&desired).map_err(|error| {
-        ServiceError::new(
-            ErrorCode::ValidationFailed,
-            format!("durable spam policy is invalid: {error}"),
-        )
-    })?;
     app.jobs
-        .start_scenario(yaml, idempotency_key, tuning.spam.use_raw)
+        .start_scenario(yaml, idempotency_key)
         .map_err(job_manager_error)
 }
 
@@ -344,6 +337,22 @@ pub fn start_spam_burst(
     };
     app.jobs
         .start_spam_burst(request, idempotency_key)
+        .map_err(job_manager_error)
+}
+
+pub fn start_spam_prepare(
+    app: &std::sync::Arc<AppState>,
+    request: SpamBurstJobRequest,
+    idempotency_key: Option<String>,
+) -> Result<JobCreatedResponse, ServiceError> {
+    let Ok(_guard) = app.apply_lock.try_lock() else {
+        return Err(ServiceError::new(
+            ErrorCode::ApplyInProgress,
+            "another desired-state mutation is already in progress",
+        ));
+    };
+    app.jobs
+        .start_spam_prepare(request, idempotency_key)
         .map_err(job_manager_error)
 }
 

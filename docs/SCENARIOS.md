@@ -33,12 +33,14 @@ a fresh chain outside the control plane when the test requires one, then run the
 
 ## Schema
 
-Every file has exactly `version: 1` and an ordered `steps` list. Unknown fields and step
+Every file has exactly `version: 1` and an ordered `steps` list. The optional top-level
+`restore_settings: true` makes `set_config` changes temporary. Unknown fields and step
 types are rejected before the mutation coordinator is reserved. Existing version-1 files
-remain valid.
+remain valid because restoration defaults to false.
 
 ```yaml
 version: 1
+restore_settings: true
 steps:
   - type: wait_height
     height: 260
@@ -120,7 +122,7 @@ steps:
   - type: partition
     node: btc-simnet-node3
     main_blocks: 3
-    isolated_blocks: 4
+    isolated_blocks: 5
 
   - type: degrade
     node: node2
@@ -164,7 +166,8 @@ Validation rules:
   `effective_generation`, `observed_height_at_least`, `active_lease_count`, and
   `cycle_phase`.
 - `sleep.secs`, `mine.blocks`, `reorg.depth`, `spam_burst.txs`, and both partition
-  block counts are positive.
+  block counts are positive. `partition.heal_delay_secs` defaults to zero and may be
+  at most 86400; it holds completed competing branches apart before healing.
 - Miner nodes are `btc-simnet-node2` or `btc-simnet-node3`.
 - `spam_burst.outputs_per_tx` may be zero. Zero sends sequential single-output
   transactions; a positive value sends that many 546-sat burn outputs per
@@ -174,7 +177,9 @@ Validation rules:
   scenario's steps run, while mining still produces blocks.
 - `set_config.settings` is a partial runtime desired-state patch using the same keys as
   `simchainctl config set`. Values may be strings, numbers, booleans, or null/empty reset
-  values.
+  values. With top-level `restore_settings: true`, the complete pre-scenario desired map
+  is durably captured before execution and restored after success, failure, abort, panic,
+  or control-plane restart. Config mutation remains blocked until restoration completes.
 - `assert_config.settings` checks durable desired values, and with `effective: true`
   (the default) also checks that the mining/spam workers expose the expected effective
   policy at the current desired generation.
@@ -264,4 +269,5 @@ before another mutation may begin.
 - `rainbow.yml` fixes the block interval at 10s and the fill ratio at 10, then uses
   `wait_n_blocks` to ramp `SPAM_FEE` x10 every block from 1 to 10,000 sat/vB, driving
   the spammer into `capacity_degraded` and spreading the mempool across every fee-rate
-  color band. Runs unmodified on a fresh stack or an already-running one.
+  color band. Runs unmodified on a fresh stack or an already-running one, then restores
+  the complete pre-run desired settings map.

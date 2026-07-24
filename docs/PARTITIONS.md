@@ -5,9 +5,10 @@ isolates one miner from Bitcoin P2P while RPC remains reachable, mines determini
 competing branches, heals the link, and witnesses the expected winning tip on all three
 nodes. A degradation job adds bounded latency and/or loss to one node's P2P egress.
 
-Both operations require bootstrap height 204. They share the control plane's single
-mutation coordinator, persisted events/results, idempotency behavior, cooperative abort,
-and cleanup reporting.
+Both operations require bootstrap height 204. They share the control plane's durable
+scheduler, persisted events/results, idempotency behavior, cooperative abort, and cleanup
+reporting. Partitions remain exclusive. Degradations use per-node lanes and may overlap
+only a manual Mine job or degradations on other nodes.
 
 ## Start the services
 
@@ -28,18 +29,23 @@ traffic continue over `btc-simnet-control`.
 
 ```bash
 cargo run -p simchainctl -- partition start \
-  --node node3 --main-blocks 3 --isolated-blocks 4 --wait
+  --node node3 --main-blocks 3 --isolated-blocks 5 \
+  --heal-delay-secs 15 --wait
 ```
 
 The convenience script submits the same job:
 
 ```bash
-./scripts/partition.sh start btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
+./scripts/partition.sh start btc-simnet-node3 --main-blocks 3 --isolated-blocks 5 \
+  --heal-delay-secs 15
 ```
 
 The isolated node may be `node2` or `node3`. Branch lengths must be positive, at most
-100, and unequal. With `3` main-side blocks and `4` isolated blocks, the isolated branch
+100, and unequal. With `3` main-side blocks and `5` isolated blocks, the isolated branch
 wins; reverse the counts to make the side that remains connected to node1 win.
+`heal_delay_secs` may be 0–86400 and defaults to zero. A delay keeps both completed
+branches isolated for observation before healing; the coordinator continues renewing
+the impairment lease during that hold.
 
 The coordinator performs these safety steps:
 
@@ -48,19 +54,59 @@ The coordinator performs these safety steps:
 3. acquires and renews a hard-partition lease on the target agent;
 4. asks Bitcoin Core to disconnect established target peers and witnesses isolation;
 5. mines both explicit branch lengths over RPC;
-6. clears the impairment, triggers P2P reconnects, and witnesses the expected tip on all
+6. holds the completed split for `heal_delay_secs`, if requested;
+7. clears the impairment, triggers P2P reconnects, and witnesses the expected tip on all
    nodes;
-7. releases spam with `chain_changed=true`, then releases mining.
+8. releases spam with `chain_changed=true`, then releases mining.
 
 Hard partition rules drop both ingress and egress IP traffic on only the P2P interface.
 It is deliberately not modeled as egress loss alone. Existing TCP sessions are flushed
 through Bitcoin RPC so the isolation witness does not depend on TCP timeouts.
 
+### Watch both sides live
+
+Start one watcher on the connected-side miner from the host:
+
+```bash
+./scripts/chainwatch.sh -P 28443 -i 1
+```
+
+Node3 deliberately has no host RPC port. For a disposable live demo, use the injection
+helper to install the watcher's `curl` dependency and copy the same script into the
+running container. Then watch node3 over its loopback RPC endpoint:
+
+```bash
+./scripts/inject-tools.sh btc-simnet-node3
+docker exec -it btc-simnet-node3 chainwatch \
+  -H 127.0.0.1 -P 18443 -u foo -p rpcpassword -i 1
+```
+
+To prepare every running Simchain Bitcoin node at once, no container name is needed:
+
+```bash
+./scripts/inject-tools.sh --all-containers
+```
+
+Injected packages and files live in each container's writable layer: they survive a
+stop/start but must be injected again after the container is recreated.
+
+Then submit a partition with a hold longer than the polling interval:
+
+```bash
+cargo run -p simchainctl -- partition start \
+  --node node3 --main-blocks 3 --isolated-blocks 5 --heal-delay-secs 15
+```
+
+During the hold, the panes show different heights and tips. When healing begins, only
+the losing side prints a reorg banner; the winning side already has the selected tip.
+The bundled mempool.space instance follows node1, so it can visualize node1 changing to
+the winning chain after healing but cannot simultaneously show node3's private branch.
+
 ## Timed latency and loss
 
 ```bash
 cargo run -p simchainctl -- degrade start \
-  --node node3 --delay-ms 500 --loss-pct 1 --seconds 60 --wait
+  --node node2 --delay-ms 5000 --loss-pct 0 --seconds 30 --wait
 ```
 
 All three nodes are valid degradation targets. Delay is one-way egress delay; loss is a
@@ -70,6 +116,18 @@ window is 1–86400 seconds. The convenience wrapper is:
 ```bash
 ./scripts/degrade.sh start btc-simnet-node3 500 1 60s
 ```
+
+To observe delayed block propagation, leave that node2 degradation running in one pane
+and mine from node2 in another:
+
+```bash
+cargo run -p simchainctl -- mine --node node2 --blocks 1 --wait
+```
+
+RPC travels over the control network and is not delayed. Node2 creates the block
+immediately; its P2P announcement leaves over the shaped egress interface, so node1 and
+node3 learn the tip after approximately the configured five seconds. Degrading a
+different node shapes that node's outbound traffic and does not provide the same demo.
 
 The old unbounded `netem.sh apply/clear` commands were removed. Every impairment now has
 an owning job and lease deadline, so a forgotten shell or dead control plane cannot
@@ -87,7 +145,7 @@ curl -s -X POST localhost:8090/api/v1/jobs/partition \
   -H "Authorization: Bearer $token" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: partition-example-1' \
-  -d '{"node":"node3","main_blocks":3,"isolated_blocks":4}'
+  -d '{"node":"node3","main_blocks":3,"isolated_blocks":5,"heal_delay_secs":15}'
 
 curl -s -X POST localhost:8090/api/v1/jobs/degrade \
   -H "Authorization: Bearer $token" \
@@ -102,10 +160,9 @@ MCP exposes `start_partition` and `start_degrade`; inspect progress with `get_jo
 
 Network leases use the same short renewal cadence as worker pause leases. If the control
 plane dies, an agent's TTL worker clears nftables/tc state automatically. When the
-control plane restarts it marks the old job interrupted, queries all agents for that
-job's owner ID, heals and reconnects affected nodes, waits for chain convergence, then
-releases spam and mining leases. The mutation lock remains held while any cleanup is
-unsafe or incomplete.
+control plane restarts it marks every active-lane job interrupted, queries agents by
+owner ID, heals each job's impairment, and releases only that job's worker leases. Each
+lane remains held while its cleanup is unsafe or incomplete.
 
 Cleanup failures are stored separately from the primary job failure. A terminal success
 therefore means both the requested experiment and its safety cleanup succeeded.

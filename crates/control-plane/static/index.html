@@ -96,19 +96,29 @@
           <label data-help="Miner node whose raw transaction engine submits the burst. Example: node2 creates transactions from node2's available spam funds.">Node
             <select id="burst-node"><option value="node2">node2</option><option value="node3">node3</option></select>
           </label>
-          <label data-help="Number of raw transactions to submit as one durable job. Example: 100 creates 100 OP_RETURN transactions.">Transactions
-            <input id="burst-txs" type="number" min="1" value="100" required>
+          <label data-help="Number of raw transactions to submit as one durable job. Example: 10 creates a modest burst without requiring extensive prefunded branch capacity.">Transactions
+            <input id="burst-txs" type="number" min="1" value="10" required>
           </label>
-          <label data-help="Bytes of arbitrary data placed in each transaction OP_RETURN output. Example: 90000 makes large data transactions that fill blocks faster; maximum is 98000.">OP_RETURN bytes
-            <input id="burst-data-bytes" type="number" min="1" max="98000" value="90000" required>
+          <label data-help="Transaction shape. Data creates one OP_RETURN payload per transaction; Outputs creates batches of spendable-looking burn outputs instead.">Shape
+            <select id="burst-shape"><option value="data">Data (OP_RETURN)</option><option value="outputs">Outputs</option></select>
           </label>
-          <button id="burst-start" type="submit">Create tx burst</button>
+          <label data-help="Bytes of arbitrary data placed in each transaction OP_RETURN output. Example: 20000 creates visible but moderate data transactions; maximum is 98000.">OP_RETURN bytes
+            <input id="burst-data-bytes" type="number" min="1" max="98000" value="20000" required>
+          </label>
+          <label data-help="Burn outputs created by each transaction. Example: 30 matches --outputs-per-tx 30 in simchainctl; zero selects sequential single-output transactions.">Outputs per transaction
+            <input id="burst-outputs-per-tx" type="number" min="0" value="30" required disabled>
+          </label>
+          <div class="action-buttons">
+            <button id="burst-prepare" class="secondary" type="button" title="Prepare the selected manual burst capacity; this may mine confirmation blocks but preserves the mining controller state.">Prepare capacity</button>
+            <button id="burst-start" type="submit">Create tx burst</button>
+          </div>
           <div id="burst-action-result" class="action-result"></div>
         </form>
       </div>
 
-      <h3>Reorganization</h3>
-      <form id="reorg-form" class="action-form">
+      <section class="reorg-card">
+        <h3>Reorganization</h3>
+        <form id="reorg-form" class="action-form">
         <label data-help="Number of recent blocks to roll back before mining the replacement branch. Example: depth 3 rewrites the last 3 blocks.">Depth
           <input id="reorg-depth" type="number" min="1" max="100" value="3" required>
         </label>
@@ -128,37 +138,41 @@
           <input id="reorg-empty" type="checkbox">
           Mine empty replacements
         </label>
-        <button id="reorg-start" type="submit">Start reorg</button>
-      </form>
-      <div id="reorg-action-result" class="action-result"></div>
+          <button id="reorg-start" type="submit">Start reorg</button>
+        </form>
+        <div id="reorg-action-result" class="action-result"></div>
+      </section>
 
       <h3>Network</h3>
       <div id="network-status" class="component-state">all P2P links clear</div>
       <div class="bounded-actions">
         <form id="partition-form" class="mini-action-form">
-          <h3>Hard partition</h3>
+          <h3>Hard partition (organic reorg)</h3>
           <label data-help="Miner temporarily cut off from the rest of the P2P network. Example: node3 mines a private side branch while node2 remains on the main side.">Isolated miner
             <select id="partition-node"><option value="node3">node3</option><option value="node2">node2</option></select>
           </label>
           <label data-help="Blocks mined by the non-isolated side while the partition is held. Example: 3 mines three public-side blocks before healing.">Main-side blocks
             <input id="partition-main-blocks" type="number" min="1" max="100" value="3" required>
           </label>
-          <label data-help="Blocks mined by the isolated miner while separated. Example: 4 isolated blocks can overtake 3 main-side blocks after the partition heals.">Isolated blocks
-            <input id="partition-isolated-blocks" type="number" min="1" max="100" value="4" required>
+          <label data-help="Blocks mined by the isolated miner while separated. Example: 5 isolated blocks overtake 3 main-side blocks after the partition heals.">Isolated blocks
+            <input id="partition-isolated-blocks" type="number" min="1" max="100" value="5" required>
+          </label>
+          <label data-help="Seconds to keep both completed branches isolated before P2P healing. Use a visible delay such as 15 seconds for live chain watchers.">Heal delay seconds
+            <input id="partition-heal-delay" type="number" min="0" max="86400" value="15" required>
           </label>
           <button id="partition-start" type="submit">Start partition</button>
           <div id="partition-action-result" class="action-result"></div>
         </form>
         <form id="degrade-form" class="mini-action-form">
           <h3>Timed degradation</h3>
-          <label data-help="Network agent target for temporary P2P impairment. Example: node3 applies delay or loss to node3's peer links.">Node
-            <select id="degrade-node"><option value="node3">node3</option><option value="node2">node2</option><option value="node1">node1</option></select>
+          <label data-help="Network agent target for temporary P2P egress impairment. To demonstrate delayed block propagation, select node2 here and mine on node2 while this job remains active; RPC traffic is unaffected.">Node
+            <select id="degrade-node"><option value="node2">node2</option><option value="node3">node3</option><option value="node1">node1</option></select>
           </label>
-          <label data-help="One-way P2P packet delay in milliseconds. Example: 500 adds about 500ms of latency to affected traffic.">Delay ms
-            <input id="degrade-delay" type="number" min="0" max="600000" value="500" required>
+          <label data-help="One-way delay on packets leaving the selected node's P2P interface. Example: 5000 delays a block mined by that same node by about five seconds at its peers.">Delay ms
+            <input id="degrade-delay" type="number" min="0" max="600000" value="5000" required>
           </label>
           <label data-help="Packet loss percentage for affected P2P traffic. Example: 1 drops about 1 percent of packets; 0 disables loss.">Loss %
-            <input id="degrade-loss" type="number" min="0" max="100" step="any" value="1" required>
+            <input id="degrade-loss" type="number" min="0" max="100" step="any" value="0" required>
           </label>
           <label data-help="Lease duration before the impairment is automatically removed. Example: 30 keeps the degradation active for 30 seconds.">Seconds
             <input id="degrade-seconds" type="number" min="1" max="86400" value="30" required>

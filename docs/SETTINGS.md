@@ -446,7 +446,9 @@ can cascade the rest of the run to empty blocks.
 
 Partition jobs are post-bootstrap-only and refuse to proceed below height 204. Branch
 lengths are request fields (`simchainctl partition start --main-blocks ...
---isolated-blocks ...`); only settling timeouts are process settings:
+--isolated-blocks ... --heal-delay-secs ...`); only settling timeouts are process
+settings. The optional request delay is bounded to 0–86400 seconds and keeps the two
+completed branches isolated before healing:
 
 | Variable | Default | Description |
 |---|---|---|

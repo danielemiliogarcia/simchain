@@ -4,8 +4,10 @@
 # backlog the fee floor can't drain between bumps, ramping SPAM_FEE 1 -> 10
 # -> 100 -> 1,000 -> 10,000 sat/vB one block at a time until the spammer goes
 # capacity_degraded and mempool.space shows the full fee-rate rainbow.
+# The complete pre-run desired settings map is restored when the scenario ends.
 # cargo run -p simchainctl -- scenario start scenarios/rainbow.yml --id-only
 version: 1
+restore_settings: true
 steps:
   - type: set_config
     settings:
@@ -113,5 +115,4 @@ steps:
     settings:
       SPAM_FILL_BLOCK_RATIO: 1
       SPAM_FEE: 0.00001
-
 

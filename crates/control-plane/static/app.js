@@ -21,7 +21,7 @@ let selectedJobEventAfter = 0;
 let renderedJobEventCount = 0;
 let startingJob = false;
 let startingScenario = false;
-const startingAction = { mine: false, burst: false, partition: false, degrade: false };
+const startingAction = { mine: false, prepare: false, burst: false, partition: false, degrade: false };
 let abortingJob = false;
 let faucetStatus = null;
 let faucetSubmitting = false;
@@ -189,6 +189,7 @@ function projectStatusForDashboard(status) {
       )
     ),
     active_operation: status.active_operation || null,
+    active_operations: status.active_operations || [],
     impairments: status.impairments || [],
     explorer: status.explorer || null,
     last_error: status.last_error || null,
@@ -200,6 +201,23 @@ function projectStatusForDashboard(status) {
 
 function activeMutationId() {
   return latestActiveJobId;
+}
+
+function activeJobDescriptors() {
+  if (latestJobs && Array.isArray(latestJobs.active_jobs)) return latestJobs.active_jobs;
+  return activeMutationId() == null ? [] : [{ job_id: activeMutationId(), kind: "unknown", lane: "exclusive" }];
+}
+
+function actionBlockedByActiveJobs(action) {
+  const active = activeJobDescriptors();
+  if (active.length === 0) return false;
+  if (action === "mine") return active.some((job) => job.kind !== "degrade");
+  if (action === "degrade") {
+    if (active.some((job) => job.kind !== "mine" && job.kind !== "degrade")) return true;
+    const lane = `network:${$("#degrade-node").value}`;
+    return active.some((job) => job.lane === lane);
+  }
+  return true;
 }
 
 function mutationBlockedMessage() {
@@ -904,10 +922,10 @@ function buildDashboardRequest() {
 
 function preferredSelectedJobId(jobs, selectedJobPayload) {
   if (!jobs) return selectedJobPayload ? selectedJobPayload.id : selectedJobId;
-  if (jobs.active_job_id) return jobs.active_job_id;
-  if (selectedJobPayload) return selectedJobPayload.id;
   const ids = new Set((jobs.jobs || []).map((job) => job.id));
   if (selectedJobId && ids.has(selectedJobId)) return selectedJobId;
+  if (selectedJobPayload && ids.has(selectedJobPayload.id)) return selectedJobPayload.id;
+  if (jobs.active_job_id) return jobs.active_job_id;
   return (jobs.jobs && jobs.jobs.length > 0) ? jobs.jobs[0].id : null;
 }
 
@@ -1581,11 +1599,12 @@ async function submitFaucet(event) {
 
 function renderJobs() {
   const active = activeMutationId();
+  const activeJobs = activeJobDescriptors();
   const lock = $("#mutation-lock");
-  lock.textContent = active
-    ? `mutation coordinator held by ${active}; incompatible controls are disabled`
+  lock.textContent = activeJobs.length > 0
+    ? `active jobs: ${activeJobs.map((job) => `${job.job_id} (${job.lane})`).join(", ")}; incompatible controls are disabled`
     : "mutation coordinator is idle";
-  lock.className = "mutation-lock" + (active ? " busy" : "");
+  lock.className = "mutation-lock" + (activeJobs.length > 0 ? " busy" : "");
 
   const start = $("#reorg-start");
   const reorgUnavailable = actionDependencyReason("reorg");
@@ -1599,13 +1618,17 @@ function renderJobs() {
   scenarioStart.textContent = startingScenario ? "Starting…" : "Start scenario";
   for (const [action, formId, buttonId, label] of [
     ["mine", "mine-form", "mine-start", "Mine"],
+    ["prepare", "burst-form", "burst-prepare", "Prepare capacity"],
     ["burst", "burst-form", "burst-start", "Create tx burst"],
     ["partition", "partition-form", "partition-start", "Start partition"],
     ["degrade", "degrade-form", "degrade-start", "Start degradation"],
   ]) {
     const button = $("#" + buttonId);
     const unavailable = actionDependencyReason(action);
-    button.disabled = startingAction[action] || active != null ||
+    const actionStarting = (action === "prepare" || action === "burst")
+      ? startingAction.prepare || startingAction.burst
+      : startingAction[action];
+    button.disabled = actionStarting || actionBlockedByActiveJobs(action) ||
       !$("#" + formId).checkValidity() || unavailable !== "";
     button.title = unavailable;
     setActionDependencyMessage(action, unavailable);
@@ -1651,6 +1674,7 @@ function actionDependencies(action) {
   switch (action) {
     case "mine":
       return ["mining", $("#mine-node").value];
+    case "prepare":
     case "burst":
       return ["spam", $("#burst-node").value];
     case "reorg":
@@ -1673,7 +1697,7 @@ function actionDependencyReason(action) {
 }
 
 function setActionDependencyMessage(action, message) {
-  const result = $(`#${action}-action-result`);
+  const result = $(action === "prepare" ? "#burst-action-result" : `#${action}-action-result`);
   if (!result) return;
   if (message) {
     if (result.dataset.dependencyBlocked !== "true") {
@@ -1897,21 +1921,34 @@ async function startScenario(event) {
 
 async function startBoundedAction(event, action) {
   event.preventDefault();
-  if (startingAction[action] || activeMutationId() != null || !event.currentTarget.checkValidity()) return;
+  const form = action === "mine" ? $("#mine-form") : $("#burst-form");
+  const burstActionStarting = startingAction.prepare || startingAction.burst;
+  if (startingAction[action] || (action !== "mine" && burstActionStarting) ||
+      actionBlockedByActiveJobs(action) || !form.checkValidity()) return;
   startingAction[action] = true;
   renderJobs();
   const isMine = action === "mine";
+  const isPrepare = action === "prepare";
   const result = $(isMine ? "#mine-action-result" : "#burst-action-result");
-  const path = isMine ? "mine" : "spam-burst";
-  const request = isMine ? {
-    node: $("#mine-node").value,
-    blocks: Number($("#mine-blocks").value),
-  } : {
-    node: $("#burst-node").value,
-    txs: Number($("#burst-txs").value),
-    data_bytes: Number($("#burst-data-bytes").value),
-  };
-  result.textContent = `Submitting ${isMine ? "mine" : "tx burst"} job…`;
+  const path = isMine ? "mine" : (isPrepare ? "spam-prepare" : "spam-burst");
+  let request;
+  if (isMine) {
+    request = {
+      node: $("#mine-node").value,
+      blocks: Number($("#mine-blocks").value),
+    };
+  } else {
+    request = {
+      node: $("#burst-node").value,
+      txs: Number($("#burst-txs").value),
+    };
+    if ($("#burst-shape").value === "data") {
+      request.data_bytes = Number($("#burst-data-bytes").value);
+    } else {
+      request.outputs_per_tx = Number($("#burst-outputs-per-tx").value);
+    }
+  }
+  result.textContent = `Submitting ${isMine ? "mine" : (isPrepare ? "capacity preparation" : "tx burst")} job…`;
   result.className = "action-result";
   try {
     const { ok, body } = await api(`/api/v1/jobs/${path}`, {
@@ -1935,9 +1972,16 @@ async function startBoundedAction(event, action) {
   }
 }
 
+function renderBurstShapeControls() {
+  const dataShape = $("#burst-shape").value === "data";
+  $("#burst-data-bytes").disabled = !dataShape;
+  $("#burst-outputs-per-tx").disabled = dataShape;
+  renderJobs();
+}
+
 async function startNetworkAction(event, action) {
   event.preventDefault();
-  if (startingAction[action] || activeMutationId() != null || !event.currentTarget.checkValidity()) return;
+  if (startingAction[action] || actionBlockedByActiveJobs(action) || !event.currentTarget.checkValidity()) return;
   startingAction[action] = true;
   renderJobs();
   const partition = action === "partition";
@@ -1946,6 +1990,7 @@ async function startNetworkAction(event, action) {
     node: $("#partition-node").value,
     main_blocks: Number($("#partition-main-blocks").value),
     isolated_blocks: Number($("#partition-isolated-blocks").value),
+    heal_delay_secs: Number($("#partition-heal-delay").value),
   } : {
     node: $("#degrade-node").value,
     delay_ms: Number($("#degrade-delay").value),
@@ -2129,7 +2174,10 @@ async function init() {
   $("#mine-form").addEventListener("submit", (event) => startBoundedAction(event, "mine"));
   $("#mine-form").addEventListener("input", renderJobs);
   $("#burst-form").addEventListener("submit", (event) => startBoundedAction(event, "burst"));
+  $("#burst-prepare").addEventListener("click", (event) => startBoundedAction(event, "prepare"));
   $("#burst-form").addEventListener("input", renderJobs);
+  $("#burst-shape").addEventListener("change", renderBurstShapeControls);
+  renderBurstShapeControls();
   $("#partition-form").addEventListener("submit", (event) => startNetworkAction(event, "partition"));
   $("#partition-form").addEventListener("input", renderJobs);
   $("#degrade-form").addEventListener("submit", (event) => startNetworkAction(event, "degrade"));

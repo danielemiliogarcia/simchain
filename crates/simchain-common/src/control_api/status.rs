@@ -112,6 +112,8 @@ pub struct StatusResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_operation: Option<OperationSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_operations: Vec<OperationSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub impairments: Vec<ImpairmentSummary>,
     pub desired_generation: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
