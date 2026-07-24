@@ -96,11 +96,17 @@
           <label data-help="Miner node whose raw transaction engine submits the burst. Example: node2 creates transactions from node2's available spam funds.">Node
             <select id="burst-node"><option value="node2">node2</option><option value="node3">node3</option></select>
           </label>
-          <label data-help="Number of raw transactions to submit as one durable job. Example: 100 creates 100 OP_RETURN transactions.">Transactions
-            <input id="burst-txs" type="number" min="1" value="100" required>
+          <label data-help="Number of raw transactions to submit as one durable job. Example: 10 creates a modest burst without requiring extensive prefunded branch capacity.">Transactions
+            <input id="burst-txs" type="number" min="1" value="10" required>
           </label>
-          <label data-help="Bytes of arbitrary data placed in each transaction OP_RETURN output. Example: 90000 makes large data transactions that fill blocks faster; maximum is 98000.">OP_RETURN bytes
-            <input id="burst-data-bytes" type="number" min="1" max="98000" value="90000" required>
+          <label data-help="Transaction shape. Data creates one OP_RETURN payload per transaction; Outputs creates batches of spendable-looking burn outputs instead.">Shape
+            <select id="burst-shape"><option value="data">Data (OP_RETURN)</option><option value="outputs">Outputs</option></select>
+          </label>
+          <label data-help="Bytes of arbitrary data placed in each transaction OP_RETURN output. Example: 20000 creates visible but moderate data transactions; maximum is 98000.">OP_RETURN bytes
+            <input id="burst-data-bytes" type="number" min="1" max="98000" value="20000" required>
+          </label>
+          <label data-help="Burn outputs created by each transaction. Example: 30 matches --outputs-per-tx 30 in simchainctl; zero selects sequential single-output transactions.">Outputs per transaction
+            <input id="burst-outputs-per-tx" type="number" min="0" value="30" required disabled>
           </label>
           <button id="burst-start" type="submit">Create tx burst</button>
           <div id="burst-action-result" class="action-result"></div>

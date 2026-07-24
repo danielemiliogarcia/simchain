@@ -1748,6 +1748,14 @@ steps:
         let html = String::from_utf8_lossy(&bytes);
         assert!(html.contains("test-token"));
         assert!(!html.contains("__CONTROL_PLANE_TOKEN_JSON__"));
+        assert!(html.contains("id=\"burst-txs\" type=\"number\" min=\"1\" value=\"10\""));
+        assert!(html.contains(
+            "id=\"burst-data-bytes\" type=\"number\" min=\"1\" max=\"98000\" value=\"20000\""
+        ));
+        assert!(html.contains("id=\"burst-shape\""));
+        assert!(html.contains(
+            "id=\"burst-outputs-per-tx\" type=\"number\" min=\"0\" value=\"30\" required disabled"
+        ));
     }
 
     #[test]

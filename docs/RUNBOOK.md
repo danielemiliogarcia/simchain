@@ -124,7 +124,7 @@ Submit wallet transactions through a server-side action job:
 
 ```bash
 cargo run -p simchainctl -- spam burst \
-  --node node3 --txs 10 --outputs-per-tx 0 --wait
+  --node node3 --txs 10 --data-bytes 20000 --wait
 ```
 
 ## Miner-prioritized zero-fee faucet

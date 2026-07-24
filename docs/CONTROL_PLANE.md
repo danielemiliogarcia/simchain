@@ -145,7 +145,7 @@ cargo run -p simchainctl -- jobs list
 cargo run -p simchainctl -- jobs watch JOB_ID --timeout 900
 cargo run -p simchainctl -- jobs abort JOB_ID
 cargo run -p simchainctl -- mine --node node2 --blocks 1 --wait
-cargo run -p simchainctl -- spam burst --node node2 --txs 100 --outputs-per-tx 25 --wait
+cargo run -p simchainctl -- spam burst --node node2 --txs 10 --data-bytes 20000 --wait
 cargo run -p simchainctl -- faucet --to bcrt1q...=1btc --to bcrt1p...=25000000sat --wait
 cargo run -p simchainctl -- faucet status
 cargo run -p simchainctl -- faucet transfer TXID --watch

@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use simchain_common::config::{
     parse_rpc_url, RpcUrl, DEFAULT_NODE2_WALLET_NAME, DEFAULT_NODE3_WALLET_NAME,
 };
+use simchain_common::internal_api::{DesiredState, WorkerPhase};
 use simchain_common::{
     create_client, create_jsonrpc_client, create_wallet_client, get_or_create_mining_address,
     mining_address_label,
@@ -173,6 +174,49 @@ impl RpcScenarioActionBackend {
             .context("read the live spam policy for scenario bursts")?
             .policy)
     }
+
+    fn ensure_mining_can_confirm_burst_funding(&self) -> Result<()> {
+        let status = self
+            .mining
+            .status()
+            .context("read mining status before preparing burst branches")?;
+        anyhow::ensure!(
+            status.desired_state == DesiredState::Running
+                && matches!(status.phase, WorkerPhase::Running),
+            "burst_preparation_requires_mining: mining must be running so burst branch funding can confirm"
+        );
+        Ok(())
+    }
+}
+
+fn wait_for_burst_branches(
+    engine: &mut RawSpammer,
+    node: MinerNode,
+    needed_branches: u64,
+    deadline: Instant,
+    timeout: Duration,
+    description: &str,
+    control: &dyn ScenarioControl,
+) -> Result<u64> {
+    loop {
+        let checkpoint = |_: &str| !control.abort_requested() && Instant::now() < deadline;
+        if engine.ensure_branches(needed_branches, &checkpoint) {
+            return Ok(engine.usable_branches_for_current_shape());
+        }
+        let usable = engine.usable_branches_for_current_shape();
+        if control.abort_requested() {
+            anyhow::bail!(
+                "interrupted while preparing {description} for {node}: {usable}/{needed_branches} confirmed usable branches"
+            );
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out after {}s preparing {description} for {node}: {usable}/{needed_branches} confirmed usable branches",
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
 }
 
 impl ScenarioActionBackend for RpcScenarioActionBackend {
@@ -249,32 +293,22 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
         let branches = policy.fanout_utxos.max(1);
         let deadline = Instant::now() + self.timeout;
         let mut prepared = Vec::new();
+        self.ensure_mining_can_confirm_burst_funding()?;
         for target in targets {
             self.with_burst_engine(target.node, policy.fee_rate_sat_vb(), |engine| {
                 engine.set_burst_shape(policy.fee_rate_sat_vb(), target.outputs_per_tx);
-                let checkpoint =
-                    |_: &str| !control.abort_requested() && Instant::now() < deadline;
-                if !engine.ensure_branches(branches, &checkpoint) {
-                    let usable = engine.usable_branches_for_current_shape();
-                    if control.abort_requested() {
-                        anyhow::bail!(
-                            "interrupted while funding the scenario burst engine for {}",
-                            target.node
-                        );
-                    }
-                    if Instant::now() >= deadline {
-                        anyhow::bail!(
-                            "timed out after {}s funding the scenario burst engine for {}",
-                            self.timeout.as_secs(),
-                            target.node
-                        );
-                    }
-                    anyhow::bail!(
-                        "scenario burst engine for {} has only {usable}/{branches} confirmed usable branches for outputs_per_tx={}",
-                        target.node,
+                wait_for_burst_branches(
+                    engine,
+                    target.node,
+                    branches,
+                    deadline,
+                    self.timeout,
+                    &format!(
+                        "scenario burst branches for outputs_per_tx={}",
                         target.outputs_per_tx
-                    );
-                }
+                    ),
+                    control,
+                )?;
                 Ok(())
             })?;
             prepared.push(json!({
@@ -298,33 +332,21 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
     ) -> Result<Value> {
         let policy = self.burst_policy()?;
         let fanout = policy.fanout_utxos.max(1);
+        self.ensure_mining_can_confirm_burst_funding()?;
         self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
             engine.set_burst_shape(policy.fee_rate_sat_vb(), outputs_per_tx);
             let deadline = Instant::now() + self.timeout;
-            let checkpoint = |_: &str| !control.abort_requested() && Instant::now() < deadline;
             let needed_branches = txs.min(fanout).max(1);
-            if !engine.ensure_branches(needed_branches, &checkpoint) {
-                let usable = engine.usable_branches_for_current_shape();
-                if control.abort_requested() {
-                    return Ok(json!({
-                        "node": node.to_string(),
-                        "requested_transactions": txs,
-                        "accepted_transactions": 0,
-                        "outputs_per_transaction": outputs_per_tx,
-                        "engine": "raw",
-                        "aborted": true
-                    }));
-                }
-                if Instant::now() >= deadline {
-                    anyhow::bail!(
-                        "timed out after {}s preparing raw scenario burst for {node}",
-                        self.timeout.as_secs()
-                    );
-                }
-                anyhow::bail!(
-                    "raw scenario burst for {node} is not funded: {usable}/{needed_branches} confirmed usable branches"
-                );
-            }
+            let prepared_branches = wait_for_burst_branches(
+                engine,
+                node,
+                needed_branches,
+                deadline,
+                self.timeout,
+                &format!("raw OUTPUT burst branches for outputs_per_tx={outputs_per_tx}"),
+                control,
+            )?;
+            let checkpoint = |_: &str| !control.abort_requested() && Instant::now() < deadline;
             let mut txids = engine.output_round(txs, fanout, false, 0, &checkpoint);
             if (txids.len() as u64) < txs && !control.abort_requested() {
                 // A chain mutation between steps (reorg, partition) may have
@@ -356,6 +378,7 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
                 "requested_transactions": txs,
                 "accepted_transactions": txids.len() as u64,
                 "outputs_per_transaction": outputs_per_tx,
+                "prepared_branches": prepared_branches,
                 "engine": "raw",
                 "aborted": control.abort_requested()
             }))
@@ -371,55 +394,30 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
     ) -> Result<Value> {
         let policy = self.burst_policy()?;
         let fanout = policy.fanout_utxos.max(1);
+        self.ensure_mining_can_confirm_burst_funding()?;
         self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
             engine.set_burst_data_shape(policy.fee_rate_sat_vb(), data_bytes);
             let deadline = Instant::now() + self.timeout;
-            let checkpoint = |_: &str| !control.abort_requested() && Instant::now() < deadline;
             let needed_branches = txs.min(fanout).max(1);
-            if !engine.ensure_branches(needed_branches, &checkpoint) {
-                let usable = engine.usable_branches_for_current_shape();
-                if control.abort_requested() {
-                    return Ok(json!({
-                        "node": node.to_string(),
-                        "requested_transactions": txs,
-                        "accepted_transactions": 0,
-                        "data_bytes": data_bytes,
-                        "engine": "raw",
-                        "shape": "op_return",
-                        "aborted": true
-                    }));
-                }
-                if Instant::now() >= deadline {
-                    anyhow::bail!(
-                        "timed out after {}s preparing raw data burst for {node}",
-                        self.timeout.as_secs()
-                    );
-                }
-                anyhow::bail!(
-                    "raw data burst for {node} is not funded: {usable}/{needed_branches} confirmed usable branches"
-                );
-            }
-            let (mut txids, mut offered_vbytes) = engine.data_round(
-                txs,
-                fanout,
-                data_bytes,
-                false,
-                0,
-                &checkpoint,
-            );
+            let prepared_branches = wait_for_burst_branches(
+                engine,
+                node,
+                needed_branches,
+                deadline,
+                self.timeout,
+                &format!("raw DATA burst branches for data_bytes={data_bytes}"),
+                control,
+            )?;
+            let checkpoint = |_: &str| !control.abort_requested() && Instant::now() < deadline;
+            let (mut txids, mut offered_vbytes) =
+                engine.data_round(txs, fanout, data_bytes, false, 0, &checkpoint);
             if (txids.len() as u64) < txs && !control.abort_requested() {
                 engine
                     .reconcile()
                     .context("reconcile the scenario burst engine mid-data-burst")?;
                 let remaining = txs - txids.len() as u64;
-                let (more, more_vbytes) = engine.data_round(
-                    remaining,
-                    fanout,
-                    data_bytes,
-                    false,
-                    0,
-                    &checkpoint,
-                );
+                let (more, more_vbytes) =
+                    engine.data_round(remaining, fanout, data_bytes, false, 0, &checkpoint);
                 txids.extend(more);
                 offered_vbytes += more_vbytes;
             }
@@ -443,6 +441,7 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
                 "requested_transactions": txs,
                 "accepted_transactions": txids.len() as u64,
                 "data_bytes": data_bytes,
+                "prepared_branches": prepared_branches,
                 "offered_vbytes": offered_vbytes,
                 "engine": "raw",
                 "shape": "op_return",

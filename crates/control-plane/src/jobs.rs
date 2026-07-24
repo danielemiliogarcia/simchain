@@ -2367,19 +2367,21 @@ impl JobManager {
             self.finish_aborted_with_cleanup(&job_id, vec![lease], false, stop_error);
             return;
         }
-        self.set_phase(&job_id, "submitting_spam_burst");
+        self.set_phase(&job_id, "preparing_spam_burst_branches");
         let message = match data_bytes {
             Some(bytes) => {
                 format!(
-                    "submitting {txs} OP_RETURN data transaction(s) from {node} ({bytes} byte payloads)"
+                    "preparing branches and submitting {txs} OP_RETURN data transaction(s) from {node} ({bytes} byte payloads)"
                 )
             }
-            None => format!("submitting {txs} transaction(s) from {node}"),
+            None => format!(
+                "preparing branches and submitting {txs} transaction(s) from {node} with outputs_per_tx={outputs_per_tx}"
+            ),
         };
         self.emit_best_effort(
             &job_id,
             "action_started",
-            "submitting_spam_burst",
+            "preparing_spam_burst_branches",
             &message,
             None,
         );

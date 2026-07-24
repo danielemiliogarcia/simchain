@@ -1903,14 +1903,23 @@ async function startBoundedAction(event, action) {
   const isMine = action === "mine";
   const result = $(isMine ? "#mine-action-result" : "#burst-action-result");
   const path = isMine ? "mine" : "spam-burst";
-  const request = isMine ? {
-    node: $("#mine-node").value,
-    blocks: Number($("#mine-blocks").value),
-  } : {
-    node: $("#burst-node").value,
-    txs: Number($("#burst-txs").value),
-    data_bytes: Number($("#burst-data-bytes").value),
-  };
+  let request;
+  if (isMine) {
+    request = {
+      node: $("#mine-node").value,
+      blocks: Number($("#mine-blocks").value),
+    };
+  } else {
+    request = {
+      node: $("#burst-node").value,
+      txs: Number($("#burst-txs").value),
+    };
+    if ($("#burst-shape").value === "data") {
+      request.data_bytes = Number($("#burst-data-bytes").value);
+    } else {
+      request.outputs_per_tx = Number($("#burst-outputs-per-tx").value);
+    }
+  }
   result.textContent = `Submitting ${isMine ? "mine" : "tx burst"} job…`;
   result.className = "action-result";
   try {
@@ -1933,6 +1942,13 @@ async function startBoundedAction(event, action) {
     startingAction[action] = false;
     await refreshDashboard({ force: true });
   }
+}
+
+function renderBurstShapeControls() {
+  const dataShape = $("#burst-shape").value === "data";
+  $("#burst-data-bytes").disabled = !dataShape;
+  $("#burst-outputs-per-tx").disabled = dataShape;
+  renderJobs();
 }
 
 async function startNetworkAction(event, action) {
@@ -2131,6 +2147,8 @@ async function init() {
   $("#mine-form").addEventListener("input", renderJobs);
   $("#burst-form").addEventListener("submit", (event) => startBoundedAction(event, "burst"));
   $("#burst-form").addEventListener("input", renderJobs);
+  $("#burst-shape").addEventListener("change", renderBurstShapeControls);
+  renderBurstShapeControls();
   $("#partition-form").addEventListener("submit", (event) => startNetworkAction(event, "partition"));
   $("#partition-form").addEventListener("input", renderJobs);
   $("#degrade-form").addEventListener("submit", (event) => startNetworkAction(event, "degrade"));
