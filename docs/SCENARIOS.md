@@ -269,4 +269,5 @@ before another mutation may begin.
 - `rainbow.yml` fixes the block interval at 10s and the fill ratio at 10, then uses
   `wait_n_blocks` to ramp `SPAM_FEE` x10 every block from 1 to 10,000 sat/vB, driving
   the spammer into `capacity_degraded` and spreading the mempool across every fee-rate
-  color band. Runs unmodified on a fresh stack or an already-running one.
+  color band. Runs unmodified on a fresh stack or an already-running one, then restores
+  the complete pre-run desired settings map.
