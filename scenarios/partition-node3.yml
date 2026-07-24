@@ -6,4 +6,4 @@ steps:
   - type: partition
     node: btc-simnet-node3
     main_blocks: 3
-    isolated_blocks: 4
+    isolated_blocks: 5

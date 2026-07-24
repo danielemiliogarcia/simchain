@@ -9,7 +9,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/partition.sh start <miner-node> [--main-blocks N] [--isolated-blocks N]
+  ./scripts/partition.sh start <miner-node> [--main-blocks N] [--isolated-blocks N] [--heal-delay-secs N]
   ./scripts/partition.sh --help
 
 Starts a TTL-healed control-plane partition job and waits for it to finish.

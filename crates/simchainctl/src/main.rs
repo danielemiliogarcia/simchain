@@ -215,6 +215,7 @@ fn run(cli: Cli) -> Result<(), ClientError> {
                     node: node.to_string(),
                     main_blocks: args.main_blocks,
                     isolated_blocks: args.isolated_blocks,
+                    heal_delay_secs: args.heal_delay_secs,
                 },
                 args.idempotency_key.as_deref(),
             )?;
@@ -611,8 +612,9 @@ fn describe_step(step: &Step) -> String {
             node,
             main_blocks,
             isolated_blocks,
+            heal_delay_secs,
         } => format!(
-            "partition {node}: main {main_blocks} block(s), isolated {isolated_blocks} block(s)"
+            "partition {node}: main {main_blocks} block(s), isolated {isolated_blocks} block(s), heal delay {heal_delay_secs}s"
         ),
         Step::Degrade {
             node,

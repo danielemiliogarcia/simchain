@@ -111,6 +111,8 @@ pub struct PartitionJobRequest {
     pub node: String,
     pub main_blocks: u64,
     pub isolated_blocks: u64,
+    #[serde(default)]
+    pub heal_delay_secs: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

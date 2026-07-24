@@ -317,8 +317,11 @@ pub struct PartitionStartArgs {
     #[arg(long, default_value_t = 3)]
     pub main_blocks: u64,
     /// Blocks mined by the isolated miner; must differ from main-blocks.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 5)]
     pub isolated_blocks: u64,
+    /// Seconds to keep both mined branches isolated before healing.
+    #[arg(long, default_value_t = 0)]
+    pub heal_delay_secs: u64,
     /// Wait for healing and terminal convergence.
     #[arg(long)]
     pub wait: bool,
@@ -784,7 +787,9 @@ mod tests {
             "--main-blocks",
             "3",
             "--isolated-blocks",
-            "4",
+            "5",
+            "--heal-delay-secs",
+            "15",
             "--wait",
         ])
         .expect("partition");
@@ -793,7 +798,8 @@ mod tests {
             Command::Partition(PartitionArgs {
                 start: PartitionStartArgs {
                     main_blocks: 3,
-                    isolated_blocks: 4,
+                    isolated_blocks: 5,
+                    heal_delay_secs: 15,
                     wait: true,
                     ..
                 },
@@ -810,7 +816,9 @@ mod tests {
             "--main-blocks",
             "3",
             "--isolated-blocks",
-            "4",
+            "5",
+            "--heal-delay-secs",
+            "15",
             "--wait",
         ])
         .expect("partition start");
@@ -819,7 +827,8 @@ mod tests {
             Command::Partition(PartitionArgs {
                 command: Some(PartitionCommand::Start(PartitionStartArgs {
                     main_blocks: 3,
-                    isolated_blocks: 4,
+                    isolated_blocks: 5,
+                    heal_delay_secs: 15,
                     wait: true,
                     ..
                 })),

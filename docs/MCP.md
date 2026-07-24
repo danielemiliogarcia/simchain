@@ -107,7 +107,7 @@ Pause the spammer.
 Resume the spammer.
 Set the mean block interval to 12 seconds.
 Start a 3-block reorg on node3 and wait for the job to finish.
-Partition node3 with 3 main blocks and 4 isolated blocks.
+Partition node3 with 3 main blocks and 5 isolated blocks.
 Fund this regtest address with 1 BTC from the faucet.
 List recent jobs and explain any failures.
 ```

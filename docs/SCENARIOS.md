@@ -120,7 +120,7 @@ steps:
   - type: partition
     node: btc-simnet-node3
     main_blocks: 3
-    isolated_blocks: 4
+    isolated_blocks: 5
 
   - type: degrade
     node: node2
@@ -164,7 +164,8 @@ Validation rules:
   `effective_generation`, `observed_height_at_least`, `active_lease_count`, and
   `cycle_phase`.
 - `sleep.secs`, `mine.blocks`, `reorg.depth`, `spam_burst.txs`, and both partition
-  block counts are positive.
+  block counts are positive. `partition.heal_delay_secs` defaults to zero and may be
+  at most 86400; it holds completed competing branches apart before healing.
 - Miner nodes are `btc-simnet-node2` or `btc-simnet-node3`.
 - `spam_burst.outputs_per_tx` may be zero. Zero sends sequential single-output
   transactions; a positive value sends that many 546-sat burn outputs per

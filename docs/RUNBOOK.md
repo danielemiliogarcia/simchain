@@ -60,14 +60,15 @@ docker exec btc-simnet-node1 bitcoin-cli -regtest -rpcuser=foo -rpcpassword=rpcp
 
 Partition runs are post-bootstrap only (node1 must be at height 204 or higher). This
 job leases mining, spam, and node3's private network agent; mines three blocks on the
-connected side and four on node3; heals; and witnesses the expected winner:
+connected side and five on node3; heals; and witnesses the expected winner:
 
 ```bash
 cargo run -p simchainctl -- partition start \
-  --node node3 --main-blocks 3 --isolated-blocks 4 --wait
+  --node node3 --main-blocks 3 --isolated-blocks 5 \
+  --heal-delay-secs 15 --wait
 ```
 
-Note who wins with those defaults: the **isolated** miner. Its 4-block branch is longer,
+Note who wins with those defaults: the **isolated** miner. Its 5-block branch is longer,
 so on heal the connected side's three blocks are orphaned and every node reorgs onto
 node3's chain — "main" means "still connected to node1", not "the side that wins".
 
@@ -75,6 +76,10 @@ The block counts must differ, otherwise the winning branch would be nondetermini
 The allowed isolated miners are `node2` and `node3`. A failed or aborted job heals its
 owned impairment and waits for convergence before releasing spam and mining. The old
 manual detach/heal commands were removed because they had no TTL owner.
+
+For a live demonstration, `--heal-delay-secs 15` leaves the two completed branches
+visible to one-second RPC watchers before reconnection. The losing side reports the
+reorg when the hold ends; the winning side simply keeps its existing tip.
 
 Partitions cut the Docker P2P network path only. Host-side P2P connections through the
 published ports (e.g. `localhost:18444` into node1) bypass the partition, so keep
@@ -92,7 +97,7 @@ cargo run -p simchainctl -- degrade start \
 The convenience wrappers submit the same durable jobs:
 
 ```bash
-./scripts/partition.sh start btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
+./scripts/partition.sh start btc-simnet-node3 --main-blocks 3 --isolated-blocks 5 --heal-delay-secs 15
 ./scripts/degrade.sh start btc-simnet-node3 500 1 60s
 ```
 

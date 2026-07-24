@@ -143,8 +143,11 @@
           <label data-help="Blocks mined by the non-isolated side while the partition is held. Example: 3 mines three public-side blocks before healing.">Main-side blocks
             <input id="partition-main-blocks" type="number" min="1" max="100" value="3" required>
           </label>
-          <label data-help="Blocks mined by the isolated miner while separated. Example: 4 isolated blocks can overtake 3 main-side blocks after the partition heals.">Isolated blocks
-            <input id="partition-isolated-blocks" type="number" min="1" max="100" value="4" required>
+          <label data-help="Blocks mined by the isolated miner while separated. Example: 5 isolated blocks overtake 3 main-side blocks after the partition heals.">Isolated blocks
+            <input id="partition-isolated-blocks" type="number" min="1" max="100" value="5" required>
+          </label>
+          <label data-help="Seconds to keep both completed branches isolated before P2P healing. Use a visible delay such as 15 seconds for live chain watchers.">Heal delay seconds
+            <input id="partition-heal-delay" type="number" min="0" max="86400" value="0" required>
           </label>
           <button id="partition-start" type="submit">Start partition</button>
           <div id="partition-action-result" class="action-result"></div>

@@ -52,6 +52,14 @@ const DEFAULT_LEASE_TTL_SECS: u64 = 120;
 const FAUCET_SUBMIT_TIMEOUT_SECS: u64 = 30;
 const MAX_EVENT_PAGE: usize = 500;
 
+#[derive(Clone, Copy, Debug)]
+struct PartitionPlan {
+    node: MinerNode,
+    main_blocks: u64,
+    isolated_blocks: u64,
+    heal_delay_secs: u64,
+}
+
 fn default_next_checkpoint_generation() -> u64 {
     1
 }
@@ -1018,6 +1026,7 @@ impl JobManager {
                         node,
                         request.main_blocks,
                         request.isolated_blocks,
+                        request.heal_delay_secs,
                         abort,
                     )
                 }));
@@ -2422,6 +2431,7 @@ impl JobManager {
         node: MinerNode,
         main_blocks: u64,
         isolated_blocks: u64,
+        heal_delay_secs: u64,
         abort: Arc<AtomicBool>,
     ) {
         if abort.load(Ordering::Acquire) {
@@ -2502,9 +2512,12 @@ impl JobManager {
         let chain_changed = AtomicBool::new(false);
         let execution = self.execute_partition(
             &job_id,
-            node,
-            main_blocks,
-            isolated_blocks,
+            PartitionPlan {
+                node,
+                main_blocks,
+                isolated_blocks,
+                heal_delay_secs,
+            },
             &SimpleJobControl {
                 abort: abort.clone(),
             },
@@ -2754,12 +2767,16 @@ impl JobManager {
     fn execute_partition(
         &self,
         job_id: &str,
-        node: MinerNode,
-        main_blocks: u64,
-        isolated_blocks: u64,
+        plan: PartitionPlan,
         control: &dyn ScenarioControl,
         chain_changed: &AtomicBool,
     ) -> anyhow::Result<Value> {
+        let PartitionPlan {
+            node,
+            main_blocks,
+            isolated_blocks,
+            heal_delay_secs,
+        } = plan;
         let initial = self.network_actions.validate_ready_and_converged()?;
         self.set_phase(job_id, "disconnecting_partition_peers");
         self.network_actions.disconnect_target_peers(node)?;
@@ -2784,6 +2801,17 @@ impl JobManager {
             isolated_tip.clone()
         };
 
+        if heal_delay_secs > 0 {
+            self.set_phase(job_id, "holding_partition_before_heal");
+            let started = Instant::now();
+            let duration = Duration::from_secs(heal_delay_secs);
+            while started.elapsed() < duration && !control.abort_requested() {
+                thread::sleep(
+                    Duration::from_millis(100).min(duration.saturating_sub(started.elapsed())),
+                );
+            }
+        }
+
         self.set_phase(job_id, "healing_partition");
         let network_lease = self
             .get(job_id)
@@ -2804,6 +2832,7 @@ impl JobManager {
             "main_node": main.short_name(),
             "main_blocks": main_blocks,
             "isolated_blocks": isolated_blocks,
+            "heal_delay_secs": heal_delay_secs,
             "initial": initial,
             "split": split,
             "main_branch": main_result,
@@ -5145,6 +5174,7 @@ impl ScenarioActions for JobScenarioActions {
         node: MinerNode,
         main_blocks: u64,
         isolated_blocks: u64,
+        heal_delay_secs: u64,
         control: &dyn ScenarioControl,
     ) -> anyhow::Result<Value> {
         let acquired_spam = self.ensure_spam_lease("scenario partition step")?;
@@ -5167,9 +5197,12 @@ impl ScenarioActions for JobScenarioActions {
         let chain_changed = AtomicBool::new(false);
         let execution = self.manager.execute_partition(
             &self.job_id,
-            node,
-            main_blocks,
-            isolated_blocks,
+            PartitionPlan {
+                node,
+                main_blocks,
+                isolated_blocks,
+                heal_delay_secs,
+            },
             control,
             &chain_changed,
         );
@@ -5830,6 +5863,12 @@ fn normalize_partition_request(
         return Err(JobManagerError::new(
             ErrorCode::ValidationFailed,
             "partition branch lengths must not exceed 100 blocks",
+        ));
+    }
+    if request.heal_delay_secs > 86_400 {
+        return Err(JobManagerError::new(
+            ErrorCode::ValidationFailed,
+            "heal_delay_secs must not exceed 86400",
         ));
     }
     Ok((request, node))
@@ -7122,6 +7161,7 @@ steps:
                     node: "btc-simnet-node3".to_string(),
                     main_blocks: 2,
                     isolated_blocks: 3,
+                    heal_delay_secs: 0,
                 },
                 Some("partition-retry".to_string()),
             )
@@ -7152,6 +7192,45 @@ steps:
             .expect("spam")
             .active_leases
             .is_empty());
+
+        let held_partition = manager
+            .start_partition(
+                PartitionJobRequest {
+                    node: "node3".to_string(),
+                    main_blocks: 2,
+                    isolated_blocks: 3,
+                    heal_delay_secs: 30,
+                },
+                None,
+            )
+            .expect("start held partition");
+        wait_until(|| {
+            manager
+                .get(&held_partition.job_id)
+                .is_ok_and(|job| job.summary.phase == "holding_partition_before_heal")
+        });
+        assert!(NetworkControlBackend::status(backend.as_ref(), "node3")
+            .expect("held network status")
+            .active_lease
+            .is_some());
+        manager
+            .abort(&held_partition.job_id)
+            .expect("abort held partition");
+        wait_until(|| {
+            manager
+                .get(&held_partition.job_id)
+                .expect("held partition")
+                .summary
+                .state
+                .is_terminal()
+        });
+        let detail = manager.get(&held_partition.job_id).expect("held partition");
+        assert_eq!(detail.summary.state, JobState::Aborted);
+        assert_eq!(detail.summary.cleanup.state, CleanupState::Succeeded);
+        assert!(NetworkControlBackend::status(backend.as_ref(), "node3")
+            .expect("healed network status")
+            .active_lease
+            .is_none());
 
         let degrade = manager
             .start_degrade(
@@ -7205,6 +7284,7 @@ steps:
                     node: "node3".to_string(),
                     main_blocks: 2,
                     isolated_blocks: 3,
+                    heal_delay_secs: 0,
                 },
                 None,
             )
@@ -7279,6 +7359,18 @@ steps:
                 None,
             )
             .expect_err("zero txs");
+        assert_eq!(error.code, ErrorCode::ValidationFailed);
+        let error = manager
+            .start_partition(
+                PartitionJobRequest {
+                    node: "node3".to_string(),
+                    main_blocks: 2,
+                    isolated_blocks: 3,
+                    heal_delay_secs: 86_401,
+                },
+                None,
+            )
+            .expect_err("excessive heal delay");
         assert_eq!(error.code, ErrorCode::ValidationFailed);
         assert!(manager.list().active_job_id.is_none());
         assert!(manager.list().jobs.is_empty());

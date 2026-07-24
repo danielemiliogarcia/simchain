@@ -68,6 +68,7 @@ pub trait ScenarioActions: Send + Sync {
         node: MinerNode,
         main_blocks: u64,
         isolated_blocks: u64,
+        heal_delay_secs: u64,
         control: &dyn ScenarioControl,
     ) -> anyhow::Result<Value>;
     fn degrade(
@@ -316,7 +317,14 @@ fn execute_step(
             node,
             main_blocks,
             isolated_blocks,
-        } => actions.run_partition(*node, *main_blocks, *isolated_blocks, control),
+            heal_delay_secs,
+        } => actions.run_partition(
+            *node,
+            *main_blocks,
+            *isolated_blocks,
+            *heal_delay_secs,
+            control,
+        ),
         Step::Degrade {
             node,
             delay_ms,
@@ -474,9 +482,14 @@ mod tests {
             _: MinerNode,
             main_blocks: u64,
             isolated_blocks: u64,
+            heal_delay_secs: u64,
             _: &dyn ScenarioControl,
         ) -> anyhow::Result<Value> {
-            Ok(json!({"main": main_blocks, "isolated": isolated_blocks}))
+            Ok(json!({
+                "main": main_blocks,
+                "isolated": isolated_blocks,
+                "heal_delay_secs": heal_delay_secs
+            }))
         }
         fn degrade(
             &self,

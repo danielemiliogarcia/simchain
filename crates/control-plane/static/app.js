@@ -1946,6 +1946,7 @@ async function startNetworkAction(event, action) {
     node: $("#partition-node").value,
     main_blocks: Number($("#partition-main-blocks").value),
     isolated_blocks: Number($("#partition-isolated-blocks").value),
+    heal_delay_secs: Number($("#partition-heal-delay").value),
   } : {
     node: $("#degrade-node").value,
     delay_ms: Number($("#degrade-delay").value),

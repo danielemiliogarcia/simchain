@@ -93,6 +93,8 @@ pub enum Step {
         node: MinerNode,
         main_blocks: u64,
         isolated_blocks: u64,
+        #[serde(default)]
+        heal_delay_secs: u64,
     },
     Degrade {
         node: NetworkNode,
@@ -501,6 +503,11 @@ impl Scenario {
                     ..
                 } if main_blocks == isolated_blocks => {
                     Some("main_blocks and isolated_blocks must differ".to_string())
+                }
+                Step::Partition {
+                    heal_delay_secs, ..
+                } if *heal_delay_secs > 86_400 => {
+                    Some("heal_delay_secs must not exceed 86400".to_string())
                 }
                 Step::Degrade {
                     delay_ms, loss_pct, ..
@@ -1034,6 +1041,10 @@ steps:
         .is_err());
         assert!(serde_yaml::from_str::<Scenario>(
             "version: 1\nsteps:\n  - type: mine\n    node: btc-simnet-node1\n    blocks: 1\n",
+        )
+        .is_err());
+        assert!(parse(
+            "version: 1\nsteps:\n  - type: partition\n    node: btc-simnet-node3\n    main_blocks: 3\n    isolated_blocks: 4\n    heal_delay_secs: 86401\n",
         )
         .is_err());
     }

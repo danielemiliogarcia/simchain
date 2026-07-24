@@ -139,7 +139,7 @@ cargo run -p simchainctl -- config set BLOCK_INTERVAL_MEAN_SECS=12 SPAM_FILL_BLO
 cargo run -p simchainctl -- mining pause
 cargo run -p simchainctl -- mining resume
 cargo run -p simchainctl -- reorg start --depth 3 --empty --wait
-cargo run -p simchainctl -- partition start --node node3 --main-blocks 3 --isolated-blocks 4 --wait
+cargo run -p simchainctl -- partition start --node node3 --main-blocks 3 --isolated-blocks 5 --heal-delay-secs 15 --wait
 cargo run -p simchainctl -- degrade start --node node3 --delay-ms 500 --loss-pct 1 --seconds 60 --wait
 cargo run -p simchainctl -- jobs list
 cargo run -p simchainctl -- jobs watch JOB_ID --timeout 900

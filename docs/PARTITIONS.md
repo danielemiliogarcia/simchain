@@ -28,18 +28,23 @@ traffic continue over `btc-simnet-control`.
 
 ```bash
 cargo run -p simchainctl -- partition start \
-  --node node3 --main-blocks 3 --isolated-blocks 4 --wait
+  --node node3 --main-blocks 3 --isolated-blocks 5 \
+  --heal-delay-secs 15 --wait
 ```
 
 The convenience script submits the same job:
 
 ```bash
-./scripts/partition.sh start btc-simnet-node3 --main-blocks 3 --isolated-blocks 4
+./scripts/partition.sh start btc-simnet-node3 --main-blocks 3 --isolated-blocks 5 \
+  --heal-delay-secs 15
 ```
 
 The isolated node may be `node2` or `node3`. Branch lengths must be positive, at most
-100, and unequal. With `3` main-side blocks and `4` isolated blocks, the isolated branch
+100, and unequal. With `3` main-side blocks and `5` isolated blocks, the isolated branch
 wins; reverse the counts to make the side that remains connected to node1 win.
+`heal_delay_secs` may be 0–86400 and defaults to zero. A delay keeps both completed
+branches isolated for observation before healing; the coordinator continues renewing
+the impairment lease during that hold.
 
 The coordinator performs these safety steps:
 
@@ -48,13 +53,46 @@ The coordinator performs these safety steps:
 3. acquires and renews a hard-partition lease on the target agent;
 4. asks Bitcoin Core to disconnect established target peers and witnesses isolation;
 5. mines both explicit branch lengths over RPC;
-6. clears the impairment, triggers P2P reconnects, and witnesses the expected tip on all
+6. holds the completed split for `heal_delay_secs`, if requested;
+7. clears the impairment, triggers P2P reconnects, and witnesses the expected tip on all
    nodes;
-7. releases spam with `chain_changed=true`, then releases mining.
+8. releases spam with `chain_changed=true`, then releases mining.
 
 Hard partition rules drop both ingress and egress IP traffic on only the P2P interface.
 It is deliberately not modeled as egress loss alone. Existing TCP sessions are flushed
 through Bitcoin RPC so the isolation witness does not depend on TCP timeouts.
+
+### Watch both sides live
+
+Start one watcher on the connected-side miner from the host:
+
+```bash
+./scripts/chainwatch.sh -P 28443 -i 1
+```
+
+Node3 deliberately has no host RPC port. For a disposable live demo, install the
+watcher's `curl` dependency in the running container, copy the same script into it, and
+watch node3 over its loopback RPC endpoint:
+
+```bash
+docker exec -u root btc-simnet-node3 bash -c \
+  "apt-get update -qq && apt-get install -y -qq curl"
+docker cp scripts/chainwatch.sh btc-simnet-node3:/tmp/chainwatch.sh
+docker exec -it btc-simnet-node3 bash /tmp/chainwatch.sh \
+  -H 127.0.0.1 -P 18443 -u foo -p rpcpassword -i 1
+```
+
+Then submit a partition with a hold longer than the polling interval:
+
+```bash
+cargo run -p simchainctl -- partition start \
+  --node node3 --main-blocks 3 --isolated-blocks 5 --heal-delay-secs 15
+```
+
+During the hold, the panes show different heights and tips. When healing begins, only
+the losing side prints a reorg banner; the winning side already has the selected tip.
+The bundled mempool.space instance follows node1, so it can visualize node1 changing to
+the winning chain after healing but cannot simultaneously show node3's private branch.
 
 ## Timed latency and loss
 
@@ -87,7 +125,7 @@ curl -s -X POST localhost:8090/api/v1/jobs/partition \
   -H "Authorization: Bearer $token" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: partition-example-1' \
-  -d '{"node":"node3","main_blocks":3,"isolated_blocks":4}'
+  -d '{"node":"node3","main_blocks":3,"isolated_blocks":5,"heal_delay_secs":15}'
 
 curl -s -X POST localhost:8090/api/v1/jobs/degrade \
   -H "Authorization: Bearer $token" \

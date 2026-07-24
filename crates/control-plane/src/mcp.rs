@@ -153,6 +153,9 @@ pub struct StartPartitionParams {
     /// Blocks mined by the isolated miner. Must differ from main_blocks.
     #[serde(default = "default_isolated_blocks")]
     pub isolated_blocks: u64,
+    /// Seconds to keep both mined branches isolated before healing.
+    #[serde(default)]
+    pub heal_delay_secs: u64,
     /// Optional retry key for an identical request.
     #[serde(default)]
     pub idempotency_key: Option<String>,
@@ -163,7 +166,7 @@ fn default_main_blocks() -> u64 {
 }
 
 fn default_isolated_blocks() -> u64 {
-    4
+    5
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -504,6 +507,7 @@ impl ControlPlaneMcp {
             node: params.node,
             main_blocks: params.main_blocks,
             isolated_blocks: params.isolated_blocks,
+            heal_delay_secs: params.heal_delay_secs,
         };
         match tokio::task::spawn_blocking(move || {
             start_partition_service(&app, request, params.idempotency_key)
