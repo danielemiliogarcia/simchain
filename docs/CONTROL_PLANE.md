@@ -15,8 +15,9 @@ watch chain state and manage live operations.
 
 Mining and spam policy plus pause/resume use private worker APIs and never recreate
 their containers. Reorgs, partitions, timed network degradation, manual mine/burst
-actions, faucet funding, and scenarios are durable server-side jobs under one mutation
-lock. Reorgs and partitions pause workers with expiring leases; namespace-local network
+actions, faucet funding, and scenarios are durable server-side jobs under one scheduler.
+Most mutations remain exclusive; a timed degradation may overlap a manual Mine job and
+degradations on other nodes. Reorgs and partitions pause workers with expiring leases; namespace-local network
 agents also heal on TTL expiry. Scenarios persist ordered steps, checkpoints, results,
 and owned cleanup.
 
@@ -27,11 +28,11 @@ its named state volume.
 ## Mutation coordinator
 
 Dashboard, CLI, MCP, and direct HTTP clients all submit mutation jobs to the same
-control-plane coordinator. At most one mutation job runs at a time. If a reorg,
-scenario, manual mine, spam burst, partition, degradation, or faucet job already owns
-the coordinator, a second incompatible request is rejected; it is not queued for later
-execution. The dashboard shows the active job banner and disables conflicting controls,
-while CLI/API/MCP callers receive the same busy/error response from the backend.
+control-plane coordinator. At most one exclusive mutation runs at a time. Timed
+degradations occupy a per-node lane and may overlap only a manual Mine job or a
+degradation on another node. A second incompatible request is rejected; it is not queued
+for later execution. The dashboard shows every active lane and disables conflicting
+controls, while CLI/API/MCP callers receive the same busy/error response from the backend.
 
 This is deliberate: queued chain mutations can become stale or unsafe after the active
 job changes height, mempool contents, worker leases, faucet state, or network
@@ -140,7 +141,7 @@ cargo run -p simchainctl -- mining pause
 cargo run -p simchainctl -- mining resume
 cargo run -p simchainctl -- reorg start --depth 3 --empty --wait
 cargo run -p simchainctl -- partition start --node node3 --main-blocks 3 --isolated-blocks 5 --heal-delay-secs 15 --wait
-cargo run -p simchainctl -- degrade start --node node3 --delay-ms 500 --loss-pct 1 --seconds 60 --wait
+cargo run -p simchainctl -- degrade start --node node2 --delay-ms 5000 --loss-pct 0 --seconds 30 --wait
 cargo run -p simchainctl -- jobs list
 cargo run -p simchainctl -- jobs watch JOB_ID --timeout 900
 cargo run -p simchainctl -- jobs abort JOB_ID
@@ -165,5 +166,5 @@ Stable automation exit codes are:
 
 Job metadata and the most recent 100 summaries are stored in the
 `btc-simnet-control-state` volume. A control-plane restart marks an unfinished job
-interrupted and keeps the coordinator locked until any network impairment is healed,
-convergence is witnessed, and worker leases are confirmed clear.
+interrupted and keeps each occupied lane locked until its owned network impairment is
+healed and worker leases are confirmed clear.

@@ -234,12 +234,18 @@ pub fn status(app: &AppState) -> StatusSnapshot {
     if let Some(spam) = status.components.get_mut(SPAM_COMPONENT) {
         spam.desired_state = Some(control.spam_state);
     }
-    status.active_operation = app.jobs.active_summary().map(|job| OperationSummary {
-        job_id: job.id,
-        kind: job.kind.as_str().to_string(),
-        state: job.state.as_str().to_string(),
-        phase: job.phase,
-    });
+    status.active_operations = app
+        .jobs
+        .active_summaries()
+        .into_iter()
+        .map(|job| OperationSummary {
+            job_id: job.id,
+            kind: job.kind.as_str().to_string(),
+            state: job.state.as_str().to_string(),
+            phase: job.phase,
+        })
+        .collect();
+    status.active_operation = status.active_operations.first().cloned();
     status
 }
 

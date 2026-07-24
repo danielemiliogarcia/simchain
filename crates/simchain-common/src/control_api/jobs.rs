@@ -264,7 +264,18 @@ fn is_false(value: &bool) -> bool {
 pub struct JobListResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_job_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_jobs: Vec<ActiveJobSummary>,
     pub jobs: Vec<JobSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActiveJobSummary {
+    pub job_id: String,
+    pub kind: JobKind,
+    pub lane: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

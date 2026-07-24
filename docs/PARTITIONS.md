@@ -5,9 +5,10 @@ isolates one miner from Bitcoin P2P while RPC remains reachable, mines determini
 competing branches, heals the link, and witnesses the expected winning tip on all three
 nodes. A degradation job adds bounded latency and/or loss to one node's P2P egress.
 
-Both operations require bootstrap height 204. They share the control plane's single
-mutation coordinator, persisted events/results, idempotency behavior, cooperative abort,
-and cleanup reporting.
+Both operations require bootstrap height 204. They share the control plane's durable
+scheduler, persisted events/results, idempotency behavior, cooperative abort, and cleanup
+reporting. Partitions remain exclusive. Degradations use per-node lanes and may overlap
+only a manual Mine job or degradations on other nodes.
 
 ## Start the services
 
@@ -98,7 +99,7 @@ the winning chain after healing but cannot simultaneously show node3's private b
 
 ```bash
 cargo run -p simchainctl -- degrade start \
-  --node node3 --delay-ms 500 --loss-pct 1 --seconds 60 --wait
+  --node node2 --delay-ms 5000 --loss-pct 0 --seconds 30 --wait
 ```
 
 All three nodes are valid degradation targets. Delay is one-way egress delay; loss is a
@@ -108,6 +109,18 @@ window is 1–86400 seconds. The convenience wrapper is:
 ```bash
 ./scripts/degrade.sh start btc-simnet-node3 500 1 60s
 ```
+
+To observe delayed block propagation, leave that node2 degradation running in one pane
+and mine from node2 in another:
+
+```bash
+cargo run -p simchainctl -- mine --node node2 --blocks 1 --wait
+```
+
+RPC travels over the control network and is not delayed. Node2 creates the block
+immediately; its P2P announcement leaves over the shaped egress interface, so node1 and
+node3 learn the tip after approximately the configured five seconds. Degrading a
+different node shapes that node's outbound traffic and does not provide the same demo.
 
 The old unbounded `netem.sh apply/clear` commands were removed. Every impairment now has
 an owning job and lease deadline, so a forgotten shell or dead control plane cannot
@@ -140,10 +153,9 @@ MCP exposes `start_partition` and `start_degrade`; inspect progress with `get_jo
 
 Network leases use the same short renewal cadence as worker pause leases. If the control
 plane dies, an agent's TTL worker clears nftables/tc state automatically. When the
-control plane restarts it marks the old job interrupted, queries all agents for that
-job's owner ID, heals and reconnects affected nodes, waits for chain convergence, then
-releases spam and mining leases. The mutation lock remains held while any cleanup is
-unsafe or incomplete.
+control plane restarts it marks every active-lane job interrupted, queries agents by
+owner ID, heals each job's impairment, and releases only that job's worker leases. Each
+lane remains held while its cleanup is unsafe or incomplete.
 
 Cleanup failures are stored separately from the primary job failure. A terminal success
 therefore means both the requested experiment and its safety cleanup succeeded.

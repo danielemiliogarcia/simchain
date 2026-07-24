@@ -18,14 +18,14 @@ use crate::scenario_job::{ScenarioActionBackend, SpamBurstTarget};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use simchain_common::control_api::{
-    AbortJobResponse, CheckpointState, CleanupState, ComponentState, DegradeJobRequest, ErrorCode,
-    FaucetDeliveryState, FaucetJobRequest, FaucetOutput, FaucetSource, FaucetSourceNode,
-    FaucetStatusResponse, FaucetTransfer, FaucetWalletStatus, JobCheckpoint, JobCheckpointResponse,
-    JobCleanup, JobCreatedResponse, JobDetail, JobEvent, JobEventsResponse, JobFailure, JobKind,
-    JobLease, JobListResponse, JobState, JobSummary, MineJobRequest, PartitionJobRequest,
-    ReleaseCheckpointRequest, ReorgJobRequest, ScenarioStepStatus, SpamBurstJobRequest,
-    FAUCET_MAX_OUTPUTS, FAUCET_MAX_TX_VBYTES, FAUCET_PRIORITY_DELTA_SATS,
-    FAUCET_PRIORITY_DOMINANCE_FACTOR,
+    AbortJobResponse, ActiveJobSummary, CheckpointState, CleanupState, ComponentState,
+    DegradeJobRequest, ErrorCode, FaucetDeliveryState, FaucetJobRequest, FaucetOutput,
+    FaucetSource, FaucetSourceNode, FaucetStatusResponse, FaucetTransfer, FaucetWalletStatus,
+    JobCheckpoint, JobCheckpointResponse, JobCleanup, JobCreatedResponse, JobDetail, JobEvent,
+    JobEventsResponse, JobFailure, JobKind, JobLease, JobListResponse, JobState, JobSummary,
+    MineJobRequest, PartitionJobRequest, ReleaseCheckpointRequest, ReorgJobRequest,
+    ScenarioStepStatus, SpamBurstJobRequest, FAUCET_MAX_OUTPUTS, FAUCET_MAX_TX_VBYTES,
+    FAUCET_PRIORITY_DELTA_SATS, FAUCET_PRIORITY_DOMINANCE_FACTOR,
 };
 use simchain_common::internal_api::{
     LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest, NetworkImpairment,
@@ -45,7 +45,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const JOB_SCHEMA_VERSION: u32 = 3;
+const JOB_SCHEMA_VERSION: u32 = 4;
 const MAX_JOB_HISTORY: usize = 100;
 const EVENT_RING_CAPACITY: usize = 2_048;
 const DEFAULT_LEASE_TTL_SECS: u64 = 120;
@@ -179,6 +179,17 @@ struct PersistedJobsV2 {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedJobsV3 {
+    schema_version: u32,
+    next_event_sequence: u64,
+    #[serde(default = "default_next_checkpoint_generation")]
+    next_checkpoint_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_job_id: Option<String>,
+    jobs: Vec<StoredJob>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedJobs {
     schema_version: u32,
     next_event_sequence: u64,
@@ -186,6 +197,8 @@ struct PersistedJobs {
     next_checkpoint_generation: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     active_job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    active_degradation_jobs: BTreeMap<String, String>,
     jobs: Vec<StoredJob>,
 }
 
@@ -196,6 +209,7 @@ impl Default for PersistedJobs {
             next_event_sequence: 1,
             next_checkpoint_generation: 1,
             active_job_id: None,
+            active_degradation_jobs: BTreeMap::new(),
             jobs: Vec::new(),
         }
     }
@@ -218,6 +232,7 @@ fn load_and_migrate_jobs(store: &JobStore) -> anyhow::Result<PersistedJobs> {
                 next_event_sequence: old.next_event_sequence,
                 next_checkpoint_generation: old.next_checkpoint_generation,
                 active_job_id: old.active_job_id,
+                active_degradation_jobs: BTreeMap::new(),
                 jobs: old
                     .jobs
                     .into_iter()
@@ -231,6 +246,7 @@ fn load_and_migrate_jobs(store: &JobStore) -> anyhow::Result<PersistedJobs> {
                     })
                     .collect(),
             };
+            let migrated = migrate_legacy_active_job(migrated)?;
             store.save(&migrated)?;
             Ok(migrated)
         }
@@ -242,6 +258,7 @@ fn load_and_migrate_jobs(store: &JobStore) -> anyhow::Result<PersistedJobs> {
                 next_event_sequence: old.next_event_sequence,
                 next_checkpoint_generation: old.next_checkpoint_generation,
                 active_job_id: old.active_job_id,
+                active_degradation_jobs: BTreeMap::new(),
                 jobs: old
                     .jobs
                     .into_iter()
@@ -255,12 +272,59 @@ fn load_and_migrate_jobs(store: &JobStore) -> anyhow::Result<PersistedJobs> {
                     })
                     .collect(),
             };
+            let migrated = migrate_legacy_active_job(migrated)?;
             store.save(&migrated)?;
             Ok(migrated)
         }
-        3 => serde_json::from_value(value).map_err(Into::into),
+        3 => {
+            let old: PersistedJobsV3 = serde_json::from_value(value)?;
+            anyhow::ensure!(old.schema_version == 3, "invalid v3 job schema marker");
+            let migrated = migrate_legacy_active_job(PersistedJobs {
+                schema_version: JOB_SCHEMA_VERSION,
+                next_event_sequence: old.next_event_sequence,
+                next_checkpoint_generation: old.next_checkpoint_generation,
+                active_job_id: old.active_job_id,
+                active_degradation_jobs: BTreeMap::new(),
+                jobs: old.jobs,
+            })?;
+            store.save(&migrated)?;
+            Ok(migrated)
+        }
+        4 => serde_json::from_value(value).map_err(Into::into),
         future => anyhow::bail!("unsupported job schema {future} (expected {JOB_SCHEMA_VERSION})"),
     }
+}
+
+fn migrate_legacy_active_job(mut persisted: PersistedJobs) -> anyhow::Result<PersistedJobs> {
+    let Some(job_id) = persisted.active_job_id.clone() else {
+        return Ok(persisted);
+    };
+    let job = find_stored(&persisted, &job_id)
+        .ok_or_else(|| anyhow::anyhow!("active job {job_id} is missing from job history"))?;
+    if job.detail.summary.kind != JobKind::Degrade {
+        return Ok(persisted);
+    }
+    let raw_node = job
+        .detail
+        .request
+        .get("node")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("active degradation {job_id} has no node"))?;
+    let node = match raw_node.trim().to_ascii_lowercase().as_str() {
+        "node1" | "btc-simnet-node1" => "node1",
+        "node2" | "btc-simnet-node2" => "node2",
+        "node3" | "btc-simnet-node3" => "node3",
+        other => anyhow::bail!("active degradation {job_id} has invalid node {other}"),
+    };
+    anyhow::ensure!(
+        persisted
+            .active_degradation_jobs
+            .insert(node.to_string(), job_id)
+            .is_none(),
+        "duplicate active degradation for {node}"
+    );
+    persisted.active_job_id = None;
+    Ok(persisted)
 }
 
 struct ManagerState {
@@ -377,8 +441,8 @@ impl JobManager {
             .rev()
             .collect();
 
-        let recovery_job = persisted.active_job_id.clone();
-        if let Some(job_id) = recovery_job.as_deref() {
+        let recovery_jobs = active_job_ids(&persisted);
+        for job_id in &recovery_jobs {
             let job = find_stored_mut(&mut persisted, job_id).ok_or_else(|| {
                 anyhow::anyhow!("active job {job_id} is missing from job history")
             })?;
@@ -393,6 +457,8 @@ impl JobManager {
                         .to_string(),
                 });
             }
+        }
+        if !recovery_jobs.is_empty() {
             store.save(&persisted)?;
         }
 
@@ -423,7 +489,7 @@ impl JobManager {
             id_sequence: AtomicU64::new(1),
             lease_ttl_secs,
         });
-        if let Some(job_id) = recovery_job {
+        for job_id in recovery_jobs {
             manager.emit_best_effort(
                 &job_id,
                 "restart_recovery",
@@ -444,7 +510,7 @@ impl JobManager {
                 "faucet-delivery-recovery".to_string(),
             ));
         }
-        match state.persisted.active_job_id.clone() {
+        match first_active_job_id(&state.persisted) {
             Some(job_id) => Err(JobManagerError::operation_in_progress(job_id)),
             None => Ok(()),
         }
@@ -452,8 +518,17 @@ impl JobManager {
 
     pub fn active_summary(&self) -> Option<JobSummary> {
         let state = self.state.lock().expect("job manager lock");
-        let job_id = state.persisted.active_job_id.as_deref()?;
-        find_stored(&state.persisted, job_id).map(|job| job.detail.summary.clone())
+        let job_id = first_active_job_id(&state.persisted)?;
+        find_stored(&state.persisted, &job_id).map(|job| job.detail.summary.clone())
+    }
+
+    pub fn active_summaries(&self) -> Vec<JobSummary> {
+        let state = self.state.lock().expect("job manager lock");
+        active_job_ids(&state.persisted)
+            .iter()
+            .filter_map(|job_id| find_stored(&state.persisted, job_id))
+            .map(|job| job.detail.summary.clone())
+            .collect()
     }
 
     pub fn has_pending_faucet(&self) -> bool {
@@ -600,7 +675,7 @@ impl JobManager {
                     reused: true,
                 });
             }
-            if let Some(active) = state.persisted.active_job_id.clone() {
+            if let Some(active) = first_active_job_id(&state.persisted) {
                 return Err(JobManagerError::operation_in_progress(active));
             }
             if state.delivery_recovering {
@@ -729,7 +804,7 @@ impl JobManager {
                     });
                 }
             }
-            if let Some(active) = state.persisted.active_job_id.clone() {
+            if let Some(active) = first_active_job_id(&state.persisted) {
                 return Err(JobManagerError::operation_in_progress(active));
             }
             if state.delivery_recovering {
@@ -925,7 +1000,7 @@ impl JobManager {
                     });
                 }
             }
-            if let Some(active) = state.persisted.active_job_id.clone() {
+            if let Some(active) = first_active_job_id(&state.persisted) {
                 return Err(JobManagerError::operation_in_progress(active));
             }
             if state.delivery_recovering {
@@ -1218,6 +1293,22 @@ impl JobManager {
     ) -> Result<(JobCreatedResponse, Option<Arc<AtomicBool>>), JobManagerError> {
         let fingerprint = serde_json::to_string(&request).map_err(internal_error)?;
         let idempotency_key = normalize_idempotency_key(idempotency_key)?;
+        let degradation_node = if kind == JobKind::Degrade {
+            Some(
+                request
+                    .get("node")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        JobManagerError::new(
+                            ErrorCode::ValidationFailed,
+                            "degradation request is missing its normalized node",
+                        )
+                    })?
+                    .to_string(),
+            )
+        } else {
+            None
+        };
         let abort = Arc::new(AtomicBool::new(false));
         let job_id = {
             let mut state = self.state.lock().expect("job manager lock");
@@ -1246,8 +1337,19 @@ impl JobManager {
                     ));
                 }
             }
-            if let Some(active) = state.persisted.active_job_id.clone() {
-                return Err(JobManagerError::operation_in_progress(active));
+            if !jobs_are_compatible(
+                active_exclusive_kind(&state.persisted),
+                &state.persisted.active_degradation_jobs,
+                kind,
+                degradation_node.as_deref(),
+            ) {
+                let conflict = degradation_node
+                    .as_ref()
+                    .and_then(|node| state.persisted.active_degradation_jobs.get(node))
+                    .cloned()
+                    .or_else(|| first_active_job_id(&state.persisted))
+                    .unwrap_or_else(|| "unknown-active-job".to_string());
+                return Err(JobManagerError::operation_in_progress(conflict));
             }
             if state.delivery_recovering {
                 return Err(JobManagerError::operation_in_progress(
@@ -1291,7 +1393,14 @@ impl JobManager {
                 reorg_recovery: ReorgRecoveryContext::default(),
                 scenario_settings_backup: None,
             });
-            state.persisted.active_job_id = Some(job_id.clone());
+            if let Some(node) = degradation_node {
+                state
+                    .persisted
+                    .active_degradation_jobs
+                    .insert(node, job_id.clone());
+            } else {
+                state.persisted.active_job_id = Some(job_id.clone());
+            }
             state.aborts.insert(job_id.clone(), abort.clone());
             self.trim_history_locked(&mut state)
                 .map_err(internal_error)?;
@@ -1320,8 +1429,32 @@ impl JobManager {
 
     pub fn list(&self) -> JobListResponse {
         let state = self.state.lock().expect("job manager lock");
+        let active_job_ids = active_job_ids(&state.persisted);
+        let active_jobs = active_job_ids
+            .iter()
+            .filter_map(|job_id| {
+                let job = find_stored(&state.persisted, job_id)?;
+                let lane = if state.persisted.active_job_id.as_deref() == Some(job_id) {
+                    "exclusive".to_string()
+                } else {
+                    let node = state
+                        .persisted
+                        .active_degradation_jobs
+                        .iter()
+                        .find_map(|(node, active_id)| (active_id == job_id).then_some(node))?;
+                    format!("network:{node}")
+                };
+                Some(ActiveJobSummary {
+                    job_id: job_id.clone(),
+                    kind: job.detail.summary.kind,
+                    lane,
+                })
+            })
+            .collect();
         JobListResponse {
-            active_job_id: state.persisted.active_job_id.clone(),
+            active_job_id: active_job_ids.first().cloned(),
+            active_job_ids,
+            active_jobs,
             jobs: state
                 .persisted
                 .jobs
@@ -3046,12 +3179,27 @@ impl JobManager {
     ) -> JobCleanup {
         self.set_cleanup_running(job_id);
         let mut errors = stop_error.into_iter().collect::<Vec<_>>();
+        let reconnect_after_network_cleanup = self
+            .get(job_id)
+            .is_ok_and(|job| job.summary.kind != JobKind::Degrade);
+        let lease_prefix = format!("{job_id}-");
+        for lease in leases
+            .iter()
+            .filter(|lease| !lease.lease_id.starts_with(&lease_prefix))
+        {
+            errors.push(format!(
+                "refused to clean lease {} because it is not owned by job {job_id}",
+                lease.lease_id
+            ));
+        }
         // Network healing is first and is witnessed before either worker can
         // resume. Historical lease records are intentional: reconnect and
         // convergence are harmless if the happy path already healed.
         let network_leases: Vec<&JobLease> = leases
             .iter()
-            .filter(|lease| lease.component.starts_with("network:"))
+            .filter(|lease| {
+                lease.lease_id.starts_with(&lease_prefix) && lease.component.starts_with("network:")
+            })
             .collect();
         for lease in &network_leases {
             match network_lease_node(lease) {
@@ -3086,40 +3234,44 @@ impl JobManager {
                 Err(error) => errors.push(error.to_string()),
             }
         }
-        let mut healed_nodes = HashSet::new();
-        for lease in &network_leases {
-            let Ok(node_name) = network_lease_node(lease) else {
-                continue;
-            };
-            if !healed_nodes.insert(node_name.to_string()) {
-                continue;
-            }
-            if node_name == "node1" {
-                continue;
-            }
-            match parse_miner_node(node_name) {
-                Ok(node) => {
-                    if let Err(error) = self.network_actions.reconnect_target(node) {
-                        errors.push(format!("failed to reconnect {node_name}: {error}"));
-                    }
+        if reconnect_after_network_cleanup {
+            let mut healed_nodes = HashSet::new();
+            for lease in &network_leases {
+                let Ok(node_name) = network_lease_node(lease) else {
+                    continue;
+                };
+                if !healed_nodes.insert(node_name.to_string()) {
+                    continue;
                 }
-                Err(error) => errors.push(error.message),
+                if node_name == "node1" {
+                    continue;
+                }
+                match parse_miner_node(node_name) {
+                    Ok(node) => {
+                        if let Err(error) = self.network_actions.reconnect_target(node) {
+                            errors.push(format!("failed to reconnect {node_name}: {error}"));
+                        }
+                    }
+                    Err(error) => errors.push(error.message),
+                }
             }
-        }
-        if !network_leases.is_empty() {
-            if let Err(error) = self
-                .network_actions
-                .wait_for_convergence(None, &NeverAbortControl)
-            {
-                errors.push(format!(
-                    "network healed but chain convergence failed: {error}"
-                ));
+            if !network_leases.is_empty() {
+                if let Err(error) = self
+                    .network_actions
+                    .wait_for_convergence(None, &NeverAbortControl)
+                {
+                    errors.push(format!(
+                        "network healed but chain convergence failed: {error}"
+                    ));
+                }
             }
         }
         // Spam is released first so its chain-derived pools reconcile while
         // continuous mining is still held.
         for component in ["spam", "mining"] {
-            for lease in leases.iter().filter(|lease| lease.component == component) {
+            for lease in leases.iter().filter(|lease| {
+                lease.lease_id.starts_with(&lease_prefix) && lease.component == component
+            }) {
                 let request = LeaseReleaseRequest {
                     request_id: format!("{job_id}-{}-release", lease.lease_id),
                     chain_changed,
@@ -3448,8 +3600,8 @@ impl JobManager {
                 job.detail.failure = failure;
             }
             state.aborts.remove(job_id);
-            if !cleanup_failed && state.persisted.active_job_id.as_deref() == Some(job_id) {
-                state.persisted.active_job_id = None;
+            if !cleanup_failed {
+                clear_active_lane(&mut state.persisted, job_id);
             }
             if let Err(error) = self.store.save(&state.persisted) {
                 tracing::error!(job_id, "failed to persist terminal job state: {error}");
@@ -3588,11 +3740,17 @@ impl JobManager {
 
     fn trim_history_locked(&self, state: &mut ManagerState) -> anyhow::Result<()> {
         while state.persisted.jobs.len() > MAX_JOB_HISTORY {
+            let active = active_job_ids(&state.persisted)
+                .into_iter()
+                .collect::<HashSet<_>>();
             let removable = state
                 .persisted
                 .jobs
                 .iter()
-                .position(|job| job.detail.summary.state.is_terminal())
+                .position(|job| {
+                    job.detail.summary.state.is_terminal()
+                        && !active.contains(&job.detail.summary.id)
+                })
                 .ok_or_else(|| anyhow::anyhow!("job history has no removable terminal record"))?;
             let removed = state.persisted.jobs.remove(removable);
             self.store.remove_events(&removed.detail.summary.id)?;
@@ -3670,7 +3828,7 @@ impl JobManager {
 
         {
             let mut state = self.state.lock().expect("job manager lock");
-            if state.delivery_recovering || state.persisted.active_job_id.is_some() {
+            if state.delivery_recovering || first_active_job_id(&state.persisted).is_some() {
                 return Ok(());
             }
             state.delivery_recovering = true;
@@ -3862,9 +4020,7 @@ impl JobManager {
                             job.detail.summary.cleanup.state = CleanupState::Succeeded;
                             job.detail.summary.phase = "recovery_complete".to_string();
                         }
-                        if state.persisted.active_job_id.as_deref() == Some(job_id.as_str()) {
-                            state.persisted.active_job_id = None;
-                        }
+                        clear_active_lane(&mut state.persisted, &job_id);
                         state.recovering.remove(&job_id);
                         state.recovery_errors.remove(&job_id);
                         if let Err(error) = self.store.save(&state.persisted) {
@@ -4153,9 +4309,11 @@ impl JobManager {
     }
 
     fn recover_network_resources(&self, job_id: &str) -> anyhow::Result<()> {
-        let recorded_nodes: HashSet<String> = self
+        let detail = self
             .get(job_id)
-            .map_err(|error| anyhow::anyhow!(error.message))?
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let reconnect_after_cleanup = detail.summary.kind != JobKind::Degrade;
+        let recorded_nodes: HashSet<String> = detail
             .leases
             .into_iter()
             .filter_map(|lease| network_lease_node(&lease).ok().map(str::to_string))
@@ -4177,18 +4335,20 @@ impl JobManager {
                 affected.insert(node.to_string());
             }
         }
-        for node in &affected {
-            if node == "node1" {
-                continue;
+        if reconnect_after_cleanup {
+            for node in &affected {
+                if node == "node1" {
+                    continue;
+                }
+                self.network_actions
+                    .reconnect_target(parse_miner_node(node).map_err(|error| {
+                        anyhow::anyhow!("invalid recovery network node: {}", error.message)
+                    })?)?;
             }
-            self.network_actions
-                .reconnect_target(parse_miner_node(node).map_err(|error| {
-                    anyhow::anyhow!("invalid recovery network node: {}", error.message)
-                })?)?;
-        }
-        if !affected.is_empty() {
-            self.network_actions
-                .wait_for_convergence(None, &NeverAbortControl)?;
+            if !affected.is_empty() {
+                self.network_actions
+                    .wait_for_convergence(None, &NeverAbortControl)?;
+            }
         }
         Ok(())
     }
@@ -6249,6 +6409,57 @@ fn find_stored_mut<'a>(
         .find(|job| job.detail.summary.id == job_id)
 }
 
+fn active_job_ids(persisted: &PersistedJobs) -> Vec<String> {
+    let mut ids = persisted.active_job_id.iter().cloned().collect::<Vec<_>>();
+    let mut degradations = persisted
+        .active_degradation_jobs
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    degradations.sort_by_key(|job_id| {
+        find_stored(persisted, job_id)
+            .map(|job| job.detail.summary.created_at_ms)
+            .unwrap_or(u64::MAX)
+    });
+    ids.extend(degradations);
+    ids
+}
+
+fn first_active_job_id(persisted: &PersistedJobs) -> Option<String> {
+    active_job_ids(persisted).into_iter().next()
+}
+
+fn active_exclusive_kind(persisted: &PersistedJobs) -> Option<JobKind> {
+    let job_id = persisted.active_job_id.as_deref()?;
+    find_stored(persisted, job_id).map(|job| job.detail.summary.kind)
+}
+
+fn jobs_are_compatible(
+    active_exclusive: Option<JobKind>,
+    active_degradations: &BTreeMap<String, String>,
+    requested_kind: JobKind,
+    requested_degradation_node: Option<&str>,
+) -> bool {
+    match requested_kind {
+        JobKind::Mine => active_exclusive.is_none(),
+        JobKind::Degrade => {
+            matches!(active_exclusive, None | Some(JobKind::Mine))
+                && requested_degradation_node
+                    .is_some_and(|node| !active_degradations.contains_key(node))
+        }
+        _ => active_exclusive.is_none() && active_degradations.is_empty(),
+    }
+}
+
+fn clear_active_lane(persisted: &mut PersistedJobs, job_id: &str) {
+    if persisted.active_job_id.as_deref() == Some(job_id) {
+        persisted.active_job_id = None;
+    }
+    persisted
+        .active_degradation_jobs
+        .retain(|_, active_id| active_id != job_id);
+}
+
 fn owned_leases<'a>(leases: &'a [PauseLease], job_id: &str) -> Vec<&'a PauseLease> {
     leases
         .iter()
@@ -6516,6 +6727,7 @@ mod tests {
                 next_event_sequence: 1,
                 next_checkpoint_generation: 1,
                 active_job_id: Some(job_id.clone()),
+                active_degradation_jobs: BTreeMap::new(),
                 jobs: vec![StoredJob {
                     detail: JobDetail {
                         summary: JobSummary {
@@ -6583,6 +6795,155 @@ mod tests {
     }
 
     #[test]
+    fn restart_recovers_exclusive_and_multiple_degradation_lanes() {
+        fn interrupted_job(
+            id: &str,
+            kind: JobKind,
+            request: Value,
+            leases: Vec<JobLease>,
+        ) -> StoredJob {
+            StoredJob {
+                detail: JobDetail {
+                    summary: JobSummary {
+                        id: id.to_string(),
+                        kind,
+                        state: JobState::Running,
+                        phase: "active".to_string(),
+                        created_at_ms: 1,
+                        started_at_ms: Some(2),
+                        ended_at_ms: None,
+                        cleanup: JobCleanup::default(),
+                    },
+                    request,
+                    leases,
+                    current_step: None,
+                    checkpoints: Vec::new(),
+                    result: None,
+                    failure: None,
+                },
+                idempotency_key: None,
+                request_fingerprint: "recovery".to_string(),
+                faucet_recovery: None,
+                reorg_recovery: ReorgRecoveryContext::default(),
+                scenario_settings_backup: None,
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = Arc::new(MockBackend::new());
+        backend.sync_workers();
+        let mine_id = "job-restart-mine".to_string();
+        let node2_id = "job-restart-node2".to_string();
+        let node3_id = "job-restart-node3".to_string();
+        let mine_lease = format!("{mine_id}-mining-1");
+        MiningControlBackend::acquire_lease(
+            backend.as_ref(),
+            LeaseRequest {
+                lease_id: mine_lease.clone(),
+                owner_job_id: mine_id.clone(),
+                purpose: "manual mine job".to_string(),
+                ttl_secs: 60,
+                request_id: "seed-mine".to_string(),
+            },
+        )
+        .expect("seed mining lease");
+        for (node, job_id) in [("node2", &node2_id), ("node3", &node3_id)] {
+            NetworkControlBackend::acquire_lease(
+                backend.as_ref(),
+                node,
+                NetworkLeaseRequest {
+                    lease_id: format!("{job_id}-network-{node}-1"),
+                    owner_job_id: job_id.clone(),
+                    purpose: "timed network degradation".to_string(),
+                    impairment: NetworkImpairment::Netem {
+                        delay_ms: 5000,
+                        loss_pct: 0.0,
+                    },
+                    ttl_secs: 60,
+                    request_id: format!("seed-{node}"),
+                },
+            )
+            .expect("seed network lease");
+        }
+        let degradation_job = |node: &str, job_id: &str| {
+            interrupted_job(
+                job_id,
+                JobKind::Degrade,
+                json!({"node": node, "delay_ms": 5000, "loss_pct": 0, "seconds": 30}),
+                vec![JobLease {
+                    component: format!("network:{node}"),
+                    lease_id: format!("{job_id}-network-{node}-1"),
+                    purpose: "timed network degradation".to_string(),
+                }],
+            )
+        };
+        JobStore::open(dir.path())
+            .expect("job store")
+            .save(&PersistedJobs {
+                schema_version: JOB_SCHEMA_VERSION,
+                next_event_sequence: 1,
+                next_checkpoint_generation: 1,
+                active_job_id: Some(mine_id.clone()),
+                active_degradation_jobs: BTreeMap::from([
+                    ("node2".to_string(), node2_id.clone()),
+                    ("node3".to_string(), node3_id.clone()),
+                ]),
+                jobs: vec![
+                    interrupted_job(
+                        &mine_id,
+                        JobKind::Mine,
+                        json!({"node": "node2", "blocks": 1}),
+                        vec![JobLease {
+                            component: "mining".to_string(),
+                            lease_id: mine_lease,
+                            purpose: "manual mine job".to_string(),
+                        }],
+                    ),
+                    degradation_job("node2", &node2_id),
+                    degradation_job("node3", &node3_id),
+                ],
+            })
+            .expect("seed active lanes");
+
+        let (control_store, control_state, apply_lock) = control_fixture(dir.path());
+        let manager = JobManager::open_with_ttl(
+            dir.path(),
+            JobDependencies {
+                mining: backend.clone(),
+                spam: backend.clone(),
+                network: backend.clone(),
+                chain: backend.clone(),
+                control_store,
+                control_state,
+                apply_lock,
+                reorg: Arc::new(BlockingExecutor::new()),
+                scenario: backend.clone(),
+                network_actions: backend.clone(),
+                faucet: backend.clone(),
+                faucet_settings: test_faucet_settings(),
+            },
+            60,
+        )
+        .expect("restart manager");
+        wait_until(|| manager.list().active_job_ids.is_empty());
+        assert!(MiningControlBackend::status(backend.as_ref())
+            .expect("mining status")
+            .active_leases
+            .is_empty());
+        for node in ["node2", "node3"] {
+            assert!(NetworkControlBackend::status(backend.as_ref(), node)
+                .expect("network status")
+                .active_lease
+                .is_none());
+        }
+        for job_id in [mine_id, node2_id, node3_id] {
+            let job = manager.get(&job_id).expect("recovered job");
+            assert_eq!(job.summary.state, JobState::Interrupted);
+            assert_eq!(job.summary.cleanup.state, CleanupState::Succeeded);
+        }
+    }
+
+    #[test]
     fn restart_keeps_leases_and_mutation_lock_until_chain_recovery_is_safe() {
         let dir = tempfile::tempdir().expect("tempdir");
         let backend = Arc::new(MockBackend::new());
@@ -6617,6 +6978,7 @@ mod tests {
                 next_event_sequence: 1,
                 next_checkpoint_generation: 1,
                 active_job_id: Some(job_id.clone()),
+                active_degradation_jobs: BTreeMap::new(),
                 jobs: vec![StoredJob {
                     detail: JobDetail {
                         summary: JobSummary {
@@ -6724,6 +7086,7 @@ mod tests {
                 next_event_sequence: 1,
                 next_checkpoint_generation: 2,
                 active_job_id: Some(job_id.clone()),
+                active_degradation_jobs: BTreeMap::new(),
                 jobs: vec![StoredJob {
                     detail: JobDetail {
                         summary: JobSummary {
@@ -7417,6 +7780,7 @@ steps:
                 next_event_sequence: 1,
                 next_checkpoint_generation: 1,
                 active_job_id: Some(job_id.clone()),
+                active_degradation_jobs: BTreeMap::new(),
                 jobs: vec![StoredJob {
                     detail: JobDetail {
                         summary: JobSummary {
@@ -7515,7 +7879,7 @@ steps:
     }
 
     #[test]
-    fn job_store_v1_migrates_to_v3_without_recovery_material() {
+    fn job_store_v1_migrates_to_v4_without_recovery_material() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = JobStore::open(dir.path()).expect("store");
         store
@@ -7612,6 +7976,56 @@ steps:
         assert_eq!(migrated.schema_version, JOB_SCHEMA_VERSION);
         assert_eq!(migrated.active_job_id.as_deref(), Some("job-v2"));
         assert!(migrated.jobs[0].scenario_settings_backup.is_none());
+    }
+
+    #[test]
+    fn job_store_v3_migrates_active_degradation_to_its_node_lane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = JobStore::open(dir.path()).expect("store");
+        let job_id = "job-v3-degrade".to_string();
+        store
+            .save(&PersistedJobsV3 {
+                schema_version: 3,
+                next_event_sequence: 8,
+                next_checkpoint_generation: 3,
+                active_job_id: Some(job_id.clone()),
+                jobs: vec![StoredJob {
+                    detail: JobDetail {
+                        summary: JobSummary {
+                            id: job_id.clone(),
+                            kind: JobKind::Degrade,
+                            state: JobState::Running,
+                            phase: "observing_degraded_network".to_string(),
+                            created_at_ms: 1,
+                            started_at_ms: Some(2),
+                            ended_at_ms: None,
+                            cleanup: JobCleanup::default(),
+                        },
+                        request: json!({
+                            "node": "btc-simnet-node2",
+                            "delay_ms": 5000,
+                            "loss_pct": 0,
+                            "seconds": 30
+                        }),
+                        leases: Vec::new(),
+                        current_step: None,
+                        checkpoints: Vec::new(),
+                        result: None,
+                        failure: None,
+                    },
+                    idempotency_key: None,
+                    request_fingerprint: "v3-degrade".to_string(),
+                    faucet_recovery: None,
+                    reorg_recovery: ReorgRecoveryContext::default(),
+                    scenario_settings_backup: None,
+                }],
+            })
+            .expect("seed v3 index");
+
+        let migrated = load_and_migrate_jobs(&store).expect("migrate v3 index");
+        assert_eq!(migrated.schema_version, JOB_SCHEMA_VERSION);
+        assert!(migrated.active_job_id.is_none());
+        assert_eq!(migrated.active_degradation_jobs.get("node2"), Some(&job_id));
     }
 
     #[test]
@@ -7804,6 +8218,168 @@ steps:
             .expect("network status")
             .active_lease
             .is_none());
+    }
+
+    #[test]
+    fn compatibility_matrix_only_overlaps_mine_and_degradations() {
+        let no_degradations = BTreeMap::new();
+        let node2_degradation = BTreeMap::from([("node2".to_string(), "job-d2".to_string())]);
+        assert!(jobs_are_compatible(
+            None,
+            &node2_degradation,
+            JobKind::Mine,
+            None
+        ));
+        assert!(jobs_are_compatible(
+            Some(JobKind::Mine),
+            &no_degradations,
+            JobKind::Degrade,
+            Some("node2")
+        ));
+        assert!(jobs_are_compatible(
+            None,
+            &node2_degradation,
+            JobKind::Degrade,
+            Some("node3")
+        ));
+        assert!(!jobs_are_compatible(
+            None,
+            &node2_degradation,
+            JobKind::Degrade,
+            Some("node2")
+        ));
+        for kind in [
+            JobKind::Faucet,
+            JobKind::Reorg,
+            JobKind::Scenario,
+            JobKind::Partition,
+            JobKind::SpamBurst,
+        ] {
+            assert!(!jobs_are_compatible(None, &node2_degradation, kind, None));
+            assert!(!jobs_are_compatible(
+                Some(kind),
+                &no_degradations,
+                JobKind::Degrade,
+                Some("node3")
+            ));
+        }
+    }
+
+    #[test]
+    fn degradation_lanes_allow_mine_and_other_nodes_independently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(BlockingExecutor::new());
+        let (backend, manager) = manager(dir.path(), executor);
+        let node2 = manager
+            .start_degrade(
+                DegradeJobRequest {
+                    node: "node2".to_string(),
+                    delay_ms: 10,
+                    loss_pct: 0.0,
+                    seconds: 5,
+                },
+                None,
+            )
+            .expect("node2 degradation");
+        wait_until(|| {
+            manager
+                .get(&node2.job_id)
+                .is_ok_and(|job| job.summary.phase == "observing_degraded_network")
+        });
+
+        let mine = manager
+            .start_mine(
+                MineJobRequest {
+                    node: "node2".to_string(),
+                    blocks: 1,
+                },
+                None,
+            )
+            .expect("mine during degradation");
+        wait_until(|| {
+            manager
+                .get(&mine.job_id)
+                .is_ok_and(|job| job.summary.state.is_terminal())
+        });
+        assert_eq!(
+            manager.get(&mine.job_id).expect("mine").summary.state,
+            JobState::Succeeded
+        );
+        assert_eq!(
+            manager.get(&node2.job_id).expect("node2").summary.state,
+            JobState::Running
+        );
+
+        let node3 = manager
+            .start_degrade(
+                DegradeJobRequest {
+                    node: "node3".to_string(),
+                    delay_ms: 20,
+                    loss_pct: 0.0,
+                    seconds: 5,
+                },
+                None,
+            )
+            .expect("node3 degradation");
+        wait_until(|| {
+            manager
+                .get(&node3.job_id)
+                .is_ok_and(|job| job.summary.phase == "observing_degraded_network")
+        });
+        let conflict = manager
+            .start_degrade(
+                DegradeJobRequest {
+                    node: "node2".to_string(),
+                    delay_ms: 30,
+                    loss_pct: 0.0,
+                    seconds: 1,
+                },
+                None,
+            )
+            .expect_err("same-node degradation must conflict");
+        assert_eq!(conflict.code, ErrorCode::OperationInProgress);
+        assert_eq!(
+            conflict.active_job_id.as_deref(),
+            Some(node2.job_id.as_str())
+        );
+        let blocked = manager
+            .start_partition(
+                PartitionJobRequest {
+                    node: "node3".to_string(),
+                    main_blocks: 3,
+                    isolated_blocks: 5,
+                    heal_delay_secs: 0,
+                },
+                None,
+            )
+            .expect_err("partition must remain exclusive");
+        assert_eq!(blocked.code, ErrorCode::OperationInProgress);
+
+        let active = manager.list();
+        assert_eq!(active.active_job_ids.len(), 2);
+        assert_eq!(active.active_jobs.len(), 2);
+        assert!(active
+            .active_jobs
+            .iter()
+            .any(|job| job.lane == "network:node2"));
+        assert!(active
+            .active_jobs
+            .iter()
+            .any(|job| job.lane == "network:node3"));
+
+        manager.abort(&node2.job_id).expect("abort node2");
+        wait_until(|| {
+            manager
+                .get(&node2.job_id)
+                .is_ok_and(|job| job.summary.state.is_terminal())
+        });
+        assert!(NetworkControlBackend::status(backend.as_ref(), "node2")
+            .expect("node2 status")
+            .active_lease
+            .is_none());
+        assert!(manager.list().active_job_ids.contains(&node3.job_id));
+        manager.abort(&node3.job_id).expect("abort node3");
+        wait_until(|| manager.list().active_job_ids.is_empty());
     }
 
     #[test]

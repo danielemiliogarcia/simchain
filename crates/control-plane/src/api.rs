@@ -350,9 +350,10 @@ fn dashboard_snapshot(
         DashboardTab::All | DashboardTab::Control | DashboardTab::Faucet
     );
     let selected_job_id = if include_selected_job {
-        active_job_id
+        query
+            .selected_job_id
             .as_deref()
-            .or(query.selected_job_id.as_deref())
+            .or(active_job_id.as_deref())
             .or_else(|| {
                 jobs.as_ref()
                     .and_then(|jobs| jobs.jobs.first().map(|job| job.id.as_str()))
@@ -1708,6 +1709,67 @@ steps:
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["error"]["code"], "validation_failed");
+    }
+
+    #[tokio::test]
+    async fn degradation_and_mine_overlap_through_shared_http_contract() {
+        let fx = fixture(None);
+        let (status, body) = send(
+            &fx.router,
+            post_action(
+                "degrade",
+                serde_json::json!({
+                    "node": "node2",
+                    "delay_ms": 5000,
+                    "loss_pct": 0,
+                    "seconds": 30
+                }),
+                Some("test-token"),
+                Some("degrade-http"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let degrade_id = body["job_id"].as_str().expect("degrade ID").to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let (_, job) = send(&fx.router, get(&format!("/api/v1/jobs/{degrade_id}"))).await;
+            if job["phase"] == "observing_degraded_network" {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let (_, jobs) = send(&fx.router, get("/api/v1/jobs")).await;
+        assert_eq!(jobs["active_job_ids"], serde_json::json!([degrade_id]));
+        assert_eq!(jobs["active_jobs"][0]["kind"], "degrade");
+        assert_eq!(jobs["active_jobs"][0]["lane"], "network:node2");
+
+        let (status, body) = send(
+            &fx.router,
+            post_action(
+                "mine",
+                serde_json::json!({"node": "node2", "blocks": 1}),
+                Some("test-token"),
+                Some("mine-during-degrade-http"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let mine_id = body["job_id"].as_str().expect("mine ID").to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let (_, job) = send(&fx.router, get(&format!("/api/v1/jobs/{mine_id}"))).await;
+            if job["state"] == "succeeded" {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let (_, degradation) = send(&fx.router, get(&format!("/api/v1/jobs/{degrade_id}"))).await;
+        assert_eq!(degradation["state"], "running");
+        let (status, _) = send(&fx.router, post_abort(&degrade_id, Some("test-token"))).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

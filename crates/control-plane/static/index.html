@@ -160,14 +160,14 @@
         </form>
         <form id="degrade-form" class="mini-action-form">
           <h3>Timed degradation</h3>
-          <label data-help="Network agent target for temporary P2P impairment. Example: node3 applies delay or loss to node3's peer links.">Node
-            <select id="degrade-node"><option value="node3">node3</option><option value="node2">node2</option><option value="node1">node1</option></select>
+          <label data-help="Network agent target for temporary P2P egress impairment. To demonstrate delayed block propagation, select node2 here and mine on node2 while this job remains active; RPC traffic is unaffected.">Node
+            <select id="degrade-node"><option value="node2">node2</option><option value="node3">node3</option><option value="node1">node1</option></select>
           </label>
-          <label data-help="One-way P2P packet delay in milliseconds. Example: 500 adds about 500ms of latency to affected traffic.">Delay ms
-            <input id="degrade-delay" type="number" min="0" max="600000" value="500" required>
+          <label data-help="One-way delay on packets leaving the selected node's P2P interface. Example: 5000 delays a block mined by that same node by about five seconds at its peers.">Delay ms
+            <input id="degrade-delay" type="number" min="0" max="600000" value="5000" required>
           </label>
           <label data-help="Packet loss percentage for affected P2P traffic. Example: 1 drops about 1 percent of packets; 0 disables loss.">Loss %
-            <input id="degrade-loss" type="number" min="0" max="100" step="any" value="1" required>
+            <input id="degrade-loss" type="number" min="0" max="100" step="any" value="0" required>
           </label>
           <label data-help="Lease duration before the impairment is automatically removed. Example: 30 keeps the degradation active for 30 seconds.">Seconds
             <input id="degrade-seconds" type="number" min="1" max="86400" value="30" required>

@@ -189,6 +189,7 @@ function projectStatusForDashboard(status) {
       )
     ),
     active_operation: status.active_operation || null,
+    active_operations: status.active_operations || [],
     impairments: status.impairments || [],
     explorer: status.explorer || null,
     last_error: status.last_error || null,
@@ -200,6 +201,23 @@ function projectStatusForDashboard(status) {
 
 function activeMutationId() {
   return latestActiveJobId;
+}
+
+function activeJobDescriptors() {
+  if (latestJobs && Array.isArray(latestJobs.active_jobs)) return latestJobs.active_jobs;
+  return activeMutationId() == null ? [] : [{ job_id: activeMutationId(), kind: "unknown", lane: "exclusive" }];
+}
+
+function actionBlockedByActiveJobs(action) {
+  const active = activeJobDescriptors();
+  if (active.length === 0) return false;
+  if (action === "mine") return active.some((job) => job.kind !== "degrade");
+  if (action === "degrade") {
+    if (active.some((job) => job.kind !== "mine" && job.kind !== "degrade")) return true;
+    const lane = `network:${$("#degrade-node").value}`;
+    return active.some((job) => job.lane === lane);
+  }
+  return true;
 }
 
 function mutationBlockedMessage() {
@@ -904,10 +922,10 @@ function buildDashboardRequest() {
 
 function preferredSelectedJobId(jobs, selectedJobPayload) {
   if (!jobs) return selectedJobPayload ? selectedJobPayload.id : selectedJobId;
-  if (jobs.active_job_id) return jobs.active_job_id;
-  if (selectedJobPayload) return selectedJobPayload.id;
   const ids = new Set((jobs.jobs || []).map((job) => job.id));
   if (selectedJobId && ids.has(selectedJobId)) return selectedJobId;
+  if (selectedJobPayload && ids.has(selectedJobPayload.id)) return selectedJobPayload.id;
+  if (jobs.active_job_id) return jobs.active_job_id;
   return (jobs.jobs && jobs.jobs.length > 0) ? jobs.jobs[0].id : null;
 }
 
@@ -1581,11 +1599,12 @@ async function submitFaucet(event) {
 
 function renderJobs() {
   const active = activeMutationId();
+  const activeJobs = activeJobDescriptors();
   const lock = $("#mutation-lock");
-  lock.textContent = active
-    ? `mutation coordinator held by ${active}; incompatible controls are disabled`
+  lock.textContent = activeJobs.length > 0
+    ? `active jobs: ${activeJobs.map((job) => `${job.job_id} (${job.lane})`).join(", ")}; incompatible controls are disabled`
     : "mutation coordinator is idle";
-  lock.className = "mutation-lock" + (active ? " busy" : "");
+  lock.className = "mutation-lock" + (activeJobs.length > 0 ? " busy" : "");
 
   const start = $("#reorg-start");
   const reorgUnavailable = actionDependencyReason("reorg");
@@ -1605,7 +1624,7 @@ function renderJobs() {
   ]) {
     const button = $("#" + buttonId);
     const unavailable = actionDependencyReason(action);
-    button.disabled = startingAction[action] || active != null ||
+    button.disabled = startingAction[action] || actionBlockedByActiveJobs(action) ||
       !$("#" + formId).checkValidity() || unavailable !== "";
     button.title = unavailable;
     setActionDependencyMessage(action, unavailable);
@@ -1897,7 +1916,7 @@ async function startScenario(event) {
 
 async function startBoundedAction(event, action) {
   event.preventDefault();
-  if (startingAction[action] || activeMutationId() != null || !event.currentTarget.checkValidity()) return;
+  if (startingAction[action] || actionBlockedByActiveJobs(action) || !event.currentTarget.checkValidity()) return;
   startingAction[action] = true;
   renderJobs();
   const isMine = action === "mine";
@@ -1953,7 +1972,7 @@ function renderBurstShapeControls() {
 
 async function startNetworkAction(event, action) {
   event.preventDefault();
-  if (startingAction[action] || activeMutationId() != null || !event.currentTarget.checkValidity()) return;
+  if (startingAction[action] || actionBlockedByActiveJobs(action) || !event.currentTarget.checkValidity()) return;
   startingAction[action] = true;
   renderJobs();
   const partition = action === "partition";

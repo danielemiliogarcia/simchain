@@ -381,9 +381,10 @@ For full details, commands, and modes, see [REORGS.md](./docs/REORGS.md).
 Isolates one miner from the P2P mesh (RPC stays up), mines competing branches on both
 sides, then heals so the longer branch wins everywhere: an organic reorg caused by the
 real mechanism (a partition), unlike the administrative reorg simulator below.
-`degrade` makes a node slower and/or lossy for a bounded number of seconds. Both faults
-are lease-owned and target P2P traffic only — block/tx propagation becomes observable,
-RPC stays clean.
+`degrade` makes a node's P2P egress slower and/or lossy for a bounded number of seconds.
+It may remain active while a manual Mine job creates a block on that same node, making
+propagation delay directly observable while RPC stays clean. Both faults are lease-owned
+and target P2P traffic only.
 
 For commands, manual walkthroughs, and caveats, see
 [PARTITIONS.md](./docs/PARTITIONS.md).

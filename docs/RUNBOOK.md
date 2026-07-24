@@ -91,8 +91,19 @@ Degrade a node's P2P link for a bounded number of seconds:
 
 ```bash
 cargo run -p simchainctl -- degrade start \
-  --node node3 --delay-ms 500 --loss-pct 1 --seconds 60 --wait
+  --node node2 --delay-ms 5000 --loss-pct 0 --seconds 30 --wait
 ```
+
+While that job reports `observing_degraded_network`, mine from the same node in a second
+pane:
+
+```bash
+cargo run -p simchainctl -- mine --node node2 --blocks 1 --wait
+```
+
+Netem shapes node2 egress only. The RPC mine returns immediately, while node1/node3 see
+the block roughly five seconds later. Mine is the only exclusive job allowed to overlap
+a degradation; independent degradations may also run on different nodes.
 
 The convenience wrappers submit the same durable jobs:
 
