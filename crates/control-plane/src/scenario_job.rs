@@ -219,6 +219,15 @@ fn wait_for_burst_branches(
     }
 }
 
+/// Manual bursts reserve one confirmed, shape-usable branch per requested
+/// transaction. This deliberately does not cap preparation at the resident
+/// spammer's preferred fanout: a burst must not depend on unconfirmed branch
+/// reuse merely because its request is larger than the background target.
+/// Existing surplus branches satisfy the requirement and are never reduced.
+fn burst_required_branches(txs: u64) -> u64 {
+    txs.max(1)
+}
+
 impl ScenarioActionBackend for RpcScenarioActionBackend {
     fn wait_height(&self, target: u64, control: &dyn ScenarioControl) -> Result<Value> {
         let client = create_client(&self.node1_url)?;
@@ -331,12 +340,12 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
         control: &dyn ScenarioControl,
     ) -> Result<Value> {
         let policy = self.burst_policy()?;
-        let fanout = policy.fanout_utxos.max(1);
+        let needed_branches = burst_required_branches(txs);
+        let fanout = policy.fanout_utxos.max(needed_branches);
         self.ensure_mining_can_confirm_burst_funding()?;
         self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
             engine.set_burst_shape(policy.fee_rate_sat_vb(), outputs_per_tx);
             let deadline = Instant::now() + self.timeout;
-            let needed_branches = txs.min(fanout).max(1);
             let prepared_branches = wait_for_burst_branches(
                 engine,
                 node,
@@ -378,6 +387,7 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
                 "requested_transactions": txs,
                 "accepted_transactions": txids.len() as u64,
                 "outputs_per_transaction": outputs_per_tx,
+                "required_branches": needed_branches,
                 "prepared_branches": prepared_branches,
                 "engine": "raw",
                 "aborted": control.abort_requested()
@@ -393,12 +403,12 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
         control: &dyn ScenarioControl,
     ) -> Result<Value> {
         let policy = self.burst_policy()?;
-        let fanout = policy.fanout_utxos.max(1);
+        let needed_branches = burst_required_branches(txs);
+        let fanout = policy.fanout_utxos.max(needed_branches);
         self.ensure_mining_can_confirm_burst_funding()?;
         self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
             engine.set_burst_data_shape(policy.fee_rate_sat_vb(), data_bytes);
             let deadline = Instant::now() + self.timeout;
-            let needed_branches = txs.min(fanout).max(1);
             let prepared_branches = wait_for_burst_branches(
                 engine,
                 node,
@@ -441,6 +451,7 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
                 "requested_transactions": txs,
                 "accepted_transactions": txids.len() as u64,
                 "data_bytes": data_bytes,
+                "required_branches": needed_branches,
                 "prepared_branches": prepared_branches,
                 "offered_vbytes": offered_vbytes,
                 "engine": "raw",
@@ -603,5 +614,12 @@ mod tests {
             2
         ));
         assert!(tx_wait_satisfied(&missing, TxWaitState::Missing, 0));
+    }
+
+    #[test]
+    fn manual_burst_branch_requirement_is_never_capped_by_background_fanout() {
+        assert_eq!(burst_required_branches(1), 1);
+        assert_eq!(burst_required_branches(10), 10);
+        assert_eq!(burst_required_branches(51), 51);
     }
 }

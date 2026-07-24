@@ -7,8 +7,9 @@ The implementation deliberately leaves the Phase 2 capacity telemetry and Phase 
 idle warm reserve as optional follow-up work. Live measurements showed that the bounded
 preparation loop is sufficient for correctness: a cold one-branch OUTPUT burst prepared
 and completed in about 34 seconds, and a cold ten-branch 20,000-byte DATA burst prepared
-and completed in about 69 seconds. Keeping preparation demand-driven avoids permanently
-growing the UTXO set merely to optimize demo latency.
+and completed in about 69 seconds. Preparation is demand-driven rather than speculative;
+branches created for a burst remain available afterward and are never consolidated just
+because current demand or the configured fanout target is lower.
 
 ## Problem confirmed live
 
@@ -81,7 +82,8 @@ fn wait_for_burst_branches(
 Behavior:
 
 1. Select the requested shape and current live spam fee.
-2. Compute `needed = min(txs, fanout_utxos).max(1)`.
+2. Compute `needed = txs.max(1)`: one confirmed, shape-usable branch per requested
+   transaction. Do not cap a manual burst at the resident spammer's preferred fanout.
 3. Call `ensure_branches(needed, checkpoint)`.
 4. If ready, proceed immediately.
 5. If provisioning is pending, keep phase `preparing_spam_burst_branches`, wait about
@@ -90,6 +92,12 @@ Behavior:
 7. On abort, stop preparation and perform ordinary owned-lease cleanup.
 8. On timeout, return a specific error containing node, shape, usable/needed counts,
    provisioning phase, and the fact that confirmations were awaited.
+
+This is a grow-only capacity policy. If the burst engine already owns more than
+`needed` usable branches, it proceeds immediately and keeps the surplus. If it owns
+fewer, it funds and fans out until the requirement is met. Any additional policy
+headroom is also retained; no path consolidates a healthy surplus down to either
+`needed` or `SPAM_FANOUT_UTXOS`.
 
 Do not busy-loop and do not sleep for the whole timeout. The wait must observe abort at
 sub-second cadence.
@@ -258,6 +266,12 @@ cargo run -p simchainctl -- spam burst \
 
 Both must reach `succeeded`, report exact accepted counts, and leave no active spam
 lease. Then repeat through the dashboard and inspect the mempool transaction shapes.
+
+Grow-only follow-up acceptance: with `SPAM_FANOUT_UTXOS=50`, a manual 51-transaction
+OUTPUT burst waited for its dedicated engine to reach 51 usable branches, accepted all
+51 transactions, and reported `required_branches=51` and `prepared_branches=51`. A
+subsequent 10-transaction burst completed immediately and still reported 51 prepared
+branches, proving that the lower request did not consolidate or discard the surplus.
 
 Run the repository CI-equivalent checks after implementation:
 
