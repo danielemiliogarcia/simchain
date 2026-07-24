@@ -146,6 +146,7 @@ cargo run -p simchainctl -- jobs list
 cargo run -p simchainctl -- jobs watch JOB_ID --timeout 900
 cargo run -p simchainctl -- jobs abort JOB_ID
 cargo run -p simchainctl -- mine --node node2 --blocks 1 --wait
+cargo run -p simchainctl -- spam prepare --node node2 --txs 10 --data-bytes 20000 --wait
 cargo run -p simchainctl -- spam burst --node node2 --txs 10 --data-bytes 20000 --wait
 cargo run -p simchainctl -- faucet --to bcrt1q...=1btc --to bcrt1p...=25000000sat --wait
 cargo run -p simchainctl -- faucet status
@@ -153,6 +154,11 @@ cargo run -p simchainctl -- faucet transfer TXID --watch
 ```
 
 `reorg start --wait` streams progress and exits `0` only after successful cleanup.
+`spam prepare` reads the same node, transaction count, and shape fields as
+`spam burst`. It provisions the dedicated manual-burst branch pool and may mine
+the minimum confirmation blocks without changing the mining controller's desired
+paused/running state. A later burst checks this capacity without mining; if it is
+insufficient, the failed job tells the operator to prepare it first.
 Stable automation exit codes are:
 
 | Code | Meaning |

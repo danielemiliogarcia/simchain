@@ -83,10 +83,32 @@ fn run(cli: Cli) -> Result<(), ClientError> {
                 let state = match command {
                     SpamCommand::Pause => DesiredState::Paused,
                     SpamCommand::Resume => DesiredState::Running,
-                    SpamCommand::Burst(_) => unreachable!("handled by outer match"),
+                    SpamCommand::Prepare(_) | SpamCommand::Burst(_) => {
+                        unreachable!("handled by outer match")
+                    }
                 };
                 let response = client.set_spam_state(state)?;
                 output::print_component_control(&response)?;
+            }
+            SpamCommand::Prepare(args) => {
+                if args.txs == 0 {
+                    return Err(ClientError::Local("--txs must be positive".to_string()));
+                }
+                let node = scenario_node(&args.node)?;
+                let response = client.start_spam_prepare(
+                    &SpamBurstJobRequest {
+                        node: node.to_string(),
+                        txs: args.txs,
+                        outputs_per_tx: args.outputs_per_tx,
+                        data_bytes: args.data_bytes,
+                    },
+                    args.idempotency_key.as_deref(),
+                )?;
+                output::print_job_created(&response, args.json)?;
+                if args.wait {
+                    let job = watch_job(&client, &response.job_id, args.json, args.timeout)?;
+                    terminal_result(&job)?;
+                }
             }
             SpamCommand::Burst(args) => {
                 if args.txs == 0 {

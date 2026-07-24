@@ -21,7 +21,7 @@ let selectedJobEventAfter = 0;
 let renderedJobEventCount = 0;
 let startingJob = false;
 let startingScenario = false;
-const startingAction = { mine: false, burst: false, partition: false, degrade: false };
+const startingAction = { mine: false, prepare: false, burst: false, partition: false, degrade: false };
 let abortingJob = false;
 let faucetStatus = null;
 let faucetSubmitting = false;
@@ -1618,13 +1618,17 @@ function renderJobs() {
   scenarioStart.textContent = startingScenario ? "Starting…" : "Start scenario";
   for (const [action, formId, buttonId, label] of [
     ["mine", "mine-form", "mine-start", "Mine"],
+    ["prepare", "burst-form", "burst-prepare", "Prepare capacity"],
     ["burst", "burst-form", "burst-start", "Create tx burst"],
     ["partition", "partition-form", "partition-start", "Start partition"],
     ["degrade", "degrade-form", "degrade-start", "Start degradation"],
   ]) {
     const button = $("#" + buttonId);
     const unavailable = actionDependencyReason(action);
-    button.disabled = startingAction[action] || actionBlockedByActiveJobs(action) ||
+    const actionStarting = (action === "prepare" || action === "burst")
+      ? startingAction.prepare || startingAction.burst
+      : startingAction[action];
+    button.disabled = actionStarting || actionBlockedByActiveJobs(action) ||
       !$("#" + formId).checkValidity() || unavailable !== "";
     button.title = unavailable;
     setActionDependencyMessage(action, unavailable);
@@ -1670,6 +1674,7 @@ function actionDependencies(action) {
   switch (action) {
     case "mine":
       return ["mining", $("#mine-node").value];
+    case "prepare":
     case "burst":
       return ["spam", $("#burst-node").value];
     case "reorg":
@@ -1692,7 +1697,7 @@ function actionDependencyReason(action) {
 }
 
 function setActionDependencyMessage(action, message) {
-  const result = $(`#${action}-action-result`);
+  const result = $(action === "prepare" ? "#burst-action-result" : `#${action}-action-result`);
   if (!result) return;
   if (message) {
     if (result.dataset.dependencyBlocked !== "true") {
@@ -1916,12 +1921,16 @@ async function startScenario(event) {
 
 async function startBoundedAction(event, action) {
   event.preventDefault();
-  if (startingAction[action] || actionBlockedByActiveJobs(action) || !event.currentTarget.checkValidity()) return;
+  const form = action === "mine" ? $("#mine-form") : $("#burst-form");
+  const burstActionStarting = startingAction.prepare || startingAction.burst;
+  if (startingAction[action] || (action !== "mine" && burstActionStarting) ||
+      actionBlockedByActiveJobs(action) || !form.checkValidity()) return;
   startingAction[action] = true;
   renderJobs();
   const isMine = action === "mine";
+  const isPrepare = action === "prepare";
   const result = $(isMine ? "#mine-action-result" : "#burst-action-result");
-  const path = isMine ? "mine" : "spam-burst";
+  const path = isMine ? "mine" : (isPrepare ? "spam-prepare" : "spam-burst");
   let request;
   if (isMine) {
     request = {
@@ -1939,7 +1948,7 @@ async function startBoundedAction(event, action) {
       request.outputs_per_tx = Number($("#burst-outputs-per-tx").value);
     }
   }
-  result.textContent = `Submitting ${isMine ? "mine" : "tx burst"} job…`;
+  result.textContent = `Submitting ${isMine ? "mine" : (isPrepare ? "capacity preparation" : "tx burst")} job…`;
   result.className = "action-result";
   try {
     const { ok, body } = await api(`/api/v1/jobs/${path}`, {
@@ -2165,6 +2174,7 @@ async function init() {
   $("#mine-form").addEventListener("submit", (event) => startBoundedAction(event, "mine"));
   $("#mine-form").addEventListener("input", renderJobs);
   $("#burst-form").addEventListener("submit", (event) => startBoundedAction(event, "burst"));
+  $("#burst-prepare").addEventListener("click", (event) => startBoundedAction(event, "prepare"));
   $("#burst-form").addEventListener("input", renderJobs);
   $("#burst-shape").addEventListener("change", renderBurstShapeControls);
   renderBurstShapeControls();

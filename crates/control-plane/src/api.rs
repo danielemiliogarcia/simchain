@@ -6,7 +6,7 @@ use crate::service::{
     abort_job, config, faucet_status, faucet_transfer, get_checkpoint, get_job, job_events,
     list_jobs, release_checkpoint, schema, set_mining_state, set_spam_state, start_degrade,
     start_faucet, start_mine, start_partition, start_reorg, start_scenario, start_spam_burst,
-    status, ErrorCode, ServiceError,
+    start_spam_prepare, status, ErrorCode, ServiceError,
 };
 use crate::state::SharedState;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -57,6 +57,7 @@ pub fn router(app: SharedState) -> Router {
         .route("/api/v1/jobs/reorg", post(reorg_job_handler))
         .route("/api/v1/jobs/scenario", post(scenario_job_handler))
         .route("/api/v1/jobs/mine", post(mine_job_handler))
+        .route("/api/v1/jobs/spam-prepare", post(spam_prepare_job_handler))
         .route("/api/v1/jobs/spam-burst", post(spam_burst_job_handler))
         .route("/api/v1/jobs/partition", post(partition_job_handler))
         .route("/api/v1/jobs/degrade", post(degrade_job_handler))
@@ -815,6 +816,15 @@ async fn spam_burst_job_handler(State(app): State<SharedState>, request: Request
             format!("control-plane worker task failed: {error}"),
         )),
     }
+}
+
+async fn spam_prepare_job_handler(State(app): State<SharedState>, request: Request) -> Response {
+    authenticated_job_request::<simchain_common::control_api::SpamBurstJobRequest, _>(
+        app,
+        request,
+        start_spam_prepare,
+    )
+    .await
 }
 
 async fn partition_job_handler(State(app): State<SharedState>, request: Request) -> Response {
@@ -1586,7 +1596,7 @@ steps:
     }
 
     #[tokio::test]
-    async fn manual_mine_and_spam_burst_use_dedicated_job_contracts() {
+    async fn manual_mine_spam_prepare_and_burst_use_dedicated_job_contracts() {
         let fx = fixture(None);
         let (status, body) = send(
             &fx.router,
@@ -1619,6 +1629,31 @@ steps:
             if job["state"] == "succeeded" {
                 assert_eq!(job["kind"], "mine");
                 assert_eq!(job["result"]["blocks"], 2);
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let (status, body) = send(
+            &fx.router,
+            post_action(
+                "spam-prepare",
+                serde_json::json!({"node": "node3", "txs": 3, "data_bytes": 512}),
+                Some("test-token"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let prepare_id = body["job_id"].as_str().expect("prepare ID").to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let (_, job) = send(&fx.router, get(&format!("/api/v1/jobs/{prepare_id}"))).await;
+            if job["state"] == "succeeded" {
+                assert_eq!(job["kind"], "spam_prepare");
+                assert_eq!(job["result"]["prepared_branches"], 3);
+                assert_eq!(job["result"]["shape"], "op_return:512");
                 break;
             }
             assert!(tokio::time::Instant::now() < deadline);
@@ -1815,6 +1850,10 @@ steps:
             "id=\"burst-data-bytes\" type=\"number\" min=\"1\" max=\"98000\" value=\"20000\""
         ));
         assert!(html.contains("id=\"burst-shape\""));
+        assert!(html.contains("id=\"burst-prepare\""));
+        assert!(html.contains(
+            "id=\"partition-heal-delay\" type=\"number\" min=\"0\" max=\"86400\" value=\"15\""
+        ));
         assert!(html.contains(
             "id=\"burst-outputs-per-tx\" type=\"number\" min=\"0\" value=\"30\" required disabled"
         ));

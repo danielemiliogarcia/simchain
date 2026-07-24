@@ -1195,6 +1195,54 @@ impl JobManager {
         Ok(created)
     }
 
+    pub fn start_spam_prepare(
+        self: &Arc<Self>,
+        request: SpamBurstJobRequest,
+        idempotency_key: Option<String>,
+    ) -> Result<JobCreatedResponse, JobManagerError> {
+        let (request, node) = normalize_spam_burst_request(request)?;
+        let request_value = serde_json::to_value(&request).map_err(internal_error)?;
+        let (created, abort) = self.reserve_action_job(
+            JobKind::SpamPrepare,
+            request_value,
+            idempotency_key,
+            "manual spam burst capacity preparation accepted",
+        )?;
+        let Some(abort) = abort else {
+            return Ok(created);
+        };
+        let manager = self.clone();
+        let job_id = created.job_id.clone();
+        let thread_job_id = job_id.clone();
+        let spawn = thread::Builder::new()
+            .name(format!("spam-prepare-{job_id}"))
+            .spawn(move || {
+                let panic_manager = manager.clone();
+                let panic_job_id = thread_job_id.clone();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    manager.run_spam_prepare_job(
+                        thread_job_id,
+                        node,
+                        request.txs,
+                        request.outputs_per_tx,
+                        request.data_bytes,
+                        abort,
+                    )
+                }));
+                if outcome.is_err() {
+                    panic_manager.handle_executor_panic(&panic_job_id);
+                }
+            });
+        if let Err(error) = spawn {
+            self.fail_before_thread(&job_id, format!("failed to start job thread: {error}"));
+            return Err(JobManagerError::new(
+                ErrorCode::Internal,
+                format!("failed to start job thread: {error}"),
+            ));
+        }
+        Ok(created)
+    }
+
     pub fn start_partition(
         self: &Arc<Self>,
         request: PartitionJobRequest,
@@ -1357,7 +1405,10 @@ impl JobManager {
                 ));
             }
             if self.faucet_store.pending().is_some()
-                && !matches!(kind, JobKind::Mine | JobKind::SpamBurst)
+                && !matches!(
+                    kind,
+                    JobKind::Mine | JobKind::SpamPrepare | JobKind::SpamBurst
+                )
             {
                 return Err(JobManagerError::new(
                     ErrorCode::FaucetDeliveryPending,
@@ -2632,21 +2683,21 @@ impl JobManager {
             self.finish_aborted_with_cleanup(&job_id, vec![lease], false, stop_error);
             return;
         }
-        self.set_phase(&job_id, "preparing_spam_burst_branches");
+        self.set_phase(&job_id, "checking_spam_burst_capacity");
         let message = match data_bytes {
             Some(bytes) => {
                 format!(
-                    "preparing branches and submitting {txs} OP_RETURN data transaction(s) from {node} ({bytes} byte payloads)"
+                    "checking prepared capacity and submitting {txs} OP_RETURN data transaction(s) from {node} ({bytes} byte payloads)"
                 )
             }
             None => format!(
-                "preparing branches and submitting {txs} transaction(s) from {node} with outputs_per_tx={outputs_per_tx}"
+                "checking prepared capacity and submitting {txs} transaction(s) from {node} with outputs_per_tx={outputs_per_tx}"
             ),
         };
         self.emit_best_effort(
             &job_id,
             "action_started",
-            "preparing_spam_burst_branches",
+            "checking_spam_burst_capacity",
             &message,
             None,
         );
@@ -2678,13 +2729,118 @@ impl JobManager {
                 None,
                 cleanup,
             ),
+            Err(error) => {
+                let message = error.to_string();
+                let code = if message.contains("burst_capacity_not_prepared:") {
+                    "spam_burst_capacity_not_prepared"
+                } else {
+                    "spam_burst_failed"
+                };
+                self.finish_job(
+                    &job_id,
+                    JobState::Failed,
+                    "failed",
+                    None,
+                    Some(JobFailure {
+                        code: code.to_string(),
+                        message,
+                    }),
+                    cleanup,
+                )
+            }
+        }
+    }
+
+    fn run_spam_prepare_job(
+        self: Arc<Self>,
+        job_id: String,
+        node: MinerNode,
+        txs: u64,
+        outputs_per_tx: u64,
+        data_bytes: Option<u64>,
+        abort: Arc<AtomicBool>,
+    ) {
+        if abort.load(Ordering::Acquire) {
+            self.finish_job(
+                &job_id,
+                JobState::Aborted,
+                "aborted_before_start",
+                None,
+                None,
+                successful_cleanup(),
+            );
+            return;
+        }
+        self.set_running(&job_id, "acquiring_spam_lease");
+        let lease = match self.acquire_scenario_lease(
+            &job_id,
+            "spam",
+            "manual spam burst capacity preparation",
+            1,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.finish_failed_before_mutation(&job_id, error, Vec::new(), abort);
+                return;
+            }
+        };
+        let renewer = match OwnedLeaseRenewer::start(
+            self.clone(),
+            job_id.clone(),
+            abort.clone(),
+            self.lease_ttl_secs,
+        ) {
+            Ok(renewer) => renewer,
+            Err(error) => {
+                self.finish_failed_before_mutation(&job_id, error, vec![lease], abort);
+                return;
+            }
+        };
+
+        self.set_phase(&job_id, "preparing_spam_burst_capacity");
+        self.emit_best_effort(
+            &job_id,
+            "action_started",
+            "preparing_spam_burst_capacity",
+            "preparing dedicated manual burst branches; confirmation blocks may be mined without changing the mining controller's desired state",
+            None,
+        );
+        let control = SimpleJobControl {
+            abort: abort.clone(),
+        };
+        let result = self.scenario.prepare_manual_spam_burst(
+            node,
+            txs,
+            outputs_per_tx,
+            data_bytes,
+            &control,
+        );
+        let stop_error = renewer.stop().err().map(|error| error.to_string());
+        let cleanup = self.cleanup_leases(&job_id, &[lease], false, stop_error);
+        match result {
+            Ok(result) if abort.load(Ordering::Acquire) => self.finish_job(
+                &job_id,
+                JobState::Aborted,
+                "aborted_safely",
+                Some(result),
+                None,
+                cleanup,
+            ),
+            Ok(result) => self.finish_job(
+                &job_id,
+                JobState::Succeeded,
+                "capacity_ready",
+                Some(result),
+                None,
+                cleanup,
+            ),
             Err(error) => self.finish_job(
                 &job_id,
                 JobState::Failed,
                 "failed",
                 None,
                 Some(JobFailure {
-                    code: "spam_burst_failed".to_string(),
+                    code: "spam_prepare_failed".to_string(),
                     message: error.to_string(),
                 }),
                 cleanup,
@@ -8029,7 +8185,7 @@ steps:
     }
 
     #[test]
-    fn manual_mine_and_spam_burst_are_bounded_owned_jobs() {
+    fn manual_mine_spam_prepare_and_burst_are_bounded_owned_jobs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = Arc::new(BlockingExecutor::new());
         let (backend, manager) = manager(dir.path(), executor);
@@ -8066,6 +8222,34 @@ steps:
         assert_eq!(mine_detail.summary.state, JobState::Succeeded);
         assert_eq!(mine_detail.request["node"], "node2");
         assert_eq!(mine_detail.result.expect("mine result")["blocks"], 2);
+
+        let prepare = manager
+            .start_spam_prepare(
+                SpamBurstJobRequest {
+                    node: "node3".to_string(),
+                    txs: 3,
+                    outputs_per_tx: 2,
+                    data_bytes: None,
+                },
+                Some("prepare-retry".to_string()),
+            )
+            .expect("start prepare");
+        wait_until(|| {
+            manager
+                .get(&prepare.job_id)
+                .expect("prepare job")
+                .summary
+                .state
+                .is_terminal()
+        });
+        let prepare_detail = manager.get(&prepare.job_id).expect("prepare job");
+        assert_eq!(prepare_detail.summary.kind, JobKind::SpamPrepare);
+        assert_eq!(prepare_detail.summary.state, JobState::Succeeded);
+        assert_eq!(prepare_detail.summary.phase, "capacity_ready");
+        assert_eq!(
+            prepare_detail.result.expect("prepare result")["prepared_branches"],
+            3
+        );
 
         let burst = manager
             .start_spam_burst(
@@ -8253,6 +8437,7 @@ steps:
             JobKind::Reorg,
             JobKind::Scenario,
             JobKind::Partition,
+            JobKind::SpamPrepare,
             JobKind::SpamBurst,
         ] {
             assert!(!jobs_are_compatible(None, &node2_degradation, kind, None));

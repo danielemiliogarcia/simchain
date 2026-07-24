@@ -141,6 +141,18 @@ impl ControlClient {
         )
     }
 
+    pub fn start_spam_prepare(
+        &self,
+        request: &SpamBurstJobRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<JobCreatedResponse, ClientError> {
+        self.post_json(
+            &format!("{API_PREFIX}/jobs/spam-prepare"),
+            request,
+            idempotency_key,
+        )
+    }
+
     pub fn start_partition(
         &self,
         request: &PartitionJobRequest,

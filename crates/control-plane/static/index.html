@@ -108,13 +108,17 @@
           <label data-help="Burn outputs created by each transaction. Example: 30 matches --outputs-per-tx 30 in simchainctl; zero selects sequential single-output transactions.">Outputs per transaction
             <input id="burst-outputs-per-tx" type="number" min="0" value="30" required disabled>
           </label>
-          <button id="burst-start" type="submit">Create tx burst</button>
+          <div class="action-buttons">
+            <button id="burst-prepare" class="secondary" type="button" title="Prepare the selected manual burst capacity; this may mine confirmation blocks but preserves the mining controller state.">Prepare capacity</button>
+            <button id="burst-start" type="submit">Create tx burst</button>
+          </div>
           <div id="burst-action-result" class="action-result"></div>
         </form>
       </div>
 
-      <h3>Reorganization</h3>
-      <form id="reorg-form" class="action-form">
+      <section class="reorg-card">
+        <h3>Reorganization</h3>
+        <form id="reorg-form" class="action-form">
         <label data-help="Number of recent blocks to roll back before mining the replacement branch. Example: depth 3 rewrites the last 3 blocks.">Depth
           <input id="reorg-depth" type="number" min="1" max="100" value="3" required>
         </label>
@@ -134,15 +138,16 @@
           <input id="reorg-empty" type="checkbox">
           Mine empty replacements
         </label>
-        <button id="reorg-start" type="submit">Start reorg</button>
-      </form>
-      <div id="reorg-action-result" class="action-result"></div>
+          <button id="reorg-start" type="submit">Start reorg</button>
+        </form>
+        <div id="reorg-action-result" class="action-result"></div>
+      </section>
 
       <h3>Network</h3>
       <div id="network-status" class="component-state">all P2P links clear</div>
       <div class="bounded-actions">
         <form id="partition-form" class="mini-action-form">
-          <h3>Hard partition</h3>
+          <h3>Hard partition (organic reorg)</h3>
           <label data-help="Miner temporarily cut off from the rest of the P2P network. Example: node3 mines a private side branch while node2 remains on the main side.">Isolated miner
             <select id="partition-node"><option value="node3">node3</option><option value="node2">node2</option></select>
           </label>
@@ -153,7 +158,7 @@
             <input id="partition-isolated-blocks" type="number" min="1" max="100" value="5" required>
           </label>
           <label data-help="Seconds to keep both completed branches isolated before P2P healing. Use a visible delay such as 15 seconds for live chain watchers.">Heal delay seconds
-            <input id="partition-heal-delay" type="number" min="0" max="86400" value="0" required>
+            <input id="partition-heal-delay" type="number" min="0" max="86400" value="15" required>
           </label>
           <button id="partition-start" type="submit">Start partition</button>
           <div id="partition-action-result" class="action-result"></div>

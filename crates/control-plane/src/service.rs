@@ -340,6 +340,22 @@ pub fn start_spam_burst(
         .map_err(job_manager_error)
 }
 
+pub fn start_spam_prepare(
+    app: &std::sync::Arc<AppState>,
+    request: SpamBurstJobRequest,
+    idempotency_key: Option<String>,
+) -> Result<JobCreatedResponse, ServiceError> {
+    let Ok(_guard) = app.apply_lock.try_lock() else {
+        return Err(ServiceError::new(
+            ErrorCode::ApplyInProgress,
+            "another desired-state mutation is already in progress",
+        ));
+    };
+    app.jobs
+        .start_spam_prepare(request, idempotency_key)
+        .map_err(job_manager_error)
+}
+
 pub fn start_partition(
     app: &std::sync::Arc<AppState>,
     request: PartitionJobRequest,

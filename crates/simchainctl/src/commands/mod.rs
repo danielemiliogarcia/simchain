@@ -153,6 +153,8 @@ pub enum SpamCommand {
     Pause,
     /// Resume spam unless disabled by policy or held by a job-owned lease.
     Resume,
+    /// Prepare dedicated branch capacity for a later manual burst.
+    Prepare(SpamBurstArgs),
     /// Submit a bounded raw transaction burst.
     Burst(SpamBurstArgs),
 }
@@ -753,6 +755,31 @@ mod tests {
                 command: SpamCommand::Burst(SpamBurstArgs {
                     txs: 10,
                     outputs_per_tx: 4,
+                    ..
+                })
+            })
+        ));
+
+        let prepare = Cli::try_parse_from([
+            "simchainctl",
+            "spam",
+            "prepare",
+            "--node",
+            "node2",
+            "--txs",
+            "1",
+            "--data-bytes",
+            "20000",
+            "--wait",
+        ])
+        .expect("spam prepare");
+        assert!(matches!(
+            prepare.command,
+            Command::Spam(SpamArgs {
+                command: SpamCommand::Prepare(SpamBurstArgs {
+                    txs: 1,
+                    data_bytes: Some(20000),
+                    wait: true,
                     ..
                 })
             })

@@ -24,6 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_SCENARIO_TIMEOUT_SECS: u64 = 1_800;
+const MAX_MANUAL_PREPARATION_BLOCKS: u64 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpamBurstTarget {
@@ -51,6 +52,17 @@ pub trait ScenarioActionBackend: Send + Sync {
         node: MinerNode,
         txs: u64,
         outputs_per_tx: u64,
+        control: &dyn ScenarioControl,
+    ) -> Result<Value>;
+    /// Prepare the dedicated manual burst engine for the exact requested
+    /// shape. This is an explicit operation because it may mine confirmation
+    /// blocks; the later burst itself never mines or starts funding.
+    fn prepare_manual_spam_burst(
+        &self,
+        node: MinerNode,
+        txs: u64,
+        outputs_per_tx: u64,
+        data_bytes: Option<u64>,
         control: &dyn ScenarioControl,
     ) -> Result<Value>;
     fn data_spam_burst(
@@ -228,6 +240,20 @@ fn burst_required_branches(txs: u64) -> u64 {
     txs.max(1)
 }
 
+fn require_prepared_burst_capacity(
+    engine: &RawSpammer,
+    node: MinerNode,
+    needed_branches: u64,
+    shape: &str,
+) -> Result<u64> {
+    let usable = engine.usable_branches_for_current_shape();
+    anyhow::ensure!(
+        usable >= needed_branches,
+        "burst_capacity_not_prepared: manual burst capacity for {node} ({shape}) is {usable}/{needed_branches} usable branches; use Prepare capacity in the dashboard or run `simchainctl spam prepare` with the same burst fields, wait until it reports ready, then submit the burst again"
+    );
+    Ok(usable)
+}
+
 impl ScenarioActionBackend for RpcScenarioActionBackend {
     fn wait_height(&self, target: u64, control: &dyn ScenarioControl) -> Result<Value> {
         let client = create_client(&self.node1_url)?;
@@ -341,22 +367,17 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
     ) -> Result<Value> {
         let policy = self.burst_policy()?;
         let needed_branches = burst_required_branches(txs);
-        let fanout = policy.fanout_utxos.max(needed_branches);
-        self.ensure_mining_can_confirm_burst_funding()?;
         self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
             engine.set_burst_shape(policy.fee_rate_sat_vb(), outputs_per_tx);
             let deadline = Instant::now() + self.timeout;
-            let prepared_branches = wait_for_burst_branches(
+            let prepared_branches = require_prepared_burst_capacity(
                 engine,
                 node,
                 needed_branches,
-                deadline,
-                self.timeout,
-                &format!("raw OUTPUT burst branches for outputs_per_tx={outputs_per_tx}"),
-                control,
+                &format!("outputs_per_tx={outputs_per_tx}"),
             )?;
             let checkpoint = |_: &str| !control.abort_requested() && Instant::now() < deadline;
-            let mut txids = engine.output_round(txs, fanout, false, 0, &checkpoint);
+            let mut txids = engine.output_round(txs, needed_branches, false, 0, &checkpoint);
             if (txids.len() as u64) < txs && !control.abort_requested() {
                 // A chain mutation between steps (reorg, partition) may have
                 // invalidated in-memory branches; resync once and finish the
@@ -365,7 +386,13 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
                     .reconcile()
                     .context("reconcile the scenario burst engine mid-burst")?;
                 let remaining = txs - txids.len() as u64;
-                txids.extend(engine.output_round(remaining, fanout, false, 0, &checkpoint));
+                txids.extend(engine.output_round(
+                    remaining,
+                    needed_branches,
+                    false,
+                    0,
+                    &checkpoint,
+                ));
             }
             if (txids.len() as u64) < txs && !control.abort_requested() {
                 if Instant::now() >= deadline {
@@ -404,30 +431,31 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
     ) -> Result<Value> {
         let policy = self.burst_policy()?;
         let needed_branches = burst_required_branches(txs);
-        let fanout = policy.fanout_utxos.max(needed_branches);
-        self.ensure_mining_can_confirm_burst_funding()?;
         self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
             engine.set_burst_data_shape(policy.fee_rate_sat_vb(), data_bytes);
             let deadline = Instant::now() + self.timeout;
-            let prepared_branches = wait_for_burst_branches(
+            let prepared_branches = require_prepared_burst_capacity(
                 engine,
                 node,
                 needed_branches,
-                deadline,
-                self.timeout,
-                &format!("raw DATA burst branches for data_bytes={data_bytes}"),
-                control,
+                &format!("OP_RETURN data_bytes={data_bytes}"),
             )?;
             let checkpoint = |_: &str| !control.abort_requested() && Instant::now() < deadline;
             let (mut txids, mut offered_vbytes) =
-                engine.data_round(txs, fanout, data_bytes, false, 0, &checkpoint);
+                engine.data_round(txs, needed_branches, data_bytes, false, 0, &checkpoint);
             if (txids.len() as u64) < txs && !control.abort_requested() {
                 engine
                     .reconcile()
                     .context("reconcile the scenario burst engine mid-data-burst")?;
                 let remaining = txs - txids.len() as u64;
-                let (more, more_vbytes) =
-                    engine.data_round(remaining, fanout, data_bytes, false, 0, &checkpoint);
+                let (more, more_vbytes) = engine.data_round(
+                    remaining,
+                    needed_branches,
+                    data_bytes,
+                    false,
+                    0,
+                    &checkpoint,
+                );
                 txids.extend(more);
                 offered_vbytes += more_vbytes;
             }
@@ -457,6 +485,75 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
                 "engine": "raw",
                 "shape": "op_return",
                 "aborted": control.abort_requested()
+            }))
+        })
+    }
+
+    fn prepare_manual_spam_burst(
+        &self,
+        node: MinerNode,
+        txs: u64,
+        outputs_per_tx: u64,
+        data_bytes: Option<u64>,
+        control: &dyn ScenarioControl,
+    ) -> Result<Value> {
+        let policy = self.burst_policy()?;
+        let needed_branches = burst_required_branches(txs);
+        self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
+            let shape = match data_bytes {
+                Some(bytes) => {
+                    engine.set_burst_data_shape(policy.fee_rate_sat_vb(), bytes);
+                    format!("op_return:{bytes}")
+                }
+                None => {
+                    engine.set_burst_shape(policy.fee_rate_sat_vb(), outputs_per_tx);
+                    format!("outputs:{outputs_per_tx}")
+                }
+            };
+            let initial_branches = engine.usable_branches_for_current_shape();
+            let deadline = Instant::now() + self.timeout;
+            let mut mined_confirmation_blocks = 0_u64;
+
+            while engine.usable_branches_for_current_shape() < needed_branches {
+                if control.abort_requested() {
+                    anyhow::bail!("manual burst capacity preparation was interrupted");
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out after {}s preparing manual burst capacity for {node}",
+                        self.timeout.as_secs()
+                    );
+                }
+                if mined_confirmation_blocks >= MAX_MANUAL_PREPARATION_BLOCKS {
+                    anyhow::bail!(
+                        "manual burst capacity for {node} is still {}/{} usable branches after mining {mined_confirmation_blocks} confirmation blocks",
+                        engine.usable_branches_for_current_shape(),
+                        needed_branches
+                    );
+                }
+
+                let checkpoint = |_: &str| {
+                    !control.abort_requested() && Instant::now() < deadline
+                };
+                if engine.ensure_branches(needed_branches, &checkpoint) {
+                    break;
+                }
+                self.mine(node, 1)
+                    .with_context(|| format!("mine a confirmation block while preparing manual burst capacity for {node}"))?;
+                mined_confirmation_blocks += 1;
+            }
+
+            let prepared_branches = engine.usable_branches_for_current_shape();
+            Ok(json!({
+                "node": node.to_string(),
+                "shape": shape,
+                "requested_transactions": txs,
+                "required_branches": needed_branches,
+                "initial_branches": initial_branches,
+                "prepared_branches": prepared_branches,
+                "mined_confirmation_blocks": mined_confirmation_blocks,
+                "ready": prepared_branches >= needed_branches,
+                "mining_desired_state_changed": false
             }))
         })
     }

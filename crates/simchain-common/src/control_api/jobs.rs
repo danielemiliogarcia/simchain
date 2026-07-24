@@ -10,6 +10,7 @@ pub enum JobKind {
     Partition,
     Degrade,
     Mine,
+    SpamPrepare,
     SpamBurst,
 }
 
@@ -22,6 +23,7 @@ impl JobKind {
             Self::Partition => "partition",
             Self::Degrade => "degrade",
             Self::Mine => "mine",
+            Self::SpamPrepare => "spam_prepare",
             Self::SpamBurst => "spam_burst",
         }
     }

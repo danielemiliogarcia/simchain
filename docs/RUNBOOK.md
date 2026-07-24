@@ -131,12 +131,28 @@ cargo run -p simchainctl -- mine --node node3 --blocks 1 --wait
 
 ## Bounded spam burst
 
-Submit wallet transactions through a server-side action job:
+Prepare the dedicated manual-burst capacity for the exact transaction count and shape.
+Preparation may mine confirmation blocks, but it preserves the mining controller's
+desired state:
+
+```bash
+cargo run -p simchainctl -- spam prepare \
+  --node node3 --txs 10 --data-bytes 20000 --wait
+```
+
+Then submit the transactions through a separate server-side action job. The burst
+itself never mines or starts branch funding, so mining can remain paused while the
+transactions are inspected in the mempool:
 
 ```bash
 cargo run -p simchainctl -- spam burst \
   --node node3 --txs 10 --data-bytes 20000 --wait
 ```
+
+The dashboard exposes the same two-step flow. **Prepare capacity** and **Create tx
+burst** both read the current Node, Transactions, Shape, and shape-specific field. If
+capacity is insufficient, the burst fails without partially preparing it and reports
+how many usable branches exist versus how many are required.
 
 ## Miner-prioritized zero-fee faucet
 
