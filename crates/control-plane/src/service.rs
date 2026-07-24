@@ -297,21 +297,8 @@ pub fn start_scenario(
     yaml: String,
     idempotency_key: Option<String>,
 ) -> Result<JobCreatedResponse, ServiceError> {
-    let Ok(_guard) = app.apply_lock.try_lock() else {
-        return Err(ServiceError::new(
-            ErrorCode::ApplyInProgress,
-            "another desired-state mutation is already in progress",
-        ));
-    };
-    let desired = load_durable_control_state(app)?.desired;
-    let (tuning, _) = LiveTuning::from_source(&desired).map_err(|error| {
-        ServiceError::new(
-            ErrorCode::ValidationFailed,
-            format!("durable spam policy is invalid: {error}"),
-        )
-    })?;
     app.jobs
-        .start_scenario(yaml, idempotency_key, tuning.spam.use_raw)
+        .start_scenario(yaml, idempotency_key)
         .map_err(job_manager_error)
 }
 

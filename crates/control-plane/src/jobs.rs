@@ -45,7 +45,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const JOB_SCHEMA_VERSION: u32 = 2;
+const JOB_SCHEMA_VERSION: u32 = 3;
 const MAX_JOB_HISTORY: usize = 100;
 const EVENT_RING_CAPACITY: usize = 2_048;
 const DEFAULT_LEASE_TTL_SECS: u64 = 120;
@@ -74,6 +74,31 @@ struct StoredJob {
     faucet_recovery: Option<FaucetRecoveryContext>,
     #[serde(default)]
     reorg_recovery: ReorgRecoveryContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scenario_settings_backup: Option<ScenarioSettingsBackup>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SettingsRestorePhase {
+    #[default]
+    Captured,
+    RestoreRunning,
+    Restored,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ScenarioSettingsBackup {
+    baseline_generation: u64,
+    baseline_desired: BTreeMap<String, String>,
+    captured_at_ms: u64,
+    phase: SettingsRestorePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restored_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restored_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -120,6 +145,18 @@ struct StoredJobV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct StoredJobV2 {
+    detail: JobDetail,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<String>,
+    request_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    faucet_recovery: Option<FaucetRecoveryContext>,
+    #[serde(default)]
+    reorg_recovery: ReorgRecoveryContext,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedJobsV1 {
     schema_version: u32,
     next_event_sequence: u64,
@@ -128,6 +165,17 @@ struct PersistedJobsV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     active_job_id: Option<String>,
     jobs: Vec<StoredJobV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedJobsV2 {
+    schema_version: u32,
+    next_event_sequence: u64,
+    #[serde(default = "default_next_checkpoint_generation")]
+    next_checkpoint_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_job_id: Option<String>,
+    jobs: Vec<StoredJobV2>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -179,13 +227,38 @@ fn load_and_migrate_jobs(store: &JobStore) -> anyhow::Result<PersistedJobs> {
                         request_fingerprint: job.request_fingerprint,
                         faucet_recovery: None,
                         reorg_recovery: job.reorg_recovery,
+                        scenario_settings_backup: None,
                     })
                     .collect(),
             };
             store.save(&migrated)?;
             Ok(migrated)
         }
-        2 => serde_json::from_value(value).map_err(Into::into),
+        2 => {
+            let old: PersistedJobsV2 = serde_json::from_value(value)?;
+            anyhow::ensure!(old.schema_version == 2, "invalid v2 job schema marker");
+            let migrated = PersistedJobs {
+                schema_version: JOB_SCHEMA_VERSION,
+                next_event_sequence: old.next_event_sequence,
+                next_checkpoint_generation: old.next_checkpoint_generation,
+                active_job_id: old.active_job_id,
+                jobs: old
+                    .jobs
+                    .into_iter()
+                    .map(|job| StoredJob {
+                        detail: job.detail,
+                        idempotency_key: job.idempotency_key,
+                        request_fingerprint: job.request_fingerprint,
+                        faucet_recovery: job.faucet_recovery,
+                        reorg_recovery: job.reorg_recovery,
+                        scenario_settings_backup: None,
+                    })
+                    .collect(),
+            };
+            store.save(&migrated)?;
+            Ok(migrated)
+        }
+        3 => serde_json::from_value(value).map_err(Into::into),
         future => anyhow::bail!("unsupported job schema {future} (expected {JOB_SCHEMA_VERSION})"),
     }
 }
@@ -572,6 +645,7 @@ impl JobManager {
                     ..FaucetRecoveryContext::default()
                 }),
                 reorg_recovery: ReorgRecoveryContext::default(),
+                scenario_settings_backup: None,
             });
             state.persisted.active_job_id = Some(job_id.clone());
             state.aborts.insert(job_id.clone(), abort.clone());
@@ -703,6 +777,7 @@ impl JobManager {
                     request: Some(request.clone()),
                     invalidated_block_hash: None,
                 },
+                scenario_settings_backup: None,
             });
             state.persisted.active_job_id = Some(job_id.clone());
             state.aborts.insert(job_id.clone(), abort.clone());
@@ -756,7 +831,6 @@ impl JobManager {
         self: &Arc<Self>,
         yaml: String,
         idempotency_key: Option<String>,
-        use_raw_tx_spam: bool,
     ) -> Result<JobCreatedResponse, JobManagerError> {
         if yaml.trim().is_empty() || yaml.len() > 1024 * 1024 {
             return Err(JobManagerError::new(
@@ -794,7 +868,40 @@ impl JobManager {
             })
             .collect();
 
-        let job_id = {
+        let (job_id, use_raw_tx_spam) = {
+            let Ok(_process_guard) = self.apply_lock.try_lock() else {
+                return Err(JobManagerError::new(
+                    ErrorCode::ApplyInProgress,
+                    "another desired-state mutation is already in progress",
+                ));
+            };
+            let _file_guard = self
+                .control_store
+                .try_apply_lock()
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    JobManagerError::new(
+                        ErrorCode::ApplyInProgress,
+                        "another control-plane process holds the durable apply lock",
+                    )
+                })?;
+            let baseline = self.control_store.load_current().map_err(internal_error)?;
+            let (tuning, _) =
+                live_tuning::LiveTuning::from_source(&baseline.desired).map_err(|error| {
+                    JobManagerError::new(
+                        ErrorCode::ValidationFailed,
+                        format!("durable spam policy is invalid: {error}"),
+                    )
+                })?;
+            let settings_backup = scenario.restore_settings.then(|| ScenarioSettingsBackup {
+                baseline_generation: baseline.generation,
+                baseline_desired: baseline.desired,
+                captured_at_ms: now_ms(),
+                phase: SettingsRestorePhase::Captured,
+                restored_generation: None,
+                restored_at_ms: None,
+                last_error: None,
+            });
             let mut state = self.state.lock().expect("job manager lock");
             if let Some(key) = idempotency_key.as_deref() {
                 if let Some(existing) = state
@@ -857,13 +964,14 @@ impl JobManager {
                 request_fingerprint: fingerprint,
                 faucet_recovery: None,
                 reorg_recovery: ReorgRecoveryContext::default(),
+                scenario_settings_backup: settings_backup,
             });
             state.persisted.active_job_id = Some(job_id.clone());
             state.aborts.insert(job_id.clone(), abort.clone());
             self.trim_history_locked(&mut state)
                 .map_err(internal_error)?;
             self.store.save(&state.persisted).map_err(internal_error)?;
-            job_id
+            (job_id, tuning.spam.use_raw)
         };
 
         if let Err(error) = self.emit(
@@ -871,10 +979,26 @@ impl JobManager {
             "created",
             "starting",
             "scenario job accepted",
-            Some(json!({"steps": scenario.steps.len()})),
+            Some(json!({
+                "steps": scenario.steps.len(),
+                "restore_settings": scenario.restore_settings
+            })),
         ) {
             self.fail_before_thread(&job_id, error.to_string());
             return Err(internal_error(error));
+        }
+
+        if let Some(backup) = self.scenario_settings_backup(&job_id) {
+            self.emit_best_effort(
+                &job_id,
+                "settings_snapshot_captured",
+                "starting",
+                "captured the pre-scenario desired settings",
+                Some(json!({
+                    "baseline_generation": backup.baseline_generation,
+                    "setting_count": backup.baseline_desired.len()
+                })),
+            );
         }
 
         let manager = self.clone();
@@ -1165,6 +1289,7 @@ impl JobManager {
                 request_fingerprint: fingerprint,
                 faucet_recovery: None,
                 reorg_recovery: ReorgRecoveryContext::default(),
+                scenario_settings_backup: None,
             });
             state.persisted.active_job_id = Some(job_id.clone());
             state.aborts.insert(job_id.clone(), abort.clone());
@@ -2191,7 +2316,14 @@ impl JobManager {
             .lock()
             .expect("scenario runtime lock")
             .chain_changed;
-        let cleanup = self.cleanup_owned_leases(&job_id, chain_changed, stop_error);
+        let mut cleanup = self.cleanup_owned_leases(&job_id, chain_changed, stop_error);
+        if let Err(error) = self.restore_scenario_settings(&job_id) {
+            cleanup.state = CleanupState::Failed;
+            let message = error.to_string();
+            if !cleanup.errors.contains(&message) {
+                cleanup.errors.push(message);
+            }
+        }
         let result_value = serde_json::to_value(&result).ok();
         if result.aborted || abort.load(Ordering::Acquire) {
             self.finish_job(
@@ -3025,6 +3157,123 @@ impl JobManager {
         self.cleanup_leases(job_id, &leases, chain_changed, stop_error)
     }
 
+    fn scenario_settings_backup(&self, job_id: &str) -> Option<ScenarioSettingsBackup> {
+        let state = self.state.lock().expect("job manager lock");
+        find_stored(&state.persisted, job_id)?
+            .scenario_settings_backup
+            .clone()
+    }
+
+    fn restore_scenario_settings(self: &Arc<Self>, job_id: &str) -> anyhow::Result<Option<u64>> {
+        let backup = {
+            let mut state = self.state.lock().expect("job manager lock");
+            let Some(job) = find_stored_mut(&mut state.persisted, job_id) else {
+                anyhow::bail!("settings restore job {job_id} is missing");
+            };
+            let Some(backup) = job.scenario_settings_backup.as_mut() else {
+                return Ok(None);
+            };
+            if backup.phase == SettingsRestorePhase::Restored {
+                return Ok(backup.restored_generation);
+            }
+            backup.phase = SettingsRestorePhase::RestoreRunning;
+            backup.last_error = None;
+            job.detail.summary.phase = "restoring_settings".to_string();
+            let backup = backup.clone();
+            self.store.save(&state.persisted)?;
+            backup
+        };
+
+        let current = self.control_store.load_current()?;
+        let changed_key_count = backup
+            .baseline_desired
+            .keys()
+            .chain(current.desired.keys())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|key| backup.baseline_desired.get(*key) != current.desired.get(*key))
+            .count();
+        self.emit_best_effort(
+            job_id,
+            "settings_restore_started",
+            "restoring_settings",
+            "restoring the pre-scenario desired settings",
+            Some(json!({
+                "baseline_generation": backup.baseline_generation,
+                "current_generation": current.generation,
+                "changed_key_count": changed_key_count
+            })),
+        );
+
+        let context = ApplyContext {
+            apply_lock: self.apply_lock.as_ref(),
+            control_store: &self.control_store,
+            control_state: self.control_state.as_ref(),
+            chain: self.chain.as_ref(),
+            mining: self.mining.as_ref(),
+            spam: self.spam.as_ref(),
+        };
+        let report = match apply_with_context(
+            &context,
+            ApplyRequest {
+                settings: backup.baseline_desired.clone(),
+                base_generation: Some(current.generation),
+            },
+            |_| Ok(()),
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                let message = format!("settings_restore_failed: {}", error.message);
+                {
+                    let mut state = self.state.lock().expect("job manager lock");
+                    if let Some(restore) = find_stored_mut(&mut state.persisted, job_id)
+                        .and_then(|job| job.scenario_settings_backup.as_mut())
+                    {
+                        restore.phase = SettingsRestorePhase::RestoreRunning;
+                        restore.last_error = Some(message.clone());
+                    }
+                    self.store.save(&state.persisted)?;
+                }
+                self.emit_best_effort(
+                    job_id,
+                    "settings_restore_pending",
+                    "restoring_settings",
+                    &message,
+                    Some(json!({
+                        "baseline_generation": backup.baseline_generation,
+                        "current_generation": current.generation
+                    })),
+                );
+                anyhow::bail!(message);
+            }
+        };
+
+        {
+            let mut state = self.state.lock().expect("job manager lock");
+            let restore = find_stored_mut(&mut state.persisted, job_id)
+                .and_then(|job| job.scenario_settings_backup.as_mut())
+                .ok_or_else(|| anyhow::anyhow!("settings backup disappeared for job {job_id}"))?;
+            restore.phase = SettingsRestorePhase::Restored;
+            restore.restored_generation = Some(report.generation);
+            restore.restored_at_ms = Some(now_ms());
+            restore.last_error = None;
+            self.store.save(&state.persisted)?;
+        }
+        self.emit_best_effort(
+            job_id,
+            "settings_restored",
+            "restoring_settings",
+            "restored the pre-scenario desired settings",
+            Some(json!({
+                "baseline_generation": backup.baseline_generation,
+                "restored_generation": report.generation,
+                "changed_key_count": changed_key_count,
+                "changed": report.changed
+            })),
+        );
+        Ok(Some(report.generation))
+    }
+
     fn renew_owned_leases(&self, job_id: &str, sequence: u64) -> anyhow::Result<()> {
         for lease in owned_leases(&self.spam.status()?.active_leases, job_id) {
             self.spam.renew_lease(
@@ -3733,7 +3982,11 @@ impl JobManager {
             self.ensure_recovery_leases(job_id)?;
             self.reorg.recover(&request, &context, &observer)?;
         }
-        self.recover_worker_leases(job_id)
+        self.recover_worker_leases(job_id)?;
+        if kind == JobKind::Scenario {
+            self.restore_scenario_settings(job_id)?;
+        }
+        Ok(())
     }
 
     fn recover_faucet_job(
@@ -6294,6 +6547,7 @@ mod tests {
                         request: Some(ReorgJobRequest::default()),
                         invalidated_block_hash: Some("00".repeat(32)),
                     },
+                    scenario_settings_backup: None,
                 }],
             })
             .expect("seed active job");
@@ -6391,6 +6645,7 @@ mod tests {
                         request: Some(ReorgJobRequest::default()),
                         invalidated_block_hash: Some("00".repeat(32)),
                     },
+                    scenario_settings_backup: None,
                 }],
             })
             .expect("seed job");
@@ -6511,6 +6766,7 @@ mod tests {
                     request_fingerprint: "scenario".to_string(),
                     faucet_recovery: None,
                     reorg_recovery: ReorgRecoveryContext::default(),
+                    scenario_settings_backup: None,
                 }],
             })
             .expect("seed held scenario");
@@ -6564,10 +6820,10 @@ steps:
   - type: resume_mining
 "#;
         let created = manager
-            .start_scenario(yaml.to_string(), Some("scenario-retry".to_string()), true)
+            .start_scenario(yaml.to_string(), Some("scenario-retry".to_string()))
             .expect("start scenario");
         let reused = manager
-            .start_scenario(yaml.to_string(), Some("scenario-retry".to_string()), true)
+            .start_scenario(yaml.to_string(), Some("scenario-retry".to_string()))
             .expect("idempotent retry");
         assert!(reused.reused);
         assert_eq!(reused.job_id, created.job_id);
@@ -6659,7 +6915,6 @@ steps:
 "#
                 .to_string(),
                 None,
-                true,
             )
             .expect("start scenario");
         wait_until(|| {
@@ -6727,7 +6982,6 @@ steps:
 "#
                 .to_string(),
                 None,
-                true,
             )
             .expect("start scenario");
         wait_until(|| {
@@ -6795,7 +7049,6 @@ steps:
 "#
                 .to_string(),
                 None,
-                true,
             )
             .expect("start scenario");
         wait_until(|| {
@@ -6849,7 +7102,6 @@ steps:
 "#
                 .to_string(),
                 None,
-                true,
             )
             .expect("start scenario");
         wait_until(|| {
@@ -6899,6 +7151,7 @@ steps:
     fn spam_burst_target_helpers_coalesce_by_node_and_detect_spam_settings() {
         let scenario = Scenario {
             version: 1,
+            restore_settings: false,
             steps: vec![
                 Step::SpamBurst {
                     node: MinerNode::Node2,
@@ -6979,7 +7232,6 @@ steps:
 "#
                 .to_string(),
                 None,
-                true,
             )
             .expect("start scenario");
         wait_until(|| {
@@ -7004,6 +7256,242 @@ steps:
     }
 
     #[test]
+    fn scenario_restores_settings_after_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(BlockingExecutor::new());
+        let (_backend, manager) = manager(dir.path(), executor);
+        let baseline = manager.control_store.load_current().expect("baseline");
+        let created = manager
+            .start_scenario(
+                r#"
+version: 1
+restore_settings: true
+steps:
+  - type: set_config
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 2
+"#
+                .to_string(),
+                None,
+            )
+            .expect("start scenario");
+        wait_until(|| manager.list().active_job_id.is_none());
+
+        let restored = manager
+            .control_store
+            .load_current()
+            .expect("restored state");
+        assert_eq!(restored.desired, baseline.desired);
+        assert!(restored.generation >= baseline.generation + 2);
+        let job = manager.get(&created.job_id).expect("job");
+        assert_eq!(job.summary.state, JobState::Succeeded);
+        assert_eq!(job.summary.cleanup.state, CleanupState::Succeeded);
+        let events = manager
+            .events(Some(&created.job_id), 0, 500)
+            .expect("events");
+        for expected in [
+            "settings_snapshot_captured",
+            "settings_restore_started",
+            "settings_restored",
+        ] {
+            assert!(events.events.iter().any(|event| event.event == expected));
+        }
+        let state = manager.state.lock().expect("job manager lock");
+        let backup = find_stored(&state.persisted, &created.job_id)
+            .and_then(|job| job.scenario_settings_backup.as_ref())
+            .expect("settings backup");
+        assert_eq!(backup.phase, SettingsRestorePhase::Restored);
+        assert_eq!(backup.baseline_generation, baseline.generation);
+    }
+
+    #[test]
+    fn scenario_restores_settings_after_abort() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(BlockingExecutor::new());
+        let (_backend, manager) = manager(dir.path(), executor);
+        let baseline = manager.control_store.load_current().expect("baseline");
+        let created = manager
+            .start_scenario(
+                r#"
+version: 1
+restore_settings: true
+steps:
+  - type: set_config
+    settings:
+      BLOCK_INTERVAL_MODE: fixed
+      BLOCK_INTERVAL_MEAN_SECS: 2
+  - type: checkpoint
+    name: changed
+    timeout_secs: 30
+"#
+                .to_string(),
+                None,
+            )
+            .expect("start scenario");
+        wait_until(|| {
+            manager
+                .checkpoint(&created.job_id, "changed")
+                .is_ok_and(|response| response.checkpoint.state == CheckpointState::Reached)
+        });
+        assert_ne!(
+            manager
+                .control_store
+                .load_current()
+                .expect("changed")
+                .desired,
+            baseline.desired
+        );
+        manager.abort(&created.job_id).expect("abort scenario");
+        wait_until(|| manager.list().active_job_id.is_none());
+
+        let job = manager.get(&created.job_id).expect("job");
+        assert_eq!(job.summary.state, JobState::Aborted);
+        assert_eq!(job.summary.cleanup.state, CleanupState::Succeeded);
+        assert_eq!(
+            manager
+                .control_store
+                .load_current()
+                .expect("restored")
+                .desired,
+            baseline.desired
+        );
+    }
+
+    #[test]
+    fn no_op_scenario_restore_preserves_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(BlockingExecutor::new());
+        let (_backend, manager) = manager(dir.path(), executor);
+        let baseline = manager.control_store.load_current().expect("baseline");
+        let created = manager
+            .start_scenario(
+                "version: 1\nrestore_settings: true\nsteps: []\n".to_string(),
+                None,
+            )
+            .expect("start scenario");
+        wait_until(|| manager.list().active_job_id.is_none());
+        let restored = manager.control_store.load_current().expect("restored");
+        assert_eq!(restored.desired, baseline.desired);
+        assert_eq!(restored.generation, baseline.generation);
+        assert_eq!(
+            manager
+                .get(&created.job_id)
+                .expect("job")
+                .summary
+                .cleanup
+                .state,
+            CleanupState::Succeeded
+        );
+    }
+
+    #[test]
+    fn restart_recovery_restores_captured_scenario_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = Arc::new(MockBackend::new());
+        backend.sync_workers();
+        let (control_store, control_state, apply_lock) = control_fixture(dir.path());
+        let baseline = control_store.load_current().expect("baseline");
+        let mut source = baseline.desired.clone();
+        source.insert("BLOCK_INTERVAL_MODE".to_string(), "fixed".to_string());
+        source.insert("BLOCK_INTERVAL_MEAN_SECS".to_string(), "2".to_string());
+        let (tuning, _) = live_tuning::LiveTuning::from_source(&source).expect("changed tuning");
+        let desired = tuning
+            .canonical_values()
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
+        let changed = crate::control_state::successful_apply(&baseline, desired);
+        MiningControlBackend::set_policy(backend.as_ref(), changed.generation, tuning.mining)
+            .expect("seed mining policy");
+        SpamControlBackend::set_policy(backend.as_ref(), changed.generation, tuning.spam)
+            .expect("seed spam policy");
+        control_store.save(&changed).expect("save changed state");
+        *control_state.write().expect("control state") = changed;
+
+        let job_id = "job-interrupted-settings".to_string();
+        JobStore::open(dir.path())
+            .expect("job store")
+            .save(&PersistedJobs {
+                schema_version: JOB_SCHEMA_VERSION,
+                next_event_sequence: 1,
+                next_checkpoint_generation: 1,
+                active_job_id: Some(job_id.clone()),
+                jobs: vec![StoredJob {
+                    detail: JobDetail {
+                        summary: JobSummary {
+                            id: job_id.clone(),
+                            kind: JobKind::Scenario,
+                            state: JobState::Running,
+                            phase: "running_scenario".to_string(),
+                            created_at_ms: 1,
+                            started_at_ms: Some(2),
+                            ended_at_ms: None,
+                            cleanup: JobCleanup::default(),
+                        },
+                        request: json!({"version": 1, "restore_settings": true, "steps": []}),
+                        leases: Vec::new(),
+                        current_step: None,
+                        checkpoints: Vec::new(),
+                        result: None,
+                        failure: None,
+                    },
+                    idempotency_key: None,
+                    request_fingerprint: "scenario".to_string(),
+                    faucet_recovery: None,
+                    reorg_recovery: ReorgRecoveryContext::default(),
+                    scenario_settings_backup: Some(ScenarioSettingsBackup {
+                        baseline_generation: baseline.generation,
+                        baseline_desired: baseline.desired.clone(),
+                        captured_at_ms: 1,
+                        phase: SettingsRestorePhase::Captured,
+                        restored_generation: None,
+                        restored_at_ms: None,
+                        last_error: None,
+                    }),
+                }],
+            })
+            .expect("seed interrupted scenario");
+
+        let manager = JobManager::open_with_ttl(
+            dir.path(),
+            JobDependencies {
+                mining: backend.clone(),
+                spam: backend.clone(),
+                network: backend.clone(),
+                chain: backend.clone(),
+                control_store,
+                control_state,
+                apply_lock,
+                reorg: Arc::new(BlockingExecutor::new()),
+                scenario: backend.clone(),
+                network_actions: backend.clone(),
+                faucet: backend,
+                faucet_settings: test_faucet_settings(),
+            },
+            60,
+        )
+        .expect("restart manager");
+        wait_until(|| manager.list().active_job_id.is_none());
+        assert_eq!(
+            manager
+                .control_store
+                .load_current()
+                .expect("restored")
+                .desired,
+            baseline.desired
+        );
+        let state = manager.state.lock().expect("job manager lock");
+        assert_eq!(
+            find_stored(&state.persisted, &job_id)
+                .and_then(|job| job.scenario_settings_backup.as_ref())
+                .expect("backup")
+                .phase,
+            SettingsRestorePhase::Restored
+        );
+    }
+
+    #[test]
     fn wait_n_blocks_step_runs_inline_under_the_scenario_job() {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = Arc::new(BlockingExecutor::new());
@@ -7012,7 +7500,6 @@ steps:
             .start_scenario(
                 "version: 1\nsteps:\n  - type: wait_n_blocks\n    n: 3\n".to_string(),
                 None,
-                true,
             )
             .expect("start scenario");
         wait_until(|| {
@@ -7028,7 +7515,7 @@ steps:
     }
 
     #[test]
-    fn job_store_v1_migrates_to_v2_without_faucet_recovery_material() {
+    fn job_store_v1_migrates_to_v3_without_recovery_material() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = JobStore::open(dir.path()).expect("store");
         store
@@ -7069,12 +7556,62 @@ steps:
         assert_eq!(migrated.next_checkpoint_generation, 4);
         assert_eq!(migrated.jobs.len(), 1);
         assert!(migrated.jobs[0].faucet_recovery.is_none());
+        assert!(migrated.jobs[0].scenario_settings_backup.is_none());
         let persisted = store
             .load_optional::<Value>()
             .expect("load migrated index")
             .expect("migrated index");
         assert_eq!(persisted["schema_version"], JOB_SCHEMA_VERSION);
         assert!(persisted["jobs"][0].get("faucet_recovery").is_none());
+        assert!(persisted["jobs"][0]
+            .get("scenario_settings_backup")
+            .is_none());
+    }
+
+    #[test]
+    fn job_store_v2_migrates_without_inventing_settings_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = JobStore::open(dir.path()).expect("store");
+        store
+            .save(&PersistedJobsV2 {
+                schema_version: 2,
+                next_event_sequence: 5,
+                next_checkpoint_generation: 2,
+                active_job_id: Some("job-v2".to_string()),
+                jobs: vec![StoredJobV2 {
+                    detail: JobDetail {
+                        summary: JobSummary {
+                            id: "job-v2".to_string(),
+                            kind: JobKind::Scenario,
+                            state: JobState::Interrupted,
+                            phase: "recovering_owned_resources".to_string(),
+                            created_at_ms: 1,
+                            started_at_ms: Some(2),
+                            ended_at_ms: Some(3),
+                            cleanup: JobCleanup {
+                                state: CleanupState::Running,
+                                errors: Vec::new(),
+                            },
+                        },
+                        request: json!({"version": 1, "steps": []}),
+                        leases: Vec::new(),
+                        current_step: None,
+                        checkpoints: Vec::new(),
+                        result: None,
+                        failure: None,
+                    },
+                    idempotency_key: None,
+                    request_fingerprint: "v2-request".to_string(),
+                    faucet_recovery: None,
+                    reorg_recovery: ReorgRecoveryContext::default(),
+                }],
+            })
+            .expect("seed v2 index");
+
+        let migrated = load_and_migrate_jobs(&store).expect("migrate v2 index");
+        assert_eq!(migrated.schema_version, JOB_SCHEMA_VERSION);
+        assert_eq!(migrated.active_job_id.as_deref(), Some("job-v2"));
+        assert!(migrated.jobs[0].scenario_settings_backup.is_none());
     }
 
     #[test]

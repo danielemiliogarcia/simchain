@@ -33,12 +33,14 @@ a fresh chain outside the control plane when the test requires one, then run the
 
 ## Schema
 
-Every file has exactly `version: 1` and an ordered `steps` list. Unknown fields and step
+Every file has exactly `version: 1` and an ordered `steps` list. The optional top-level
+`restore_settings: true` makes `set_config` changes temporary. Unknown fields and step
 types are rejected before the mutation coordinator is reserved. Existing version-1 files
-remain valid.
+remain valid because restoration defaults to false.
 
 ```yaml
 version: 1
+restore_settings: true
 steps:
   - type: wait_height
     height: 260
@@ -175,7 +177,9 @@ Validation rules:
   scenario's steps run, while mining still produces blocks.
 - `set_config.settings` is a partial runtime desired-state patch using the same keys as
   `simchainctl config set`. Values may be strings, numbers, booleans, or null/empty reset
-  values.
+  values. With top-level `restore_settings: true`, the complete pre-scenario desired map
+  is durably captured before execution and restored after success, failure, abort, panic,
+  or control-plane restart. Config mutation remains blocked until restoration completes.
 - `assert_config.settings` checks durable desired values, and with `effective: true`
   (the default) also checks that the mining/spam workers expose the expected effective
   policy at the current desired generation.
