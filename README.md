@@ -276,6 +276,23 @@ docker compose --profile "*" down -v
 ./scripts/fresh-chain.sh --profile all-tools
 ```
 
+### Injecting diagnostic tools into nodes
+
+The official Bitcoin node image is intentionally minimal. To install the prerequisites
+for Simchain's container-side diagnostic tools and copy them into one running node, use:
+
+```bash
+./scripts/inject-tools.sh btc-simnet-node3
+```
+
+Use `./scripts/inject-tools.sh --all-containers` to prepare every running
+`btc-simnet-nodeN` container. Currently the helper installs `curl` when needed and
+installs the watcher as `/usr/local/bin/chainwatch`, so it can be invoked directly on
+the container's `PATH`. These changes live in each container's writable layer and must
+be injected again after container recreation. Run the script with `--help` for usage;
+see [PARTITIONS.md](./docs/PARTITIONS.md#watch-both-sides-live) for the complete
+two-sided fork-watching example.
+
 ### Retuning a live chain
 
 Change mining-controller and spammer settings without restarting nodes or either

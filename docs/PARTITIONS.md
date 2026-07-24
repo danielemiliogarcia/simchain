@@ -71,17 +71,24 @@ Start one watcher on the connected-side miner from the host:
 ./scripts/chainwatch.sh -P 28443 -i 1
 ```
 
-Node3 deliberately has no host RPC port. For a disposable live demo, install the
-watcher's `curl` dependency in the running container, copy the same script into it, and
-watch node3 over its loopback RPC endpoint:
+Node3 deliberately has no host RPC port. For a disposable live demo, use the injection
+helper to install the watcher's `curl` dependency and copy the same script into the
+running container. Then watch node3 over its loopback RPC endpoint:
 
 ```bash
-docker exec -u root btc-simnet-node3 bash -c \
-  "apt-get update -qq && apt-get install -y -qq curl"
-docker cp scripts/chainwatch.sh btc-simnet-node3:/tmp/chainwatch.sh
-docker exec -it btc-simnet-node3 bash /tmp/chainwatch.sh \
+./scripts/inject-tools.sh btc-simnet-node3
+docker exec -it btc-simnet-node3 chainwatch \
   -H 127.0.0.1 -P 18443 -u foo -p rpcpassword -i 1
 ```
+
+To prepare every running Simchain Bitcoin node at once, no container name is needed:
+
+```bash
+./scripts/inject-tools.sh --all-containers
+```
+
+Injected packages and files live in each container's writable layer: they survive a
+stop/start but must be injected again after the container is recreated.
 
 Then submit a partition with a hold longer than the polling interval:
 
