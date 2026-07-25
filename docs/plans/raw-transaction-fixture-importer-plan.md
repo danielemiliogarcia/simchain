@@ -7,7 +7,7 @@
 This is a future feature plan. It defines a Simchain module that imports selected
 mainnet transactions as Simchain-valid raw transaction fixtures without relying on
 Bitcoin Core node wallets. The feature is recorded from
-[NICE-TO-HAVE.md](NICE-TO-HAVE.md) and is not implemented.
+[NICE-TO-HAVE.md](../NICE-TO-HAVE.md) and is not implemented.
 
 ## 1. Decision summary
 

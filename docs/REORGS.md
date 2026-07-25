@@ -95,7 +95,7 @@ orphaned window has zero eligible transactions, the tool emits a highlighted
 warning explaining the mismatch. Transactions signed by external user keys are
 likewise ineligible; their conflict must be supplied separately. Making
 double-spends work against raw-engine spam is planned (see
-`docs/reorg-double-spend-raw-engine-plan.md`).
+`docs/plans/reorg-double-spend-raw-engine-plan.md`).
 
 ### Why conflicts are mined directly
 

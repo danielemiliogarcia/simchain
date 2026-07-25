@@ -241,7 +241,7 @@ neighbors):
 ### 3.6 `NICE-TO-HAVE.md`
 
 Per repo convention: **delete** the fee-market entry from the Parked features section
-entirely (never mark done), drop this plan from `docs/parked/`, and fix every reference
+entirely (never mark done), drop this plan from `docs/plans/parked/`, and fix every reference
 to it (the list in the Simulations section, the Parked features intro). Also update the
 "Fee-market pressure" bullet under Simulations to point at the new `SPAM_FEE_MODE`
 setting instead of describing it as future work.

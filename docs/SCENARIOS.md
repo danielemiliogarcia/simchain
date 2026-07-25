@@ -258,16 +258,20 @@ before another mutation may begin.
 
 ## Shipped examples
 
-- `pause-then-burst.yml` pauses background mining, creates a wallet burst, then resumes.
-- `reorg-during-sync.yml` creates a two-block reorganization and observation delay.
-- `partition-node3.yml` builds unequal branches across a temporary partition.
-- `ci-checkpoint.yml` holds a deterministic mempool state for external assertions.
-- `tutorial-one-block.yml` pauses background mining, manually mines one block, then resumes.
-- `fresh-chain-tour.yml` performs the full hot-control tour after an externally fresh
+- [`pause-then-burst.yml`](../scenarios/pause-then-burst.yml) pauses background mining, creates a wallet burst, then resumes.
+- [`reorg-during-sync.yml`](../scenarios/reorg-during-sync.yml) creates a two-block reorganization and observation delay.
+- [`partition-node3.yml`](../scenarios/partition-node3.yml) builds unequal branches across a temporary partition.
+- [`ci-checkpoint.yml`](../scenarios/ci-checkpoint.yml) holds a deterministic mempool state for external assertions.
+- [`tutorial-one-block.yml`](../scenarios/tutorial-one-block.yml) pauses background mining, manually mines one block, then resumes.
+- [`fresh-chain-tour.yml`](../scenarios/fresh-chain-tour.yml) performs the full hot-control tour after an externally fresh
   chain start: retune, faucet funding, config assertion, empty reorg, organic partition
   reorg, another split, timed degradation, and final fee-floor change.
-- `rainbow.yml` fixes the block interval at 10s and the fill ratio at 10, then uses
+- [`rainbow.yml`](../scenarios/rainbow.yml) fixes the block interval at 10s and the fill ratio at 10, then uses
   `wait_n_blocks` to ramp `SPAM_FEE` x10 every block from 1 to 10,000 sat/vB, driving
   the spammer into `capacity_degraded` and spreading the mempool across every fee-rate
   color band. Runs unmodified on a fresh stack or an already-running one, then restores
   the complete pre-run desired settings map.
+
+## How the rainbow scenario execution looks like
+
+![rainbow scenario mempool.space fee-rate coloring](img/rainbow.png)
