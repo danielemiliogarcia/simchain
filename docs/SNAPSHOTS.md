@@ -192,3 +192,48 @@ already spent by its own still-in-mempool transactions with
 `gettxout(include_mempool)`. What it loses is only ephemeral bookkeeping (branch
 cursors, RBF shape cache); the funds are in the miner wallets and on-chain. After a
 restore, spam resumes and the mempool refills without intervention.
+
+
+## Full snapshots
+
+`./scripts/full-snapshot.sh` is a standalone companion to `./scripts/snapshot.sh`
+(which it does not modify) for the one thing a plain snapshot loses: the explorer's
+view of **stale/orphaned blocks produced by reorgs**. A plain restore repopulates
+electrs and the mempool.space MariaDB by re-indexing node1's *active* chain, so any
+block a reorg had already orphaned before the save disappears from the explorer (see
+"What survives a snapshot" above). A full snapshot additionally archives and restores
+those two stores' data, so the explorer still shows the orphaned blocks after a
+restore.
+
+```bash
+# Same CLI shape as snapshot.sh, separate storage:
+./scripts/full-snapshot.sh save mysnap      # stop stack, archive nodes + electrs + mempool DB, resume
+./scripts/full-snapshot.sh restore mysnap   # wipe volumes, unarchive everything, up
+./scripts/full-snapshot.sh list             # what is saved
+
+# Full snapshots land in ./snapshots/full/ (override with FULL_SNAPSHOT_DIR),
+# kept separate from ./snapshots/ so the two formats never collide.
+```
+
+What gets captured depends on what was running at save time (basic profile: no
+explorer, so nothing extra to capture; `electrs`/`mempool`/`all-tools` profiles:
+electrs and/or the mempool.space database are archived via `docker cp` from the
+stopped containers, since they live in the container filesystem rather than on a
+named volume). Restore streams that data back into freshly created containers before
+starting them; if a captured store's container isn't part of the restore shape (e.g.
+restoring with `--profile basic`), it is skipped with a loud warning instead of
+failing the restore. Guard rails (name validation, `--force` mismatch handling,
+recorded service shape) are identical to `snapshot.sh`.
+
+Manual verification for the reorg/orphan scenario this exists for (requires Docker,
+not exercised by CI):
+
+```bash
+docker compose --profile mempool up -d
+# ...let the explorer index, trigger a reorg, note an orphaned block hash...
+docker compose run --rm btc-simnet-reorg 3
+./scripts/full-snapshot.sh save r
+./scripts/fresh-chain.sh --profile mempool
+./scripts/full-snapshot.sh restore r
+# the previously orphaned block hash is still visible in the mempool.space explorer
+```

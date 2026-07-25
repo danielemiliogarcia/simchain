@@ -334,6 +334,11 @@ they were taken with (restore checks and refuses a mismatch).
 
 Recipes for the common situations: **[SNAPSHOTS.md](./docs/SNAPSHOTS.md)**.
 
+A plain snapshot's restored explorer (electrs / mempool.space) re-indexes from the
+active chain, so blocks orphaned by a reorg before the save are gone. To keep those
+too, use the standalone `./scripts/full-snapshot.sh` instead — see SNAPSHOTS.md's
+["Full snapshots"](./docs/SNAPSHOTS.md#full-snapshots) section.
+
 ### Profiles
 
 One compose file serves every combination via
