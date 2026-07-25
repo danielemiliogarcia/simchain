@@ -272,6 +272,6 @@ before another mutation may begin.
   color band. Runs unmodified on a fresh stack or an already-running one, then restores
   the complete pre-run desired settings map.
 
-## How the rainbow scenario execution looks like
+## How the rainbow scenario execution looks like at mempool-space :P
 
 ![rainbow scenario mempool.space fee-rate coloring](img/rainbow.png)
