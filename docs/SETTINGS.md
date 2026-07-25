@@ -240,7 +240,7 @@ an integer to zero happens before the `halvings >= 64` mainnet-style cutoff woul
 | 4950+ | 33 | **0 sat, permanently** |
 
 This matters for the faucet: node2/node3 are funded only by coinbase (the deterministic
-bootstrap through height 204, then continuous mining — see [faucet-plan.md](faucet-plan.md)
+bootstrap through height 204, then continuous mining — see [faucet-plan.md](plans/faucet-plan.md)
 and the treasury note under [Simchain control plane](#simchain-control-plane) below), and spam
 fees paid to those same blocks return as coinbase too. Past height 4950 neither source adds
 anything new: mining continues (spam still confirms, fees still get paid), but every future

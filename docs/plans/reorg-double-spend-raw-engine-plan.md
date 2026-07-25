@@ -7,7 +7,7 @@
 This is a handoff plan, not an implemented feature. It extends the existing
 `REORG_DOUBLE_SPEND_PCT` implementation to transactions produced by the default raw
 spammer (`USE_RAW_TX_SPAM=true`). The completed wallet-engine behavior and rationale
-are documented in [REORGS.md](REORGS.md).
+are documented in [REORGS.md](../REORGS.md).
 
 ## 1. Decision summary
 

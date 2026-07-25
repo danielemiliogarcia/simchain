@@ -30,7 +30,7 @@ No open findings from the last review remain.
 ### Walletless mainnet transaction fixture importer
 
 **Status (2026-07-17): planned/design only** — full design in
-[raw-transaction-fixture-importer-plan.md](raw-transaction-fixture-importer-plan.md).
+[raw-transaction-fixture-importer-plan.md](plans/raw-transaction-fixture-importer-plan.md).
 
 Import selected mainnet transactions as Simchain-valid raw transaction fixtures without
 using node wallets. The importer would fetch source transactions from a mainnet node,
@@ -57,18 +57,18 @@ limitations and future enhancements, and a section for parked features.
 ### Chaos monkey mode
 
 ### Rebalance spammer <-> faucet
-see [rebalance-plan.md](rebalance-plan.md)
+see [rebalance-plan.md](plans/rebalance-plan.md)
 
 ## Parked features
 
 Designed but deliberately not built. Each entry records why it is parked and what would
-revive it; the expensive design thinking is preserved in `parked/`.
+revive it; the expensive design thinking is preserved in `plans/parked/`.
 
 ### Fee-market simulation in the spammer — PARKED
 
 **Status (2026-07-10): parked** — complexity/benefit says wait for a concrete
 fee-estimation or fee-bumping test need. Full design (CPFP-safe per-branch fee ladder,
-funding-pull deadlock fix) in [parked/fee-market-plan.md](parked/fee-market-plan.md),
+funding-pull deadlock fix) in [parked/fee-market-plan.md](plans/parked/fee-market-plan.md),
 which supersedes the implementation sketch that used to live here.
 
 **What:** Make the spammer emit transactions with varied fee rates (sampled from a
