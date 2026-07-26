@@ -1172,14 +1172,7 @@ impl JobManager {
                 let panic_manager = manager.clone();
                 let panic_job_id = thread_job_id.clone();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    manager.run_spam_burst_job(
-                        thread_job_id,
-                        node,
-                        request.txs,
-                        request.outputs_per_tx,
-                        request.data_bytes,
-                        abort,
-                    )
+                    manager.run_spam_burst_job(thread_job_id, node, request, abort)
                 }));
                 if outcome.is_err() {
                     panic_manager.handle_executor_panic(&panic_job_id);
@@ -1220,14 +1213,7 @@ impl JobManager {
                 let panic_manager = manager.clone();
                 let panic_job_id = thread_job_id.clone();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    manager.run_spam_prepare_job(
-                        thread_job_id,
-                        node,
-                        request.txs,
-                        request.outputs_per_tx,
-                        request.data_bytes,
-                        abort,
-                    )
+                    manager.run_spam_prepare_job(thread_job_id, node, request, abort)
                 }));
                 if outcome.is_err() {
                     panic_manager.handle_executor_panic(&panic_job_id);
@@ -2639,11 +2625,16 @@ impl JobManager {
         self: Arc<Self>,
         job_id: String,
         node: MinerNode,
-        txs: u64,
-        outputs_per_tx: u64,
-        data_bytes: Option<u64>,
+        request: SpamBurstJobRequest,
         abort: Arc<AtomicBool>,
     ) {
+        let SpamBurstJobRequest {
+            txs,
+            outputs_per_tx,
+            data_bytes,
+            fee_rate_sat_vb,
+            ..
+        } = request;
         if abort.load(Ordering::Acquire) {
             self.finish_job(
                 &job_id,
@@ -2705,10 +2696,13 @@ impl JobManager {
             abort: abort.clone(),
         };
         let result = match data_bytes {
-            Some(bytes) => self.scenario.data_spam_burst(node, txs, bytes, &control),
+            Some(bytes) => {
+                self.scenario
+                    .data_spam_burst(node, txs, bytes, fee_rate_sat_vb, &control)
+            }
             None => self
                 .scenario
-                .spam_burst(node, txs, outputs_per_tx, &control),
+                .spam_burst(node, txs, outputs_per_tx, fee_rate_sat_vb, &control),
         };
         let stop_error = renewer.stop().err().map(|error| error.to_string());
         let cleanup = self.cleanup_leases(&job_id, &[lease], false, stop_error);
@@ -2755,11 +2749,16 @@ impl JobManager {
         self: Arc<Self>,
         job_id: String,
         node: MinerNode,
-        txs: u64,
-        outputs_per_tx: u64,
-        data_bytes: Option<u64>,
+        request: SpamBurstJobRequest,
         abort: Arc<AtomicBool>,
     ) {
+        let SpamBurstJobRequest {
+            txs,
+            outputs_per_tx,
+            data_bytes,
+            fee_rate_sat_vb,
+            ..
+        } = request;
         if abort.load(Ordering::Acquire) {
             self.finish_job(
                 &job_id,
@@ -2813,6 +2812,7 @@ impl JobManager {
             txs,
             outputs_per_tx,
             data_bytes,
+            fee_rate_sat_vb,
             &control,
         );
         let stop_error = renewer.stop().err().map(|error| error.to_string());
@@ -5603,7 +5603,7 @@ impl ScenarioActions for JobScenarioActions {
     ) -> anyhow::Result<Value> {
         self.manager
             .scenario
-            .spam_burst(node, txs, outputs_per_tx, control)
+            .spam_burst(node, txs, outputs_per_tx, None, control)
     }
 
     fn set_config(&self, settings: &BTreeMap<String, String>) -> anyhow::Result<Value> {
@@ -6406,6 +6406,14 @@ fn normalize_spam_burst_request(
             return Err(JobManagerError::new(
                 ErrorCode::ValidationFailed,
                 format!("data_bytes must not exceed {MAX_DATA_BYTES}"),
+            ));
+        }
+    }
+    if let Some(fee_rate_sat_vb) = request.fee_rate_sat_vb {
+        if !fee_rate_sat_vb.is_finite() || fee_rate_sat_vb <= 0.0 {
+            return Err(JobManagerError::new(
+                ErrorCode::ValidationFailed,
+                "fee_rate_sat_vb must be finite and positive",
             ));
         }
     }
@@ -8230,6 +8238,7 @@ steps:
                     txs: 3,
                     outputs_per_tx: 2,
                     data_bytes: None,
+                    fee_rate_sat_vb: Some(42.5),
                 },
                 Some("prepare-retry".to_string()),
             )
@@ -8246,6 +8255,7 @@ steps:
         assert_eq!(prepare_detail.summary.kind, JobKind::SpamPrepare);
         assert_eq!(prepare_detail.summary.state, JobState::Succeeded);
         assert_eq!(prepare_detail.summary.phase, "capacity_ready");
+        assert_eq!(prepare_detail.request["fee_rate_sat_vb"], 42.5);
         assert_eq!(
             prepare_detail.result.expect("prepare result")["prepared_branches"],
             3
@@ -8258,6 +8268,7 @@ steps:
                     txs: 3,
                     outputs_per_tx: 2,
                     data_bytes: None,
+                    fee_rate_sat_vb: Some(42.5),
                 },
                 None,
             )
@@ -8273,6 +8284,7 @@ steps:
         let burst_detail = manager.get(&burst.job_id).expect("burst job");
         assert_eq!(burst_detail.summary.kind, JobKind::SpamBurst);
         assert_eq!(burst_detail.summary.state, JobState::Succeeded);
+        assert_eq!(burst_detail.request["fee_rate_sat_vb"], 42.5);
         assert_eq!(
             burst_detail.result.expect("burst result")["accepted_transactions"],
             3
@@ -8655,11 +8667,26 @@ steps:
                     txs: 0,
                     outputs_per_tx: 0,
                     data_bytes: None,
+                    fee_rate_sat_vb: None,
                 },
                 None,
             )
             .expect_err("zero txs");
         assert_eq!(error.code, ErrorCode::ValidationFailed);
+        let error = manager
+            .start_spam_burst(
+                SpamBurstJobRequest {
+                    node: "node2".to_string(),
+                    txs: 1,
+                    outputs_per_tx: 0,
+                    data_bytes: None,
+                    fee_rate_sat_vb: Some(0.0),
+                },
+                None,
+            )
+            .expect_err("zero fee rate");
+        assert_eq!(error.code, ErrorCode::ValidationFailed);
+        assert!(error.message.contains("fee_rate_sat_vb"));
         let error = manager
             .start_partition(
                 PartitionJobRequest {

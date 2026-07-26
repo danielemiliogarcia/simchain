@@ -194,6 +194,10 @@ pub struct SpamBurstArgs {
     /// selects DATA mode and ignores --outputs-per-tx.
     #[arg(long)]
     pub data_bytes: Option<u64>,
+    /// Exact fee rate for this burst in sat/vB. Omit to use the current
+    /// live SPAM_FEE policy.
+    #[arg(long)]
+    pub fee_rate_sat_vb: Option<f64>,
     /// Wait for the server-side action to finish.
     #[arg(long)]
     pub wait: bool,
@@ -793,18 +797,19 @@ mod tests {
             "10",
             "--data-bytes",
             "512",
+            "--fee-rate-sat-vb",
+            "42.5",
         ])
         .expect("data spam burst");
-        assert!(matches!(
-            data_burst.command,
-            Command::Spam(SpamArgs {
-                command: SpamCommand::Burst(SpamBurstArgs {
-                    txs: 10,
-                    data_bytes: Some(512),
-                    ..
-                })
-            })
-        ));
+        let Command::Spam(SpamArgs {
+            command: SpamCommand::Burst(data_burst),
+        }) = data_burst.command
+        else {
+            panic!("expected data spam burst");
+        };
+        assert_eq!(data_burst.txs, 10);
+        assert_eq!(data_burst.data_bytes, Some(512));
+        assert_eq!(data_burst.fee_rate_sat_vb, Some(42.5));
 
         let partition = Cli::try_parse_from([
             "simchainctl",

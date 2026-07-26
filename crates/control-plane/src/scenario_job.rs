@@ -52,6 +52,7 @@ pub trait ScenarioActionBackend: Send + Sync {
         node: MinerNode,
         txs: u64,
         outputs_per_tx: u64,
+        fee_rate_sat_vb: Option<f64>,
         control: &dyn ScenarioControl,
     ) -> Result<Value>;
     /// Prepare the dedicated manual burst engine for the exact requested
@@ -63,6 +64,7 @@ pub trait ScenarioActionBackend: Send + Sync {
         txs: u64,
         outputs_per_tx: u64,
         data_bytes: Option<u64>,
+        fee_rate_sat_vb: Option<f64>,
         control: &dyn ScenarioControl,
     ) -> Result<Value>;
     fn data_spam_burst(
@@ -70,6 +72,7 @@ pub trait ScenarioActionBackend: Send + Sync {
         node: MinerNode,
         txs: u64,
         data_bytes: u64,
+        fee_rate_sat_vb: Option<f64>,
         control: &dyn ScenarioControl,
     ) -> Result<Value>;
     fn wait_tx(
@@ -363,12 +366,14 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
         node: MinerNode,
         txs: u64,
         outputs_per_tx: u64,
+        fee_rate_sat_vb: Option<f64>,
         control: &dyn ScenarioControl,
     ) -> Result<Value> {
         let policy = self.burst_policy()?;
+        let effective_fee_rate = fee_rate_sat_vb.unwrap_or_else(|| policy.fee_rate_sat_vb());
         let needed_branches = burst_required_branches(txs);
-        self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
-            engine.set_burst_shape(policy.fee_rate_sat_vb(), outputs_per_tx);
+        self.with_burst_engine(node, effective_fee_rate, |engine| {
+            engine.set_burst_shape(effective_fee_rate, outputs_per_tx);
             let deadline = Instant::now() + self.timeout;
             let prepared_branches = require_prepared_burst_capacity(
                 engine,
@@ -414,6 +419,7 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
                 "requested_transactions": txs,
                 "accepted_transactions": txids.len() as u64,
                 "outputs_per_transaction": outputs_per_tx,
+                "fee_rate_sat_vb": effective_fee_rate,
                 "required_branches": needed_branches,
                 "prepared_branches": prepared_branches,
                 "engine": "raw",
@@ -427,12 +433,21 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
         node: MinerNode,
         txs: u64,
         data_bytes: u64,
+        fee_rate_sat_vb: Option<f64>,
         control: &dyn ScenarioControl,
     ) -> Result<Value> {
         let policy = self.burst_policy()?;
+        let effective_fee_rate = fee_rate_sat_vb.unwrap_or_else(|| {
+            policy.fee_rate_sat_vb()
+                + simchain_common::live_tuning::SpamTuning::BULK_FEE_PREMIUM_SAT_VB
+        });
         let needed_branches = burst_required_branches(txs);
         self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
-            engine.set_burst_data_shape(policy.fee_rate_sat_vb(), data_bytes);
+            if fee_rate_sat_vb.is_some() {
+                engine.set_burst_data_shape_exact_fee(effective_fee_rate, data_bytes);
+            } else {
+                engine.set_burst_data_shape(policy.fee_rate_sat_vb(), data_bytes);
+            }
             let deadline = Instant::now() + self.timeout;
             let prepared_branches = require_prepared_burst_capacity(
                 engine,
@@ -479,6 +494,7 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
                 "requested_transactions": txs,
                 "accepted_transactions": txids.len() as u64,
                 "data_bytes": data_bytes,
+                "fee_rate_sat_vb": effective_fee_rate,
                 "required_branches": needed_branches,
                 "prepared_branches": prepared_branches,
                 "offered_vbytes": offered_vbytes,
@@ -495,18 +511,31 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
         txs: u64,
         outputs_per_tx: u64,
         data_bytes: Option<u64>,
+        fee_rate_sat_vb: Option<f64>,
         control: &dyn ScenarioControl,
     ) -> Result<Value> {
         let policy = self.burst_policy()?;
+        let default_fee_rate = policy.fee_rate_sat_vb();
+        let effective_fee_rate = fee_rate_sat_vb.unwrap_or_else(|| {
+            if data_bytes.is_some() {
+                default_fee_rate + simchain_common::live_tuning::SpamTuning::BULK_FEE_PREMIUM_SAT_VB
+            } else {
+                default_fee_rate
+            }
+        });
         let needed_branches = burst_required_branches(txs);
-        self.with_burst_engine(node, policy.fee_rate_sat_vb(), |engine| {
+        self.with_burst_engine(node, default_fee_rate, |engine| {
             let shape = match data_bytes {
                 Some(bytes) => {
-                    engine.set_burst_data_shape(policy.fee_rate_sat_vb(), bytes);
+                    if fee_rate_sat_vb.is_some() {
+                        engine.set_burst_data_shape_exact_fee(effective_fee_rate, bytes);
+                    } else {
+                        engine.set_burst_data_shape(default_fee_rate, bytes);
+                    }
                     format!("op_return:{bytes}")
                 }
                 None => {
-                    engine.set_burst_shape(policy.fee_rate_sat_vb(), outputs_per_tx);
+                    engine.set_burst_shape(effective_fee_rate, outputs_per_tx);
                     format!("outputs:{outputs_per_tx}")
                 }
             };
@@ -547,6 +576,7 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
             Ok(json!({
                 "node": node.to_string(),
                 "shape": shape,
+                "fee_rate_sat_vb": effective_fee_rate,
                 "requested_transactions": txs,
                 "required_branches": needed_branches,
                 "initial_branches": initial_branches,

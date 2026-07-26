@@ -190,6 +190,39 @@ mod tests {
     }
 
     #[test]
+    fn manual_data_fee_override_is_exact_without_the_bulk_premium() {
+        let initial = policy();
+        let mut engine = RawSpammer::new(
+            rpc_client(),
+            json_client(),
+            Vec::new(),
+            rpc_client(),
+            "wallet",
+            "test-exact-fee",
+            "Exact fee test",
+            initial.fee_rate_sat_vb(),
+            0,
+            0,
+            0,
+        );
+        let data_bytes = 20_000;
+        let shape = SpamShape::Data(data_bytes);
+        let vsize = engine.shape_vsize(&shape);
+
+        engine.set_burst_data_shape(10.0, data_bytes as u64);
+        assert_eq!(
+            engine.shape_fee(&shape).to_sat(),
+            (vsize as f64 * 11.0).ceil() as u64
+        );
+
+        engine.set_burst_data_shape_exact_fee(25.5, data_bytes as u64);
+        assert_eq!(
+            engine.shape_fee(&shape).to_sat(),
+            (vsize as f64 * 25.5).ceil() as u64
+        );
+    }
+
+    #[test]
     fn ratio_increase_uses_headroom_while_requesting_background_fanout() {
         assert_eq!(
             branch_provisioning_action(60, 50, 75, false, false),
@@ -317,6 +350,9 @@ pub struct RawSpammer {
     address: Address,
     script_pubkey: ScriptBuf,
     fee_rate_sat_vb: f64,
+    // Resident/scenario DATA traffic normally sits just above the configured
+    // floor. A manual exact-fee override sets this premium to zero.
+    data_fee_premium_sat_vb: f64,
     // OUTPUT-mode burn scripts (one, or SPAM_SENDMANY_OUTPUTS of them).
     burn_scripts: Vec<ScriptBuf>,
     // A single P2WPKH burn script for the minimum-size gap-sealer txs.
@@ -455,6 +491,7 @@ impl RawSpammer {
 
     pub fn apply_prepared_policy(&mut self, policy: &PreparedRawPolicy) {
         self.fee_rate_sat_vb = policy.fee_rate_sat_vb;
+        self.data_fee_premium_sat_vb = SpamTuning::BULK_FEE_PREMIUM_SAT_VB;
         self.burn_scripts.clone_from(&policy.burn_scripts);
         self.data_min = policy.data_min;
         self.data_max = policy.data_max;
@@ -526,6 +563,7 @@ impl RawSpammer {
             address,
             script_pubkey,
             fee_rate_sat_vb,
+            data_fee_premium_sat_vb: SpamTuning::BULK_FEE_PREMIUM_SAT_VB,
             burn_scripts,
             sealer_script,
             data_min: data_min as usize,
@@ -553,8 +591,7 @@ impl RawSpammer {
 
     fn bulk_fee_from_vsize(&self, vsize: u64) -> Amount {
         Amount::from_sat(
-            (vsize as f64 * (self.fee_rate_sat_vb + SpamTuning::BULK_FEE_PREMIUM_SAT_VB)).ceil()
-                as u64,
+            (vsize as f64 * (self.fee_rate_sat_vb + self.data_fee_premium_sat_vb)).ceil() as u64,
         )
     }
 
@@ -983,6 +1020,15 @@ impl RawSpammer {
     /// Retarget the burst engine to fixed-size OP_RETURN DATA transactions.
     pub fn set_burst_data_shape(&mut self, fee_rate_sat_vb: f64, data_bytes: u64) {
         self.fee_rate_sat_vb = fee_rate_sat_vb;
+        self.data_fee_premium_sat_vb = SpamTuning::BULK_FEE_PREMIUM_SAT_VB;
+        self.data_min = data_bytes as usize;
+        self.data_max = data_bytes as usize;
+    }
+
+    /// Retarget a manual DATA burst to an exact caller-selected fee rate.
+    pub fn set_burst_data_shape_exact_fee(&mut self, fee_rate_sat_vb: f64, data_bytes: u64) {
+        self.fee_rate_sat_vb = fee_rate_sat_vb;
+        self.data_fee_premium_sat_vb = 0.0;
         self.data_min = data_bytes as usize;
         self.data_max = data_bytes as usize;
     }

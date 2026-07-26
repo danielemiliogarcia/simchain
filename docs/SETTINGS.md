@@ -156,6 +156,11 @@ floor fills pay `SPAM_FEE`, DATA/HYBRID bulk spam pays a tiny premium above it, 
 OUTPUT-mode spam (including scenario bursts) pays it directly. With the defaults,
 the floor is ~10 sat/vB.
 
+Manual dashboard/API/CLI bursts may optionally override this rate for one prepared
+burst using `fee_rate_sat_vb` / `--fee-rate-sat-vb`. With no override they retain the
+behavior above. With an override, both OUTPUT and DATA transactions pay the selected
+exact sat/vB rate; capacity preparation must use the same value as submission.
+
 The estimator never escapes that level either: its only data is the spam itself,
 and all of it confirmed at the floor rate — so it recommends that same rate back.
 `SPAM_FEE` is therefore not just a bootstrap value: it sets the simnet's price

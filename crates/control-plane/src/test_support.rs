@@ -398,12 +398,14 @@ impl ScenarioActionBackend for MockBackend {
         node: simchain_scenario_engine::MinerNode,
         txs: u64,
         outputs_per_tx: u64,
+        fee_rate_sat_vb: Option<f64>,
         control: &dyn simchain_scenario_engine::ScenarioControl,
     ) -> anyhow::Result<serde_json::Value> {
         Ok(serde_json::json!({
             "node": node.to_string(),
             "accepted_transactions": txs,
             "outputs_per_transaction": outputs_per_tx,
+            "fee_rate_sat_vb": fee_rate_sat_vb.unwrap_or(10.0),
             "aborted": control.abort_requested()
         }))
     }
@@ -414,6 +416,7 @@ impl ScenarioActionBackend for MockBackend {
         txs: u64,
         outputs_per_tx: u64,
         data_bytes: Option<u64>,
+        fee_rate_sat_vb: Option<f64>,
         control: &dyn simchain_scenario_engine::ScenarioControl,
     ) -> anyhow::Result<serde_json::Value> {
         Ok(serde_json::json!({
@@ -423,6 +426,7 @@ impl ScenarioActionBackend for MockBackend {
                 |bytes| format!("op_return:{bytes}")
             ),
             "requested_transactions": txs,
+            "fee_rate_sat_vb": fee_rate_sat_vb.unwrap_or(11.0),
             "required_branches": txs,
             "initial_branches": 0,
             "prepared_branches": txs,
@@ -437,12 +441,14 @@ impl ScenarioActionBackend for MockBackend {
         node: simchain_scenario_engine::MinerNode,
         txs: u64,
         data_bytes: u64,
+        fee_rate_sat_vb: Option<f64>,
         control: &dyn simchain_scenario_engine::ScenarioControl,
     ) -> anyhow::Result<serde_json::Value> {
         Ok(serde_json::json!({
             "node": node.to_string(),
             "accepted_transactions": txs,
             "data_bytes": data_bytes,
+            "fee_rate_sat_vb": fee_rate_sat_vb.unwrap_or(11.0),
             "shape": "op_return",
             "aborted": control.abort_requested()
         }))

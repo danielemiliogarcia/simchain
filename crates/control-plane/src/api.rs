@@ -1639,7 +1639,7 @@ steps:
             &fx.router,
             post_action(
                 "spam-prepare",
-                serde_json::json!({"node": "node3", "txs": 3, "data_bytes": 512}),
+                serde_json::json!({"node": "node3", "txs": 3, "data_bytes": 512, "fee_rate_sat_vb": 25.5}),
                 Some("test-token"),
                 None,
             ),
@@ -1654,6 +1654,7 @@ steps:
                 assert_eq!(job["kind"], "spam_prepare");
                 assert_eq!(job["result"]["prepared_branches"], 3);
                 assert_eq!(job["result"]["shape"], "op_return:512");
+                assert_eq!(job["result"]["fee_rate_sat_vb"], 25.5);
                 break;
             }
             assert!(tokio::time::Instant::now() < deadline);
@@ -1664,7 +1665,7 @@ steps:
             &fx.router,
             post_action(
                 "spam-burst",
-                serde_json::json!({"node": "node3", "txs": 3, "data_bytes": 512}),
+                serde_json::json!({"node": "node3", "txs": 3, "data_bytes": 512, "fee_rate_sat_vb": 25.5}),
                 Some("test-token"),
                 None,
             ),
@@ -1680,6 +1681,7 @@ steps:
                 assert_eq!(job["result"]["accepted_transactions"], 3);
                 assert_eq!(job["result"]["data_bytes"], 512);
                 assert_eq!(job["result"]["shape"], "op_return");
+                assert_eq!(job["result"]["fee_rate_sat_vb"], 25.5);
                 break;
             }
             assert!(tokio::time::Instant::now() < deadline);
@@ -1851,6 +1853,10 @@ steps:
         ));
         assert!(html.contains("id=\"burst-shape\""));
         assert!(html.contains("id=\"burst-prepare\""));
+        assert!(html.contains("id=\"burst-fee-enabled\" type=\"checkbox\""));
+        assert!(html.contains(
+            "id=\"burst-fee-rate\" type=\"number\" min=\"0.001\" step=\"0.001\" value=\"10\" required disabled"
+        ));
         assert!(html.contains(
             "id=\"partition-heal-delay\" type=\"number\" min=\"0\" max=\"86400\" value=\"15\""
         ));
