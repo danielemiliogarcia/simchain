@@ -87,7 +87,9 @@ their availability is intentional because Simchain is a test environment.
 
 The Compose-managed config allowlist targets the pinned Bitcoin Core 31.1 image. Review
 `docker/node1-rpc-configs.compose.yml` whenever `BTC_IMAGE` changes to another Core
-release. Its interpolated `content` requires Docker Compose 2.23.1 or newer.
+release. Its interpolated `content` requires Docker Compose 2.23.1 or newer. The
+selection is fully declarative: no shell wrapper and no custom entrypoint are
+involved.
 
 ## Host port mappings
 

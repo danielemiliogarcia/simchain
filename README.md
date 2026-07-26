@@ -7,6 +7,35 @@ regtest allows: several P2P-connected nodes, rotating miners, a non-mining full 
 the user endpoint, non-empty blocks, and simulated reorgs. Compose boot infrastructure
 comes from `.env`; live policy and experiments are owned by one control plane.
 
+## Contents
+
+- [Intro](#intro)
+- [Scope and non-goals](#scope-and-non-goals)
+- [Features](#features)
+- [Network topology](#network-topology)
+- [Configuration](#configuration)
+  - [Choosing the bitcoin node image](#choosing-the-bitcoin-node-image)
+- [How to run](#how-to-run)
+  - [Node1 production-like RPC policy](#node1-production-like-rpc-policy)
+  - [Retuning a live chain](#retuning-a-live-chain)
+  - [Chain snapshots](#chain-snapshots)
+  - [Profiles](#profiles)
+- [Simchain control plane](#simchain-control-plane)
+- [Scenarios](#scenarios)
+- [Simulating reorgs](#simulating-reorgs)
+  - [Rewind without a replacement chain](#rewind-without-a-replacement-chain)
+- [Partitions and P2P latency](#partitions-and-p2p-latency)
+- [ZMQ notifications](#zmq-notifications)
+- [Repository structure](#repository-structure)
+  - [Embedding under a parent workspace](#embedding-under-a-parent-workspace)
+- [Documents](#documents)
+- [Limitations and future enhancements](#limitations-and-future-enhancements)
+- [Contributing](#contributing)
+  - [Development workflow](#development-workflow)
+- [Troubleshooting](#troubleshooting)
+  - [BuildKit snapshot export failure](#buildkit-snapshot-export-failure)
+- [License](#license)
+
 ## Intro
 
 Blockchain regtest tool that helps write tests needing minimal changes to run on testnet/mainnet.
@@ -246,7 +275,7 @@ by compose itself.
 ## How to run
 
 ```bash
-docker compose up -d --build
+docker compose --profile all-tools up -d --build
 ```
 
 That's it (with the default registry image there is nothing to build). Useful follow-ups:
@@ -283,52 +312,15 @@ docker compose --profile "*" down -v
 ### Node1 production-like RPC policy
 
 Node1 keeps the normal `localhost:18443` Bitcoin JSON-RPC interface, but the default
-`FILTER_NODE1_RPC=true` setting uses Bitcoin Core's native per-user `rpcwhitelist`
-to reject block generation, mock time, chain-choice changes, process shutdown, and
-selected administrative methods. A rejected call receives Core's HTTP 403 response.
-Set it to `false` and recreate node1 plus its namespace-sharing network agent to
-restore unrestricted RPC:
-
-```bash
-docker compose up -d --force-recreate \
-  btc-simnet-node1 btc-simnet-network-agent-node1
-```
+`FILTER_NODE1_RPC=true` filters RPC to emulate a 3rd party node.
+A rejected call receives Core's HTTP 403 response.
 
 Node2 and node3 remain unrestricted with the same credentials in either mode; P2P
-and ZMQ are never filtered. Peer-connectivity calls and a documented set of advanced
-testing/debug/snapshot RPCs remain available while filtering is enabled.
-The control plane has a second full-access `rpcauth` identity for internal rewind and
-recovery calls. Its Compose-defaulted username/password are internal wiring—not public
-settings—and are intentionally absent from both example environment files. The public
-identity remains restricted because its whitelist is explicit.
-See [SETTINGS.md](./docs/SETTINGS.md#node1-rpc-method-policy) for the exact method
-list and intentional exceptions. This declarative selection requires Docker Compose
-2.23.1 or newer; no shell wrapper or custom entrypoint is involved.
+and ZMQ are never filtered.
 
-With the basic stack running under the strict default, exercise the real HTTP
-authorization boundary (positive calls, every denied method, every intentional
-exception, batch atomicity, and a real block mined by unrestricted node2) with:
-
-```bash
-./scripts/check-node1-rpc-policy-live.sh
-```
-
-### Injecting diagnostic tools into nodes
-
-The official Bitcoin node image is intentionally minimal. To install the prerequisites
-for Simchain's container-side diagnostic tools and copy them into one running node, use:
-
-```bash
-./scripts/inject-tools.sh btc-simnet-node3
-```
-
-Use `./scripts/inject-tools.sh --all-containers` to prepare every running
-`btc-simnet-nodeN` container. Currently the helper installs `curl` when needed and
-installs the watcher as `/usr/local/bin/chainwatch`, so it can be invoked directly on
-the container's `PATH`. These changes live in each container's writable layer and must
-be injected again after container recreation. Run the script with `--help` for usage;
-see [PARTITIONS.md](./docs/PARTITIONS.md#watch-both-sides-live) for the complete
-two-sided fork-watching example.
+Exact method list and exceptions: [SETTINGS.md](./docs/SETTINGS.md#node1-rpc-method-policy).
+Disabling the filter and verifying the live boundary:
+[RUNBOOK.md](./docs/RUNBOOK.md#node1-rpc-boundary).
 
 ### Retuning a live chain
 

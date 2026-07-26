@@ -32,10 +32,28 @@ docker exec btc-simnet-node2 bitcoin-cli -regtest \
   -rpcuser=foo -rpcpassword=rpcpassword generatetoaddress 1 "$address"
 ```
 
-Set `FILTER_NODE1_RPC=false` and recreate node1 plus
-`btc-simnet-network-agent-node1` to disable the complete filter. See
-[SETTINGS.md](SETTINGS.md#node1-rpc-method-policy) for exact membership and
+Set `FILTER_NODE1_RPC=false` and recreate node1 plus its namespace-sharing network
+agent to restore unrestricted RPC:
+
+```bash
+docker compose up -d --force-recreate \
+  btc-simnet-node1 btc-simnet-network-agent-node1
+```
+
+See [SETTINGS.md](SETTINGS.md#node1-rpc-method-policy) for exact membership and
 intentional peer/debug/snapshot exceptions.
+
+With the basic stack running under the strict default, exercise the real HTTP
+authorization boundary end to end -- positive calls, every denied method, every
+intentional exception, batch atomicity, and a real block mined by unrestricted
+node2 -- with:
+
+```bash
+./scripts/check-node1-rpc-policy-live.sh
+```
+
+The companion `./scripts/check-node1-rpc-policy.sh` asserts the rendered allowlist
+statically and needs no running stack.
 
 ## Declarative scenarios
 

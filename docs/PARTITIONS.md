@@ -93,6 +93,10 @@ To prepare every running Simchain Bitcoin node at once, no container name is nee
 ./scripts/inject-tools.sh --all-containers
 ```
 
+The official Bitcoin node image is intentionally minimal, so the helper installs `curl`
+when it is missing and copies the watcher to `/usr/local/bin/chainwatch`, making it
+directly invocable on the container's `PATH`. Run it with `--help` for full usage.
+
 Injected packages and files live in each container's writable layer: they survive a
 stop/start but must be injected again after the container is recreated.
 
