@@ -63,6 +63,12 @@ Hard partition rules drop both ingress and egress IP traffic on only the P2P int
 It is deliberately not modeled as egress loss alone. Existing TCP sessions are flushed
 through Bitcoin RPC so the isolation witness does not depend on TCP timeouts.
 
+Node1 deliberately allows `addnode` and `addpeeraddress` under its strict public RPC
+policy. They simplify deterministic connectivity and partition recovery, do not mint
+blocks or bypass consensus, and avoid a second internal credential solely for healing.
+The startup `-addnode` full-mesh configuration and P2P interface are unaffected by the
+RPC whitelist.
+
 ### Watch both sides live
 
 Start one watcher on the connected-side miner from the host:

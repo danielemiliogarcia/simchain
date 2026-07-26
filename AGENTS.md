@@ -15,8 +15,11 @@ docker/                     # docker build files and helper scripts
   tools.Dockerfile          # one builder stage, per-tool final targets
   build-bitcoin-image.sh    # local bitcoind image build helper
   entrypoint.sh             # bitcoind container entrypoint
+  node1-rpc-configs.compose.yml # filtered/unfiltered node1 Core RPC configs
 scripts/                    # host-side helper scripts
   chainwatch.sh             # host RPC watcher
+  check-node1-rpc-policy.sh # rendered node1 RPC allowlist assertions
+  check-node1-rpc-policy-live.sh # running-stack RPC authorization smoke test
   simulate-reorg.sh         # convenience reorg wrapper
 crates/
   simchain-common/          # shared helpers (RPC clients, config parsing)

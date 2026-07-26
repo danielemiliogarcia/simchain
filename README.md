@@ -50,7 +50,8 @@ mainnet network behavior.
 
 - **Mainnet-like network shape.** Three Bitcoin Core nodes form a full P2P mesh;
   two mine while a wallet-disabled, non-mining node gives applications a
-  production-like RPC endpoint.
+  production-like RPC endpoint whose native Core whitelist rejects regtest mining
+  superpowers and node-administration calls.
 - **Configurable, reproducible mining.** Choose fixed or bounded-Poisson block
   intervals, strict miner alternation or weighted selection, and an optional RNG
   seed for repeatable runs.
@@ -274,6 +275,35 @@ docker compose --profile "*" down -v
 
 # Or in one command: wipe + start a fresh chain (flags are passed to compose)
 ./scripts/fresh-chain.sh --profile all-tools
+```
+
+### Node1 production-like RPC policy
+
+Node1 keeps the normal `localhost:18443` Bitcoin JSON-RPC interface, but the default
+`FILTER_NODE1_RPC=true` setting uses Bitcoin Core's native per-user `rpcwhitelist`
+to reject block generation, mock time, chain-choice changes, process shutdown, and
+selected administrative methods. A rejected call receives Core's HTTP 403 response.
+Set it to `false` and recreate node1 plus its namespace-sharing network agent to
+restore unrestricted RPC:
+
+```bash
+docker compose up -d --force-recreate \
+  btc-simnet-node1 btc-simnet-network-agent-node1
+```
+
+Node2 and node3 remain unrestricted with the same credentials in either mode; P2P
+and ZMQ are never filtered. Peer-connectivity calls and a documented set of advanced
+testing/debug/snapshot RPCs remain available while filtering is enabled.
+See [SETTINGS.md](./docs/SETTINGS.md#node1-rpc-method-policy) for the exact method
+list and intentional exceptions. This declarative selection requires Docker Compose
+2.23.1 or newer; no shell wrapper or custom entrypoint is involved.
+
+With the basic stack running under the strict default, exercise the real HTTP
+authorization boundary (positive calls, every denied method, every intentional
+exception, batch atomicity, and a real block mined by unrestricted node2) with:
+
+```bash
+./scripts/check-node1-rpc-policy-live.sh
 ```
 
 ### Injecting diagnostic tools into nodes

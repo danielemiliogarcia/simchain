@@ -98,7 +98,7 @@ pub struct MineJobRequest {
     pub blocks: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SpamBurstJobRequest {
     pub node: String,
     pub txs: u64,
@@ -106,6 +106,10 @@ pub struct SpamBurstJobRequest {
     pub outputs_per_tx: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_bytes: Option<u64>,
+    /// Exact fee rate for this manual burst in sat/vB. When omitted, the
+    /// current live spam policy supplies the fee at execution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_rate_sat_vb: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -329,5 +333,27 @@ mod tests {
         );
         assert!(JobState::Interrupted.is_terminal());
         assert!(!JobState::Running.is_terminal());
+    }
+
+    #[test]
+    fn spam_burst_fee_override_is_optional_and_omitted_by_default() {
+        let request: SpamBurstJobRequest = serde_json::from_value(serde_json::json!({
+            "node": "node2",
+            "txs": 10,
+            "data_bytes": 20_000
+        }))
+        .expect("legacy burst request");
+        assert_eq!(request.fee_rate_sat_vb, None);
+        let value = serde_json::to_value(&request).expect("burst request JSON");
+        assert!(value.get("fee_rate_sat_vb").is_none());
+
+        let overridden: SpamBurstJobRequest = serde_json::from_value(serde_json::json!({
+            "node": "node2",
+            "txs": 10,
+            "data_bytes": 20_000,
+            "fee_rate_sat_vb": 42.5
+        }))
+        .expect("overridden burst request");
+        assert_eq!(overridden.fee_rate_sat_vb, Some(42.5));
     }
 }

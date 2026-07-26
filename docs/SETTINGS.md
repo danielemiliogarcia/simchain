@@ -38,6 +38,42 @@ Shared by all nodes and every tool (mining controller, spammer, reorg, electrs, 
 > `-rpcauth` (salted hash) plus a proper secrets mechanism (Docker/Compose secrets,
 > Kubernetes Secrets or a vault) instead of environment variables in compose files.
 
+## Node1 RPC method policy
+
+| Variable | Default | Description |
+|---|---|---|
+| `FILTER_NODE1_RPC` | `true` | Boot-only native Bitcoin Core RPC filtering for node1. Lowercase `true` enables the complete filter; lowercase `false` disables it. Recreate node1 and `btc-simnet-network-agent-node1` after changing it because the agent shares node1's network namespace. |
+
+This policy applies only to node1. Node2 and node3 remain unrestricted even though all
+three processes use the same `BTC_RPC_USER` and `BTC_RPC_PASS`; each bitcoind owns its
+own per-user whitelist. P2P and ZMQ are unaffected. A method denied by Core returns an
+empty HTTP 403 response, and a JSON-RPC batch containing any denied member executes no
+members.
+
+When enabled, the filter denies these regtest-only/test control methods:
+
+| Methods |
+|---|
+| `generate`, `generateblock`, `generatetoaddress`, `generatetodescriptor`, `mockscheduler`, `setmocktime`, `syncwithvalidationinterfacequeue` |
+
+It also denies process, network, chain-choice, block-ingress, mining-policy, and
+persistent-state administration:
+
+| Methods |
+|---|
+| `abortprivatebroadcast`, `clearbanned`, `disconnectnode`, `getblockfrompeer`, `invalidateblock`, `preciousblock`, `prioritisetransaction`, `pruneblockchain`, `reconsiderblock`, `setban`, `setnetworkactive`, `stop`, `submitblock`, `submitheader` |
+
+Two peer-management methods are intentional connectivity exceptions and stay allowed:
+`addnode` and `addpeeraddress`. The filter also deliberately
+allows these advanced testing methods: `addconnection`, `sendmsgtopeer`, `echo`,
+`echojson`, `echoipc`, `logging`, `dumptxoutset`, `loadtxoutset`, `savemempool`, and
+`importmempool`. They may alter node-local connections, logging, or persisted state;
+their availability is intentional because Simchain is a test environment.
+
+The Compose-managed config allowlist targets the pinned Bitcoin Core 31.1 image. Review
+`docker/node1-rpc-configs.compose.yml` whenever `BTC_IMAGE` changes to another Core
+release. Its interpolated `content` requires Docker Compose 2.23.1 or newer.
+
 ## Host port mappings
 
 | Variable | Default | Description |
@@ -119,6 +155,11 @@ Spam uses `SPAM_FEE` as the price anchor. The raw engine sets fees explicitly:
 floor fills pay `SPAM_FEE`, DATA/HYBRID bulk spam pays a tiny premium above it, and
 OUTPUT-mode spam (including scenario bursts) pays it directly. With the defaults,
 the floor is ~10 sat/vB.
+
+Manual dashboard/API/CLI bursts may optionally override this rate for one prepared
+burst using `fee_rate_sat_vb` / `--fee-rate-sat-vb`. With no override they retain the
+behavior above. With an override, both OUTPUT and DATA transactions pay the selected
+exact sat/vB rate; capacity preparation must use the same value as submission.
 
 The estimator never escapes that level either: its only data is the spam itself,
 and all of it confirmed at the floor rate — so it recommends that same rate back.

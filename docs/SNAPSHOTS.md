@@ -100,10 +100,9 @@ rebuilds the stack from scratch.
 
 ## Risks and edge cases
 
-- **In-flight writes at stop time**: `docker compose stop` default grace is 10 s;
-  bitcoind normally flushes well within it, but set `stop_grace_period: 60s` on the
-  node services in the same PR so a slow flush (large mempool) is never killed
-  mid-write.
+- **In-flight writes at stop time**: each node has `stop_grace_period: 300s`, so
+  bitcoind can cleanly flush chainstate and `mempool.dat` after a large spam run.
+  Do not force-kill the containers while snapshot save is stopping them.
 - **Ownership across images**: official image and local image may use different UIDs
   for the `bitcoin` user. `--numeric-owner` preserves whatever the snapshot had, and
   the local entrypoint re-chowns on start; the official image handles its own

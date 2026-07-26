@@ -9,6 +9,7 @@ config="$(mktemp)"
 trap 'rm -f "$config"' EXIT
 
 cd "$repo_root"
+"$repo_root/scripts/check-node1-rpc-policy.sh"
 docker compose config --format json >"$config"
 
 jq -e '
@@ -61,5 +62,41 @@ for node in node1 node2 node3; do
     and (($agent.security_opt // []) | index("no-new-privileges:true") != null)
   ' "$config" >/dev/null
 done
+
+jq -e '
+  . as $root
+  | .services["btc-simnet-node1"] as $node1
+  | $node1.environment.FILTER_NODE1_RPC as $filter
+  | ("node1-rpc-" + $filter) as $policy
+  | $node1.entrypoint == null
+  and (["true", "false"] | index($filter) != null)
+  and (($node1.configs // []) | length == 1)
+  and $node1.configs[0].source == $policy
+  and $node1.configs[0].target == "/etc/bitcoin/node1-rpc.conf"
+  and (($node1.volumes // []) | all(.type != "bind"))
+  and $node1.command[0] == "-conf=/etc/bitcoin/node1-rpc.conf"
+  and $node1.command[1] == "-printtoconsole"
+  and ($node1.command | all(contains("/bin/bash") | not))
+  and ($root.configs[$policy] != null)
+  and (
+    if $filter == "true" then
+      ($root.configs[$policy].content | contains("rpcwhitelistdefault=1"))
+      and ($root.configs[$policy].content
+           | contains("rpcwhitelist=" + $node1.environment.BTC_RPC_USER + ":"))
+    else
+      ($root.configs[$policy].content | contains("rpcwhitelist") | not)
+    end
+  )
+  and (
+    ["btc-simnet-node2", "btc-simnet-node3"]
+    | all(. as $service
+        | (($root.services[$service].configs // []) | length == 0)
+        and ($root.services[$service].entrypoint == null)
+        and ($root.services[$service].environment.FILTER_NODE1_RPC == null)
+        and (($root.services[$service].command // [])
+             | all((contains("rpcwhitelist") or contains("node1-rpc.conf")) | not))
+      )
+  )
+' "$config" >/dev/null
 
 echo "Compose security boundary verified"

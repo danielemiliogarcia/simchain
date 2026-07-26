@@ -1947,6 +1947,9 @@ async function startBoundedAction(event, action) {
     } else {
       request.outputs_per_tx = Number($("#burst-outputs-per-tx").value);
     }
+    if ($("#burst-fee-enabled").checked) {
+      request.fee_rate_sat_vb = Number($("#burst-fee-rate").value);
+    }
   }
   result.textContent = `Submitting ${isMine ? "mine" : (isPrepare ? "capacity preparation" : "tx burst")} job…`;
   result.className = "action-result";
@@ -1972,10 +1975,11 @@ async function startBoundedAction(event, action) {
   }
 }
 
-function renderBurstShapeControls() {
+function renderBurstControls() {
   const dataShape = $("#burst-shape").value === "data";
   $("#burst-data-bytes").disabled = !dataShape;
   $("#burst-outputs-per-tx").disabled = dataShape;
+  $("#burst-fee-rate").disabled = !$("#burst-fee-enabled").checked;
   renderJobs();
 }
 
@@ -2176,8 +2180,9 @@ async function init() {
   $("#burst-form").addEventListener("submit", (event) => startBoundedAction(event, "burst"));
   $("#burst-prepare").addEventListener("click", (event) => startBoundedAction(event, "prepare"));
   $("#burst-form").addEventListener("input", renderJobs);
-  $("#burst-shape").addEventListener("change", renderBurstShapeControls);
-  renderBurstShapeControls();
+  $("#burst-shape").addEventListener("change", renderBurstControls);
+  $("#burst-fee-enabled").addEventListener("change", renderBurstControls);
+  renderBurstControls();
   $("#partition-form").addEventListener("submit", (event) => startNetworkAction(event, "partition"));
   $("#partition-form").addEventListener("input", renderJobs);
   $("#degrade-form").addEventListener("submit", (event) => startNetworkAction(event, "degrade"));

@@ -16,7 +16,7 @@ unreachable.
 
 ### Node 1 `btc-simnet-node1`
 
-Exposed to the host (RPC 18443). Simulates a production endpoint (`-txindex`, `-disablewallet=1`): like most 3rd-party production nodes there is no hot wallet online, so you manage your own keys in an external wallet, obtain the outpoints of your addresses' UTxOs and submit externally signed raw transactions; mining is not under your control. It never mines. Set `NODE1_DISABLE_WALLET=0` in `.env` if you need a wallet on it. Publishes all ZMQ topics on host ports 28332-28336 (see [ZMQ notifications](../README.md#zmq-notifications)).
+Exposed to the host (RPC 18443). Simulates a production endpoint (`-txindex`, `-disablewallet=1`): like most 3rd-party production nodes there is no hot wallet online, so you manage your own keys in an external wallet, obtain the outpoints of your addresses' UTxOs and submit externally signed raw transactions; mining is not under your control. Bitcoin Core's native per-user whitelist rejects regtest mining superpowers and selected administrative RPCs by default. This applies only to node1 RPC: P2P and ZMQ are untouched, and node2/node3 remain unrestricted. It never mines. Set `NODE1_DISABLE_WALLET=0` in `.env` if you need a wallet on it. Publishes all ZMQ topics on host ports 28332-28336 (see [ZMQ notifications](../README.md#zmq-notifications)).
 
 ### Node 2 `btc-simnet-node2`
 

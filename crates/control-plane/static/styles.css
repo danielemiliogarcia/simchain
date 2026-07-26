@@ -335,6 +335,17 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.72); }
   opacity: 0.45;
   cursor: not-allowed;
 }
+.mini-action-form .check-field {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text);
+}
+.mini-action-form .check-field input[type="checkbox"] {
+  display: inline-block;
+  width: auto;
+  margin: 0;
+}
 .action-buttons { display: flex; flex-wrap: wrap; gap: 0.45rem; }
 .scenario-form textarea {
   display: block;

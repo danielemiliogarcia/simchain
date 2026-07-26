@@ -101,6 +101,7 @@ fn run(cli: Cli) -> Result<(), ClientError> {
                         txs: args.txs,
                         outputs_per_tx: args.outputs_per_tx,
                         data_bytes: args.data_bytes,
+                        fee_rate_sat_vb: args.fee_rate_sat_vb,
                     },
                     args.idempotency_key.as_deref(),
                 )?;
@@ -121,6 +122,7 @@ fn run(cli: Cli) -> Result<(), ClientError> {
                         txs: args.txs,
                         outputs_per_tx: args.outputs_per_tx,
                         data_bytes: args.data_bytes,
+                        fee_rate_sat_vb: args.fee_rate_sat_vb,
                     },
                     args.idempotency_key.as_deref(),
                 )?;

@@ -146,8 +146,8 @@ cargo run -p simchainctl -- jobs list
 cargo run -p simchainctl -- jobs watch JOB_ID --timeout 900
 cargo run -p simchainctl -- jobs abort JOB_ID
 cargo run -p simchainctl -- mine --node node2 --blocks 1 --wait
-cargo run -p simchainctl -- spam prepare --node node2 --txs 10 --data-bytes 20000 --wait
-cargo run -p simchainctl -- spam burst --node node2 --txs 10 --data-bytes 20000 --wait
+cargo run -p simchainctl -- spam prepare --node node2 --txs 10 --data-bytes 20000 --fee-rate-sat-vb 25 --wait
+cargo run -p simchainctl -- spam burst --node node2 --txs 10 --data-bytes 20000 --fee-rate-sat-vb 25 --wait
 cargo run -p simchainctl -- faucet --to bcrt1q...=1btc --to bcrt1p...=25000000sat --wait
 cargo run -p simchainctl -- faucet status
 cargo run -p simchainctl -- faucet transfer TXID --watch
@@ -158,7 +158,9 @@ cargo run -p simchainctl -- faucet transfer TXID --watch
 `spam burst`. It provisions the dedicated manual-burst branch pool and may mine
 the minimum confirmation blocks without changing the mining controller's desired
 paused/running state. A later burst checks this capacity without mining; if it is
-insufficient, the failed job tells the operator to prepare it first.
+insufficient, the failed job tells the operator to prepare it first. The optional
+`--fee-rate-sat-vb` value must be supplied to both commands and selects the exact
+manual-burst feerate. Omitting it preserves the live `SPAM_FEE` behavior.
 Stable automation exit codes are:
 
 | Code | Meaning |

@@ -108,6 +108,13 @@
           <label data-help="Burn outputs created by each transaction. Example: 30 matches --outputs-per-tx 30 in simchainctl; zero selects sequential single-output transactions.">Outputs per transaction
             <input id="burst-outputs-per-tx" type="number" min="0" value="30" required disabled>
           </label>
+          <label class="check-field" data-help="Enable a one-off fee rate for both capacity preparation and burst submission. Leave disabled to use the current live SPAM_FEE policy exactly as before.">
+            <input id="burst-fee-enabled" type="checkbox">
+            Override fee rate
+          </label>
+          <label data-help="Exact transaction fee rate in sat/vB for this manual burst. Prepare capacity with the same value before submitting. When the override is disabled, the current live SPAM_FEE policy is used.">Fee rate (sat/vB)
+            <input id="burst-fee-rate" type="number" min="0.001" step="0.001" value="10" required disabled>
+          </label>
           <div class="action-buttons">
             <button id="burst-prepare" class="secondary" type="button" title="Prepare the selected manual burst capacity; this may mine confirmation blocks but preserves the mining controller state.">Prepare capacity</button>
             <button id="burst-start" type="submit">Create tx burst</button>
