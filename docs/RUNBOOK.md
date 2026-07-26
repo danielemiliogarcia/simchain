@@ -6,6 +6,37 @@ Handy `bitcoin-cli` one-liners against the simnet. This how all this started... 
 > are the defaults; replace them with your `BTC_RPC_USER` / `BTC_RPC_PASS` from
 > `.env`.
 
+## Node1 RPC boundary
+
+Node1's strict default policy allows ordinary observation but rejects regtest block
+generation with Bitcoin Core's native HTTP 403 response:
+
+```bash
+curl -sS --user foo:rpcpassword \
+  --data-binary '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
+  http://127.0.0.1:18443/
+
+curl -i --user foo:rpcpassword \
+  --data-binary '{"jsonrpc":"2.0","id":2,"method":"generatetoaddress","params":[1,"bcrt1qexample"]}' \
+  http://127.0.0.1:18443/
+# HTTP/1.1 403 Forbidden
+```
+
+The same credentials remain unrestricted on the owned miner node2. This example mines
+one block to a valid address created by node2:
+
+```bash
+address="$(docker exec btc-simnet-node2 bitcoin-cli -regtest \
+  -rpcuser=foo -rpcpassword=rpcpassword -rpcwallet=node2 getnewaddress)"
+docker exec btc-simnet-node2 bitcoin-cli -regtest \
+  -rpcuser=foo -rpcpassword=rpcpassword generatetoaddress 1 "$address"
+```
+
+Set `FILTER_NODE1_RPC=false` and recreate node1 plus
+`btc-simnet-network-agent-node1` to disable the complete filter. See
+[SETTINGS.md](SETTINGS.md#node1-rpc-method-policy) for exact membership and
+intentional peer/debug/snapshot exceptions.
+
 ## Declarative scenarios
 
 Start the simnet plus its single control plane, then upload a scenario. The server waits

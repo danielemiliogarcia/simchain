@@ -19,6 +19,11 @@
 # future different nodes can run different bitcoind versions/images and
 # per-node policies, like in a real network.
 
+# Keep the long node1 RPC method policy out of the service definition. The
+# included model exposes filtered and unfiltered Bitcoin config objects.
+include:
+  - docker/node1-rpc-configs.compose.yml
+
 networks:
   btc-simnet-control:
     name: btc-simnet-control
@@ -58,6 +63,9 @@ services:
     stop_grace_period: 300s
     volumes:
       - node1-data:/home/bitcoin/.bitcoin
+    configs:
+      - source: node1-rpc-${FILTER_NODE1_RPC:-true}
+        target: /etc/bitcoin/node1-rpc.conf
     ports:
       - "${NODE1_RPC_PORT:-18443}:18443"
       - "${NODE1_P2P_PORT:-18444}:18444"
@@ -74,12 +82,15 @@ services:
     environment:
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
+      # The only node1 RPC policy setting.
+      - FILTER_NODE1_RPC=${FILTER_NODE1_RPC:-true}
     healthcheck:
       test: ["CMD-SHELL", "bitcoin-cli -regtest -rpcuser=$${BTC_RPC_USER} -rpcpassword=$${BTC_RPC_PASS} getblockcount"]
       interval: 2s
       timeout: 5s
       retries: 30
     command:
+      - -conf=/etc/bitcoin/node1-rpc.conf
       - -printtoconsole
       - -regtest=1
       - -server=1
