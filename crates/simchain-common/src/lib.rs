@@ -27,6 +27,6 @@ pub use config::{CommonConfig, ConfigError, RpcUrl};
 pub use error::CommonError;
 pub use logging::init_tracing;
 pub use rpc::{
-    create_client, create_jsonrpc_client, create_wallet_client, rpc_retry, wait_for_height,
-    wait_for_rpc, RPC_RETRY_ATTEMPTS, RPC_TIMEOUT_SECS,
+    create_client, create_client_with_auth, create_jsonrpc_client, create_wallet_client, rpc_retry,
+    wait_for_height, wait_for_rpc, RPC_RETRY_ATTEMPTS, RPC_TIMEOUT_SECS,
 };

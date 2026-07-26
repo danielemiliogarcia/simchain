@@ -62,6 +62,9 @@ mainnet network behavior.
   continuous reorgs with configurable depth, rebuild replacement blocks from the
   live mempool, inject new transactions, leave transactions unconfirmed in chaos
   mode, or permanently drop selected transactions through simulated double spends.
+- **True shorter-chain rewinds.** Administratively invalidate the same recent block
+  boundary on node2, node3, and the production-like node1 endpoint, leaving every node
+  at the same lower height without mining replacement blocks.
 - **Network splits and organic reorgs.** Partition the P2P mesh while keeping the RPC
   control plane reachable, let both sides mine competing branches, then heal the
   split and observe every node converge on the most-work chain.
@@ -294,6 +297,10 @@ docker compose up -d --force-recreate \
 Node2 and node3 remain unrestricted with the same credentials in either mode; P2P
 and ZMQ are never filtered. Peer-connectivity calls and a documented set of advanced
 testing/debug/snapshot RPCs remain available while filtering is enabled.
+The control plane has a second full-access `rpcauth` identity for internal rewind and
+recovery calls. Its Compose-defaulted username/password are internal wiring—not public
+settings—and are intentionally absent from both example environment files. The public
+identity remains restricted because its whitelist is explicit.
 See [SETTINGS.md](./docs/SETTINGS.md#node1-rpc-method-policy) for the exact method
 list and intentional exceptions. This declarative selection requires Docker Compose
 2.23.1 or newer; no shell wrapper or custom entrypoint is involved.
@@ -421,6 +428,25 @@ mempool, witnesses convergence, and records cleanup. A lower-level standalone RP
 also remains available for one-shot and continuous experiments.
 
 For full details, commands, and modes, see [REORGS.md](./docs/REORGS.md).
+
+### Rewind without a replacement chain
+
+The dashboard's **Rewind chain** subpanel and this command leave all nodes on a genuinely
+shorter common chain:
+
+```bash
+cargo run -p simchainctl -- rewind --blocks 3 --wait
+```
+
+This is not organic chain selection: `invalidateblock` state is local and does not
+propagate over P2P, so the coordinator must invalidate the same boundary on node2,
+node3, and node1. It pauses spam and mining with owned leases, requires a common start,
+never crosses below bootstrap height 204, persists rollback information before mutation,
+and uses `reconsiderblock` to restore the original branch after a partial failure.
+If an electrs-based profile is active, the dashboard warns that its disposable index
+may not understand this rollback-only shape. `./scripts/recover-explorer.sh` recreates
+that existing indexer and waits for its exact tip to match node1; it does nothing when
+the selected profile did not include electrs.
 
 
 ## Partitions and P2P latency

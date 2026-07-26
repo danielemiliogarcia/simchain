@@ -14,6 +14,9 @@ use crate::faucet_store::{FaucetStore, StoredFaucetTransfer};
 use crate::job_store::JobStore;
 use crate::network_job::NetworkActionBackend;
 use crate::reorg_job::{ReorgExecution, ReorgExecutor, ReorgRecoveryContext};
+use crate::rewind_job::{
+    RewindExecution, RewindExecutor, RewindObserver, RewindRecoveryContext, MAX_REWIND_BLOCKS,
+};
 use crate::scenario_job::{ScenarioActionBackend, SpamBurstTarget};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -24,8 +27,8 @@ use simchain_common::control_api::{
     JobCheckpoint, JobCheckpointResponse, JobCleanup, JobCreatedResponse, JobDetail, JobEvent,
     JobEventsResponse, JobFailure, JobKind, JobLease, JobListResponse, JobState, JobSummary,
     MineJobRequest, PartitionJobRequest, ReleaseCheckpointRequest, ReorgJobRequest,
-    ScenarioStepStatus, SpamBurstJobRequest, FAUCET_MAX_OUTPUTS, FAUCET_MAX_TX_VBYTES,
-    FAUCET_PRIORITY_DELTA_SATS, FAUCET_PRIORITY_DOMINANCE_FACTOR,
+    RewindJobRequest, ScenarioStepStatus, SpamBurstJobRequest, FAUCET_MAX_OUTPUTS,
+    FAUCET_MAX_TX_VBYTES, FAUCET_PRIORITY_DELTA_SATS, FAUCET_PRIORITY_DOMINANCE_FACTOR,
 };
 use simchain_common::internal_api::{
     LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest, NetworkImpairment,
@@ -45,7 +48,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const JOB_SCHEMA_VERSION: u32 = 4;
+const JOB_SCHEMA_VERSION: u32 = 5;
 const MAX_JOB_HISTORY: usize = 100;
 const EVENT_RING_CAPACITY: usize = 2_048;
 const DEFAULT_LEASE_TTL_SECS: u64 = 120;
@@ -74,6 +77,8 @@ struct StoredJob {
     faucet_recovery: Option<FaucetRecoveryContext>,
     #[serde(default)]
     reorg_recovery: ReorgRecoveryContext,
+    #[serde(default)]
+    rewind_recovery: RewindRecoveryContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scenario_settings_backup: Option<ScenarioSettingsBackup>,
 }
@@ -242,6 +247,7 @@ fn load_and_migrate_jobs(store: &JobStore) -> anyhow::Result<PersistedJobs> {
                         request_fingerprint: job.request_fingerprint,
                         faucet_recovery: None,
                         reorg_recovery: job.reorg_recovery,
+                        rewind_recovery: RewindRecoveryContext::default(),
                         scenario_settings_backup: None,
                     })
                     .collect(),
@@ -268,6 +274,7 @@ fn load_and_migrate_jobs(store: &JobStore) -> anyhow::Result<PersistedJobs> {
                         request_fingerprint: job.request_fingerprint,
                         faucet_recovery: job.faucet_recovery,
                         reorg_recovery: job.reorg_recovery,
+                        rewind_recovery: RewindRecoveryContext::default(),
                         scenario_settings_backup: None,
                     })
                     .collect(),
@@ -290,7 +297,13 @@ fn load_and_migrate_jobs(store: &JobStore) -> anyhow::Result<PersistedJobs> {
             store.save(&migrated)?;
             Ok(migrated)
         }
-        4 => serde_json::from_value(value).map_err(Into::into),
+        4 => {
+            let mut migrated: PersistedJobs = serde_json::from_value(value)?;
+            migrated.schema_version = JOB_SCHEMA_VERSION;
+            store.save(&migrated)?;
+            Ok(migrated)
+        }
+        5 => serde_json::from_value(value).map_err(Into::into),
         future => anyhow::bail!("unsupported job schema {future} (expected {JOB_SCHEMA_VERSION})"),
     }
 }
@@ -373,6 +386,7 @@ pub struct JobManager {
     network: Arc<dyn NetworkControlBackend>,
     network_actions: Arc<dyn NetworkActionBackend>,
     reorg: Arc<dyn ReorgExecutor>,
+    rewind: Arc<dyn RewindExecutor>,
     scenario: Arc<dyn ScenarioActionBackend>,
     faucet: Arc<dyn FaucetBackend>,
     faucet_store: FaucetStore,
@@ -400,6 +414,7 @@ pub struct JobDependencies {
     pub apply_lock: Arc<Mutex<()>>,
     pub network: Arc<dyn NetworkControlBackend>,
     pub reorg: Arc<dyn ReorgExecutor>,
+    pub rewind: Arc<dyn RewindExecutor>,
     pub scenario: Arc<dyn ScenarioActionBackend>,
     pub network_actions: Arc<dyn NetworkActionBackend>,
     pub faucet: Arc<dyn FaucetBackend>,
@@ -480,6 +495,7 @@ impl JobManager {
             apply_lock: dependencies.apply_lock,
             network: dependencies.network,
             reorg: dependencies.reorg,
+            rewind: dependencies.rewind,
             scenario: dependencies.scenario,
             network_actions: dependencies.network_actions,
             faucet: dependencies.faucet,
@@ -720,6 +736,7 @@ impl JobManager {
                     ..FaucetRecoveryContext::default()
                 }),
                 reorg_recovery: ReorgRecoveryContext::default(),
+                rewind_recovery: RewindRecoveryContext::default(),
                 scenario_settings_backup: None,
             });
             state.persisted.active_job_id = Some(job_id.clone());
@@ -852,6 +869,7 @@ impl JobManager {
                     request: Some(request.clone()),
                     invalidated_block_hash: None,
                 },
+                rewind_recovery: RewindRecoveryContext::default(),
                 scenario_settings_backup: None,
             });
             state.persisted.active_job_id = Some(job_id.clone());
@@ -900,6 +918,47 @@ impl JobManager {
             state: JobState::Starting,
             reused: false,
         })
+    }
+
+    pub fn start_rewind(
+        self: &Arc<Self>,
+        request: RewindJobRequest,
+        idempotency_key: Option<String>,
+    ) -> Result<JobCreatedResponse, JobManagerError> {
+        let request = normalize_rewind_request(request)?;
+        let request_value = serde_json::to_value(&request).map_err(internal_error)?;
+        let (created, abort) = self.reserve_action_job(
+            JobKind::Rewind,
+            request_value,
+            idempotency_key,
+            "shorter-chain rewind job accepted",
+        )?;
+        let Some(abort) = abort else {
+            return Ok(created);
+        };
+        let manager = self.clone();
+        let job_id = created.job_id.clone();
+        let thread_job_id = job_id.clone();
+        let spawn = thread::Builder::new()
+            .name(format!("rewind-{job_id}"))
+            .spawn(move || {
+                let panic_manager = manager.clone();
+                let panic_job_id = thread_job_id.clone();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    manager.run_rewind_job(thread_job_id, request, abort)
+                }));
+                if outcome.is_err() {
+                    panic_manager.handle_executor_panic(&panic_job_id);
+                }
+            });
+        if let Err(error) = spawn {
+            self.fail_before_thread(&job_id, format!("failed to start rewind thread: {error}"));
+            return Err(JobManagerError::new(
+                ErrorCode::Internal,
+                format!("failed to start rewind thread: {error}"),
+            ));
+        }
+        Ok(created)
     }
 
     pub fn start_scenario(
@@ -1039,6 +1098,7 @@ impl JobManager {
                 request_fingerprint: fingerprint,
                 faucet_recovery: None,
                 reorg_recovery: ReorgRecoveryContext::default(),
+                rewind_recovery: RewindRecoveryContext::default(),
                 scenario_settings_backup: settings_backup,
             });
             state.persisted.active_job_id = Some(job_id.clone());
@@ -1428,6 +1488,7 @@ impl JobManager {
                 request_fingerprint: fingerprint,
                 faucet_recovery: None,
                 reorg_recovery: ReorgRecoveryContext::default(),
+                rewind_recovery: RewindRecoveryContext::default(),
                 scenario_settings_backup: None,
             });
             if let Some(node) = degradation_node {
@@ -2375,6 +2436,105 @@ impl JobManager {
         }
     }
 
+    fn run_rewind_job(
+        self: Arc<Self>,
+        job_id: String,
+        request: RewindJobRequest,
+        abort: Arc<AtomicBool>,
+    ) {
+        if abort.load(Ordering::Acquire) {
+            self.finish_job(
+                &job_id,
+                JobState::Aborted,
+                "aborted_before_start",
+                None,
+                None,
+                successful_cleanup(),
+            );
+            return;
+        }
+        self.set_running(&job_id, "acquiring_spam_lease");
+        let mut leases = Vec::new();
+        if let Err(error) = self.acquire_spam_lease(&job_id, &mut leases) {
+            self.finish_failed_before_mutation(&job_id, error, leases, abort);
+            return;
+        }
+        if abort.load(Ordering::Acquire) {
+            self.finish_aborted_with_cleanup(&job_id, leases, false, None);
+            return;
+        }
+        self.set_phase(&job_id, "acquiring_mining_lease");
+        if let Err(error) = self.acquire_mining_lease(&job_id, &mut leases) {
+            self.finish_failed_before_mutation(&job_id, error, leases, abort);
+            return;
+        }
+        if abort.load(Ordering::Acquire) {
+            self.finish_aborted_with_cleanup(&job_id, leases, false, None);
+            return;
+        }
+        let renewer = match LeaseRenewer::start(
+            self.clone(),
+            job_id.clone(),
+            abort.clone(),
+            self.mining.clone(),
+            self.spam.clone(),
+            self.lease_ttl_secs,
+        ) {
+            Ok(renewer) => renewer,
+            Err(error) => {
+                self.finish_failed_before_mutation(&job_id, error, leases, abort);
+                return;
+            }
+        };
+
+        self.set_phase(&job_id, "preparing_rewind");
+        let observer = JobRewindObserver {
+            manager: self.clone(),
+            job_id: job_id.clone(),
+            abort,
+            chain_changed: AtomicBool::new(false),
+        };
+        let execution = self.rewind.execute(&request, &observer);
+        let chain_changed = execution
+            .as_ref()
+            .map(|execution| execution.chain_changed)
+            .unwrap_or(false)
+            || observer.chain_changed.load(Ordering::Acquire);
+        let stop_error = renewer.stop().err().map(|error| error.to_string());
+        let cleanup = self.cleanup_leases(&job_id, &leases, chain_changed, stop_error);
+        match execution {
+            Ok(RewindExecution {
+                result, aborted, ..
+            }) => self.finish_job(
+                &job_id,
+                if aborted {
+                    JobState::Aborted
+                } else {
+                    JobState::Succeeded
+                },
+                if aborted {
+                    "aborted_safely"
+                } else {
+                    "succeeded"
+                },
+                Some(result),
+                None,
+                cleanup,
+            ),
+            Err(error) => self.finish_job(
+                &job_id,
+                JobState::Failed,
+                "failed",
+                None,
+                Some(JobFailure {
+                    code: rewind_failure_code(&error.to_string()).to_string(),
+                    message: error.to_string(),
+                }),
+                cleanup,
+            ),
+        }
+    }
+
     fn run_scenario_job(
         self: Arc<Self>,
         job_id: String,
@@ -3076,7 +3236,7 @@ impl JobManager {
         let lease = JobLease {
             component: "spam".to_string(),
             lease_id: format!("{job_id}-spam"),
-            purpose: "reorg chain mutation".to_string(),
+            purpose: "exclusive chain mutation".to_string(),
         };
         self.persist_lease_intent(job_id, lease.clone())?;
         self.spam.acquire_lease(LeaseRequest {
@@ -3095,7 +3255,7 @@ impl JobManager {
         let lease = JobLease {
             component: "mining".to_string(),
             lease_id: format!("{job_id}-mining"),
-            purpose: "reorg chain mutation".to_string(),
+            purpose: "exclusive chain mutation".to_string(),
         };
         self.persist_lease_intent(job_id, lease.clone())?;
         self.mining.acquire_lease(LeaseRequest {
@@ -4259,7 +4419,7 @@ impl JobManager {
     }
 
     fn recover_job_resources(self: &Arc<Self>, job_id: &str) -> anyhow::Result<()> {
-        let (kind, detail_request, context, faucet_context) = {
+        let (kind, detail_request, context, rewind_context, faucet_context) = {
             let state = self.state.lock().expect("job manager lock");
             let job = find_stored(&state.persisted, job_id)
                 .ok_or_else(|| anyhow::anyhow!("recovery job {job_id} is missing"))?;
@@ -4267,6 +4427,7 @@ impl JobManager {
                 job.detail.summary.kind,
                 job.detail.request.clone(),
                 job.reorg_recovery.clone(),
+                job.rewind_recovery.clone(),
                 job.faucet_recovery.clone(),
             )
         };
@@ -4293,6 +4454,16 @@ impl JobManager {
             };
             self.ensure_recovery_leases(job_id)?;
             self.reorg.recover(&request, &context, &observer)?;
+        }
+        if kind == JobKind::Rewind && rewind_context.boundary_hash.is_some() {
+            let observer = JobRewindObserver {
+                manager: self.clone(),
+                job_id: job_id.to_string(),
+                abort: Arc::new(AtomicBool::new(false)),
+                chain_changed: AtomicBool::new(true),
+            };
+            self.ensure_recovery_leases(job_id)?;
+            self.rewind.recover(&rewind_context, &observer)?;
         }
         self.recover_worker_leases(job_id)?;
         if kind == JobKind::Scenario {
@@ -4518,13 +4689,13 @@ impl JobManager {
             let lease = JobLease {
                 component: "spam".to_string(),
                 lease_id: lease_id.clone(),
-                purpose: "interrupted reorg recovery".to_string(),
+                purpose: "interrupted chain-mutation recovery".to_string(),
             };
             self.persist_lease_intent(job_id, lease.clone())?;
             self.spam.acquire_lease(LeaseRequest {
                 lease_id: lease_id.clone(),
                 owner_job_id: job_id.to_string(),
-                purpose: "interrupted reorg recovery".to_string(),
+                purpose: "interrupted chain-mutation recovery".to_string(),
                 ttl_secs: self.lease_ttl_secs,
                 request_id: format!("{job_id}-spam-recovery-acquire-{nonce}"),
             })?;
@@ -4548,13 +4719,13 @@ impl JobManager {
             let lease = JobLease {
                 component: "mining".to_string(),
                 lease_id: lease_id.clone(),
-                purpose: "interrupted reorg recovery".to_string(),
+                purpose: "interrupted chain-mutation recovery".to_string(),
             };
             self.persist_lease_intent(job_id, lease.clone())?;
             self.mining.acquire_lease(LeaseRequest {
                 lease_id: lease_id.clone(),
                 owner_job_id: job_id.to_string(),
-                purpose: "interrupted reorg recovery".to_string(),
+                purpose: "interrupted chain-mutation recovery".to_string(),
                 ttl_secs: self.lease_ttl_secs,
                 request_id: format!("{job_id}-mining-recovery-acquire-{nonce}"),
             })?;
@@ -4591,6 +4762,18 @@ impl JobManager {
                 tracing::error!(job_id, "failed to persist reorg recovery context: {error}");
             }
         }
+    }
+
+    fn persist_rewind_recovery(
+        &self,
+        job_id: &str,
+        context: &RewindRecoveryContext,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock().expect("job manager lock");
+        let job = find_stored_mut(&mut state.persisted, job_id)
+            .ok_or_else(|| anyhow::anyhow!("rewind job {job_id} disappeared"))?;
+        job.rewind_recovery = context.clone();
+        self.store.save(&state.persisted)
     }
 
     fn prepare_scenario_reorg(
@@ -5928,6 +6111,31 @@ impl ReorgObserver for JobReorgObserver {
     }
 }
 
+struct JobRewindObserver {
+    manager: Arc<JobManager>,
+    job_id: String,
+    abort: Arc<AtomicBool>,
+    chain_changed: AtomicBool,
+}
+
+impl RewindObserver for JobRewindObserver {
+    fn persist(&self, context: &RewindRecoveryContext) -> anyhow::Result<()> {
+        self.manager.persist_rewind_recovery(&self.job_id, context)
+    }
+
+    fn progress(&self, phase: &str, message: &str, data: Option<Value>) {
+        if matches!(phase, "invalidating" | "invalidated") {
+            self.chain_changed.store(true, Ordering::Release);
+        }
+        self.manager
+            .emit_best_effort(&self.job_id, "rewind_progress", phase, message, data);
+    }
+
+    fn abort_requested(&self) -> bool {
+        self.abort.load(Ordering::Acquire)
+    }
+}
+
 struct LeaseRenewer {
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -6368,6 +6576,31 @@ fn normalize_reorg_request(
     Ok(request)
 }
 
+fn normalize_rewind_request(
+    request: RewindJobRequest,
+) -> Result<RewindJobRequest, JobManagerError> {
+    if !(1..=MAX_REWIND_BLOCKS).contains(&request.blocks) {
+        return Err(JobManagerError::new(
+            ErrorCode::ValidationFailed,
+            format!("rewind blocks must be between 1 and {MAX_REWIND_BLOCKS}"),
+        ));
+    }
+    Ok(request)
+}
+
+fn rewind_failure_code(message: &str) -> &'static str {
+    [
+        "rewind_precondition_failed",
+        "rewind_invalidation_failed",
+        "rewind_rollback_failed",
+        "rewind_convergence_failed",
+        "rewind_recovery_required",
+    ]
+    .into_iter()
+    .find(|code| message.contains(code))
+    .unwrap_or("rewind_failed")
+}
+
 fn normalize_mine_request(
     mut request: MineJobRequest,
 ) -> Result<(MineJobRequest, MinerNode), JobManagerError> {
@@ -6645,7 +6878,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::MockBackend;
+    use crate::test_support::{MockBackend, MockRewindExecutor};
     use std::sync::atomic::AtomicBool;
 
     struct BlockingExecutor {
@@ -6749,6 +6982,7 @@ mod tests {
                 control_state,
                 apply_lock,
                 reorg: executor,
+                rewind: Arc::new(MockRewindExecutor),
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
                 faucet: backend.clone(),
@@ -6923,6 +7157,7 @@ mod tests {
                         request: Some(ReorgJobRequest::default()),
                         invalidated_block_hash: Some("00".repeat(32)),
                     },
+                    rewind_recovery: RewindRecoveryContext::default(),
                     scenario_settings_backup: None,
                 }],
             })
@@ -6940,6 +7175,7 @@ mod tests {
                 control_state,
                 apply_lock,
                 reorg: Arc::new(BlockingExecutor::new()),
+                rewind: Arc::new(MockRewindExecutor),
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
                 faucet: backend,
@@ -6989,6 +7225,7 @@ mod tests {
                 request_fingerprint: "recovery".to_string(),
                 faucet_recovery: None,
                 reorg_recovery: ReorgRecoveryContext::default(),
+                rewind_recovery: RewindRecoveryContext::default(),
                 scenario_settings_backup: None,
             }
         }
@@ -7081,6 +7318,7 @@ mod tests {
                 control_state,
                 apply_lock,
                 reorg: Arc::new(BlockingExecutor::new()),
+                rewind: Arc::new(MockRewindExecutor),
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
                 faucet: backend.clone(),
@@ -7171,6 +7409,7 @@ mod tests {
                         request: Some(ReorgJobRequest::default()),
                         invalidated_block_hash: Some("00".repeat(32)),
                     },
+                    rewind_recovery: RewindRecoveryContext::default(),
                     scenario_settings_backup: None,
                 }],
             })
@@ -7191,6 +7430,7 @@ mod tests {
                 control_state,
                 apply_lock,
                 reorg: executor.clone(),
+                rewind: Arc::new(MockRewindExecutor),
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
                 faucet: backend.clone(),
@@ -7293,6 +7533,7 @@ mod tests {
                     request_fingerprint: "scenario".to_string(),
                     faucet_recovery: None,
                     reorg_recovery: ReorgRecoveryContext::default(),
+                    rewind_recovery: RewindRecoveryContext::default(),
                     scenario_settings_backup: None,
                 }],
             })
@@ -7310,6 +7551,7 @@ mod tests {
                 control_state,
                 apply_lock,
                 reorg: Arc::new(BlockingExecutor::new()),
+                rewind: Arc::new(MockRewindExecutor),
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
                 faucet: backend.clone(),
@@ -7968,6 +8210,7 @@ steps:
                     request_fingerprint: "scenario".to_string(),
                     faucet_recovery: None,
                     reorg_recovery: ReorgRecoveryContext::default(),
+                    rewind_recovery: RewindRecoveryContext::default(),
                     scenario_settings_backup: Some(ScenarioSettingsBackup {
                         baseline_generation: baseline.generation,
                         baseline_desired: baseline.desired.clone(),
@@ -7992,6 +8235,7 @@ steps:
                 control_state,
                 apply_lock,
                 reorg: Arc::new(BlockingExecutor::new()),
+                rewind: Arc::new(MockRewindExecutor),
                 scenario: backend.clone(),
                 network_actions: backend.clone(),
                 faucet: backend,
@@ -8181,6 +8425,7 @@ steps:
                     request_fingerprint: "v3-degrade".to_string(),
                     faucet_recovery: None,
                     reorg_recovery: ReorgRecoveryContext::default(),
+                    rewind_recovery: RewindRecoveryContext::default(),
                     scenario_settings_backup: None,
                 }],
             })
@@ -8190,6 +8435,70 @@ steps:
         assert_eq!(migrated.schema_version, JOB_SCHEMA_VERSION);
         assert!(migrated.active_job_id.is_none());
         assert_eq!(migrated.active_degradation_jobs.get("node2"), Some(&job_id));
+    }
+
+    #[test]
+    fn job_store_v4_migrates_without_inventing_rewind_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = JobStore::open(dir.path()).expect("store");
+        let persisted = PersistedJobs {
+            schema_version: 4,
+            next_event_sequence: 6,
+            next_checkpoint_generation: 2,
+            active_job_id: None,
+            active_degradation_jobs: BTreeMap::new(),
+            jobs: vec![StoredJob {
+                detail: JobDetail {
+                    summary: JobSummary {
+                        id: "job-v4".to_string(),
+                        kind: JobKind::Mine,
+                        state: JobState::Succeeded,
+                        phase: "succeeded".to_string(),
+                        created_at_ms: 1,
+                        started_at_ms: Some(2),
+                        ended_at_ms: Some(3),
+                        cleanup: successful_cleanup(),
+                    },
+                    request: json!({"node": "node2", "blocks": 1}),
+                    leases: Vec::new(),
+                    current_step: None,
+                    checkpoints: Vec::new(),
+                    result: None,
+                    failure: None,
+                },
+                idempotency_key: None,
+                request_fingerprint: "v4-request".to_string(),
+                faucet_recovery: None,
+                reorg_recovery: ReorgRecoveryContext::default(),
+                rewind_recovery: RewindRecoveryContext::default(),
+                scenario_settings_backup: None,
+            }],
+        };
+        let mut old_value = serde_json::to_value(persisted).expect("serialize v4 index");
+        old_value["jobs"][0]
+            .as_object_mut()
+            .expect("v4 job object")
+            .remove("rewind_recovery");
+        store.save(&old_value).expect("seed v4 index");
+
+        let migrated = load_and_migrate_jobs(&store).expect("migrate v4 index");
+        assert_eq!(migrated.schema_version, JOB_SCHEMA_VERSION);
+        assert!(migrated.jobs[0].rewind_recovery.boundary_hash.is_none());
+        assert!(!migrated.jobs[0].rewind_recovery.resolved);
+    }
+
+    #[test]
+    fn rewind_failures_keep_their_stable_domain_code() {
+        assert_eq!(
+            rewind_failure_code(
+                "rewind_invalidation_failed on node3 (original chain restored): timeout"
+            ),
+            "rewind_invalidation_failed"
+        );
+        assert_eq!(
+            rewind_failure_code("unexpected transport error"),
+            "rewind_failed"
+        );
     }
 
     #[test]
@@ -8447,6 +8756,7 @@ steps:
         for kind in [
             JobKind::Faucet,
             JobKind::Reorg,
+            JobKind::Rewind,
             JobKind::Scenario,
             JobKind::Partition,
             JobKind::SpamPrepare,

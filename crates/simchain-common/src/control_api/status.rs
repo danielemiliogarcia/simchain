@@ -95,7 +95,20 @@ pub struct ImpairmentSummary {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ExplorerStatus {
     pub url: String,
+    /// Whether the mempool.space frontend itself answers HTTP requests.
     pub reachable: bool,
+    /// Whether the backing electrs HTTP API answers tip queries.
+    #[serde(default)]
+    pub indexer_reachable: bool,
+    /// True only when electrs reports the exact same height and hash as node1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synchronized: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

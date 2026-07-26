@@ -7,6 +7,7 @@ const TOKEN = window.CONTROL_PLANE_TOKEN;
 const $ = (sel) => document.querySelector(sel);
 
 let schema = null;          // {settings: [{key, default, group, scope, control, options, optional, help, warning}], boot_settings: [{key, value, group, help}]}
+let explorerWasDetected = false;
 let lastState = null;       // last /api/v1/config payload
 let dirty = new Map();      // key -> edited value (string)
 let fieldErrors = new Map(); // key -> latest client/server validation message
@@ -21,7 +22,7 @@ let selectedJobEventAfter = 0;
 let renderedJobEventCount = 0;
 let startingJob = false;
 let startingScenario = false;
-const startingAction = { mine: false, prepare: false, burst: false, partition: false, degrade: false };
+const startingAction = { mine: false, rewind: false, prepare: false, burst: false, partition: false, degrade: false };
 let abortingJob = false;
 let faucetStatus = null;
 let faucetSubmitting = false;
@@ -405,14 +406,32 @@ function renderExplorer(explorer) {
   const label = container.querySelector("span:not(.dot)");
   const link = $("#explorer-link");
   const url = explorer && httpUrl(explorer.url);
-  dot.className = "dot " + (explorer && explorer.reachable ? "ok" : "warn");
-  label.textContent = explorer
-    ? `mempool.space ${explorer.reachable ? "reachable" : "unreachable"}`
-    : "mempool.space unavailable";
+  if (explorer && (explorer.reachable || explorer.indexer_reachable)) explorerWasDetected = true;
+  const synchronized = explorer && explorer.synchronized === true;
+  dot.className = "dot " + (explorer && explorer.reachable && synchronized
+    ? "ok"
+    : explorer && (explorer.reachable || explorer.indexer_reachable) ? "warn" : "off");
+  if (!explorer || (!explorer.reachable && !explorer.indexer_reachable)) {
+    label.textContent = "mempool.space unavailable";
+  } else if (explorer.reachable && synchronized) {
+    label.textContent = `mempool.space synchronized · height ${explorer.indexed_height ?? "?"}`;
+  } else if (explorer.indexer_reachable && synchronized) {
+    label.textContent = `electrs synchronized · height ${explorer.indexed_height ?? "?"} · frontend unavailable`;
+  } else if (explorer.indexer_reachable && explorer.synchronized === false) {
+    label.textContent = `electrs indexing · height ${explorer.indexed_height ?? "?"}`;
+  } else if (explorer.indexer_reachable) {
+    label.textContent = "electrs reachable · synchronization unknown";
+  } else {
+    label.textContent = "mempool.space degraded · electrs unavailable";
+  }
   link.hidden = !url;
   if (url) link.href = url.toString();
   else link.removeAttribute("href");
-  container.title = (explorer && explorer.error) || "";
+  const recovery = explorer && explorer.recovery_command
+    ? ` Recovery: ${explorer.recovery_command}` : "";
+  container.title = `${(explorer && explorer.error) || ""}${recovery}`.trim();
+  const rewindWarning = $("#rewind-explorer-warning");
+  if (rewindWarning) rewindWarning.hidden = !explorerWasDetected;
 }
 
 function renderConnectionStatus(s) {
@@ -1618,6 +1637,7 @@ function renderJobs() {
   scenarioStart.textContent = startingScenario ? "Starting…" : "Start scenario";
   for (const [action, formId, buttonId, label] of [
     ["mine", "mine-form", "mine-start", "Mine"],
+    ["rewind", "rewind-form", "rewind-start", "Rewind"],
     ["prepare", "burst-form", "burst-prepare", "Prepare capacity"],
     ["burst", "burst-form", "burst-start", "Create tx burst"],
     ["partition", "partition-form", "partition-start", "Start partition"],
@@ -1674,6 +1694,8 @@ function actionDependencies(action) {
   switch (action) {
     case "mine":
       return ["mining", $("#mine-node").value];
+    case "rewind":
+      return ["mining", "spam", "node1", "node2", "node3"];
     case "prepare":
     case "burst":
       return ["spam", $("#burst-node").value];
@@ -1741,6 +1763,13 @@ function renderSelectedJob(options = {}) {
     if (selectedJob.started_at_ms != null) lines.push(`started ${formatJobTime(selectedJob.started_at_ms)}`);
     if (selectedJob.ended_at_ms != null) lines.push(`ended ${formatJobTime(selectedJob.ended_at_ms)}`);
     if (selectedJob.failure) lines.push(`failure ${selectedJob.failure.code}: ${selectedJob.failure.message}`);
+    for (const warning of (selectedJob.result && selectedJob.result.warnings) || []) {
+      const message = typeof warning === "string" ? warning : warning.message;
+      if (message) lines.push(`warning: ${message}`);
+      if (warning && warning.recovery_command) {
+        lines.push(`recovery: ${warning.recovery_command}`);
+      }
+    }
     if (selectedJob.current_step) {
       const step = selectedJob.current_step;
       lines.push(`step ${step.index}/${step.total} · ${step.kind} · ${step.state}`);
@@ -1975,6 +2004,55 @@ async function startBoundedAction(event, action) {
   }
 }
 
+async function startRewind(event) {
+  event.preventDefault();
+  const form = $("#rewind-form");
+  if (startingAction.rewind || actionBlockedByActiveJobs("rewind") || !form.checkValidity()) return;
+  const blocks = Number($("#rewind-blocks").value);
+  const currentHeight = latestStatus && Number.isFinite(Number(latestStatus.height))
+    ? Number(latestStatus.height)
+    : null;
+  const targetText = currentHeight == null
+    ? "a shorter common height"
+    : `height ${currentHeight - blocks} (currently ${currentHeight})`;
+  const confirmed = window.confirm(
+    `Rewind all three nodes by ${blocks} block(s) to ${targetText}?\n\n` +
+    "This administratively invalidates the same block boundary on node2, node3, and node1. " +
+    "Disconnected transactions may return to mempools. This is not a proof-of-work reorg." +
+    (explorerWasDetected
+      ? "\n\nThe active electrs-based explorer may temporarily become unavailable. " +
+        "If that happens, recover it with ./scripts/recover-explorer.sh."
+      : "")
+  );
+  if (!confirmed) return;
+
+  startingAction.rewind = true;
+  renderJobs();
+  const result = $("#rewind-action-result");
+  result.textContent = "Submitting shorter-chain rewind job…";
+  result.className = "action-result";
+  try {
+    const { ok, body } = await api("/api/v1/jobs/rewind", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + TOKEN,
+        "Idempotency-Key": browserIdempotencyKey(),
+      },
+      body: JSON.stringify({ blocks }),
+    });
+    if (!ok) throw new Error((body && body.error && body.error.message) || "rewind request failed");
+    result.textContent = `${body.reused ? "Reused" : "Started"} ${body.job_id}`;
+    selectJobLocally(body.job_id);
+  } catch (error) {
+    result.textContent = String(error);
+    result.className = "action-result err";
+  } finally {
+    startingAction.rewind = false;
+    await refreshDashboard({ force: true });
+  }
+}
+
 function renderBurstControls() {
   const dataShape = $("#burst-shape").value === "data";
   $("#burst-data-bytes").disabled = !dataShape;
@@ -2177,6 +2255,8 @@ async function init() {
   $("#job-download").addEventListener("click", downloadSelectedJob);
   $("#mine-form").addEventListener("submit", (event) => startBoundedAction(event, "mine"));
   $("#mine-form").addEventListener("input", renderJobs);
+  $("#rewind-form").addEventListener("submit", startRewind);
+  $("#rewind-form").addEventListener("input", renderJobs);
   $("#burst-form").addEventListener("submit", (event) => startBoundedAction(event, "burst"));
   $("#burst-prepare").addEventListener("click", (event) => startBoundedAction(event, "prepare"));
   $("#burst-form").addEventListener("input", renderJobs);

@@ -6,6 +6,7 @@ use serde_json::Value;
 pub enum JobKind {
     Faucet,
     Reorg,
+    Rewind,
     Scenario,
     Partition,
     Degrade,
@@ -19,6 +20,7 @@ impl JobKind {
         match self {
             Self::Faucet => "faucet",
             Self::Reorg => "reorg",
+            Self::Rewind => "rewind",
             Self::Scenario => "scenario",
             Self::Partition => "partition",
             Self::Degrade => "degrade",
@@ -85,6 +87,11 @@ pub struct ReorgJobRequest {
     pub adds_new_txs: u64,
     #[serde(default)]
     pub double_spend_pct: u8,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RewindJobRequest {
+    pub blocks: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -333,6 +340,20 @@ mod tests {
         );
         assert!(JobState::Interrupted.is_terminal());
         assert!(!JobState::Running.is_terminal());
+        assert_eq!(
+            serde_json::to_string(&JobKind::Rewind).expect("kind JSON"),
+            "\"rewind\""
+        );
+        assert_eq!(JobKind::Rewind.as_str(), "rewind");
+    }
+
+    #[test]
+    fn rewind_request_has_a_minimal_stable_shape() {
+        let request = RewindJobRequest { blocks: 3 };
+        assert_eq!(
+            serde_json::to_value(request).expect("rewind JSON"),
+            serde_json::json!({"blocks": 3})
+        );
     }
 
     #[test]

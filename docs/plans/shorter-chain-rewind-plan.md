@@ -1,6 +1,6 @@
 # True shorter-chain rewind plan
 
-Status: proposed; not implemented.
+Status: implemented.
 
 ## Goal
 
@@ -41,7 +41,7 @@ In scope:
 - a versioned HTTP job endpoint, shared DTO, service method, CLI command, and MCP tool;
 - coordinated `invalidateblock` calls on all three nodes;
 - durable progress/recovery and strict postcondition checks;
-- a private, least-privilege node1 RPC identity for the control plane;
+- a private, full-access node1 RPC identity used only by Simchain internals;
 - preserving the existing public node1 RPC restriction;
 - worker leases so background mining and spam cannot race the rewind.
 
@@ -55,48 +55,62 @@ Out of scope:
 - automatically keeping the chain paused after the job. The job preserves the
   mining worker's previous desired state; users who want to inspect a stable lower
   height should pause mining before pressing **Rewind**.
+- controlling external indexer processes. The bundled electrs version can require a
+  force-recreate after its indexed tip moves backward; the runbook documents this
+  operator action because the control plane deliberately has no Docker lifecycle access.
 
 ## Node1 authorization design
 
 The existing public `BTC_RPC_USER` must continue receiving HTTP 403 for
 `invalidateblock` and `reconsiderblock` when `FILTER_NODE1_RPC=true`. The control plane
 currently uses that same identity, so the rewind creates the first genuine need for a
-separate node1 operator identity.
+separate node1 internal identity.
 
-Use Bitcoin Core's native `rpcauth` plus `rpcwhitelist`; do not add a gateway:
+The implementation uses Bitcoin Core's native `rpcauth` support; it does not add a
+gateway. It keeps the existing legacy `-rpcuser`/`-rpcpassword` public identity and
+adds one fixed `rpcauth` identity to both Compose-managed node1 configurations:
 
 ```ini
 rpcauth=simchain-control:<salt>$<hash>
-rpcwhitelist=simchain-control:getbestblockhash,getblockcount,getblockhash,getblockheader,getchaintips,getrawmempool,invalidateblock,reconsiderblock
 ```
 
-The operator whitelist is intentionally narrow. It permits the reads required for
-preconditions, postconditions, and recovery, plus only the two chain-choice mutations.
-It does not permit mining, shutdown, network administration, wallet operations, or
-arbitrary RPC access.
+The internal identity may use the complete node1 RPC surface. In filtered mode, set
+`rpcwhitelistdefault=0` and keep the existing explicit public-user whitelist. The
+public identity remains restricted because it has an explicit rule; the authenticated
+internal identity has no whitelist rule and therefore receives the default full
+access. In unfiltered mode neither identity is restricted.
 
-Configuration rules:
+As-built configuration rules:
 
-1. Add a dedicated operator username, plaintext password for the control plane, and
-   matching precomputed `rpcauth` value. Provide development defaults and document how
-   to regenerate the hash when changing the password.
-2. Interpolate the `rpcauth` and operator whitelist into both Compose-managed node1
-   configs in `docker/node1-rpc-configs.compose.yml`.
-3. In filtered mode, keep `rpcwhitelistdefault=1`, the current public allowlist, and
-   the narrow operator allowlist.
-4. In unfiltered mode, set `rpcwhitelistdefault=0`: the public user remains unrestricted
-   while the operator identity is still restricted to its narrow list.
-5. Give the control plane the operator username/password through its existing
-   environment boundary. Do not mount node1's datadir or cookie into the control plane.
-6. Build a dedicated node1 operator RPC client. Do not replace process-global
+1. `NODE1_INTERNAL_RPC_USER` and `NODE1_INTERNAL_RPC_PASS` have fixed Compose defaults
+   only in the control-plane service. They factorize the private client wiring and are
+   not supported user settings. The matching salted `rpcauth` value is fixed directly
+   in the two declarative node1 config objects; there is deliberately no
+   `NODE1_INTERNAL_RPCAUTH` environment variable.
+2. Deliberately omit the two internal variables from `.env.example` and
+   `.env.full.example`.
+   Document that omission as an intentional feature so a future contributor or agent
+   does not "fix" it by exposing them as normal settings.
+3. Keep the default username, plaintext password, and precomputed `rpcauth` value as
+   one internal invariant. If maintainers deliberately rotate the internal credential,
+   they must regenerate the hash and change all three locations together.
+4. Keep the same fixed internal `rpcauth` line in both `node1-rpc-true` and
+   `node1-rpc-false` in `docker/node1-rpc-configs.compose.yml`.
+5. Give only the internal username/password to the control-plane container. Node1 gets
+   the `rpcauth` representation and does not need the plaintext internal password.
+6. Build a dedicated node1 internal RPC client. Do not replace process-global
    `BTC_RPC_USER` credentials, because all existing node1 reads and node2/node3 actions
    must retain their current identities.
-7. Keep the control plane with one narrow state volume, no Docker socket, no Docker
-   CLI, no repository mount, and no process executor.
+7. Do not add these variables to dashboard settings, public API configuration, CLI
+   flags, example environment files, or ordinary customization documentation.
+8. Do not mount node1's datadir or cookie into the control plane. Keep its narrow state
+   volume and preserve the existing prohibition on Docker sockets, Docker CLI,
+   repository mounts, and process executors.
 
-The operator credentials are an authorization separation for a local regtest tool, not
-a hardened secret from someone who controls the host or can inspect containers. That
-matches the repository's existing development credential model.
+The internal credentials are an implementation convenience for a local regtest tool,
+not a hardened secret from someone who controls the host, reads the repository, or
+inspects containers. Their purpose is to keep ordinary user-facing RPC calls realistic,
+not to establish an adversarial security boundary.
 
 ## Public contract
 
@@ -151,7 +165,7 @@ trait RewindBackend: Send + Sync {
 The production adapter uses:
 
 - existing normal RPC credentials for unrestricted node2 and node3;
-- the dedicated operator client only for node1 mutations;
+- the dedicated internal client only for node1 mutations;
 - ordinary public credentials for non-privileged node1 reads where practical.
 
 Tests use an in-memory backend that can fail before or after each node mutation and can
@@ -198,7 +212,7 @@ Invalidate in this order:
 
 1. node2;
 2. node3;
-3. node1 through the operator identity.
+3. node1 through the internal identity.
 
 Keeping node1 last avoids showing the user-facing endpoint at the lower height while a
 miner still advertises the old active tip. After every call:
@@ -330,15 +344,19 @@ Extend static and live checks:
 
 - the public node1 user still receives empty HTTP 403 for `invalidateblock` and
   `reconsiderblock`;
-- the operator identity is accepted only by node1 and only for its explicit narrow
+- the internal identity is accepted by node1 and is not restricted by the public
   whitelist;
-- the operator identity cannot call `generatetoaddress`, `stop`, `setban`, wallet RPCs,
-  or unrelated administrative methods;
+- a method forbidden to the public user reaches normal RPC dispatch when called with
+  the internal identity (the method may still return an ordinary application error,
+  such as a disabled-wallet error, but must not return an authorization 403);
 - node2 and node3 remain unrestricted under the existing shared credentials;
-- changing `FILTER_NODE1_RPC` does not accidentally broaden the operator whitelist;
+- changing `FILTER_NODE1_RPC` restricts or unrestricts only the public identity and
+  leaves the internal identity fully authorized;
+- internal RPC credential variables have Compose defaults but are absent from
+  `.env.example` and `.env.full.example` by design;
 - the rendered Compose model contains no shell wrapper, Docker socket, node datadir
   mount in the control plane, or exposed private service port;
-- logs, events, job request JSON, and status payloads never contain operator passwords
+- logs, events, job request JSON, and status payloads never contain internal passwords
   or `rpcauth` material.
 
 ## Tests
@@ -349,7 +367,8 @@ Extend static and live checks:
 - target and boundary hashes are computed correctly for depths 1 and 100;
 - one boundary invalidation represents the full requested suffix;
 - job compatibility classifies Rewind as exclusive and convergence-sensitive;
-- public and operator allowlists contain exactly their intended methods;
+- the public allowlist contains exactly its intended methods while the internal
+  identity remains outside that allowlist and receives full access;
 - recovery state transitions are exhaustive and serializable;
 - old job-store schemas migrate with no invented rewind recovery context.
 
@@ -394,6 +413,21 @@ On a fresh bootstrapped chain:
 Also run the existing bootstrap, reorg, partition/heal, snapshot, node1 RPC policy,
 Compose trust-boundary, explorer, and full Rust CI-equivalent suites.
 
+### Optional explorer behavior
+
+An electrs-based profile is optional and never participates in rewind safety. The
+bundled electrs handles replacement-chain reorgs but can exit when Core rolls back to
+an already indexed ancestor without adding any new header. The control plane therefore
+compares electrs's exact indexed height and hash with node1, and adapters attach a
+conditional recovery advisory to successful rewinds. They must not claim an explorer
+problem when the selected Compose profile did not include electrs.
+
+Docker lifecycle access remains outside the control plane. The host helper
+`scripts/recover-explorer.sh` is a no-op when no electrs container exists; otherwise it
+also declines a cleanly stopped electrs when no mempool frontend is active. For an
+active or unexpectedly exited indexer it force-recreates only electrs and waits for
+exact node1-tip synchronization.
+
 ## Documentation changes during implementation
 
 Update:
@@ -401,19 +435,22 @@ Update:
 - `README.md`: distinguish Mine, Rewind, and Reorg;
 - `docs/RUNBOOK.md`: CLI/API examples, pause-mining advice, and recovery guidance;
 - `docs/CONTROL_PLANE.md`: endpoint, DTO, job phases, CLI, and MCP tool;
-- `docs/SETTINGS.md`: private operator auth and unchanged public RPC policy;
+- `docs/SETTINGS.md`: unchanged public RPC policy and an explicit note that the
+  Compose-defaulted internal RPC variables are intentionally not user settings;
 - `docs/SNAPSHOTS.md`: persistent invalid-chain state;
 - `docs/PARTITIONS.md`: rewind is forbidden during impairments;
-- the node1 RPC whitelist plan: document the new least-privilege internal identity;
-- `.env.example` and `.env.full.example`: operator credential/hash relationship;
+- the node1 RPC whitelist plan: document the new full-access internal identity and its
+  non-adversarial trust model;
+- `AGENTS.md`: preserve the invariant that internal RPC variables stay out of both
+  example environment files and are not promoted into supported settings;
 - `AGENTS.md`: any new backend/test files.
 
 ## Implementation sequence
 
 1. Add the shared request/response types and `JobKind::Rewind` without exposing a route.
-2. Add the narrow operator `rpcauth` identity to both declarative node1 configs and
-   extend static/live policy tests.
-3. Add an explicit-auth node1 operator client and `RewindBackend` with mock coverage.
+2. Add the Compose-defaulted internal `rpcauth` identity to both declarative node1
+   configs and extend static/live policy tests without adding it to example env files.
+3. Add an explicit-auth node1 internal client and `RewindBackend` with mock coverage.
 4. Add request validation, target calculation, and converged-start checks.
 5. Add durable rewind recovery context and job-store migration.
 6. Implement owned spam/mining lease acquisition and coordinated invalidation.
@@ -429,11 +466,15 @@ Update:
   expected ancestor.
 - No replacement blocks are mined by the rewind action.
 - Public node1 callers still cannot invoke chain-choice RPCs.
-- The control plane uses a separate least-privilege identity only for node1 rewind and
-  recovery.
+- The control plane uses a separate full-access internal identity for node1 rewind and
+  recovery, while ordinary user-facing calls retain the public identity.
+- Internal credential environment variables have fixed Compose defaults and remain
+  deliberately absent from both example environment files and public settings.
 - Partial execution, abort, and restart never silently leave a split chain or unlock
   incompatible mutations before recovery.
 - Previous mining/spam desired states are preserved.
 - Existing Reorg behavior remains unchanged and is clearly distinguished in the UI.
+- Optional electrs absence is harmless; when present, degraded synchronization is
+  visible and recovery is one explicit host command.
 - The implementation adds no proxy, second backend, Docker privilege, or node datadir
   access to the control plane.

@@ -5,7 +5,11 @@ configs:
     content: >
       # Bitcoin Core 31.1 node1 RPC policy.
 
-      rpcwhitelistdefault=1
+      # Public whitelist is explicit; the internal authenticated user gets full access.
+
+      rpcwhitelistdefault=0
+
+      rpcauth=simchain-internal:5f2d63c89b7a4e10d6c13a99f2047b00$11155c539e85f95f4160663483867a80f2ea9c36a0b79690fb9053d4893a5a61
 
       rpcwhitelist=${BTC_RPC_USER:-foo}:abandontransaction,
       abortrescan,
@@ -160,3 +164,4 @@ configs:
   node1-rpc-false:
     content: |
       # Node1 RPC filtering is disabled.
+      rpcauth=simchain-internal:5f2d63c89b7a4e10d6c13a99f2047b00$11155c539e85f95f4160663483867a80f2ea9c36a0b79690fb9053d4893a5a61

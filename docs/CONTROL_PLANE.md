@@ -14,8 +14,9 @@ watch chain state and manage live operations.
 ## What It Owns
 
 Mining and spam policy plus pause/resume use private worker APIs and never recreate
-their containers. Reorgs, partitions, timed network degradation, manual mine/burst
-actions, faucet funding, and scenarios are durable server-side jobs under one scheduler.
+their containers. Reorgs, true shorter-chain rewinds, partitions, timed network
+degradation, manual mine/burst actions, faucet funding, and scenarios are durable
+server-side jobs under one scheduler.
 Most mutations remain exclusive; a timed degradation may overlap a manual Mine job and
 degradations on other nodes. Reorgs and partitions pause workers with expiring leases; namespace-local network
 agents also heal on TTL expiry. Scenarios persist ordered steps, checkpoints, results,
@@ -54,6 +55,9 @@ preserved, and the controls re-enable automatically after a successful status po
 Bounded-action buttons are also disabled when one of their required workers, Bitcoin
 nodes, or network agents is unreachable; the dashboard names the missing dependency.
 Scenario submission remains available because dependencies are determined by its YAML.
+The mining card contains separate **Mine blocks** and **Rewind chain** subpanels. Rewind
+always targets all three nodes, shows the expected lower height in a confirmation, and
+warns that disconnected transactions can return to node-local mempools.
 
 Configuration applies never touch node chain state, and mixed mining/spam applies roll
 back transactionally if a worker cannot accept or verify the new generation. Mining
@@ -105,13 +109,19 @@ job_id="$(curl -s -X POST localhost:8090/api/v1/jobs/reorg \
   -H "Idempotency-Key: example-reorg-1" \
   -d '{"depth":3,"empty":true,"node":"node3"}' | jq -r .job_id)"
 curl -s "localhost:8090/api/v1/jobs/$job_id/events?after=0" | jq .
+
+curl -s -X POST localhost:8090/api/v1/jobs/rewind \
+  -H "Authorization: Bearer $token" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: rewind-example-1" \
+  -d '{"blocks":3}'
 ```
 
 ## MCP
 
 The same operations are exposed over MCP (streamable HTTP) at
 `http://localhost:8090/mcp`, so coding agents can inspect and retune the simnet
-directly. Mutation tools include `start_reorg`, `start_partition`, `start_degrade`,
+directly. Mutation tools include `start_reorg`, `rewind_chain`, `start_partition`, `start_degrade`,
 `start_scenario`, `fund_addresses`, `get_faucet_status`, `get_faucet_transfer`,
 `get_job`, `list_jobs`, and `abort_job` over the same coordinator and validation as
 HTTP.
@@ -140,6 +150,7 @@ cargo run -p simchainctl -- config set BLOCK_INTERVAL_MEAN_SECS=12 SPAM_FILL_BLO
 cargo run -p simchainctl -- mining pause
 cargo run -p simchainctl -- mining resume
 cargo run -p simchainctl -- reorg start --depth 3 --empty --wait
+cargo run -p simchainctl -- rewind --blocks 3 --wait
 cargo run -p simchainctl -- partition start --node node3 --main-blocks 3 --isolated-blocks 5 --heal-delay-secs 15 --wait
 cargo run -p simchainctl -- degrade start --node node2 --delay-ms 5000 --loss-pct 0 --seconds 30 --wait
 cargo run -p simchainctl -- jobs list
@@ -154,6 +165,19 @@ cargo run -p simchainctl -- faucet transfer TXID --watch
 ```
 
 `reorg start --wait` streams progress and exits `0` only after successful cleanup.
+`rewind --wait` similarly waits for all three nodes to report the exact lower ancestor.
+Unlike reorg, rewind mines no replacement blocks; it uses the internal node1 identity
+only for node1's administrative RPC and rolls a partial operation back before releasing
+its worker leases. A successful rewind job includes a structured
+`electrs_reindex_may_be_required` advisory. It is conditional on an electrs-based
+profile being active; recover a degraded bundled explorer with
+`./scripts/recover-explorer.sh`.
+
+Status keeps frontend reachability separate from index correctness. `explorer.reachable`
+describes the mempool.space web frontend, `explorer.indexer_reachable` describes the
+electrs HTTP API, and `explorer.synchronized` becomes true only when electrs reports the
+same exact height and block hash as node1. The optional `recovery_command` is populated
+for a reachable frontend backed by a stale or unavailable indexer.
 `spam prepare` reads the same node, transaction count, and shape fields as
 `spam burst`. It provisions the dedicated manual-burst branch pool and may mine
 the minimum confirmation blocks without changing the mining controller's desired

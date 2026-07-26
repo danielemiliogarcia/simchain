@@ -35,16 +35,30 @@ pub fn print_status(status: &StatusResponse, json: bool) -> Result<(), ClientErr
         writeln!(out, "{name}: {}{reachability}", component.status)?;
     }
     if let Some(explorer) = &status.explorer {
-        writeln!(
-            out,
-            "explorer: {} ({})",
-            explorer.url,
-            if explorer.reachable {
-                "reachable"
-            } else {
-                "unreachable"
-            }
-        )?;
+        let state = match (
+            explorer.reachable,
+            explorer.indexer_reachable,
+            explorer.synchronized,
+        ) {
+            (true, true, Some(true)) => format!(
+                "synchronized at height {}",
+                optional(explorer.indexed_height)
+            ),
+            (true, false, _) => "degraded: electrs unavailable".to_string(),
+            (false, true, Some(false)) => format!(
+                "electrs indexing at height {}; frontend unavailable",
+                optional(explorer.indexed_height)
+            ),
+            (false, true, _) => "electrs reachable; frontend unavailable".to_string(),
+            _ => "unavailable".to_string(),
+        };
+        writeln!(out, "explorer: {} ({})", explorer.url, state)?;
+        if let Some(error) = explorer.error.as_deref() {
+            writeln!(out, "explorer warning: {error}")?;
+        }
+        if let Some(command) = explorer.recovery_command.as_deref() {
+            writeln!(out, "explorer recovery: {command}")?;
+        }
     }
     if let Some(error) = status.last_error.as_deref() {
         writeln!(out, "warning: {error}")?;
@@ -116,6 +130,18 @@ pub fn print_job_created(response: &JobCreatedResponse, json: bool) -> Result<()
         response.job_id,
         response.state.as_str(),
         reused
+    )?;
+    Ok(())
+}
+
+pub fn print_rewind_advisory(json: bool) -> Result<(), ClientError> {
+    if json {
+        return Ok(());
+    }
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
+        "warning: if an electrs-based profile is active, rewind may require ./scripts/recover-explorer.sh; Bitcoin Core and its mempools are unaffected"
     )?;
     Ok(())
 }
@@ -277,6 +303,27 @@ pub fn print_job(job: &JobDetail, json: bool) -> Result<(), ClientError> {
     )?;
     if let Some(failure) = &job.failure {
         writeln!(out, "failure: {}: {}", failure.code, failure.message)?;
+    }
+    if let Some(warnings) = job
+        .result
+        .as_ref()
+        .and_then(|result| result.get("warnings"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for warning in warnings {
+            if let Some(message) = warning
+                .as_str()
+                .or_else(|| warning.get("message").and_then(serde_json::Value::as_str))
+            {
+                writeln!(out, "warning: {message}")?;
+            }
+            if let Some(command) = warning
+                .get("recovery_command")
+                .and_then(serde_json::Value::as_str)
+            {
+                writeln!(out, "recovery: {command}")?;
+            }
+        }
     }
     if !job.summary.cleanup.errors.is_empty() {
         writeln!(

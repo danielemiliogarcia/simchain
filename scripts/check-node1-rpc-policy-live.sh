@@ -10,6 +10,7 @@ set -euo pipefail
 
 node1_container=btc-simnet-node1
 node2_container=btc-simnet-node2
+control_container=btc-simnet-control-plane
 response_file="$(mktemp)"
 trap 'unlink "$response_file" 2>/dev/null || true' EXIT
 
@@ -41,11 +42,15 @@ published_rpc_port() {
 
 rpc_user="$(container_env "$node1_container" BTC_RPC_USER)"
 rpc_pass="$(container_env "$node1_container" BTC_RPC_PASS)"
+internal_rpc_user="$(container_env "$control_container" NODE1_INTERNAL_RPC_USER)"
+internal_rpc_pass="$(container_env "$control_container" NODE1_INTERNAL_RPC_PASS)"
 node1_port="$(published_rpc_port "$node1_container")"
 node2_port="$(published_rpc_port "$node2_container")"
 
 [ -n "$rpc_user" ] || die "could not resolve BTC_RPC_USER from node1"
 [ -n "$rpc_pass" ] || die "could not resolve BTC_RPC_PASS from node1"
+[ -n "$internal_rpc_user" ] || die "could not resolve NODE1_INTERNAL_RPC_USER from control plane"
+[ -n "$internal_rpc_pass" ] || die "could not resolve NODE1_INTERNAL_RPC_PASS from control plane"
 [ -n "$node1_port" ] || die "node1 RPC port is not published to the host"
 [ -n "$node2_port" ] || die "node2 RPC port is not published to the host"
 
@@ -53,10 +58,15 @@ RPC_HTTP=""
 RPC_BODY=""
 rpc() {
     local port="$1" payload="$2" path="${3:-/}"
+    rpc_as "$port" "$rpc_user" "$rpc_pass" "$payload" "$path"
+}
+
+rpc_as() {
+    local port="$1" user="$2" pass="$3" payload="$4" path="${5:-/}"
     RPC_HTTP="$(curl -sS \
         --connect-timeout 5 \
         --max-time 30 \
-        --user "$rpc_user:$rpc_pass" \
+        --user "$user:$pass" \
         --header 'content-type: application/json' \
         --data-binary "$payload" \
         --output "$response_file" \
@@ -120,6 +130,17 @@ denied=(
 )
 for method in "${denied[@]}"; do
     assert_denied "$method"
+done
+
+# The fixed Simchain-internal identity is deliberately full-access. Invalid
+# argument counts prove that public-forbidden methods reached normal Core RPC
+# dispatch without actually changing chain or process state.
+for method in invalidateblock reconsiderblock generatetoaddress stop; do
+    payload="$(jq -nc --arg method "$method" \
+        '{jsonrpc:"2.0",id:20,method:$method,params:[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null]}')"
+    rpc_as "$node1_port" "$internal_rpc_user" "$internal_rpc_pass" "$payload"
+    [ "$RPC_HTTP" != "401" ] && [ "$RPC_HTTP" != "403" ] \
+        || die "internal identity was not authorized for '$method' (HTTP $RPC_HTTP)"
 done
 
 # Wallet routing, whitespace, and named parameters must not bypass method

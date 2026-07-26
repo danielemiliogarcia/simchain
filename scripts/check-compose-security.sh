@@ -80,13 +80,17 @@ jq -e '
   and ($root.configs[$policy] != null)
   and (
     if $filter == "true" then
-      ($root.configs[$policy].content | contains("rpcwhitelistdefault=1"))
+      ($root.configs[$policy].content | contains("rpcwhitelistdefault=0"))
       and ($root.configs[$policy].content
            | contains("rpcwhitelist=" + $node1.environment.BTC_RPC_USER + ":"))
+      and ($root.configs[$policy].content | contains("rpcauth=simchain-internal:"))
     else
       ($root.configs[$policy].content | contains("rpcwhitelist") | not)
+      and ($root.configs[$policy].content | contains("rpcauth=simchain-internal:"))
     end
   )
+  and ($root.services["btc-simnet-control-plane"].environment.NODE1_INTERNAL_RPC_USER == "simchain-internal")
+  and ($root.services["btc-simnet-control-plane"].environment.NODE1_INTERNAL_RPC_PASS == "simchain-internal-rpc-password")
   and (
     ["btc-simnet-node2", "btc-simnet-node3"]
     | all(. as $service

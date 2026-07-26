@@ -80,17 +80,28 @@
         one; owned worker leases are renewed through execution and cleaned at a safe boundary.</p>
       <div id="mutation-lock" class="mutation-lock">mutation coordinator is idle</div>
       <div class="bounded-actions">
-        <form id="mine-form" class="mini-action-form">
-          <h3>Mine blocks</h3>
-          <label data-help="Miner node that will generate the requested block or blocks. Example: node2 mines blocks with node2's stable miner label.">Node
-            <select id="mine-node"><option value="node2">node2</option><option value="node3">node3</option></select>
-          </label>
-          <label data-help="Number of blocks to mine immediately. Example: 1 advances the chain by one height; 3 mines three consecutive blocks.">Blocks
-            <input id="mine-blocks" type="number" min="1" value="1" required>
-          </label>
-          <button id="mine-start" type="submit">Mine</button>
-          <div id="mine-action-result" class="action-result"></div>
-        </form>
+        <div class="mini-action-form chain-actions-card">
+          <form id="mine-form" class="chain-action-subpane">
+            <h3>Mine blocks</h3>
+            <label data-help="Miner node that will generate the requested block or blocks. Example: node2 mines blocks with node2's stable miner label.">Node
+              <select id="mine-node"><option value="node2">node2</option><option value="node3">node3</option></select>
+            </label>
+            <label data-help="Number of blocks to mine immediately. Example: 1 advances the chain by one height; 3 mines three consecutive blocks.">Blocks
+              <input id="mine-blocks" type="number" min="1" value="1" required>
+            </label>
+            <button id="mine-start" type="submit">Mine</button>
+            <div id="mine-action-result" class="action-result"></div>
+          </form>
+          <form id="rewind-form" class="chain-action-subpane rewind-subpane">
+            <h3>Rewind chain</h3>
+            <label data-help="Newest blocks to administratively invalidate on node2, node3, and node1. All nodes finish at the same shorter height; this is not a proof-of-work reorg.">Blocks
+              <input id="rewind-blocks" type="number" min="1" max="100" value="1" required>
+            </label>
+            <button id="rewind-start" class="danger" type="submit">Rewind</button>
+            <p class="rewind-warning">Test-only administrative action. Disconnected transactions may return to node-local mempools. Mining returns to its previous state afterward: running resumes, and paused stays paused. <span id="rewind-explorer-warning" hidden>An active electrs-based explorer may temporarily become unavailable and require <code>./scripts/recover-explorer.sh</code>.</span></p>
+            <div id="rewind-action-result" class="action-result"></div>
+          </form>
+        </div>
         <form id="burst-form" class="mini-action-form">
           <h3>Spam burst</h3>
           <label data-help="Miner node whose raw transaction engine submits the burst. Example: node2 creates transactions from node2's available spam funds.">Node

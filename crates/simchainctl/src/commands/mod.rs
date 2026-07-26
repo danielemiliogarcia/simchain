@@ -66,6 +66,8 @@ pub enum Command {
     Spam(SpamArgs),
     /// Mine a bounded number of blocks through a server-side action job.
     Mine(MineArgs),
+    /// Administratively rewind all three nodes to a shorter common chain.
+    Rewind(RewindArgs),
     /// Fund regtest addresses with a miner-prioritized exact-zero-fee transaction.
     Faucet(FaucetArgs),
     /// Inspect or start bounded server-side chain reorganization jobs.
@@ -168,6 +170,22 @@ pub struct MineArgs {
     #[arg(long)]
     pub blocks: u64,
     /// Wait for the server-side action to finish.
+    #[arg(long)]
+    pub wait: bool,
+    #[arg(long, default_value_t = 900)]
+    pub timeout: u64,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RewindArgs {
+    /// Number of newest blocks to invalidate on all three nodes (1-100).
+    #[arg(long)]
+    pub blocks: u64,
+    /// Wait for the server-side rewind and convergence checks to finish.
     #[arg(long)]
     pub wait: bool,
     #[arg(long, default_value_t = 900)]
@@ -741,6 +759,26 @@ mod tests {
                 wait: true,
                 ..
             })
+        ));
+
+        let rewind = Cli::try_parse_from([
+            "simchainctl",
+            "rewind",
+            "--blocks",
+            "3",
+            "--wait",
+            "--idempotency-key",
+            "rewind-3",
+        ])
+        .expect("rewind command");
+        assert!(matches!(
+            rewind.command,
+            Command::Rewind(RewindArgs {
+                blocks: 3,
+                wait: true,
+                idempotency_key: Some(ref key),
+                ..
+            }) if key == "rewind-3"
         ));
 
         let burst = Cli::try_parse_from([

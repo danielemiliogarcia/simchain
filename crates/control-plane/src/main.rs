@@ -13,6 +13,7 @@ mod mcp;
 mod network_job;
 mod reconcile;
 mod reorg_job;
+mod rewind_job;
 mod rpc_backend;
 mod scenario_job;
 mod service;
@@ -113,6 +114,9 @@ async fn main() -> anyhow::Result<()> {
     ));
     let apply_lock = Arc::new(Mutex::new(()));
     let reorg_executor = Arc::new(reorg_job::RpcReorgExecutor::from_config(&config)?);
+    let rewind_executor = Arc::new(rewind_job::CoordinatedRewindExecutor::new(Box::new(
+        rewind_job::RpcRewindBackend::from_config(&config),
+    )));
     let scenario_backend = Arc::new(scenario_job::RpcScenarioActionBackend::from_config(
         &config,
         mining.clone(),
@@ -131,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
             control_state: control_state.clone(),
             apply_lock: apply_lock.clone(),
             reorg: reorg_executor,
+            rewind: rewind_executor,
             scenario: scenario_backend,
             network_actions,
             faucet,
@@ -184,6 +189,8 @@ mod token_tests {
             node1_url: "http://node1:18443".to_string(),
             node2_url: "http://node2:18443".to_string(),
             node3_url: "http://node3:18443".to_string(),
+            node1_internal_rpc_user: "simchain-internal".to_string(),
+            node1_internal_rpc_pass: "simchain-internal-rpc-password".to_string(),
             state_dir: dir.join(".simchain-control"),
             mining_control_url: "http://mining:9081".to_string(),
             spam_control_url: "http://spam:9082".to_string(),
@@ -193,6 +200,7 @@ mod token_tests {
             internal_token: "test-internal-token".to_string(),
             explorer_url: "http://127.0.0.1:1080".to_string(),
             explorer_probe_url: "http://mempool-web:8080".to_string(),
+            electrs_probe_url: "http://electrs:3000".to_string(),
             user_address: "bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk".to_string(),
             node2_wallet_name: "node2".to_string(),
             node3_wallet_name: "node3".to_string(),

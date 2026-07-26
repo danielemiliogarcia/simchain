@@ -20,6 +20,8 @@ pub const SPAM_COMPONENT: &str = "spam";
 pub const NODE1_COMPONENT: &str = "node1";
 pub const NODE2_COMPONENT: &str = "node2";
 pub const NODE3_COMPONENT: &str = "node3";
+pub const DEFAULT_NODE1_INTERNAL_RPC_USER: &str = "simchain-internal";
+pub const DEFAULT_NODE1_INTERNAL_RPC_PASS: &str = "simchain-internal-rpc-password";
 
 #[derive(Clone, Debug)]
 pub struct ControlPlaneConfig {
@@ -27,6 +29,8 @@ pub struct ControlPlaneConfig {
     pub node1_url: String,
     pub node2_url: String,
     pub node3_url: String,
+    pub node1_internal_rpc_user: String,
+    pub node1_internal_rpc_pass: String,
     pub state_dir: PathBuf,
     pub mining_control_url: String,
     pub spam_control_url: String,
@@ -36,6 +40,7 @@ pub struct ControlPlaneConfig {
     pub internal_token: String,
     pub explorer_url: String,
     pub explorer_probe_url: String,
+    pub electrs_probe_url: String,
     pub user_address: String,
     pub node2_wallet_name: String,
     pub node3_wallet_name: String,
@@ -56,6 +61,12 @@ impl ControlPlaneConfig {
             .unwrap_or_else(|_| "http://btc-simnet-node2:18443".to_string());
         let node3_url = std::env::var("NODE3_RPC_URL")
             .unwrap_or_else(|_| "http://btc-simnet-node3:18443".to_string());
+        // These variables are internal Compose wiring, not supported user
+        // settings. They intentionally stay out of both example env files.
+        let node1_internal_rpc_user =
+            non_empty_env("NODE1_INTERNAL_RPC_USER", DEFAULT_NODE1_INTERNAL_RPC_USER)?;
+        let node1_internal_rpc_pass =
+            non_empty_env("NODE1_INTERNAL_RPC_PASS", DEFAULT_NODE1_INTERNAL_RPC_PASS)?;
         let state_dir = std::env::var("SIMCHAIN_CONTROL_STATE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(".simchain-control"));
@@ -92,6 +103,17 @@ impl ControlPlaneConfig {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| explorer_url.clone());
         ensure_http_url("MEMPOOL_WEB_INTERNAL_URL", &explorer_probe_url)?;
+        let electrs_probe_url = std::env::var("ELECTRS_HTTP_INTERNAL_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                let port = std::env::var("ELECTRS_HTTP_PORT")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "3000".to_string());
+                format!("http://127.0.0.1:{port}")
+            });
+        ensure_http_url("ELECTRS_HTTP_INTERNAL_URL", &electrs_probe_url)?;
         let user_address = non_empty_env(
             "USER_ADDRESS",
             "bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk",
@@ -113,6 +135,8 @@ impl ControlPlaneConfig {
             node1_url,
             node2_url,
             node3_url,
+            node1_internal_rpc_user,
+            node1_internal_rpc_pass,
             state_dir,
             mining_control_url,
             spam_control_url,
@@ -122,6 +146,7 @@ impl ControlPlaneConfig {
             internal_token,
             explorer_url,
             explorer_probe_url,
+            electrs_probe_url,
             user_address,
             node2_wallet_name,
             node3_wallet_name,
