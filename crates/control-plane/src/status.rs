@@ -315,7 +315,17 @@ fn slow_tick(app: &SharedState, client: Option<&Client>) {
     let slow_result = client
         .ok_or_else(|| anyhow::anyhow!("node1 RPC client unavailable"))
         .and_then(sample_chain_detail);
-    let explorer = probe_explorer(&app.config.explorer_url, &app.config.explorer_probe_url);
+    let expected_tip = slow_result
+        .as_ref()
+        .ok()
+        .and_then(|(blocks, _, _)| blocks.first())
+        .map(|block| (block.height, block.hash.as_str()));
+    let explorer = probe_explorer(
+        &app.config.explorer_url,
+        &app.config.explorer_probe_url,
+        &app.config.electrs_probe_url,
+        expected_tip,
+    );
     let mut snapshot = app.status.write().expect("status lock");
     match slow_result {
         Ok((blocks, cadence, histogram)) => {
@@ -331,23 +341,97 @@ fn slow_tick(app: &SharedState, client: Option<&Client>) {
     refresh_last_error(&mut snapshot);
 }
 
-fn probe_explorer(public_url: &str, probe_url: &str) -> ExplorerStatus {
-    match minreq::get(probe_url).with_timeout(2).send() {
-        Ok(response) if (200..400).contains(&response.status_code) => ExplorerStatus {
-            url: public_url.to_string(),
-            reachable: true,
-            error: None,
-        },
-        Ok(response) => ExplorerStatus {
-            url: public_url.to_string(),
-            reachable: false,
-            error: Some(format!("probe returned HTTP {}", response.status_code)),
-        },
-        Err(error) => ExplorerStatus {
-            url: public_url.to_string(),
-            reachable: false,
-            error: Some(error.to_string()),
-        },
+fn probe_explorer(
+    public_url: &str,
+    web_probe_url: &str,
+    electrs_probe_url: &str,
+    expected_tip: Option<(u64, &str)>,
+) -> ExplorerStatus {
+    let web = probe_http(web_probe_url);
+    let indexed_tip = probe_electrs_tip(electrs_probe_url);
+    explorer_status(public_url, web, indexed_tip, expected_tip)
+}
+
+fn probe_http(url: &str) -> Result<(), String> {
+    let response = minreq::get(url)
+        .with_timeout(2)
+        .send()
+        .map_err(|error| error.to_string())?;
+    if (200..400).contains(&response.status_code) {
+        Ok(())
+    } else {
+        Err(format!("HTTP {}", response.status_code))
+    }
+}
+
+fn probe_electrs_tip(base_url: &str) -> Result<(u64, String), String> {
+    let base = base_url.trim_end_matches('/');
+    let height = probe_text(&format!("{base}/blocks/tip/height"))?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid electrs tip height: {error}"))?;
+    let hash = probe_text(&format!("{base}/blocks/tip/hash"))?;
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid electrs tip hash".to_string());
+    }
+    Ok((height, hash))
+}
+
+fn probe_text(url: &str) -> Result<String, String> {
+    let response = minreq::get(url)
+        .with_timeout(2)
+        .send()
+        .map_err(|error| error.to_string())?;
+    if !(200..300).contains(&response.status_code) {
+        return Err(format!("HTTP {}", response.status_code));
+    }
+    response
+        .as_str()
+        .map(|body| body.trim().to_string())
+        .map_err(|error| error.to_string())
+}
+
+fn explorer_status(
+    public_url: &str,
+    web: Result<(), String>,
+    indexed_tip: Result<(u64, String), String>,
+    expected_tip: Option<(u64, &str)>,
+) -> ExplorerStatus {
+    let reachable = web.is_ok();
+    let indexer_reachable = indexed_tip.is_ok();
+    let indexed_height = indexed_tip.as_ref().ok().map(|(height, _)| *height);
+    let indexed_hash = indexed_tip.as_ref().ok().map(|(_, hash)| hash.clone());
+    let synchronized = expected_tip.map(|(height, hash)| {
+        indexed_tip
+            .as_ref()
+            .is_ok_and(|(indexed_height, indexed_hash)| {
+                *indexed_height == height && indexed_hash == hash
+            })
+    });
+    let mut errors = Vec::new();
+    if let Err(error) = web {
+        errors.push(format!("frontend probe failed: {error}"));
+    }
+    match (&indexed_tip, expected_tip) {
+        (Err(error), _) => errors.push(format!("electrs probe failed: {error}")),
+        (Ok((indexed_height, indexed_hash)), Some((height, hash)))
+            if *indexed_height != height || indexed_hash != hash =>
+        {
+            errors.push(format!(
+                "electrs is at height {indexed_height} hash {indexed_hash}; node1 is at height {height} hash {hash}"
+            ));
+        }
+        _ => {}
+    }
+    ExplorerStatus {
+        url: public_url.to_string(),
+        reachable,
+        indexer_reachable,
+        synchronized,
+        indexed_height,
+        indexed_hash,
+        recovery_command: (reachable && synchronized == Some(false))
+            .then(|| "./scripts/recover-explorer.sh".to_string()),
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
     }
 }
 
@@ -483,5 +567,55 @@ mod tests {
         let error = snapshot.last_error.expect("aggregate error");
         assert!(error.contains("worker down"));
         assert!(error.contains("verbose mempool failed"));
+    }
+
+    #[test]
+    fn explorer_is_healthy_only_at_node1s_exact_tip() {
+        let hash = "a".repeat(64);
+        let status = explorer_status(
+            "http://localhost:1080",
+            Ok(()),
+            Ok((210, hash.clone())),
+            Some((210, &hash)),
+        );
+        assert!(status.reachable);
+        assert!(status.indexer_reachable);
+        assert_eq!(status.synchronized, Some(true));
+        assert!(status.error.is_none());
+        assert!(status.recovery_command.is_none());
+    }
+
+    #[test]
+    fn reachable_frontend_with_failed_indexer_is_degraded_and_recoverable() {
+        let hash = "b".repeat(64);
+        let status = explorer_status(
+            "http://localhost:1080",
+            Ok(()),
+            Err("connection refused".to_string()),
+            Some((210, &hash)),
+        );
+        assert!(status.reachable);
+        assert!(!status.indexer_reachable);
+        assert_eq!(status.synchronized, Some(false));
+        assert_eq!(
+            status.recovery_command.as_deref(),
+            Some("./scripts/recover-explorer.sh")
+        );
+        assert!(status.error.expect("probe error").contains("electrs"));
+    }
+
+    #[test]
+    fn absent_optional_explorer_has_no_recovery_command() {
+        let hash = "c".repeat(64);
+        let status = explorer_status(
+            "http://localhost:1080",
+            Err("not configured".to_string()),
+            Err("not configured".to_string()),
+            Some((210, &hash)),
+        );
+        assert!(!status.reachable);
+        assert!(!status.indexer_reachable);
+        assert_eq!(status.synchronized, Some(false));
+        assert!(status.recovery_command.is_none());
     }
 }

@@ -162,6 +162,11 @@ curl -s -X POST localhost:8090/api/v1/jobs/degrade \
 MCP exposes `start_partition` and `start_degrade`; inspect progress with `get_job` or
 `list_jobs`. CLI/API/MCP/dashboard all reach this one control-plane backend.
 
+A true shorter-chain rewind is an exclusive all-node mutation. It is rejected while a
+partition or degradation is active, and partition/degradation requests are rejected
+while rewind is running or recovering. Rewind requires all three nodes to start on the
+same tip, so it never attempts to reinterpret a split network as a shorter-chain action.
+
 ## Failure and recovery
 
 Network leases use the same short renewal cadence as worker pause leases. If the control

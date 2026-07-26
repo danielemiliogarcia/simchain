@@ -81,6 +81,29 @@ pub fn create_client(rpc_url: impl AsRef<str>) -> Result<Client, CommonError> {
     Ok(Client::from_jsonrpc(create_jsonrpc_client(rpc_url)?))
 }
 
+/// Build an RPC client with explicit credentials instead of the process-wide
+/// public identity. This is reserved for internal identities whose permission
+/// set deliberately differs from ordinary tool traffic.
+pub fn create_client_with_auth(
+    rpc_url: impl AsRef<str>,
+    user: impl Into<String>,
+    pass: impl Into<String>,
+) -> Result<Client, CommonError> {
+    let rpc_url = rpc_url.as_ref();
+    let transport = jsonrpc::simple_http::SimpleHttpTransport::builder()
+        .url(rpc_url)
+        .map_err(|source| CommonError::InvalidRpcUrl {
+            url: rpc_url.to_string(),
+            source,
+        })?
+        .auth(user.into(), Some(pass.into()))
+        .timeout(Duration::from_secs(RPC_TIMEOUT_SECS))
+        .build();
+    Ok(Client::from_jsonrpc(jsonrpc::Client::with_transport(
+        transport,
+    )))
+}
+
 /// Build a wallet-scoped RPC client. Wallet paths stay stable even when a node
 /// has multiple wallets loaded, unlike the generic node RPC endpoint.
 pub fn create_wallet_client(

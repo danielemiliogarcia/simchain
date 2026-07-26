@@ -23,7 +23,7 @@ pub use jobs::{
     JobCheckpoint, JobCheckpointResponse, JobCleanup, JobCreatedResponse, JobDetail, JobEvent,
     JobEventsResponse, JobFailure, JobKind, JobLease, JobListResponse, JobState, JobSummary,
     MineJobRequest, PartitionJobRequest, ReleaseCheckpointRequest, ReorgJobRequest,
-    ScenarioJobRequest, ScenarioStepStatus, SpamBurstJobRequest,
+    RewindJobRequest, ScenarioJobRequest, ScenarioStepStatus, SpamBurstJobRequest,
 };
 pub use status::{
     BlockSummary, Cadence, ComponentControlResponse, ComponentState, ExplorerStatus, FeeBucket,

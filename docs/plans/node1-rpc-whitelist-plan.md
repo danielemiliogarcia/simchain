@@ -30,8 +30,9 @@ The fixed Core 31.1 allowlist is isolated in
 `docker/node1-rpc-configs.compose.yml`. That included Compose model declares two
 configuration objects:
 
-1. `node1-rpc-true` contains `rpcwhitelistdefault=1` and the complete allowlist;
-2. `node1-rpc-false` is an empty Bitcoin configuration.
+1. `node1-rpc-true` contains `rpcwhitelistdefault=0`, the complete explicit public
+   allowlist, and the internal `rpcauth` identity;
+2. `node1-rpc-false` contains only the internal `rpcauth` identity.
 
 Node1 selects `node1-rpc-${FILTER_NODE1_RPC}` and always starts with the ordinary
 `-conf=/etc/bitcoin/node1-rpc.conf` argument. Compose interpolates `BTC_RPC_USER`
@@ -42,6 +43,14 @@ refer to an undefined config and are rejected while rendering the Compose model.
 The Bitcoin image's original entrypoint remains configured. There is no conditional
 shell, temporary file, placeholder substitution, bind-mounted policy fragment, or
 custom image. Compose `content` interpolation requires Docker Compose 2.23.1 or newer.
+
+The fixed `simchain-internal` identity is full-access and is used by the control plane
+to coordinate true shorter-chain rewinds. Its username/password are passed as internal
+Compose-defaulted environment wiring only. They intentionally do not appear in either
+example environment file and are not supported settings. The public user remains
+restricted because it has an explicit whitelist entry; the unlisted authenticated
+internal user receives Core's default full permission set. This is a realism guardrail,
+not an adversarial security boundary against someone who controls the host.
 
 ## Denied methods
 
@@ -104,7 +113,8 @@ restart, full volume restore, and policy reapplication.
 Static checks:
 
 - `scripts/check-node1-rpc-policy.sh` validates the 149-method config allowlist,
-  all 21 denied methods, and all 12 intentional exceptions.
+  all 21 denied methods, all 12 intentional exceptions, the internal identity, and its
+  deliberate absence from both example environment files.
 - `scripts/check-compose-security.sh` verifies only node1 receives the boolean,
   selected config, and ordinary `-conf` argument.
 
@@ -118,6 +128,7 @@ It verifies:
 
 - normal reads and raw-transaction RPCs reach node1;
 - every denied method returns an empty HTTP 403;
+- the internal identity reaches ordinary RPC dispatch for public-forbidden methods;
 - every intentional exception reaches Core;
 - wallet paths, named parameters, and whitespace cannot bypass filtering;
 - a mixed allowed/denied batch executes nothing;

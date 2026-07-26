@@ -11,7 +11,8 @@ use simchain_common::control_api::{
     DegradeJobRequest, EffectiveComponentConfig, FaucetJobRequest, FaucetStatusResponse,
     FaucetTransfer, JobCheckpointResponse, JobCreatedResponse, JobDetail, JobEventsResponse,
     JobListResponse, MineJobRequest, OperationSummary, PartitionJobRequest,
-    ReleaseCheckpointRequest, ReorgJobRequest, SchemaResponse, SettingSchema, SpamBurstJobRequest,
+    ReleaseCheckpointRequest, ReorgJobRequest, RewindJobRequest, SchemaResponse, SettingSchema,
+    SpamBurstJobRequest,
 };
 pub use simchain_common::control_api::{
     ApiError as ServiceError, ErrorCode, ErrorDetail, RollbackReport,
@@ -269,6 +270,22 @@ pub fn start_reorg(
     })?;
     app.jobs
         .start_reorg(request, idempotency_key, tuning.spam.use_raw)
+        .map_err(job_manager_error)
+}
+
+pub fn start_rewind(
+    app: &std::sync::Arc<AppState>,
+    request: RewindJobRequest,
+    idempotency_key: Option<String>,
+) -> Result<JobCreatedResponse, ServiceError> {
+    let Ok(_guard) = app.apply_lock.try_lock() else {
+        return Err(ServiceError::new(
+            ErrorCode::ApplyInProgress,
+            "another desired-state mutation is already in progress",
+        ));
+    };
+    app.jobs
+        .start_rewind(request, idempotency_key)
         .map_err(job_manager_error)
 }
 

@@ -496,6 +496,10 @@ services:
       - CONTROL_PLANE_API_TOKEN=${CONTROL_PLANE_API_TOKEN:-simchain-control-dev-token}
       - BTC_RPC_USER=${BTC_RPC_USER:-foo}
       - BTC_RPC_PASS=${BTC_RPC_PASS:-rpcpassword}
+      # Fixed internal wiring for privileged node1 coordination. These are
+      # intentionally not supported user settings or listed in example envs.
+      - NODE1_INTERNAL_RPC_USER=${NODE1_INTERNAL_RPC_USER:-simchain-internal}
+      - NODE1_INTERNAL_RPC_PASS=${NODE1_INTERNAL_RPC_PASS:-simchain-internal-rpc-password}
       - NODE1_RPC_URL=${NODE1_RPC_URL:-http://btc-simnet-node1:18443}
       - NODE2_RPC_URL=${NODE2_RPC_URL:-http://btc-simnet-node2:18443}
       - NODE3_RPC_URL=${NODE3_RPC_URL:-http://btc-simnet-node3:18443}
@@ -527,6 +531,9 @@ services:
       - MEMPOOL_WEB_PORT=${MEMPOOL_WEB_PORT:-1080}
       - MEMPOOL_WEB_URL=${MEMPOOL_WEB_URL:-}
       - MEMPOOL_WEB_INTERNAL_URL=http://mempool-web:8080
+      # Internal health wiring: the dashboard compares electrs's indexed tip
+      # with node1 instead of treating a reachable frontend as synchronized.
+      - ELECTRS_HTTP_INTERNAL_URL=http://electrs:3000
 
   # ---------------------------------------------------------------------------
   # Tools: electrs (profiles: electrs, mempool, all-tools)

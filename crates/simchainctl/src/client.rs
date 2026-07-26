@@ -4,7 +4,8 @@ use simchain_common::control_api::{
     ConfigResponse, DegradeJobRequest, FaucetJobRequest, FaucetStatusResponse, FaucetTransfer,
     JobCheckpointResponse, JobCreatedResponse, JobDetail, JobEventsResponse, JobListResponse,
     MineJobRequest, PartitionJobRequest, ReleaseCheckpointRequest, ReorgJobRequest,
-    ScenarioJobRequest, SetComponentStateRequest, SpamBurstJobRequest, StatusResponse, API_PREFIX,
+    RewindJobRequest, ScenarioJobRequest, SetComponentStateRequest, SpamBurstJobRequest,
+    StatusResponse, API_PREFIX,
 };
 use simchain_common::internal_api::DesiredState;
 use std::fmt;
@@ -84,6 +85,18 @@ impl ControlClient {
     ) -> Result<JobCreatedResponse, ClientError> {
         self.post_json(
             &format!("{API_PREFIX}/jobs/reorg"),
+            request,
+            idempotency_key,
+        )
+    }
+
+    pub fn start_rewind(
+        &self,
+        request: &RewindJobRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<JobCreatedResponse, ClientError> {
+        self.post_json(
+            &format!("{API_PREFIX}/jobs/rewind"),
             request,
             idempotency_key,
         )
@@ -530,6 +543,42 @@ mod tests {
             )
             .expect("job response");
         assert_eq!(response.job_id, "job-4");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn rewind_start_uses_versioned_endpoint_and_retry_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /api/v1/jobs/rewind HTTP/1.1"));
+            assert!(request.contains("Authorization: Bearer secret"));
+            assert!(request.contains("Idempotency-Key: rewind-3"));
+            assert!(request.contains(r#""blocks":3"#));
+
+            let response_body = serde_json::to_string(&JobCreatedResponse {
+                job_id: "job-rewind".to_string(),
+                state: simchain_common::control_api::JobState::Starting,
+                reused: false,
+            })
+            .expect("response JSON");
+            let response = format!(
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).expect("response");
+        });
+
+        let client = ControlClient::new(format!("http://{address}"), Some("secret".to_string()));
+        let response = client
+            .start_rewind(&RewindJobRequest { blocks: 3 }, Some("rewind-3"))
+            .expect("job response");
+        assert_eq!(response.job_id, "job-rewind");
         server.join().expect("server");
     }
 

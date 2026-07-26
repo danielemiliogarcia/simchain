@@ -22,8 +22,10 @@ grep -Fxq '  node1-rpc-false:' "$policy_file" \
 rendered_policy="$(FILTER_NODE1_RPC=true docker compose config --format json \
     | jq -er '.configs["node1-rpc-true"].content')" \
     || die "could not render the filtered Compose config"
-grep -Fxq 'rpcwhitelistdefault=1' <<<"$rendered_policy" \
-    || die "policy must set rpcwhitelistdefault=1"
+grep -Fxq 'rpcwhitelistdefault=0' <<<"$rendered_policy" \
+    || die "policy must leave authenticated users without an explicit rule unrestricted"
+grep -Eq '^rpcauth=simchain-internal:[^$]+\$+[0-9a-f]{64}$' <<<"$rendered_policy" \
+    || die "internal rpcauth identity is missing or malformed"
 allowlist="$(sed -n 's/^rpcwhitelist=[^:]*://p' <<<"$rendered_policy")"
 [ -n "$allowlist" ] || die "rendered node1 allowlist is empty"
 
@@ -59,4 +61,9 @@ for method in "${exceptions[@]}"; do
     contains "$method" || die "intentional exception '$method' is missing from the allowlist"
 done
 
-echo "Node1 RPC policy verified (declarative 149-method Core 31.1 config allowlist)"
+for example in .env.example .env.full.example; do
+    ! grep -Eq '^NODE1_INTERNAL_RPC_(USER|PASS|AUTH)=' "$example" \
+        || die "internal RPC wiring must not be exposed in $example"
+done
+
+echo "Node1 RPC policy verified (restricted public user, full-access internal identity, declarative 149-method Core 31.1 allowlist)"

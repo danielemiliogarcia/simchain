@@ -87,6 +87,7 @@ set_config
 set_mining_state
 set_spam_state
 start_reorg
+rewind_chain
 start_partition
 start_degrade
 start_scenario
@@ -99,6 +100,12 @@ abort_job
 release_checkpoint
 ```
 
+`rewind_chain` is a rollback-only administrative action. When an electrs-based profile
+is active, inspect the completed job's structured warning: the disposable explorer
+index may require `./scripts/recover-explorer.sh`. This recovery never affects Bitcoin
+Core or its mempools and is intentionally outside the MCP/control-plane Docker trust
+boundary.
+
 Example user prompts once the MCP server is connected:
 
 ```text
@@ -107,6 +114,7 @@ Pause the spammer.
 Resume the spammer.
 Set the mean block interval to 12 seconds.
 Start a 3-block reorg on node3 and wait for the job to finish.
+Rewind all three nodes by 3 blocks without mining a replacement chain.
 Partition node3 with 3 main blocks and 5 isolated blocks.
 Fund this regtest address with 1 BTC from the faucet.
 List recent jobs and explain any failures.

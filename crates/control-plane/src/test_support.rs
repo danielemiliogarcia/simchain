@@ -11,6 +11,7 @@ use crate::faucet_job::{
 use crate::jobs::{FaucetSettings, JobDependencies, JobManager};
 use crate::network_job::{ChainSnapshot, NetworkActionBackend};
 use crate::reorg_job::{ReorgExecution, ReorgExecutor, ReorgRecoveryContext};
+use crate::rewind_job::{RewindExecution, RewindExecutor, RewindObserver, RewindRecoveryContext};
 use crate::scenario_job::{ScenarioActionBackend, SpamBurstTarget};
 use crate::state::{AppState, ControlPlaneConfig, MINING_COMPONENT, SPAM_COMPONENT};
 use crate::status::StatusSnapshot;
@@ -52,6 +53,44 @@ impl ReorgExecutor for MockReorgExecutor {
         _request: &simchain_common::control_api::ReorgJobRequest,
         _context: &ReorgRecoveryContext,
         _observer: &dyn simchain_reorg::ReorgObserver,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) struct MockRewindExecutor;
+
+impl RewindExecutor for MockRewindExecutor {
+    fn execute(
+        &self,
+        request: &simchain_common::control_api::RewindJobRequest,
+        observer: &dyn RewindObserver,
+    ) -> anyhow::Result<RewindExecution> {
+        let context = RewindRecoveryContext {
+            request: Some(request.clone()),
+            original_height: Some(210),
+            original_tip: Some("original".to_string()),
+            target_height: Some(210 - request.blocks),
+            target_tip: Some("target".to_string()),
+            boundary_hash: Some("boundary".to_string()),
+            per_node_state: BTreeMap::new(),
+            resolved: true,
+        };
+        observer.persist(&context)?;
+        Ok(RewindExecution {
+            result: serde_json::json!({
+                "rewound_blocks": request.blocks,
+                "final_height": 210 - request.blocks
+            }),
+            chain_changed: true,
+            aborted: observer.abort_requested(),
+        })
+    }
+
+    fn recover(
+        &self,
+        _context: &RewindRecoveryContext,
+        _observer: &dyn RewindObserver,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -963,6 +1002,7 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
             control_state: control_state.clone(),
             apply_lock: apply_lock.clone(),
             reorg: Arc::new(MockReorgExecutor),
+            rewind: Arc::new(MockRewindExecutor),
             scenario: backend.clone(),
             network_actions: backend.clone(),
             faucet: backend.clone(),
@@ -982,6 +1022,8 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
             node1_url: "http://mock-node1:18443".to_string(),
             node2_url: "http://mock-node2:18443".to_string(),
             node3_url: "http://mock-node3:18443".to_string(),
+            node1_internal_rpc_user: "simchain-internal".to_string(),
+            node1_internal_rpc_pass: "simchain-internal-rpc-password".to_string(),
             state_dir,
             mining_control_url: "http://mock-mining:9081".to_string(),
             spam_control_url: "http://mock-spam:9082".to_string(),
@@ -991,6 +1033,7 @@ pub fn test_app(dir: &Path, backend: Arc<MockBackend>) -> AppState {
             internal_token: "test-internal-token".to_string(),
             explorer_url: "http://127.0.0.1:1080".to_string(),
             explorer_probe_url: "http://mempool-web:8080".to_string(),
+            electrs_probe_url: "http://electrs:3000".to_string(),
             user_address: "bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk".to_string(),
             node2_wallet_name: "node2".to_string(),
             node3_wallet_name: "node3".to_string(),

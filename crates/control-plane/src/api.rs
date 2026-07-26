@@ -5,8 +5,8 @@ use crate::apply::{apply, ApplyRequest};
 use crate::service::{
     abort_job, config, faucet_status, faucet_transfer, get_checkpoint, get_job, job_events,
     list_jobs, release_checkpoint, schema, set_mining_state, set_spam_state, start_degrade,
-    start_faucet, start_mine, start_partition, start_reorg, start_scenario, start_spam_burst,
-    start_spam_prepare, status, ErrorCode, ServiceError,
+    start_faucet, start_mine, start_partition, start_reorg, start_rewind, start_scenario,
+    start_spam_burst, start_spam_prepare, status, ErrorCode, ServiceError,
 };
 use crate::state::SharedState;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -55,6 +55,7 @@ pub fn router(app: SharedState) -> Router {
         .route("/api/v1/jobs", get(jobs_handler))
         .route("/api/v1/jobs/faucet", post(faucet_job_handler))
         .route("/api/v1/jobs/reorg", post(reorg_job_handler))
+        .route("/api/v1/jobs/rewind", post(rewind_job_handler))
         .route("/api/v1/jobs/scenario", post(scenario_job_handler))
         .route("/api/v1/jobs/mine", post(mine_job_handler))
         .route("/api/v1/jobs/spam-prepare", post(spam_prepare_job_handler))
@@ -677,6 +678,15 @@ async fn reorg_job_handler(State(app): State<SharedState>, request: Request) -> 
     }
 }
 
+async fn rewind_job_handler(State(app): State<SharedState>, request: Request) -> Response {
+    authenticated_job_request::<simchain_common::control_api::RewindJobRequest, _>(
+        app,
+        request,
+        start_rewind,
+    )
+    .await
+}
+
 async fn scenario_job_handler(State(app): State<SharedState>, request: Request) -> Response {
     if !request_has_token(&app, &request) {
         return error_response(&ServiceError::new(
@@ -1052,6 +1062,25 @@ mod tests {
         idempotency_key: Option<&str>,
     ) -> HttpRequest<Body> {
         let mut builder = HttpRequest::post("/api/v1/jobs/reorg")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if let Some(key) = idempotency_key {
+            builder = builder.header("Idempotency-Key", key);
+        }
+        builder
+            .body(Body::from(payload.to_string()))
+            .expect("request")
+    }
+
+    fn post_rewind(
+        payload: serde_json::Value,
+        token: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::post("/api/v1/jobs/rewind")
             .header(header::HOST, "localhost")
             .header(header::CONTENT_TYPE, "application/json");
         if let Some(token) = token {
@@ -1471,6 +1500,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rewind_jobs_are_authenticated_validated_and_idempotent() {
+        let fx = fixture(None);
+        let (status, body) = send(
+            &fx.router,
+            post_rewind(serde_json::json!({"blocks": 3}), None, None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        for blocks in [0, 101] {
+            let (status, body) = send(
+                &fx.router,
+                post_rewind(
+                    serde_json::json!({"blocks": blocks}),
+                    Some("test-token"),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(body["error"]["code"], "validation_failed");
+        }
+
+        let request = serde_json::json!({"blocks": 3});
+        let (status, body) = send(
+            &fx.router,
+            post_rewind(request.clone(), Some("test-token"), Some("rewind-retry")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job_id = body["job_id"].as_str().expect("job ID").to_string();
+
+        let (status, body) = send(
+            &fx.router,
+            post_rewind(request, Some("test-token"), Some("rewind-retry")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["job_id"], job_id);
+        assert_eq!(body["reused"], true);
+
+        let (status, body) = send(&fx.router, get(&format!("/api/v1/jobs/{job_id}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["kind"], "rewind");
+        assert_eq!(body["request"], serde_json::json!({"blocks": 3}));
+    }
+
+    #[tokio::test]
     async fn scenario_yaml_and_json_envelopes_share_checkpoint_contract() {
         let fx = fixture(None);
         let yaml = r#"
@@ -1863,6 +1941,14 @@ steps:
         assert!(html.contains(
             "id=\"burst-outputs-per-tx\" type=\"number\" min=\"0\" value=\"30\" required disabled"
         ));
+        assert!(html.contains("id=\"rewind-form\""));
+        assert!(html.contains(
+            "id=\"rewind-blocks\" type=\"number\" min=\"1\" max=\"100\" value=\"1\" required"
+        ));
+        assert!(html.contains("id=\"rewind-start\" class=\"danger\""));
+        assert!(html.contains("id=\"rewind-explorer-warning\" hidden"));
+        assert!(html.contains("./scripts/recover-explorer.sh"));
+        assert!(html.contains("not a proof-of-work reorg"));
     }
 
     #[test]
@@ -1941,6 +2027,7 @@ steps:
                 "get_status",
                 "list_jobs",
                 "release_checkpoint",
+                "rewind_chain",
                 "set_config",
                 "set_mining_state",
                 "set_spam_state",
@@ -1990,6 +2077,45 @@ steps:
         let job: serde_json::Value = serde_json::from_str(&text.text).expect("job JSON");
         assert_eq!(job["kind"], "reorg");
         assert_eq!(job["request"]["depth"], 2);
+    }
+
+    #[tokio::test]
+    async fn mcp_rewind_uses_the_same_job_service_contract() {
+        use rmcp::handler::server::wrapper::Parameters;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mock = Arc::new(MockBackend::new());
+        mock.sync_workers();
+        let app = Arc::new(test_app(dir.path(), mock));
+        let mcp = crate::mcp::ControlPlaneMcp::new(app.clone());
+
+        let result = mcp
+            .rewind_chain(Parameters(crate::mcp::RewindChainParams {
+                blocks: 3,
+                idempotency_key: Some("mcp-rewind".to_string()),
+            }))
+            .await
+            .expect("tool result");
+        assert_ne!(result.is_error, Some(true));
+        let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let created: serde_json::Value = serde_json::from_str(&text.text).expect("job JSON");
+        let job_id = created["job_id"].as_str().expect("job ID");
+
+        for _ in 0..100 {
+            let detail = app.jobs.get(job_id).expect("rewind job");
+            if detail.summary.state.is_terminal() {
+                assert_eq!(
+                    detail.summary.kind,
+                    simchain_common::control_api::JobKind::Rewind
+                );
+                assert_eq!(detail.request, serde_json::json!({"blocks": 3}));
+                assert_eq!(detail.result.expect("rewind result")["rewound_blocks"], 3);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("rewind job did not finish");
     }
 
     #[tokio::test]

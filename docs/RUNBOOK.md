@@ -160,6 +160,60 @@ Mine through the same leased job path as the dashboard, API, and MCP:
 cargo run -p simchainctl -- mine --node node3 --blocks 1 --wait
 ```
 
+## True shorter-chain rewind
+
+Pause mining first when you want time to inspect the lower tip, then rewind all three
+nodes by the same depth:
+
+```bash
+cargo run -p simchainctl -- mining pause
+cargo run -p simchainctl -- rewind --blocks 3 --wait
+```
+
+The target must remain at or above bootstrap height 204 and the depth is limited to
+100. Rewind is an administrative test action, not a proof-of-work reorg: node2, node3,
+and node1 each receive `invalidateblock` because invalid-chain state does not propagate
+over P2P. No replacement blocks are mined. Disconnected transactions may be reaccepted
+into each node's mempool independently.
+
+The job acquires spam and mining pause leases, persists the original tip, target tip,
+and invalidation boundary before changing a node, then invalidates node2, node3, and
+node1 in that order. A failure or abort after mutation calls `reconsiderblock` on all
+three and verifies the original branch before cleanup. After success, continuous mining
+returns to its previous desired state; keep it paused if you need the shorter height to
+remain stable.
+
+Resume and prove ordinary mining builds on the rewound ancestor:
+
+```bash
+cargo run -p simchainctl -- mining resume
+cargo run -p simchainctl -- mine --node node2 --blocks 1 --wait
+```
+
+### Explorer/indexer recovery after a rewind
+
+The bundled `mempool/electrs:v3.3.0` handles ordinary replacement-chain reorgs, but not
+a rollback-only move to an ancestor it already indexed. It can therefore exit after a
+true rewind that mines no replacement block. This does not affect Bitcoin Core,
+mempools, or rewind safety. The dashboard and `simchainctl status` compare electrs's
+exact indexed height and hash with node1 and report the explorer as degraded rather
+than treating a reachable frontend as healthy.
+
+If the selected Compose profile does not include electrs, there is no explorer side
+effect and recovery is a no-op. If the `mempool` or `electrs` profile is running, use:
+
+```bash
+./scripts/recover-explorer.sh
+```
+
+The helper refuses to start an electrs service that was not already part of the stack;
+it also treats a cleanly stopped electrs with no active mempool frontend as an unselected
+profile. Otherwise it force-recreates only electrs, waits for both its height and hash
+to equal node1, and reports the synchronized tip. Recreating is required; merely
+restarting the same container retains its stale container-local `/tmp/electrs-db`. The
+control plane deliberately has no Docker lifecycle access, so the dashboard displays
+this command but cannot execute it.
+
 ## Bounded spam burst
 
 Prepare the dedicated manual-burst capacity for the exact transaction count and shape.

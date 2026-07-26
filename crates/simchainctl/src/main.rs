@@ -12,7 +12,7 @@ use simchain_common::control_api::{
     CheckpointState, CleanupState, ConfigPatchRequest, DegradeJobRequest, FaucetDeliveryState,
     FaucetJobRequest, FaucetOutput, FaucetSource, JobCheckpointResponse, JobDetail,
     JobEventsResponse, JobState, MineJobRequest, PartitionJobRequest, ReorgJobRequest,
-    SpamBurstJobRequest,
+    RewindJobRequest, SpamBurstJobRequest,
 };
 use simchain_common::internal_api::DesiredState;
 use simchain_scenario_engine::{Scenario, Step};
@@ -141,6 +141,25 @@ fn run(cli: Cli) -> Result<(), ClientError> {
             let response = client.start_mine(
                 &MineJobRequest {
                     node: node.to_string(),
+                    blocks: args.blocks,
+                },
+                args.idempotency_key.as_deref(),
+            )?;
+            output::print_job_created(&response, args.json)?;
+            if args.wait {
+                let job = watch_job(&client, &response.job_id, args.json, args.timeout)?;
+                terminal_result(&job)?;
+            }
+        }
+        Command::Rewind(args) => {
+            if !(1..=100).contains(&args.blocks) {
+                return Err(ClientError::Local(
+                    "--blocks must be between 1 and 100".to_string(),
+                ));
+            }
+            output::print_rewind_advisory(args.json)?;
+            let response = client.start_rewind(
+                &RewindJobRequest {
                     blocks: args.blocks,
                 },
                 args.idempotency_key.as_deref(),

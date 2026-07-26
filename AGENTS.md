@@ -51,6 +51,13 @@ exclude = ["path/to/simchain"]
 `Cargo.lock` is committed on purpose (these are binaries for a reproducible test
 network). Do not add it to any `.gitignore`.
 
+`NODE1_INTERNAL_RPC_USER` and `NODE1_INTERNAL_RPC_PASS` are fixed-default environment
+variables for private Compose wiring, not supported user settings. Their deliberate
+absence from `.env.example` and `.env.full.example` is a feature. Do not add them to
+either template or expose them through dashboard, API, CLI, or ordinary settings
+configuration. If maintainers intentionally rotate them, update node1's precomputed
+`rpcauth` hash and the live policy tests in the same change.
+
 ## Project intent
 
 - `crates/simchain-common` — the one home for helpers shared across tools (RPC client
@@ -60,6 +67,9 @@ network). Do not add it to any `.gitignore`.
   dashboard adapters over the same domain service layer; never add a second backend.
   It may call private worker/agent APIs and Bitcoin RPC, but must never gain a Docker
   socket, Docker CLI, repository bind mount, or process-lifecycle executor.
+  True shorter-chain rewind orchestration lives in `src/rewind_job.rs`; it must mutate
+  node2, node3, then node1, preserve durable rollback context, and never release worker
+  leases from a partially converged chain.
 - `crates/simchainctl` — a thin control-plane API client. It must not call Docker or
   Bitcoin RPC directly.
 - `crates/network-agent` — the private namespace-local owner of `tc`/`nft` P2P

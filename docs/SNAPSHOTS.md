@@ -27,7 +27,7 @@ the short version lives in the README "Chain snapshots" section.
 # 2. Freeze that state:
 ./scripts/snapshot.sh save funded-wallets
 
-# 3. Run destructive tests against the chain (reorgs, double-spends, ...).
+# 3. Run destructive tests against the chain (reorgs, rewinds, double-spends, ...).
 ./scripts/simulate-reorg.sh start 5
 
 # 4. Chain trashed? Back to the funded state in ~30 s, no re-mining,
@@ -85,6 +85,11 @@ rm snapshots/baseline.tar.gz snapshots/baseline.json
 
 One rule to remember: `save` needs the stack running; `restore` doesn't care — it
 rebuilds the stack from scratch.
+
+Bitcoin Core persists locally invalidated-block state in chainstate. A snapshot saved
+after a successful true rewind therefore restores the shorter active chain and each
+node's matching invalid boundary. Let the rewind job reach a terminal state with safe
+cleanup before saving; the normal quiescence checks reject an active mutation.
 
 ## What survives a snapshot, and what doesn't
 

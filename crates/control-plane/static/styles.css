@@ -346,6 +346,13 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.72); }
   width: auto;
   margin: 0;
 }
+
+.chain-actions-card { display: flex; flex-direction: column; gap: 0.65rem; }
+.chain-action-subpane + .chain-action-subpane {
+  border-top: 1px solid var(--line);
+  padding-top: 0.65rem;
+}
+.rewind-warning { color: var(--dim); font-size: 0.68rem; line-height: 1.35; margin: 0.45rem 0 0; }
 .action-buttons { display: flex; flex-wrap: wrap; gap: 0.45rem; }
 .scenario-form textarea {
   display: block;

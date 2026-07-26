@@ -10,8 +10,8 @@ use crate::service::{
     list_jobs as list_jobs_service, schema, set_mining_state as set_mining_state_service,
     set_spam_state as set_spam_state_service, start_degrade as start_degrade_service,
     start_faucet as start_faucet_service, start_partition as start_partition_service,
-    start_reorg as start_reorg_service, start_scenario as start_scenario_service, status,
-    ServiceError,
+    start_reorg as start_reorg_service, start_rewind as start_rewind_service,
+    start_scenario as start_scenario_service, status, ServiceError,
 };
 use crate::state::SharedState;
 use rmcp::handler::server::wrapper::Parameters;
@@ -115,6 +115,15 @@ pub struct StartReorgParams {
     #[serde(default)]
     pub double_spend_pct: u8,
     /// Optional retry key. Reusing it with the same request returns the original job.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct RewindChainParams {
+    /// Number of newest blocks to invalidate on all three nodes (1-100).
+    pub blocks: u64,
+    /// Optional retry key. Reusing it with the same depth returns the original job.
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -453,6 +462,35 @@ impl ControlPlaneMcp {
         };
         match tokio::task::spawn_blocking(move || {
             start_reorg_service(&app, request, params.idempotency_key)
+        })
+        .await
+        .map_err(join_error)?
+        {
+            Ok(response) => success_json(&response),
+            Err(error) => error_json(error),
+        }
+    }
+
+    #[tool(
+        name = "rewind_chain",
+        description = "Administratively invalidate the newest blocks on node2, node3, and node1, leaving all three at the same genuinely shorter chain. This is a test-only rewind, not a proof-of-work reorg. If an electrs-based profile is active, inspect the completed job warning because its disposable explorer index may require recovery.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn rewind_chain(
+        &self,
+        Parameters(params): Parameters<RewindChainParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let app = self.app.clone();
+        let request = simchain_common::control_api::RewindJobRequest {
+            blocks: params.blocks,
+        };
+        match tokio::task::spawn_blocking(move || {
+            start_rewind_service(&app, request, params.idempotency_key)
         })
         .await
         .map_err(join_error)?

@@ -50,6 +50,21 @@ own per-user whitelist. P2P and ZMQ are unaffected. A method denied by Core retu
 empty HTTP 403 response, and a JSON-RPC batch containing any denied member executes no
 members.
 
+Node1 also recognizes a fixed full-access `simchain-internal` `rpcauth` identity used
+by the control plane for coordinated rewind and recovery. Its
+`NODE1_INTERNAL_RPC_USER` and `NODE1_INTERNAL_RPC_PASS` environment values have fixed
+Compose defaults and exist only to wire the control-plane client to that identity. They
+are deliberately absent from `.env.example` and `.env.full.example`: this omission is
+an intentional feature, not missing settings documentation. Do not override, expose,
+or promote them into dashboard/API/CLI configuration. Maintainers who intentionally
+rotate the credential must update the plaintext defaults and the precomputed `rpcauth`
+hash together and rerun the static and live node1 policy checks.
+
+With filtering enabled, the public user keeps its explicit allowlist while
+`rpcwhitelistdefault=0` gives the authenticated internal identity full access because
+it has no whitelist entry. This is an application-realism boundary for ordinary callers,
+not protection from a host operator who can read the repository or inspect containers.
+
 When enabled, the filter denies these regtest-only/test control methods:
 
 | Methods |
@@ -568,6 +583,12 @@ not safe live retunes.
 | `ELECTRS_IMAGE` | `mempool/electrs:v3.3.0` | electrs image. |
 | `ELECTRS_ELECTRUM_PORT` | `60001` | Host port for the Electrum RPC. |
 | `ELECTRS_HTTP_PORT` | `3000` | Host port for the esplora-style HTTP API. |
+
+The control plane uses fixed internal Compose wiring to query electrs's tip and compare
+its exact height and hash with node1. This is infrastructure health wiring, not a user
+setting, so `ELECTRS_HTTP_INTERNAL_URL` is intentionally absent from example env files.
+After a rollback-only rewind, `./scripts/recover-explorer.sh` recreates an existing
+electrs container and is a no-op when the selected profile did not include electrs.
 
 ## Tools: mempool.space explorer (profiles `mempool`, `all-tools`)
 
