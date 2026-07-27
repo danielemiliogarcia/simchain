@@ -1,7 +1,9 @@
 # Snapshot cookbook
 
-Concrete `./scripts/snapshot.sh` calls for the common situations. What a snapshot is
-and how it works under the hood: [snapshot-restore-plan.md](snapshot-restore-plan.md);
+Concrete `./scripts/snapshot.sh` calls for the common situations. What a snapshot is and
+how it works under the hood is in
+[what survives a snapshot](#what-survives-a-snapshot-and-what-doesnt) and the
+[rationale appendix](#appendix-rationale-from-the-original-nice-to-have-entry) below;
 the short version lives in the README "Chain snapshots" section.
 
 ```bash

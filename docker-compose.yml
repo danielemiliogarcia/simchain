@@ -216,7 +216,16 @@ services:
   # namespace, has no independent network membership or host port, and drops
   # every Linux capability except NET_ADMIN. Its authenticated lease expires
   # to a clear P2P interface if the control plane disappears.
+  #
+  # They carry profiles so the CI-oriented shapes can skip them: only
+  # partitions, netem degradation and the organic reorgs built on them need
+  # NET_ADMIN in a node's namespace. `minimal-organic-reorg` is the smallest
+  # profile that wants them, and it pulls in the control plane too, because the
+  # control plane is the only thing that can lease an agent.
+  # Nothing else may `depends_on` an agent -- Compose rejects a project whose
+  # unprofiled service depends on a profiled one.
   btc-simnet-network-agent-node1:
+    profiles: ["minimal-organic-reorg", "basic", "electrs", "mempool", "all-tools"]
     build:
       context: .
       dockerfile: docker/tools.Dockerfile
@@ -237,6 +246,7 @@ services:
       - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
 
   btc-simnet-network-agent-node2:
+    profiles: ["minimal-organic-reorg", "basic", "electrs", "mempool", "all-tools"]
     build:
       context: .
       dockerfile: docker/tools.Dockerfile
@@ -257,6 +267,7 @@ services:
       - SIMCHAIN_INTERNAL_TOKEN=${SIMCHAIN_INTERNAL_TOKEN:-simchain-internal-dev-token}
 
   btc-simnet-network-agent-node3:
+    profiles: ["minimal-organic-reorg", "basic", "electrs", "mempool", "all-tools"]
     build:
       context: .
       dockerfile: docker/tools.Dockerfile
@@ -446,14 +457,23 @@ services:
       - REORG_WITNESS_NODE=${REORG_WITNESS_NODE:-btc-simnet-node1}
 
   # ---------------------------------------------------------------------------
-  # Simchain control plane (part of ordinary startup).
+  # Simchain control plane.
   # Browser UI, versioned HTTP API and MCP endpoint on
   # http://localhost:${CONTROL_PLANE_PORT:-8090}. Mining and spam state and
   # policy use private worker APIs; mutation jobs use worker/network leases
   # plus Bitcoin RPC. It has no Docker API and sees only its narrow named
   # state volume.
+  #
+  # Profiled so the bare `docker compose up` (`minimal`) is a chain-only stack
+  # for CI jobs that drive the nodes with their own client. Everything that
+  # makes the simnet programmable -- scenarios, jobs, live retuning, faucet,
+  # simchainctl, MCP -- lives in this one container, so every richer profile
+  # lists it. Only a profiled service may depend on an unprofiled one, which is
+  # why its dependencies below are all core services.
   # ---------------------------------------------------------------------------
   btc-simnet-control-plane:
+    profiles:
+      ["minimal-api", "minimal-organic-reorg", "basic", "electrs", "mempool", "all-tools"]
     build:
       context: .
       dockerfile: docker/tools.Dockerfile
@@ -467,15 +487,14 @@ services:
       - control-state:/var/lib/simchain-control
     ports:
       - "127.0.0.1:${CONTROL_PLANE_PORT:-8090}:8080"
+    # The network agents are deliberately absent here: under `minimal-api` they
+    # do not exist at all, and the control plane must still boot. It treats an
+    # unreachable agent as a reported component state rather than a startup
+    # failure, and rejects partition and degrade work up front when the agents
+    # are not there.
     depends_on:
       btc-simnet-node1:
         condition: service_healthy
-      btc-simnet-network-agent-node1:
-        condition: service_started
-      btc-simnet-network-agent-node2:
-        condition: service_started
-      btc-simnet-network-agent-node3:
-        condition: service_started
       btc-simnet-mining-controller:
         condition: service_started
       btc-simnet-spammer:

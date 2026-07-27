@@ -4,11 +4,18 @@ Simchain exposes a streamable HTTP MCP endpoint from the control plane so coding
 agents can inspect and operate the live simnet without scraping the dashboard or
 calling Docker directly.
 
-Start the ordinary stack first:
+Start a stack that includes the control plane, which serves the MCP endpoint. A plain
+`docker compose up` is the chain-only `minimal` profile and has no control plane, so
+start at least `minimal-api`:
 
 ```bash
-docker compose up -d --build
+docker compose --profile minimal-api up -d --build
 ```
+
+Every richer profile works too. The `partition` and `degrade` tools are the one
+exception to "if the endpoint is up, the tool works": they need the network agents, so
+below `minimal-organic-reorg` they return the same HTTP 503 `component_unavailable` as
+the API, naming the profile to start.
 
 The MCP endpoint is:
 

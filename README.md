@@ -3,9 +3,55 @@
 [![CI](https://github.com/danielemiliogarcia/simchain/actions/workflows/ci.yml/badge.svg)](https://github.com/danielemiliogarcia/simchain/actions/workflows/ci.yml) [![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](./LICENSE)
 
 A regtest Bitcoin simulation network that tries to stay as close to mainnet reality as
-regtest allows: several P2P-connected nodes, rotating miners, a non-mining full node as
-the user endpoint, non-empty blocks, and simulated reorgs. Compose boot infrastructure
-comes from `.env`; live policy and experiments are owned by one control plane.
+regtest allows: several P2P-connected nodes, rotating miners, non-empty blocks a non-mining full node as
+the user endpoint emulating a 3rd party provided node. See [Features](#features) for more.
+
+## Quickstart
+
+- First, build and start everything on a brand-new chain:
+
+```bash
+./scripts/fresh-chain.sh --profile all-tools
+```
+
+- Then open the control dashboard [http://localhost:8090/](http://localhost:8090/) (`CONTROL_PLANE_PORT`)
+
+The chain bootstraps itself to height 204 before it settles into its normal block
+cadence; the dashboard shows that progress live.
+
+`fresh-chain.sh` always starts from block 0, and discards the chain.
+Use `docker compose` to put down and resume that chain instead, or [snapshot it](#chain-snapshots).
+
+Read this document below for more details.
+
+## Contents
+
+- [Quickstart](#quickstart)
+- [Intro](#intro)
+- [Scope and non-goals](#scope-and-non-goals)
+- [Features](#features)
+- [Network topology overview](#network-topology-overview)
+- [Configuration](#configuration)
+  - [Choosing the bitcoin node image](#choosing-the-bitcoin-node-image)
+- [How to run](#how-to-run)
+  - [Node1 production-like RPC policy](#node1-production-like-rpc-policy)
+  - [Retuning a live chain](#retuning-a-live-chain)
+  - [Chain snapshots](#chain-snapshots)
+  - [Profiles](#profiles)
+- [Simchain control plane](#simchain-control-plane)
+- [Scenarios](#scenarios)
+- [Simulating reorgs](#simulating-reorgs)
+- [Partitions and P2P latency](#partitions-and-p2p-latency)
+- [ZMQ notifications](#zmq-notifications)
+- [Repository structure](#repository-structure)
+  - [Embedding under a parent workspace](#embedding-under-a-parent-workspace)
+- [Documents](#documents)
+- [Limitations and future enhancements](#limitations-and-future-enhancements)
+- [Contributing](#contributing)
+  - [Development workflow](#development-workflow)
+- [Troubleshooting](#troubleshooting)
+  - [BuildKit snapshot export failure](#buildkit-snapshot-export-failure)
+- [License](#license)
 
 ## Intro
 
@@ -48,55 +94,28 @@ mainnet network behavior.
 
 ## Features
 
-- **Mainnet-like network shape.** Three Bitcoin Core nodes form a full P2P mesh;
-  two mine while a wallet-disabled, non-mining node gives applications a
-  production-like RPC endpoint whose native Core whitelist rejects regtest mining
-  superpowers and node-administration calls.
-- **Configurable, reproducible mining.** Choose fixed or bounded-Poisson block
-  intervals, strict miner alternation or weighted selection, and an optional RNG
-  seed for repeatable runs.
-- **Realistic block and fee pressure.** Locally signed raw transactions fill blocks,
-  maintain configurable mempool depth and an economic fee floor, and can exercise
-  fee replacement without changing Bitcoin Core's mainnet relay or mempool policy.
-- **Programmatic reorgs (`invalidateblock`).** Deterministically run one-shot or
-  continuous reorgs with configurable depth, rebuild replacement blocks from the
-  live mempool, inject new transactions, leave transactions unconfirmed in chaos
-  mode, or permanently drop selected transactions through simulated double spends.
-- **True shorter-chain rewinds.** Administratively invalidate the same recent block
-  boundary on node2, node3, and the production-like node1 endpoint, leaving every node
-  at the same lower height without mining replacement blocks.
-- **Network splits and organic reorgs.** Partition the P2P mesh while keeping the RPC
-  control plane reachable, let both sides mine competing branches, then heal the
-  split and observe every node converge on the most-work chain.
-- **P2P link degradation.** Add latency and packet loss for a duration or number of
-  blocks, with automatic recovery, to exercise block and transaction propagation
-  without impairing RPC traffic.
-- **Declarative scenario orchestration.** Check in YAML scenarios that retune live
-  policy, wait for chain or mempool conditions, pause/resume mining, fund wallets,
-  mine blocks, run spam bursts, trigger reorgs, create partitions, degrade links, and
-  expose durable checkpoints for CI.
-- **Built-in regtest faucet.** Fund one or many application addresses from miner
-  treasury coins through the same dashboard, CLI, HTTP API, MCP, and scenario job
-  coordinator.
-- **Reusable chain snapshots.** Named volumes make bootstrap resumable; validated
-  snapshots preserve blocks, chainstate, miner wallets, the mempool, and the active
-  Compose profile for fast restoration.
-- **First-party control dashboard.** Watch chain status, retune mining/spam behavior,
-  pause workers, start jobs, inspect job progress, use the faucet, and jump to the
-  local mempool.space explorer when it is enabled.
-- **CLI interface.** Automate control-plane operations from `simchainctl` with stable
-  commands and exit codes for humans, scripts, and CI.
-- **HTTP API.** Drive the same dashboard and job operations through a versioned
-  localhost API with token-protected mutation routes.
-- **MCP interface.** Let coding agents inspect, retune, and operate the simnet through
-  the control plane's streamable HTTP MCP endpoint.
-- **Application integration.** Use Bitcoin Core RPC, all five ZMQ topics, optional
-  Electrum RPC, and an optional local mempool.space explorer connected to node1.
-- **Live hot-reloaded configuration.** Retune mining cadence, miner selection, spam
-  fill, fee floor, and worker pause/resume state on a running chain without restarting
-  Bitcoin nodes or helper services.
+- **Mainnet-like network shape**
+- **Configurable, reproducible mining**
+- **Live hot-reloaded configuration**
+- **Realistic block and fee market pressure**
+- **Programmatic reorgs**
+- **True shorter-chain rewinds**
+- **Network splits**
+- **Organic reorgs**
+- **P2P link degradation**
+- **Declarative scenario orchestration**
+- **Built-in regtest faucet**
+- **Reusable chain snapshots**
+- **First-party control dashboard**
+- **CLI interface**
+- **HTTP API**
+- **MCP interface**
+- **Application integration**
 
-## Network topology
+Each one is expanded, with links to the document that covers it, in
+[FEATURES.md](./docs/FEATURES.md).
+
+## Network topology overview
 
 Traffic is split across two Docker networks. Only the three bitcoind nodes join
 `btc-simnet-p2p`, where `node1-p2p`, `node2-p2p`, and `node3-p2p` form the full P2P
@@ -109,91 +128,24 @@ links be partitioned or impaired without losing control access. The user talks t
 
 ```mermaid
 flowchart TB
-    subgraph host["Host machine"]
-        user["User / your tests<br/>external wallet, signs raw txs"]
-        zmqc["ZMQ consumers<br/>LND / CLN / indexers / watchers"]
-    end
+    host["Host machine<br/>your tests, external wallet,<br/>ZMQ consumers, browser"]
 
-    subgraph mesh["btc-simnet-p2p — bitcoind full mesh (port 18444)"]
-        n1["node1 — full node, never mines<br/>txindex, wallet disabled<br/>production-like endpoint"]
-        n2["node2 — miner<br/>wallet enabled, owned node"]
-        n3["node3 — miner<br/>not exposed to host"]
-    end
+    mesh["btc-simnet-p2p<br/>node1, node2, node3<br/>full bitcoind P2P mesh :18444"]
+    control["btc-simnet-control<br/>control plane, mining controller, spammer,<br/>network agents, reorg simulator"]
+    tools["explorer stack — tool profiles<br/>electrs, mempool.space<br/>(also on btc-simnet-control)"]
 
-    subgraph control["btc-simnet-control — RPC and helper traffic"]
-        cp["control-plane<br/>dashboard + API + MCP + jobs"]
-        mc["mining-controller<br/>bootstrap + configurable mining"]
-        sp["spammer<br/>fills blocks with txs"]
-        na["3 namespace-local network agents<br/>leased P2P tc/nft only"]
-        rg["reorg simulator<br/>profile: reorg, on demand"]
-    end
+    host ==>|"Bitcoin RPC :18443 and :28443"| mesh
+    host -.->|"ZMQ 28332-28336, 38332-38336"| mesh
+    host -->|"dashboard / API / MCP :8090"| control
+    host -->|"explorer :1080, Electrum :60001"| tools
 
-    %% Invisible waypoints pull the host arrows apart so each port label
-    %% sits near the host boxes in open space instead of tangling with the
-    %% other arrows.
-    zmq1(( )):::waypoint
-    rpc2a(( )):::waypoint
-    rpc2(( )):::waypoint
-    zmq2(( )):::waypoint
-
-    user ==>|"RPC localhost:18443"| n1
-    user -->|"UI / API / MCP localhost:8090"| cp
-    zmqc -.-|"ZMQ 28332-28336"| zmq1
-    zmq1 -.-> n1
-
-    user -.- rpc2a
-    rpc2a -.-|"RPC localhost:28443"| rpc2
-    rpc2 -.-> n2
-    zmqc -.-|"ZMQ 38332-38336"| zmq2
-    zmq2 -.-> n2
-
-    n1 <-->|P2P| n2
-    n1 <-->|P2P| n3
-    n2 <-->|P2P| n3
-
-    mc -->|"RPC: mine block"| n2
-    mc -->|"RPC: mine block"| n3
-    sp -->|"RPC: watch height"| n1
-    sp -->|"RPC: raw spam + floor fills"| n2
-    sp -->|"RPC: raw spam + floor fills"| n3
-    cp -->|"private policy + lease API"| mc
-    cp -->|"private policy + lease API"| sp
-    cp -->|"Bitcoin RPC jobs"| n1
-    cp -->|"Bitcoin RPC jobs"| n2
-    cp -->|"Bitcoin RPC jobs"| n3
-    cp -->|"private impairment leases"| na
-    na -.->|"P2P interface only"| n1
-    na -.->|"P2P interface only"| n2
-    na -.->|"P2P interface only"| n3
-    rg -->|"RPC: invalidate + re-mine"| n3
-    rg -.->|"witness poll"| n1
-
-    classDef waypoint width:0px,height:0px,fill:none,stroke:none
+    control -->|"Bitcoin RPC jobs"| mesh
+    control -.->|"leased P2P impairment"| mesh
+    tools -->|"index the chain through node1"| mesh
 ```
 
-With the `electrs` / `mempool` / `all-tools` [profiles](#profiles), the explorer stack
-also joins the network and indexes the chain through node1:
-
-```mermaid
-flowchart LR
-    browser["Browser<br/>localhost:1080"]
-    electrum["Electrum clients<br/>localhost:60001"]
-
-    subgraph net["btc-simnet-control (tool profiles)"]
-        mweb["mempool-web"]
-        mapi["mempool-api"]
-        mdb["mempool-db<br/>MariaDB"]
-        el["electrs"]
-        n1["node1"]
-    end
-
-    browser --> mweb --> mapi
-    electrum -.-> el
-    mapi -->|"electrum :60001"| el
-    mapi -->|"core RPC :18443"| n1
-    mapi --> mdb
-    el -->|"RPC :18443"| n1
-```
+Each box above expands into its containers and every link between them in
+**[NETWORK_TOPOLOGY.md](./docs/NETWORK_TOPOLOGY.md)**.
 
 ## Configuration
 
@@ -246,7 +198,7 @@ by compose itself.
 ## How to run
 
 ```bash
-docker compose up -d --build
+docker compose --profile all-tools up -d --build
 ```
 
 That's it (with the default registry image there is nothing to build). Useful follow-ups:
@@ -283,52 +235,15 @@ docker compose --profile "*" down -v
 ### Node1 production-like RPC policy
 
 Node1 keeps the normal `localhost:18443` Bitcoin JSON-RPC interface, but the default
-`FILTER_NODE1_RPC=true` setting uses Bitcoin Core's native per-user `rpcwhitelist`
-to reject block generation, mock time, chain-choice changes, process shutdown, and
-selected administrative methods. A rejected call receives Core's HTTP 403 response.
-Set it to `false` and recreate node1 plus its namespace-sharing network agent to
-restore unrestricted RPC:
-
-```bash
-docker compose up -d --force-recreate \
-  btc-simnet-node1 btc-simnet-network-agent-node1
-```
+`FILTER_NODE1_RPC=true` filters RPC to emulate a 3rd party node.
+A rejected call receives Core's HTTP 403 response.
 
 Node2 and node3 remain unrestricted with the same credentials in either mode; P2P
-and ZMQ are never filtered. Peer-connectivity calls and a documented set of advanced
-testing/debug/snapshot RPCs remain available while filtering is enabled.
-The control plane has a second full-access `rpcauth` identity for internal rewind and
-recovery calls. Its Compose-defaulted username/password are internal wiring—not public
-settings—and are intentionally absent from both example environment files. The public
-identity remains restricted because its whitelist is explicit.
-See [SETTINGS.md](./docs/SETTINGS.md#node1-rpc-method-policy) for the exact method
-list and intentional exceptions. This declarative selection requires Docker Compose
-2.23.1 or newer; no shell wrapper or custom entrypoint is involved.
+and ZMQ are never filtered.
 
-With the basic stack running under the strict default, exercise the real HTTP
-authorization boundary (positive calls, every denied method, every intentional
-exception, batch atomicity, and a real block mined by unrestricted node2) with:
-
-```bash
-./scripts/check-node1-rpc-policy-live.sh
-```
-
-### Injecting diagnostic tools into nodes
-
-The official Bitcoin node image is intentionally minimal. To install the prerequisites
-for Simchain's container-side diagnostic tools and copy them into one running node, use:
-
-```bash
-./scripts/inject-tools.sh btc-simnet-node3
-```
-
-Use `./scripts/inject-tools.sh --all-containers` to prepare every running
-`btc-simnet-nodeN` container. Currently the helper installs `curl` when needed and
-installs the watcher as `/usr/local/bin/chainwatch`, so it can be invoked directly on
-the container's `PATH`. These changes live in each container's writable layer and must
-be injected again after container recreation. Run the script with `--help` for usage;
-see [PARTITIONS.md](./docs/PARTITIONS.md#watch-both-sides-live) for the complete
-two-sided fork-watching example.
+Exact method list and exceptions: [SETTINGS.md](./docs/SETTINGS.md#node1-rpc-method-policy).
+Disabling the filter and verifying the live boundary:
+[RUNBOOK.md](./docs/RUNBOOK.md#node1-rpc-boundary).
 
 ### Retuning a live chain
 
@@ -376,28 +291,53 @@ Recipes for the common situations: **[SNAPSHOTS.md](./docs/SNAPSHOTS.md)**.
 One compose file serves every combination via
 [profiles](https://docs.docker.com/compose/how-tos/profiles/):
 
-| Command | What comes up |
-|---|---|
-| `docker compose up` | basic simnet + 3 private network agents + control plane/dashboard |
-| `docker compose --profile basic up` | same as above (alias) |
-| `docker compose --profile electrs up` | basic + electrs (Electrum RPC on 60001, HTTP on 3000) |
-| `docker compose --profile mempool up` | basic + electrs + mempool.space explorer |
-| `docker compose --profile all-tools up` | basic + all long-running tools above |
+| Command | Containers | What comes up |
+|---|---|---|
+| `docker compose up` | 5 | `minimal`: 3 nodes + mining controller + spammer. A live chain, nothing to drive it |
+| `docker compose --profile minimal up` | 5 | same as above (alias) |
+| `docker compose --profile minimal-api up` | 6 | minimal + control plane: scenarios, jobs, `simchainctl`, API, MCP |
+| `docker compose --profile minimal-organic-reorg up` | 9 | minimal-api + 3 private network agents: partitions and organic reorgs |
+| `docker compose --profile basic up` | 9 | the full local stack: same containers as above |
+| `docker compose --profile electrs up` | 10 | basic + electrs (Electrum RPC on 60001, HTTP on 3000) |
+| `docker compose --profile mempool up` | 13 | basic + electrs + mempool.space explorer |
+| `docker compose --profile all-tools up` | 13 | basic + all long-running tools above |
 
 With `mempool` or `all-tools`, browse the explorer at
 [http://localhost:1080/](http://localhost:1080/) (port: `MEMPOOL_WEB_PORT`).
 
-The core services have no `profiles` entry, so they are available both to plain
-`docker compose up` and whenever any profile is enabled. The `reorg` profile stays
-separate because it is a disruptive on-demand helper; including it in `all-tools` would
-run it during an ordinary startup. To stop and remove containers from every profile,
-including helper containers left by an earlier run, use
+**`docker compose up` with no profile is `minimal`, not the full stack.** The tiers exist
+so a CI job pays only for what it drives, and each one is defined by the single container
+it adds:
+
+- **`minimal`** is a chain and nothing else. The mining controller owns the bootstrap and
+  reads its policy from the environment, so you still get height 204, funded wallets,
+  configured block cadence, spam, ZMQ and node1's RPC policy. Use it when CI points its
+  own client at `localhost:18443`. `scripts/snapshot.sh` works here because it talks to
+  `bitcoin-cli` directly; every other helper script does not, because they are all
+  control-plane clients.
+- **`minimal-api`** adds the control plane, and with it everything that makes the simnet
+  programmable: scenarios and checkpoints, durable jobs (reorg, rewind, mine, faucet,
+  spam burst), live retuning, the `/api/v1` API, `/mcp`, and `simchainctl` in full. This
+  is the tier most CI wants.
+- **`minimal-organic-reorg`** adds the three namespace-local network agents, the only
+  containers holding `NET_ADMIN`. They are what makes an *organic* reorg possible:
+  partition the mesh, let both sides mine, heal, and let the longer branch win. Partition
+  and degrade jobs, and any scenario containing those steps, are refused below this tier
+  with HTTP 503 naming the profile to start, checked before the job is reserved rather
+  than failing halfway through. See [PARTITIONS.md](./docs/PARTITIONS.md).
+- **`basic`** is the same container set as `minimal-organic-reorg`, kept as the name for
+  "the normal local stack".
+
+The core chain services have no `profiles` entry, so they come up under every profile. The `reorg` profile stays separate because it is a disruptive on-demand helper;
+including it in `all-tools` would run it during an ordinary startup. To stop and remove
+containers from every profile, including helper containers left by an earlier run, use
 `docker compose --profile "*" down`.
 
 ## Simchain control plane
 
-The default Compose stack includes a localhost control plane for hot operation: browse
-the dashboard at [http://localhost:8090/](http://localhost:8090/) (`CONTROL_PLANE_PORT`)
+The `minimal-api` profile and every richer one add a localhost control plane for hot
+operation: browse the dashboard at
+[http://localhost:8090/](http://localhost:8090/) (`CONTROL_PLANE_PORT`)
 to watch the chain and manage live settings/jobs, or use the first-party CLI
 `simchainctl` for the same API-backed operations from a terminal. It also exposes HTTP
 and MCP endpoints, coordinates bounded mutation jobs, and stores its state in the
@@ -409,7 +349,7 @@ for dashboard, CLI, API, MCP, auth, and job details.
 Reproduce an ordered chain history from YAML after the simnet has bootstrapped:
 
 ```bash
-docker compose up -d --build
+docker compose --profile minimal-api up -d --build
 cargo run -p simchainctl -- scenario run scenarios/reorg-during-sync.yml \
   --result results/reorg.json
 ```
@@ -427,27 +367,10 @@ replacements. It owns worker pause leases, rebuilds replacement blocks from the 
 mempool, witnesses convergence, and records cleanup. A lower-level standalone RPC tool
 also remains available for one-shot and continuous experiments.
 
-For full details, commands, and modes, see [REORGS.md](./docs/REORGS.md).
+A **rewind** job is the related but distinct operation: it leaves all nodes on a genuinely
+shorter common chain instead of replacing history with a longer branch.
 
-### Rewind without a replacement chain
-
-The dashboard's **Rewind chain** subpanel and this command leave all nodes on a genuinely
-shorter common chain:
-
-```bash
-cargo run -p simchainctl -- rewind --blocks 3 --wait
-```
-
-This is not organic chain selection: `invalidateblock` state is local and does not
-propagate over P2P, so the coordinator must invalidate the same boundary on node2,
-node3, and node1. It pauses spam and mining with owned leases, requires a common start,
-never crosses below bootstrap height 204, persists rollback information before mutation,
-and uses `reconsiderblock` to restore the original branch after a partial failure.
-If an electrs-based profile is active, the dashboard warns that its disposable index
-may not understand this rollback-only shape. `./scripts/recover-explorer.sh` recreates
-that existing indexer and waits for its exact tip to match node1; it does nothing when
-the selected profile did not include electrs.
-
+For full details, commands, and modes of both, see [REORGS.md](./docs/REORGS.md).
 
 ## Partitions and P2P latency
 
@@ -458,6 +381,11 @@ real mechanism (a partition), unlike the administrative reorg simulator below.
 It may remain active while a manual Mine job creates a block on that same node, making
 propagation delay directly observable while RPC stays clean. Both faults are lease-owned
 and target P2P traffic only.
+
+Both need the three namespace-local network agents, so start
+`--profile minimal-organic-reorg` or `--profile basic`. Under `minimal-api` the control
+plane rejects these jobs with HTTP 503 naming the profile to start; under `minimal` there
+is no control plane to submit them to at all. See [Profiles](#profiles).
 
 For commands, manual walkthroughs, and caveats, see
 [PARTITIONS.md](./docs/PARTITIONS.md).
@@ -519,9 +447,14 @@ exclude = ["path/to/simchain"]
 ## Documents
 
 - [INTRO.md](./docs/INTRO.md), detailed component descriptions and project objective.
+- [FEATURES.md](./docs/FEATURES.md), every feature above expanded, each linked to the
+  document that covers it.
+- [NETWORK_TOPOLOGY.md](./docs/NETWORK_TOPOLOGY.md), the full container-level diagrams
+  behind the topology overview: nodes, workers, agents, and the explorer stack.
 - [RETUNING.md](./docs/RETUNING.md), how to retune mining cadence, fee floor, and block fill on a live chain.
 - [MCP.md](./docs/MCP.md), connecting coding agents to the Simchain MCP endpoint.
-- [REORGS.md](./docs/REORGS.md), simulating chain reorganizations, commands, and modes.
+- [REORGS.md](./docs/REORGS.md), simulating chain reorganizations and shorter-chain
+  rewinds: commands, modes, and permanent-drop double-spends.
 - [PARTITIONS.md](./docs/PARTITIONS.md), network partitions and P2P latency: organic
   reorgs, double-spend windows, propagation lag.
 - [SCENARIOS.md](./docs/SCENARIOS.md), declarative scenario schema, execution, and examples.

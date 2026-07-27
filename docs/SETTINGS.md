@@ -87,7 +87,9 @@ their availability is intentional because Simchain is a test environment.
 
 The Compose-managed config allowlist targets the pinned Bitcoin Core 31.1 image. Review
 `docker/node1-rpc-configs.compose.yml` whenever `BTC_IMAGE` changes to another Core
-release. Its interpolated `content` requires Docker Compose 2.23.1 or newer.
+release. Its interpolated `content` requires Docker Compose 2.23.1 or newer. The
+selection is fully declarative: no shell wrapper and no custom entrypoint are
+involved.
 
 ## Host port mappings
 
@@ -296,8 +298,8 @@ an integer to zero happens before the `halvings >= 64` mainnet-style cutoff woul
 | 4950+ | 33 | **0 sat, permanently** |
 
 This matters for the faucet: node2/node3 are funded only by coinbase (the deterministic
-bootstrap through height 204, then continuous mining — see [faucet-plan.md](plans/faucet-plan.md)
-and the treasury note under [Simchain control plane](#simchain-control-plane) below), and spam
+bootstrap through height 204, then continuous mining — see the treasury note under
+[Simchain control plane](#simchain-control-plane) below), and spam
 fees paid to those same blocks return as coinbase too. Past height 4950 neither source adds
 anything new: mining continues (spam still confirms, fees still get paid), but every future
 coinbase output is 0 sat, so the miner treasuries stop growing and only draw down as the
@@ -500,6 +502,20 @@ can cascade the rest of the run to empty blocks.
 
 ## Network partitions and P2P netem
 
+Both features need the three namespace-local network agents, which carry Compose profiles
+and so are **absent below `--profile minimal-organic-reorg`**. `minimal-organic-reorg`,
+`basic`, `electrs`, `mempool` and `all-tools` include them. Under `minimal-api` the
+control plane rejects `partition` and `degrade` jobs, and any scenario containing those
+steps, with HTTP 503 `component_unavailable` naming the profile to start; the check runs
+before the job is reserved, so nothing is half-applied. Everything else -- mining, spam,
+retuning, faucet, snapshots, forced reorgs and rewind -- works unchanged there, because
+only P2P impairment needs an agent holding `NET_ADMIN` inside a node's network namespace.
+
+Nothing may declare a `depends_on` on an agent or on the control plane: Compose rejects a
+project whose unprofiled service depends on a profiled one, which would make the smaller
+profiles unstartable. The control plane therefore does not wait for the agents, and
+reports an absent one as an unreachable component instead of failing to boot.
+
 Partition jobs are post-bootstrap-only and refuse to proceed below height 204. Branch
 lengths are request fields (`simchainctl partition start --main-blocks ...
 --isolated-blocks ... --heal-delay-secs ...`); only settling timeouts are process
@@ -518,8 +534,10 @@ egress only. The agent clears its qdisc on lease expiry or restart.
 
 ## Simchain control plane
 
-The control plane is part of ordinary Compose startup. It is the single localhost web
-UI + HTTP API + MCP backend for live retuning and jobs (see
+The control plane carries the `minimal-api`, `minimal-organic-reorg`, `basic`, `electrs`,
+`mempool` and `all-tools` profiles, so a plain `docker compose up` (the chain-only
+`minimal` shape) does not start it and none of the settings below apply there. It is the
+single localhost web UI + HTTP API + MCP backend for live retuning and jobs (see
 [RETUNING.md](RETUNING.md)). Mining and spam control use private authenticated worker
 APIs; reorg, scenario, partition, and degradation jobs use worker/network leases plus
 Bitcoin RPC directly. Its image has no Docker CLI, and its only writable mount is the

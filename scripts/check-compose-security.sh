@@ -10,7 +10,9 @@ trap 'rm -f "$config"' EXIT
 
 cd "$repo_root"
 "$repo_root/scripts/check-node1-rpc-policy.sh"
-docker compose config --format json >"$config"
+# Render every profile: the network agents are profiled, so a profile-less
+# render would drop them and silently skip their capability assertions.
+docker compose --profile "*" config --format json >"$config"
 
 jq -e '
   [
@@ -26,7 +28,9 @@ jq -e '
 jq -e '
   .services["btc-simnet-control-plane"] as $control
   | $control != null
-  and (($control.profiles // []) | length == 0)
+  and (($control.profiles // []) | sort
+       == ["all-tools", "basic", "electrs", "mempool", "minimal-api",
+           "minimal-organic-reorg"])
   and $control.read_only == true
   and (($control.cap_drop // []) == ["ALL"])
   and (($control.security_opt // []) | index("no-new-privileges:true") != null)
@@ -60,8 +64,38 @@ for node in node1 node2 node3; do
     and (($agent.cap_drop // []) == ["ALL"])
     and (($agent.cap_add // []) == ["NET_ADMIN"])
     and (($agent.security_opt // []) | index("no-new-privileges:true") != null)
+    and (($agent.profiles // []) | sort
+         == ["all-tools", "basic", "electrs", "mempool", "minimal-organic-reorg"])
   ' "$config" >/dev/null
 done
+
+# `minimal` is the profile-less render: a chain-only stack. The NET_ADMIN
+# agents and the control plane must both be absent, and nothing may depend on
+# either -- Compose rejects a project whose unprofiled service depends on a
+# profiled one, which would make `minimal` unstartable. The core chain services
+# must still be there, or `minimal` would be useless rather than minimal.
+minimal_config="$(mktemp)"
+trap 'rm -f "$config" "$minimal_config"' EXIT
+# Force the profile set empty: a developer with COMPOSE_PROFILES exported or set
+# in .env would otherwise render a larger stack and defeat this assertion.
+COMPOSE_PROFILES= docker compose config --format json >"$minimal_config"
+
+jq -e '
+  . as $root
+  | ["btc-simnet-network-agent-node1",
+     "btc-simnet-network-agent-node2",
+     "btc-simnet-network-agent-node3",
+     "btc-simnet-control-plane"] as $profiled
+  | ($profiled | all(. as $name | $root.services[$name] == null))
+  and (
+    [$root.services[] | (.depends_on // {}) | keys[]]
+    | map(select(. as $dep | $profiled | index($dep)))
+    | length == 0
+  )
+  and (["btc-simnet-node1", "btc-simnet-node2", "btc-simnet-node3",
+        "btc-simnet-mining-controller", "btc-simnet-spammer"]
+       | all(. as $name | $root.services[$name] != null))
+' "$minimal_config" >/dev/null
 
 jq -e '
   . as $root
