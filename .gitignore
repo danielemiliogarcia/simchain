@@ -16,6 +16,10 @@
 # Scenario result artifacts.
 /results/
 
+# Locally built GitHub Pages preview (./scripts/build-site.sh). Assembled from
+# docs/html/ plus the real dashboard assets; the workflow rebuilds it in CI.
+/_site/
+
 # Control-plane state (token, durable desired state, job metadata/results).
 /.simchain-control/*
 !/.simchain-control/.gitkeep

@@ -103,19 +103,35 @@
     ],
   };
 
-  // Deterministic pseudo-hash so repeated renders stay stable per height.
+  // Real mainnet block hashes for these exact heights. The preview has no
+  // explorer of its own, so its explorer links point at the public
+  // mempool.space instance -- the same software the `mempool` profile runs
+  // locally. Using genuine hashes means every block link there resolves to a
+  // real block page instead of a 404.
+  const REAL_HASHES = {
+    1031: "000000006e8d376834398b7963042cf2d8764860457573c1bb54fc8723a35a6d",
+    1032: "000000001c1791a1ffa49c32784da7c51b77c9c3ea1c4484aebe8627104b93f8",
+    1033: "00000000223bbe66d010f869ffdd9a50b7ecc5e952dcf496fd8824c386cdd30a",
+    1034: "00000000a1987ee5fea1bae12454b15dc47546d2f15e95223983c9b4c3a822de",
+    1035: "00000000bc0c29229324b6b2d483ce7da1c9adbd406cbcf5aeb8824c0b5fef7c",
+    1036: "0000000014968cc5dbf73179697c8faa3055c668b236cb7436b166b5753378e6",
+    1037: "00000000182b06a9e48db4835b47500102d0363e37513f4d330295cc94aabf74",
+    1038: "00000000a58b2ee621036b20ea940018667ddfb03aa43f0075ffd194099f8f3c",
+    1039: "00000000ec36a7861096841e14762ac7abd96cc5dd95968949f41b0b6d1cb732",
+    1040: "000000005340964e637b61a6bea06b1dffbe04c5ec3f0694ba32412ed0dca6ca",
+    1041: "00000000a1c2ef7c9653c9d46ed4ec06407f052b88d7599c4ccb04d758f8bc1f",
+    1042: "0000000062775645272a8d8785577c8f237fd83a07de643c775d7f9f27de48ee",
+  };
+
   function hashFor(height) {
-    let h = (height * 2654435761) >>> 0;
-    let out = "";
-    for (let i = 0; i < 8; i += 1) {
-      h = (h * 1664525 + 1013904223) >>> 0;
-      out += h.toString(16).padStart(8, "0");
-    }
-    return "0000" + out.slice(0, 60);
+    return REAL_HASHES[height] || REAL_HASHES[START_HEIGHT];
   }
 
+  // The tip is deliberately frozen. There is no chain behind this page, so a
+  // height that crept upwards would be inventing blocks whose hashes could not
+  // link anywhere real.
   function currentHeight() {
-    return START_HEIGHT + Math.floor((Date.now() - BOOT_MS) / 8000);
+    return START_HEIGHT;
   }
 
   function recentBlocks(tip) {
@@ -198,8 +214,11 @@
       active_operations: [],
       desired_generation: 7,
       effective_generations: { mining: 7, spam: 7 },
+      // A local stack points this at http://127.0.0.1:1080. The preview has no
+      // local explorer, so it points at the public instance of the very same
+      // software instead, and the block links above resolve there.
       explorer: {
-        url: "http://127.0.0.1:1080",
+        url: "https://mempool.space",
         reachable: true,
         indexer_reachable: true,
         synchronized: true,
@@ -238,10 +257,11 @@
       config: CONFIG,
       faucet: FAUCET,
       jobs: JOBS,
+      // A regtest address does not exist on the public explorer, so this links
+      // to its front page rather than to a lookup that would come back empty.
       user_address: {
         address: "bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk",
-        explorer_url:
-          "http://127.0.0.1:1080/address/bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk",
+        explorer_url: "https://mempool.space",
       },
     };
   }

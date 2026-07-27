@@ -5,8 +5,15 @@ name: GitHub Pages
 # crates/control-plane/static/. Nothing is compiled: the site is static files
 # and a copy step, so this stays fast and cannot break the Rust build.
 #
-# One-time repository setup: Settings → Pages → Build and deployment →
-# Source: "GitHub Actions". Without that, this workflow's deploy step fails.
+# Assembly lives in scripts/build-site.sh, which you can run locally to get a
+# byte-identical preview:  ./scripts/build-site.sh --serve
+#
+# A pull request only BUILDS the site (catching a broken assembly before it can
+# reach the live site); only master deploys, because a repository has a single
+# Pages site and a branch deploy would overwrite it.
+#
+# One-time repository setup: Settings -> Pages -> Build and deployment ->
+# Source: "GitHub Actions". Without that, the deploy job fails.
 
 on:
   push:
@@ -14,6 +21,13 @@ on:
     paths:
       - "docs/html/**"
       - "crates/control-plane/static/**"
+      - "scripts/build-site.sh"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "docs/html/**"
+      - "crates/control-plane/static/**"
+      - "scripts/build-site.sh"
       - ".github/workflows/pages.yml"
   # Allows publishing on demand from the Actions tab.
   workflow_dispatch:
@@ -37,62 +51,27 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Assemble the static site
-        run: |
-          set -euo pipefail
-          mkdir -p _site/dashboard
+        run: ./scripts/build-site.sh
 
-          # Landing page, walkthrough, and the demo scripts.
-          cp docs/html/index.html docs/html/walkthrough.html _site/
-          cp docs/html/demo-shim.js docs/html/demo-schema.js _site/dashboard/
-
-          # The preview serves the REAL dashboard, copied verbatim, so it can
-          # never drift from what the control plane ships.
-          cp crates/control-plane/static/index.html _site/dashboard/index.html
-          cp crates/control-plane/static/app.js     _site/dashboard/app.js
-          cp crates/control-plane/static/styles.css _site/dashboard/styles.css
-
-          # The control plane serves these from the domain root and substitutes
-          # the API token into the page at request time. Under Pages the site
-          # lives in a subdirectory and there is no token, so rewrite both.
-          python3 - <<'PY'
-          from pathlib import Path
-          page = Path("_site/dashboard/index.html")
-          html = page.read_text(encoding="utf-8")
-
-          before = html
-          html = html.replace('"/styles.css"', '"./styles.css"')
-          html = html.replace('"/app.js"', '"./app.js"')
-          assert html != before, "expected root-absolute asset paths to rewrite"
-
-          assert "__CONTROL_PLANE_TOKEN_JSON__" in html, "token placeholder missing"
-          html = html.replace("__CONTROL_PLANE_TOKEN_JSON__", '"static-preview-no-backend"')
-
-          # The shim must replace window.fetch before app.js runs.
-          needle = '<script src="./app.js"></script>'
-          assert needle in html, "app.js script tag not found"
-          html = html.replace(
-              needle,
-              '<script src="./demo-schema.js"></script>\n'
-              '<script src="./demo-shim.js"></script>\n'
-              + needle,
-          )
-          page.write_text(html, encoding="utf-8")
-          print("dashboard preview prepared")
-          PY
-
-          # Pages would otherwise run the site through Jekyll.
-          touch _site/.nojekyll
-
-          echo "--- published tree ---"
-          find _site -type f | sort
+      # Downloadable from the run's summary page, so a pull request can be
+      # eyeballed before it is merged and published.
+      - name: Upload preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-preview
+          path: _site
+          retention-days: 7
 
       - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
       - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
         with:
           path: _site
 
   deploy:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

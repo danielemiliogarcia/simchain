@@ -94,6 +94,8 @@ h3 { font-size: 0.85rem; margin: 0.8rem 0 0.35rem; color: var(--dim); }
 .explorer-status { display: flex; align-items: center; gap: 0.45rem; color: var(--dim); font-size: 0.76rem; margin-bottom: 0.6rem; }
 .explorer-status a, #blocks a { color: var(--accent); text-decoration: none; }
 .explorer-status a:hover, #blocks a:hover { text-decoration: underline; }
+.docs-link { font-size: 0.78rem; color: var(--dim); text-decoration: none; white-space: nowrap; }
+.docs-link:hover { color: var(--accent); text-decoration: underline; }
 .conn { font-size: 0.8rem; color: var(--dim); }
 .conn.ok { color: var(--ok); }
 .conn.stale { color: var(--err); }
@@ -126,6 +128,9 @@ main {
   align-items: start;
 }
 #panel-overview.active, #panel-faucet.active { grid-template-columns: 1fr; }
+/* One grid cell holding a stack of cards, so a short card leaves its
+   successor directly beneath it instead of in the opposite column. */
+.panel-stack { display: grid; gap: 1rem; align-content: start; min-width: 0; }
 @media (max-width: 1100px) { .dashboard-panel.active { grid-template-columns: 1fr; } }
 .card {
   background: var(--card);
@@ -164,6 +169,9 @@ td:first-child, th:first-child { text-align: left; }
 #mining-resume, #spam-resume { background: var(--ok); }
 .action-result { color: var(--dim); font-size: 0.72rem; min-height: 1rem; margin-top: 0.35rem; }
 .action-result.err { color: var(--err); }
+.snapshot-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.snapshot-rationale { margin-top: 0.8rem; padding-top: 0.7rem; border-top: 1px solid var(--line); margin-bottom: 0; }
+.snapshot-rationale b { color: var(--text); }
 .faucet-badge {
   color: var(--accent);
   font-size: 0.7rem;
