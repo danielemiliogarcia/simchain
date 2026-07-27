@@ -12,12 +12,22 @@ only a manual Mine job or degradations on other nodes.
 
 ## Start the services
 
-The three namespace-local network agents and control plane are part of the ordinary
-stack, exposing the browser, API, MCP, and `simchainctl` contract:
+Both jobs need the three namespace-local network agents, and those carry Compose
+profiles: a plain `docker compose up` is the chain-only `minimal` shape and leaves them
+out, as does `minimal-api`. Start a profile that includes them:
 
 ```bash
-docker compose up -d --build
+# smallest stack that can partition; the intended CI shape for organic reorgs
+docker compose --profile minimal-organic-reorg up -d --build
+
+# or the full local stack, same containers
+docker compose --profile basic up -d --build
 ```
+
+`electrs`, `mempool` and `all-tools` include the agents too. Without them the control
+plane refuses `partition` and `degrade` submissions, and any scenario containing those
+steps, with HTTP 503 `component_unavailable` naming the profile to start. The check runs
+before the job is reserved, so a rejected request leaves no job and no partial state.
 
 Each agent shares exactly one node's network namespace with
 `network_mode: service:<node>`. It has no host port, independent Docker network, Docker

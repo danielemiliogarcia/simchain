@@ -6,10 +6,11 @@ volume, applies a complete typed policy through private worker APIs, verifies th
 effective generation, and restores the prior runtime policy if a multi-worker
 transaction fails.
 
-Start the ordinary stack and open [http://localhost:8090/](http://localhost:8090/):
+Retuning is a control-plane feature, so start at least the `minimal-api` profile, then
+open [http://localhost:8090/](http://localhost:8090/):
 
 ```bash
-docker compose up -d --build
+docker compose --profile minimal-api up -d --build
 ```
 
 The dashboard, CLI, HTTP API, and MCP tool are adapters over the same operation. For

@@ -43,7 +43,9 @@ A Rust tool (same stack as the other tools, pure RPC calls) that forces chain re
 The single public dashboard/API/MCP backend. It stores desired runtime policy and job
 history in the `btc-simnet-control-state` Docker volume, reconciles resident workers through authenticated
 private APIs, and runs bounded reorg/scenario/network jobs through Bitcoin RPC and
-leases. It is part of ordinary startup, publishes only localhost port 8090, contains no
+leases. It arrives with the `minimal-api` profile and every richer one -- a plain
+`docker compose up` is the chain-only `minimal` shape without it -- publishes only
+localhost port 8090, contains no
 Docker CLI, drops all Linux capabilities, uses a read-only root filesystem, and mounts
 neither the repository nor the Docker socket.
 
@@ -64,6 +66,11 @@ explicitly, healing, and waiting for the deterministic winner on every node. The
 agents apply bounded P2P-only delay/loss jobs. They have only `NET_ADMIN`, no host port
 or Docker socket, and clear an impairment when its lease TTL expires. Both operations
 are post-bootstrap; the funding sequence must reach height 204 first.
+
+The agents are the only part of the stack that needs `NET_ADMIN`, so they carry Compose
+profiles: `--profile minimal-organic-reorg` is the smallest stack that has them, and
+`basic` and the tool profiles include them too. Below that tier partition and degrade
+work is refused up front. See [Profiles](../README.md#profiles).
 
 ### Tools (Profiles)
 

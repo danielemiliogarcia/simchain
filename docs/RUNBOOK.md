@@ -61,7 +61,7 @@ Start the simnet plus its single control plane, then upload a scenario. The serv
 for bootstrap height 204 before executing any declared steps:
 
 ```bash
-docker compose up -d --build
+docker compose --profile minimal-api up -d --build
 cargo run -p simchainctl -- scenario run scenarios/pause-then-burst.yml
 ```
 

@@ -8,7 +8,8 @@
 # like before" button (equivalent to `down -v` followed by `up -d`).
 #
 # Usage:
-#   ./scripts/fresh-chain.sh                     # fresh basic stack
+#   ./scripts/fresh-chain.sh                     # fresh minimal stack (chain only)
+#   ./scripts/fresh-chain.sh --profile basic     # fresh stack + control plane + agents
 #   ./scripts/fresh-chain.sh --profile mempool   # fresh stack + explorer tools
 #   ./scripts/fresh-chain.sh --profile all-tools # fresh stack + all-tools
 #

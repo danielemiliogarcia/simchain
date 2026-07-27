@@ -21,11 +21,11 @@ hash when you want to inspect a replaced block directly.
 
 ## Control-plane reorg job
 
-The primary operator path is a durable control-plane job. Start the ordinary stack,
-then use the dashboard or the thin HTTP CLI:
+The primary operator path is a durable control-plane job. Start a stack that includes the
+control plane, then use the dashboard or the thin HTTP CLI:
 
 ```bash
-docker compose up -d --build
+docker compose --profile minimal-api up -d --build
 cargo run -p simchainctl -- reorg start --depth 3 --wait
 cargo run -p simchainctl -- reorg start --depth 3 --empty --wait
 cargo run -p simchainctl -- jobs list --json
@@ -45,6 +45,27 @@ the minimum safe rewrite and convergence before cleanup.
 For retry-safe automation, HTTP callers can send `Idempotency-Key`; reusing a key with
 the same normalized request returns the original job. A different request with the same
 key is rejected.
+
+## Rewind without a replacement chain
+
+A reorg replaces history with a longer branch. A rewind does not: the dashboard's
+**Rewind chain** subpanel and this command leave all nodes on a genuinely shorter common
+chain.
+
+```bash
+cargo run -p simchainctl -- rewind --blocks 3 --wait
+```
+
+This is not organic chain selection: `invalidateblock` state is local and does not
+propagate over P2P, so the coordinator must invalidate the same boundary on node2,
+node3, and node1. It pauses spam and mining with owned leases, requires a common start,
+never crosses below bootstrap height 204, persists rollback information before mutation,
+and uses `reconsiderblock` to restore the original branch after a partial failure.
+
+If an electrs-based profile is active, the dashboard warns that its disposable index
+may not understand this rollback-only shape. `./scripts/recover-explorer.sh` recreates
+that existing indexer and waits for its exact tip to match node1; it does nothing when
+the selected profile did not include electrs.
 
 ## Standalone one-shot tool
 

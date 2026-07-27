@@ -1,15 +1,27 @@
 # Simchain Control Plane
 
 The default localhost control plane combines the browser dashboard, versioned HTTP API,
-MCP endpoint, durable job coordinator, and first-party CLI contract. It is part of the
-ordinary Compose stack:
+MCP endpoint, durable job coordinator, and first-party CLI contract. It arrives with the
+`minimal-api` profile and every richer one:
 
 ```bash
-docker compose up -d --build
+docker compose --profile minimal-api up -d --build
 ```
 
 Open [http://localhost:8090/](http://localhost:8090/) (port: `CONTROL_PLANE_PORT`) to
 watch chain state and manage live operations.
+
+The control plane is itself profiled. A plain `docker compose up` is the chain-only
+`minimal` shape and does not start it: the nodes bootstrap and mine, but nothing here is
+available -- no API, no MCP, no dashboard, no jobs, no scenarios, and `simchainctl` has
+nothing to talk to, since it is purely an API client. `--profile minimal-api` is the
+smallest stack that includes it, and every richer profile does too.
+
+With the control plane running, one capability still depends on the profile: **without
+the network agents** (`minimal-api` omits them), partition and degrade submissions, and
+any scenario containing those steps, are rejected with HTTP 503 `component_unavailable`
+naming the profile to start. The check runs before the job is reserved, so a rejected
+request leaves no job behind. Everything else is available.
 
 ## What It Owns
 

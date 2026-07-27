@@ -978,6 +978,14 @@ impl JobManager {
                 format!("invalid scenario: {error:#}"),
             )
         })?;
+        // Reject a scenario whose network steps could never run before any of
+        // its earlier chain mutations are applied, instead of failing it
+        // half-executed on the first partition or degrade step.
+        let network_nodes = scenario_network_nodes(&scenario);
+        if !network_nodes.is_empty() {
+            let nodes: Vec<&str> = network_nodes.iter().map(String::as_str).collect();
+            self.ensure_network_agents(&nodes)?;
+        }
         let fingerprint = serde_json::to_string(&scenario).map_err(internal_error)?;
         let request_value = serde_json::to_value(&scenario).map_err(internal_error)?;
         let idempotency_key = normalize_idempotency_key(idempotency_key)?;
@@ -1295,6 +1303,7 @@ impl JobManager {
         idempotency_key: Option<String>,
     ) -> Result<JobCreatedResponse, JobManagerError> {
         let (request, node) = normalize_partition_request(request)?;
+        self.ensure_network_agents(&[node.short_name()])?;
         let request_value = serde_json::to_value(&request).map_err(internal_error)?;
         let (created, abort) = self.reserve_action_job(
             JobKind::Partition,
@@ -1343,6 +1352,7 @@ impl JobManager {
         idempotency_key: Option<String>,
     ) -> Result<JobCreatedResponse, JobManagerError> {
         let (request, node) = normalize_degrade_request(request)?;
+        self.ensure_network_agents(&[node.as_str()])?;
         let request_value = serde_json::to_value(&request).map_err(internal_error)?;
         let (created, abort) = self.reserve_action_job(
             JobKind::Degrade,
@@ -3297,6 +3307,35 @@ impl JobManager {
         };
         self.acknowledge_lease(job_id, &lease);
         Ok(lease)
+    }
+
+    /// Reject network work up front when the namespace-local agents are not
+    /// deployed. Partitions, netem degradation and the organic reorgs built on
+    /// them are the only features that need NET_ADMIN inside a node's
+    /// namespace, so profiles below `minimal-organic-reorg` leave the agents
+    /// out. Probing here turns what would otherwise be an opaque mid-job lease
+    /// failure into a synchronous 503 naming the profile to start instead.
+    fn ensure_network_agents(&self, nodes: &[&str]) -> Result<(), JobManagerError> {
+        let mut unreachable: Vec<String> = Vec::new();
+        for node in nodes {
+            if let Err(error) = self.network.status(node) {
+                unreachable.push(format!("{node} ({error:#})"));
+            }
+        }
+        if unreachable.is_empty() {
+            return Ok(());
+        }
+        Err(JobManagerError::new(
+            ErrorCode::ComponentUnavailable,
+            format!(
+                "network impairment needs the namespace-local network agents, but \
+                 {} not reachable. Profiles below `minimal-organic-reorg` do not \
+                 start them: recreate the stack with \
+                 `docker compose --profile minimal-organic-reorg up -d`, or with \
+                 `--profile basic` for the full local stack.",
+                join_unreachable(&unreachable)
+            ),
+        ))
     }
 
     fn acquire_network_lease(
@@ -6747,6 +6786,32 @@ fn other_miner(node: MinerNode) -> MinerNode {
     }
 }
 
+/// Distinct nodes whose network agent a scenario's steps would need. Returns
+/// empty for the many scenarios that only mine, spam, retune or reorg.
+fn scenario_network_nodes(scenario: &Scenario) -> Vec<String> {
+    let mut nodes: Vec<String> = scenario
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Partition { node, .. } => Some(node.short_name().to_string()),
+            Step::Degrade { node, .. } => Some(node.short_name().to_string()),
+            _ => None,
+        })
+        .collect();
+    nodes.sort();
+    nodes.dedup();
+    nodes
+}
+
+/// Render one or more unreachable agents so the sentence reads naturally for
+/// both a single-node degrade and a scenario touching several nodes.
+fn join_unreachable(unreachable: &[String]) -> String {
+    match unreachable {
+        [single] => format!("{single} is"),
+        many => format!("{} are", many.join(", ")),
+    }
+}
+
 fn network_lease_node(lease: &JobLease) -> anyhow::Result<&str> {
     let node = lease
         .component
@@ -8606,6 +8671,96 @@ steps:
             .expect("spam status")
             .active_leases
             .is_empty());
+    }
+
+    /// A stack started without the network agents (the `minimal` profile) must
+    /// refuse impairment work synchronously and name the profile to use, rather
+    /// than reserving a job that dies on its first lease call.
+    #[test]
+    fn network_work_is_rejected_with_a_profile_hint_when_agents_are_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(BlockingExecutor::new());
+        let (backend, manager) = manager(dir.path(), executor);
+        backend
+            .world
+            .lock()
+            .expect("world lock")
+            .network_agents_deployed = false;
+
+        let partition = manager
+            .start_partition(
+                PartitionJobRequest {
+                    node: "node3".to_string(),
+                    main_blocks: 2,
+                    isolated_blocks: 3,
+                    heal_delay_secs: 0,
+                },
+                None,
+            )
+            .expect_err("partition must be rejected");
+        assert_eq!(partition.code, ErrorCode::ComponentUnavailable);
+        assert!(
+            partition.message.contains("node3")
+                && partition
+                    .message
+                    .contains("--profile minimal-organic-reorg"),
+            "unexpected message: {}",
+            partition.message
+        );
+
+        let degrade = manager
+            .start_degrade(
+                DegradeJobRequest {
+                    node: "node2".to_string(),
+                    delay_ms: 100,
+                    loss_pct: 0.0,
+                    seconds: 1,
+                },
+                None,
+            )
+            .expect_err("degrade must be rejected");
+        assert_eq!(degrade.code, ErrorCode::ComponentUnavailable);
+        assert!(degrade.message.contains("node2"), "{}", degrade.message);
+
+        // Rejection is a submit-time gate, so nothing was persisted.
+        assert!(manager.list().jobs.is_empty());
+    }
+
+    /// The gate is per-scenario, not per-request: a scenario is refused whole
+    /// when it contains network steps, and untouched when it does not.
+    #[test]
+    fn scenarios_are_gated_only_when_they_contain_network_steps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(BlockingExecutor::new());
+        let (backend, manager) = manager(dir.path(), executor);
+        backend
+            .world
+            .lock()
+            .expect("world lock")
+            .network_agents_deployed = false;
+
+        let with_network = manager
+            .start_scenario(
+                "version: 1\nsteps:\n  - type: partition\n    node: node3\n    \
+                 main_blocks: 3\n    isolated_blocks: 5\n"
+                    .to_string(),
+                None,
+            )
+            .expect_err("scenario with a partition step must be rejected");
+        assert_eq!(with_network.code, ErrorCode::ComponentUnavailable);
+        assert!(
+            with_network.message.contains("--profile basic"),
+            "{}",
+            with_network.message
+        );
+
+        // A mining-only scenario never touches an agent, so `minimal` runs it.
+        manager
+            .start_scenario(
+                "version: 1\nsteps:\n  - type: mine\n    node: node2\n    blocks: 1\n".to_string(),
+                None,
+            )
+            .expect("mining-only scenario must still be accepted");
     }
 
     #[test]

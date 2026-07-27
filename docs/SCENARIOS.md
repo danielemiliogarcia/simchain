@@ -8,10 +8,13 @@ leases, checkpoints, its result, and cleanup outcome.
 ## Run a scenario
 
 Start the simnet and control plane, then submit a version-1 YAML file with the first-party
-client:
+client. Scenarios are a control-plane feature, so `minimal-api` is the smallest profile
+that can run one; a plain `docker compose up` is the chain-only `minimal` profile and has
+no control plane at all. Scenarios containing a `partition` or `degrade` step need
+`--profile minimal-organic-reorg` (or `basic`) for the network agents.
 
 ```bash
-docker compose up -d --build
+docker compose --profile minimal-api up -d --build
 cargo run -p simchainctl -- scenario validate scenarios/reorg-during-sync.yml
 cargo run -p simchainctl -- scenario explain scenarios/reorg-during-sync.yml
 cargo run -p simchainctl -- scenario run scenarios/reorg-during-sync.yml \
@@ -197,6 +200,11 @@ Validation rules:
 - `degrade.node` is `node1`, `node2`, or `node3`; `delay_ms` or `loss_pct` must be
   positive. `delay_ms` is capped at 600000 and `loss_pct` must be 0 through 100. Use
   exactly one duration: `seconds` from 1 through 86400, or `until_height` at least 204.
+- A scenario containing any `partition` or `degrade` step needs the namespace-local
+  network agents, which arrive with `--profile minimal-organic-reorg`. Under
+  `minimal-api` such a scenario is rejected whole at submission with HTTP 503
+  `component_unavailable` naming the profile to start, rather than failing partway
+  through its earlier steps. Scenarios without those steps run under `minimal-api`.
 - Checkpoint names are non-empty, URL-safe, at most 100 bytes, and unique in one file.
 - Checkpoints pause by default. A pausing checkpoint requires a positive `timeout_secs`;
   `pause: false` records a durable milestone and continues immediately.

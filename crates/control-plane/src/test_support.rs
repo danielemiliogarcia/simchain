@@ -118,6 +118,9 @@ pub struct MockWorld {
     pub network_leases: HashMap<String, NetworkImpairmentLease>,
     pub network_generations: HashMap<String, u64>,
     pub network_acquire_response_fail_times: u32,
+    /// False models a stack started without the network agents (the `minimal`
+    /// profile): every agent call fails the way an unbound port does.
+    pub network_agents_deployed: bool,
     pub policy_calls: Vec<(String, u64)>,
     pub spam_burst_preparations: Vec<Vec<SpamBurstTarget>>,
 }
@@ -158,6 +161,7 @@ impl MockBackend {
                 network_leases: HashMap::new(),
                 network_generations: HashMap::new(),
                 network_acquire_response_fail_times: 0,
+                network_agents_deployed: true,
                 policy_calls: Vec::new(),
                 spam_burst_preparations: Vec::new(),
             }),
@@ -829,6 +833,10 @@ impl NetworkControlBackend for MockBackend {
     fn status(&self, node: &str) -> anyhow::Result<NetworkAgentStatus> {
         let node = normalize_mock_node(node)?;
         let world = self.world.lock().expect("world lock");
+        anyhow::ensure!(
+            world.network_agents_deployed,
+            "IO error: Connection refused (os error 111)"
+        );
         Ok(NetworkAgentStatus {
             component: "network-agent".to_string(),
             node: node.to_string(),
