@@ -6,6 +6,10 @@ A regtest Bitcoin simulation network that tries to stay as close to mainnet real
 regtest allows: several P2P-connected nodes, rotating miners, non-empty blocks a non-mining full node as
 the user endpoint emulating a 3rd party provided node. See [Features](#features) for more.
 
+🌐 **[Site, guided walkthrough, and a dashboard preview →](https://danielemiliogarcia.github.io/simchain/)**
+Browse every feature step by step, and click around the real control dashboard loaded with
+sample data, without installing anything.
+
 ## Quickstart
 
 - First, build and start everything on a brand-new chain:
@@ -451,6 +455,10 @@ exclude = ["path/to/simchain"]
   document that covers it.
 - [NETWORK_TOPOLOGY.md](./docs/NETWORK_TOPOLOGY.md), the full container-level diagrams
   behind the topology overview: nodes, workers, agents, and the explorer stack.
+- [docs/html/](./docs/html), the published site: a step-by-step feature walkthrough and a
+  read-only dashboard preview, deployed to
+  [GitHub Pages](https://danielemiliogarcia.github.io/simchain/) by
+  [`.github/workflows/pages.yml`](./.github/workflows/pages.yml).
 - [RETUNING.md](./docs/RETUNING.md), how to retune mining cadence, fee floor, and block fill on a live chain.
 - [MCP.md](./docs/MCP.md), connecting coding agents to the Simchain MCP endpoint.
 - [REORGS.md](./docs/REORGS.md), simulating chain reorganizations and shorter-chain

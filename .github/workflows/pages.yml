@@ -1,0 +1,102 @@
+name: GitHub Pages
+
+# Publishes docs/html/ to GitHub Pages, plus a read-only preview of the control
+# dashboard assembled from the real dashboard assets in
+# crates/control-plane/static/. Nothing is compiled: the site is static files
+# and a copy step, so this stays fast and cannot break the Rust build.
+#
+# One-time repository setup: Settings → Pages → Build and deployment →
+# Source: "GitHub Actions". Without that, this workflow's deploy step fails.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/html/**"
+      - "crates/control-plane/static/**"
+      - ".github/workflows/pages.yml"
+  # Allows publishing on demand from the Actions tab.
+  workflow_dispatch:
+
+# Read the repo, write an OIDC token for the Pages deployment.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two publishes at once, but let a queued one finish rather than
+# cancelling it: a half-deployed site is worse than a slightly stale one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble the static site
+        run: |
+          set -euo pipefail
+          mkdir -p _site/dashboard
+
+          # Landing page, walkthrough, and the demo scripts.
+          cp docs/html/index.html docs/html/walkthrough.html _site/
+          cp docs/html/demo-shim.js docs/html/demo-schema.js _site/dashboard/
+
+          # The preview serves the REAL dashboard, copied verbatim, so it can
+          # never drift from what the control plane ships.
+          cp crates/control-plane/static/index.html _site/dashboard/index.html
+          cp crates/control-plane/static/app.js     _site/dashboard/app.js
+          cp crates/control-plane/static/styles.css _site/dashboard/styles.css
+
+          # The control plane serves these from the domain root and substitutes
+          # the API token into the page at request time. Under Pages the site
+          # lives in a subdirectory and there is no token, so rewrite both.
+          python3 - <<'PY'
+          from pathlib import Path
+          page = Path("_site/dashboard/index.html")
+          html = page.read_text(encoding="utf-8")
+
+          before = html
+          html = html.replace('"/styles.css"', '"./styles.css"')
+          html = html.replace('"/app.js"', '"./app.js"')
+          assert html != before, "expected root-absolute asset paths to rewrite"
+
+          assert "__CONTROL_PLANE_TOKEN_JSON__" in html, "token placeholder missing"
+          html = html.replace("__CONTROL_PLANE_TOKEN_JSON__", '"static-preview-no-backend"')
+
+          # The shim must replace window.fetch before app.js runs.
+          needle = '<script src="./app.js"></script>'
+          assert needle in html, "app.js script tag not found"
+          html = html.replace(
+              needle,
+              '<script src="./demo-schema.js"></script>\n'
+              '<script src="./demo-shim.js"></script>\n'
+              + needle,
+          )
+          page.write_text(html, encoding="utf-8")
+          print("dashboard preview prepared")
+          PY
+
+          # Pages would otherwise run the site through Jekyll.
+          touch _site/.nojekyll
+
+          echo "--- published tree ---"
+          find _site -type f | sort
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
