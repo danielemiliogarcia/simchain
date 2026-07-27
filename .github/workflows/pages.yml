@@ -1,0 +1,81 @@
+name: GitHub Pages
+
+# Publishes docs/html/ to GitHub Pages, plus a read-only preview of the control
+# dashboard assembled from the real dashboard assets in
+# crates/control-plane/static/. Nothing is compiled: the site is static files
+# and a copy step, so this stays fast and cannot break the Rust build.
+#
+# Assembly lives in scripts/build-site.sh, which you can run locally to get a
+# byte-identical preview:  ./scripts/build-site.sh --serve
+#
+# A pull request only BUILDS the site (catching a broken assembly before it can
+# reach the live site); only master deploys, because a repository has a single
+# Pages site and a branch deploy would overwrite it.
+#
+# One-time repository setup: Settings -> Pages -> Build and deployment ->
+# Source: "GitHub Actions". Without that, the deploy job fails.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/html/**"
+      - "crates/control-plane/static/**"
+      - "scripts/build-site.sh"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "docs/html/**"
+      - "crates/control-plane/static/**"
+      - "scripts/build-site.sh"
+      - ".github/workflows/pages.yml"
+  # Allows publishing on demand from the Actions tab.
+  workflow_dispatch:
+
+# Read the repo, write an OIDC token for the Pages deployment.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two publishes at once, but let a queued one finish rather than
+# cancelling it: a half-deployed site is worse than a slightly stale one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble the static site
+        run: ./scripts/build-site.sh
+
+      # Downloadable from the run's summary page, so a pull request can be
+      # eyeballed before it is merged and published.
+      - name: Upload preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-preview
+          path: _site
+          retention-days: 7
+
+      - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

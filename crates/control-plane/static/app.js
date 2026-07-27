@@ -2217,11 +2217,46 @@ async function doApply() {
   }
 }
 
+/* ------------------------------------------------------------- snapshots */
+
+// Snapshots stop containers and copy Docker volumes, which this process
+// deliberately cannot do: it has no Docker socket and no Docker CLI. Rather
+// than showing two permanently dead buttons, each one reveals the exact host
+// command and copies it to the clipboard, so the feature stays discoverable
+// and the click still does something useful.
+const SNAPSHOT_COMMANDS = {
+  save: "./scripts/snapshot.sh save my-snapshot",
+  restore: "./scripts/snapshot.sh restore my-snapshot --profile all-tools",
+};
+
+async function showSnapshotCommand(action) {
+  const command = SNAPSHOT_COMMANDS[action];
+  const output = $("#snapshot-command");
+  const result = $("#snapshot-result");
+  output.textContent = command;
+  output.hidden = false;
+  result.classList.remove("err");
+  try {
+    await navigator.clipboard.writeText(command);
+    result.textContent = "Copied. Run it from the repository root.";
+  } catch (_) {
+    // Clipboard access needs a secure context and user permission; the command
+    // is on screen either way, so this is not an error worth shouting about.
+    result.textContent = "Run it from the repository root.";
+  }
+}
+
+function initSnapshots() {
+  $("#snapshot-save").addEventListener("click", () => showSnapshotCommand("save"));
+  $("#snapshot-restore").addEventListener("click", () => showSnapshotCommand("restore"));
+}
+
 /* -------------------------------------------------------------------- init */
 
 async function init() {
   initTabs();
   initRegtestWallet();
+  initSnapshots();
   const { body } = await api("/api/v1/config/schema");
   schema = body;
   buildForm();

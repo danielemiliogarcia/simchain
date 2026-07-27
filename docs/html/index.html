@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simchain — a regtest Bitcoin network that behaves like mainnet</title>
+<meta name="description" content="Simchain is a disposable Bitcoin regtest network with mainnet-like behaviour: non-empty blocks, fee pressure, reorgs, network partitions and propagation delay.">
+<style>
+  :root {
+    --bg: #0f1115; --panel: #181b22; --panel2: #1f232d;
+    --text: #e6e9ef; --muted: #9aa3b2; --accent: #f7931a; --accent2: #4fc3f7;
+    --green: #7bd88f; --border: #2a2f3a; --code-bg: #12141a;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f8fa; --panel: #ffffff; --panel2: #f0f2f6;
+      --text: #1d2330; --muted: #5c6675; --border: #dfe3ea;
+      --code-bg: #f2f4f8; --accent2: #0277bd;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 1rem 4rem;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.55;
+  }
+  main { max-width: 880px; margin: 0 auto; }
+  a { color: var(--accent2); }
+  header { padding: 3.5rem 0 1.5rem; border-bottom: 2px solid var(--accent); margin-bottom: 2rem; }
+  h1 { margin: 0 0 .5rem; font-size: 2.4rem; }
+  h1 .btc { color: var(--accent); }
+  .tagline { color: var(--muted); font-size: 1.15rem; max-width: 62ch; }
+  h2 { font-size: 1.2rem; margin: 2.4rem 0 .6rem; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; margin: 1.6rem 0; }
+  .card {
+    display: block; text-decoration: none; color: inherit;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 1.1rem 1.2rem; transition: border-color .15s, transform .15s;
+  }
+  .card:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .card .kicker { font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; color: var(--accent); font-weight: 700; }
+  .card h3 { margin: .35rem 0 .4rem; font-size: 1.1rem; }
+  .card p { margin: 0; color: var(--muted); font-size: .92rem; }
+
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: .9rem 1.1rem; overflow-x: auto; font-size: .9rem; margin: .6rem 0 1rem;
+  }
+  code { font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace; }
+  p code, li code { background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: .05rem .35rem; font-size: .85em; }
+  ul { padding-left: 1.3rem; }
+  li { margin: .3rem 0; }
+  .note { border-left: 3px solid var(--accent); background: var(--panel2); padding: .6rem 1rem; border-radius: 0 8px 8px 0; margin: 1rem 0; font-size: .93rem; }
+  footer { color: var(--muted); font-size: .85rem; margin-top: 3.5rem; text-align: center; border-top: 1px solid var(--border); padding-top: 1.2rem; }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1><span class="btc">₿</span> Simchain</h1>
+  <div class="tagline">
+    A disposable Bitcoin regtest network that behaves like mainnet — non-empty blocks, real
+    fee pressure, reorgs, network splits and propagation delay — so your application's tests
+    need minimal changes to run on testnet or mainnet.
+  </div>
+</header>
+
+<div class="cards">
+  <a class="card" href="./walkthrough.html">
+    <div class="kicker">Guided tour</div>
+    <h3>Feature walkthrough →</h3>
+    <p>Every feature, one step at a time, with the commands to run and what you should see happen.</p>
+  </a>
+  <a class="card" href="./dashboard/">
+    <div class="kicker">Preview</div>
+    <h3>Control dashboard →</h3>
+    <p>The real dashboard UI with sample data. Look around; the controls are inert.</p>
+  </a>
+  <a class="card" href="https://github.com/danielemiliogarcia/simchain">
+    <div class="kicker">Source</div>
+    <h3>GitHub repository →</h3>
+    <p>Code, full documentation, scenarios, and the issue tracker.</p>
+  </a>
+</div>
+
+<h2>Try it in two commands</h2>
+<pre><code>git clone https://github.com/danielemiliogarcia/simchain
+cd simchain
+./scripts/fresh-chain.sh --profile all-tools</code></pre>
+<p>Then open <code>http://localhost:8090/</code> for the dashboard. The chain bootstraps to height 204 before settling into its normal block cadence.</p>
+
+<h2>What it gives you</h2>
+<ul>
+  <li><b>Three real Bitcoin Core nodes</b> in a P2P mesh. Two mine; the third has its wallet disabled and mining refused at the RPC layer — your production-like endpoint.</li>
+  <li><b>Blocks that are not empty</b>, with a configurable mempool backlog and an economic fee floor built by paying for it, never by editing relay policy.</li>
+  <li><b>Chain events on demand</b> — forced reorgs, true shorter-chain rewinds, and organic reorgs produced by partitioning the mesh and letting both halves mine.</li>
+  <li><b>Propagation faults</b> — bounded latency and packet loss on P2P only, with automatic recovery.</li>
+  <li><b>Four ways to drive it</b> — a dashboard, a CLI, a versioned HTTP API, and an MCP endpoint for coding agents, all over one operation set.</li>
+  <li><b>Repeatability</b> — declarative YAML scenarios with CI checkpoints, and chain snapshots so you stop paying the bootstrap cost.</li>
+</ul>
+
+<div class="note">
+  Simchain is a test environment for <em>applications</em>. It is not a consensus, miner, or
+  network-scale testbed, and its results should not be read as testnet or mainnet network behaviour.
+</div>
+
+<h2>Documentation</h2>
+<ul>
+  <li><a href="https://github.com/danielemiliogarcia/simchain#readme">README</a> — install, configuration, profiles</li>
+  <li><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/FEATURES.md">FEATURES.md</a> — every feature, linked to its reference doc</li>
+  <li><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/SETTINGS.md">SETTINGS.md</a> — every setting and what it does</li>
+  <li><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/SCENARIOS.md">SCENARIOS.md</a> — scenario schema and CI checkpoints</li>
+  <li><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/RUNBOOK.md">RUNBOOK.md</a> — handy one-liners</li>
+</ul>
+
+<footer>
+  Simchain · <a href="https://github.com/danielemiliogarcia/simchain">github.com/danielemiliogarcia/simchain</a> · GPL-3.0-or-later
+</footer>
+
+</main>
+</body>
+</html>

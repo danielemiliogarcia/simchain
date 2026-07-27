@@ -1,0 +1,1068 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simchain — Feature Walkthrough</title>
+<meta name="description" content="A hands-on, six-act tour of Simchain: start a Bitcoin regtest chain that behaves like mainnet, reshape it live, break it on purpose, then make it reproducible.">
+<style>
+  :root {
+    --bg: #0f1115; --panel: #181b22; --panel2: #1f232d;
+    --text: #e6e9ef; --muted: #9aa3b2; --accent: #f7931a; --accent2: #4fc3f7;
+    --green: #7bd88f; --red: #ff6b6b; --purple: #c792ea;
+    --border: #2a2f3a; --code-bg: #12141a;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f8fa; --panel: #ffffff; --panel2: #f0f2f6;
+      --text: #1d2330; --muted: #5c6675; --border: #dfe3ea;
+      --code-bg: #f2f4f8; --accent2: #0277bd; --purple: #7b3fbf;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 1rem 4rem;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.55;
+  }
+  a { color: var(--accent2); }
+
+  #progress-rail { position: fixed; top: 0; left: 0; right: 0; height: 4px; background: var(--border); z-index: 100; }
+  #progress-fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--green)); transition: width .35s ease; }
+
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  header { padding: 2.6rem 0 1.2rem; border-bottom: 2px solid var(--accent); margin-bottom: 1.5rem; }
+  h1 { margin: 0 0 .3rem; font-size: 2rem; }
+  h1 .btc { color: var(--accent); }
+  .subtitle { color: var(--muted); font-size: 1.05rem; max-width: 72ch; }
+  .meta { display: flex; gap: 1.5rem; flex-wrap: wrap; margin-top: 1rem; font-size: .9rem; color: var(--muted); }
+  .meta b { color: var(--text); }
+  .homelink { font-size: .9rem; margin-top: .9rem; }
+
+  .layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 2.5rem; align-items: start; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; gap: 1rem; } nav.toc { position: static !important; max-height: none !important; } }
+
+  nav.toc {
+    position: sticky; top: 1.2rem; max-height: calc(100vh - 2.4rem); overflow-y: auto;
+    font-size: .87rem; border-right: 1px solid var(--border); padding-right: .8rem;
+  }
+  .scoreboard { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: .7rem .85rem; margin-bottom: 1rem; }
+  .scoreboard .count { font-size: 1.5rem; font-weight: 700; color: var(--accent); line-height: 1.1; }
+  .scoreboard .of { color: var(--muted); font-size: .95rem; font-weight: 400; }
+  .scoreboard .label { font-size: .78rem; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
+  .scoreboard button {
+    margin-top: .5rem; width: 100%; cursor: pointer; font: inherit; font-size: .78rem;
+    background: transparent; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 6px; padding: .25rem .4rem;
+  }
+  .scoreboard button:hover { color: var(--red); border-color: var(--red); }
+
+  nav.toc .actname { font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 1.1rem 0 .35rem; }
+  nav.toc .actname:first-of-type { margin-top: 0; }
+  nav.toc ol { list-style: none; margin: 0; padding: 0; }
+  nav.toc li { margin: .16rem 0; }
+  nav.toc a { text-decoration: none; color: var(--text); display: flex; gap: .45rem; padding: .16rem .3rem; border-radius: 4px; }
+  nav.toc a:hover { background: var(--panel2); color: var(--accent2); }
+  nav.toc a .n { color: var(--accent); font-weight: 700; min-width: 1.4em; }
+  nav.toc li.done a { color: var(--muted); }
+  nav.toc li.done a .n { color: var(--green); }
+  nav.toc li.done a .n .num { display: none; }
+  nav.toc li.done a .n::before { content: "✓"; }
+
+  .act {
+    margin: 2.6rem 0 1rem; padding: 1rem 1.2rem;
+    background: var(--panel2); border: 1px solid var(--border);
+    border-left: 4px solid var(--accent); border-radius: 10px;
+  }
+  .act:first-of-type { margin-top: 0; }
+  .act .badge { font-size: 1.6rem; line-height: 1; }
+  .act .actline { display: flex; align-items: center; gap: .7rem; flex-wrap: wrap; }
+  .act h2 { margin: 0; font-size: 1.15rem; letter-spacing: .02em; }
+  .act .actprog { margin-left: auto; font-size: .8rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .act p { margin: .5rem 0 0; color: var(--muted); font-size: .93rem; max-width: 72ch; }
+
+  section.step {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    margin: 1.1rem 0; padding: 1.3rem 1.5rem 1.1rem; scroll-margin-top: 1.5rem;
+    transition: border-color .2s;
+  }
+  section.step.done { border-color: var(--green); }
+  section.step.done .stamp { background: var(--green); }
+  .step-head { display: flex; align-items: baseline; gap: .8rem; flex-wrap: wrap; margin-bottom: .35rem; }
+  .stamp { background: var(--accent); color: #101010; font-weight: 700; font-size: .8rem; border-radius: 6px; padding: .15rem .6rem; letter-spacing: .03em; white-space: nowrap; }
+  h2.title { margin: 0; font-size: 1.25rem; }
+  .tag { color: var(--muted); font-size: .85rem; font-style: italic; }
+  .diff { color: var(--accent); font-size: .8rem; letter-spacing: .1em; margin-left: auto; }
+  .diff .off { color: var(--border); }
+  h3 { font-size: .95rem; text-transform: uppercase; letter-spacing: .06em; color: var(--accent2); margin: 1.1rem 0 .4rem; }
+  ul { margin: .3rem 0 .6rem; padding-left: 1.3rem; }
+  li { margin: .25rem 0; }
+  p { margin: .5rem 0; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: .8rem 1rem; overflow-x: auto; font-size: .86rem; line-height: 1.5; margin: .5rem 0 .8rem; }
+  code { font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace; }
+  p code, li code, td code { background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: .05rem .35rem; font-size: .85em; }
+
+  /* Shared callout shell. Every callout class must be listed here: the padding
+     and background live in this rule, so a class left out of it renders as bare
+     text hard against its colour bar. */
+  .goal, .expect, .why, .gotcha, .req, .check, .challenge, .predict {
+    background: var(--panel2); padding: .5rem .9rem;
+    border-radius: 0 8px 8px 0; margin: .6rem 0; font-size: .9rem;
+  }
+  .goal code, .expect code, .why code, .gotcha code, .req code,
+  .check code, .challenge code, .predict code {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: .05rem .35rem; font-size: .85em;
+  }
+  .goal { border-left: 3px solid var(--accent); }
+  .goal::before { content: "🎯 Goal: "; font-weight: 600; color: var(--accent); }
+  .predict { border-left: 3px solid var(--purple); }
+  .predict::before { content: "🔮 Guess first: "; font-weight: 600; color: var(--purple); }
+  .expect { border-left: 3px solid var(--accent2); }
+  .expect::before { content: "👁 What you should see: "; font-weight: 600; color: var(--accent2); }
+  .why { border-left: 3px solid var(--green); }
+  .why::before { content: "💡 Why it matters: "; font-weight: 600; color: var(--green); }
+  .gotcha { border-left: 3px solid var(--red); }
+  .gotcha::before { content: "⚠ Gotcha: "; font-weight: 600; color: var(--red); }
+  .req { border-left: 3px solid var(--accent); }
+  .req::before { content: "🧩 Needs: "; font-weight: 600; color: var(--accent); }
+  .challenge { border-left: 3px solid var(--purple); }
+  .challenge::before { content: "⚔ Side quest: "; font-weight: 600; color: var(--purple); }
+  .check { border: 1px dashed var(--green); border-left: 3px solid var(--green); background: transparent; border-radius: 8px; }
+  .check::before { content: "✅ You've got it when: "; font-weight: 600; color: var(--green); }
+
+  .docs { margin-top: .9rem; padding-top: .6rem; border-top: 1px dashed var(--border); font-size: .86rem; color: var(--muted); }
+  .docs::before { content: "📄 Read more: "; font-weight: 600; color: var(--text); }
+
+  .markwrap { margin-top: .9rem; }
+  button.mark {
+    cursor: pointer; font: inherit; font-size: .85rem; font-weight: 600;
+    background: transparent; color: var(--accent); border: 1px solid var(--accent);
+    border-radius: 8px; padding: .35rem .9rem;
+  }
+  button.mark:hover { background: var(--accent); color: #101010; }
+  section.step.done button.mark { color: var(--green); border-color: var(--green); }
+  section.step.done button.mark:hover { background: var(--green); color: #101010; }
+
+  table { border-collapse: collapse; width: 100%; margin: .6rem 0 1rem; font-size: .9rem; }
+  th, td { border: 1px solid var(--border); padding: .45rem .7rem; text-align: left; vertical-align: top; }
+  th { background: var(--panel2); }
+
+  #finale { display: none; margin: 1.5rem 0; padding: 1.4rem 1.5rem; text-align: center; background: var(--panel2); border: 2px solid var(--green); border-radius: 12px; }
+  #finale.show { display: block; }
+  #finale h2 { margin: .2rem 0 .4rem; color: var(--green); }
+  footer { color: var(--muted); font-size: .85rem; margin-top: 3rem; text-align: center; }
+</style>
+</head>
+<body>
+<div id="progress-rail"><div id="progress-fill"></div></div>
+<div class="wrap">
+
+<header>
+  <h1><span class="btc">₿</span> Simchain — Feature Walkthrough</h1>
+  <div class="subtitle">
+    Six acts, eighteen steps. You start a Bitcoin chain, learn to read it, reshape it while it runs,
+    break it on purpose, then make the whole thing reproducible. Run the commands as you go — every
+    step ends with something you can check.
+  </div>
+  <div class="meta">
+    <span><b>Time:</b> ~60 min, or stop after any act</span>
+    <span><b>You need:</b> Docker, Docker Compose 2.23.1+, Rust toolchain</span>
+    <span><b>Progress</b> is saved in this browser</span>
+  </div>
+  <div class="homelink"><a href="./index.html">← Back to the Simchain site</a> · <a href="./dashboard/">Dashboard preview</a></div>
+</header>
+
+<div class="layout">
+
+<nav class="toc">
+  <div class="scoreboard">
+    <div class="label">Steps done</div>
+    <div><span class="count" id="score">0</span><span class="of"> / 18</span></div>
+    <button id="reset" type="button">Reset progress</button>
+  </div>
+
+  <div class="actname">Act I · Look</div>
+  <ol>
+    <li data-tocfor="s1"><a href="#s1"><span class="n"><span class="num">1</span></span>First light</a></li>
+    <li data-tocfor="s2"><a href="#s2"><span class="n"><span class="num">2</span></span>Meet the three nodes</a></li>
+    <li data-tocfor="s3"><a href="#s3"><span class="n"><span class="num">3</span></span>Read the chain</a></li>
+    <li data-tocfor="s4"><a href="#s4"><span class="n"><span class="num">4</span></span>Try to cheat</a></li>
+  </ol>
+  <div class="actname">Act II · Touch</div>
+  <ol>
+    <li data-tocfor="s5"><a href="#s5"><span class="n"><span class="num">5</span></span>Change the weather</a></li>
+    <li data-tocfor="s6"><a href="#s6"><span class="n"><span class="num">6</span></span>Fill the blocks</a></li>
+    <li data-tocfor="s7"><a href="#s7"><span class="n"><span class="num">7</span></span>Get yourself paid</a></li>
+  </ol>
+  <div class="actname">Act III · Doors</div>
+  <ol>
+    <li data-tocfor="s8"><a href="#s8"><span class="n"><span class="num">8</span></span>The dashboard</a></li>
+    <li data-tocfor="s9"><a href="#s9"><span class="n"><span class="num">9</span></span>API and agents</a></li>
+  </ol>
+  <div class="actname">Act IV · Break</div>
+  <ol>
+    <li data-tocfor="s10"><a href="#s10"><span class="n"><span class="num">10</span></span>Rewrite history</a></li>
+    <li data-tocfor="s11"><a href="#s11"><span class="n"><span class="num">11</span></span>Unwind it</a></li>
+    <li data-tocfor="s12"><a href="#s12"><span class="n"><span class="num">12</span></span>Split the network</a></li>
+    <li data-tocfor="s13"><a href="#s13"><span class="n"><span class="num">13</span></span>Slow the wires</a></li>
+  </ol>
+  <div class="actname">Act V · Repeat</div>
+  <ol>
+    <li data-tocfor="s14"><a href="#s14"><span class="n"><span class="num">14</span></span>Record the run</a></li>
+    <li data-tocfor="s15"><a href="#s15"><span class="n"><span class="num">15</span></span>Save your world</a></li>
+  </ol>
+  <div class="actname">Act VI · Ship</div>
+  <ol>
+    <li data-tocfor="s16"><a href="#s16"><span class="n"><span class="num">16</span></span>Plug your app in</a></li>
+    <li data-tocfor="s17"><a href="#s17"><span class="n"><span class="num">17</span></span>The one trap</a></li>
+    <li data-tocfor="s18"><a href="#s18"><span class="n"><span class="num">18</span></span>Graduation</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ===================================== ACT I ===================================== -->
+<div class="act">
+  <div class="actline">
+    <span class="badge">🔭</span>
+    <h2>Act I · Look</h2>
+    <span class="actprog" data-actprog="1"></span>
+  </div>
+  <p>Nothing here can break anything. You start the stack and learn to read what it is telling you,
+  which is the skill every later act depends on.</p>
+</div>
+
+<section class="step" id="s1" data-step data-act="1">
+  <div class="step-head">
+    <span class="stamp">STEP 1</span>
+    <h2 class="title">First light</h2>
+    <span class="tag">~5 min, mostly waiting</span>
+    <span class="diff" title="difficulty">●<span class="off">●●</span></span>
+  </div>
+  <div class="goal">get a three-node Bitcoin network running from a single command.</div>
+  <p>From the repository root:</p>
+<pre><code>./scripts/fresh-chain.sh --profile all-tools</code></pre>
+  <p>This wipes any previous chain and boots a brand-new one with every optional tool enabled, so
+  nothing later in the walkthrough is missing. The first run also builds the images.</p>
+  <div class="expect">
+    Thirteen containers coming up. The mining controller then mines to <b>height 204</b> — past
+    coinbase maturity, with your address funded — before settling into its normal cadence. Follow it
+    with <code>docker compose logs -f btc-simnet-mining-controller</code>.
+  </div>
+  <div class="why">
+    Height 204 is not arbitrary: coinbase outputs need 100 confirmations before they can be spent, so
+    the chain must mine past that before the faucet or any wallet test can work. Every later step
+    assumes bootstrap has finished.
+  </div>
+  <p>Smaller stacks exist too. You want <code>all-tools</code> today; the others are for CI:</p>
+  <table>
+    <tr><th>Profile</th><th>Containers</th><th>Adds</th></tr>
+    <tr><td><code>docker compose up</code> (<code>minimal</code>)</td><td>5</td><td>3 nodes, mining controller, spammer. A chain, with nothing to drive it.</td></tr>
+    <tr><td><code>minimal-api</code></td><td>6</td><td>the control plane: CLI, HTTP API, MCP, jobs, scenarios</td></tr>
+    <tr><td><code>minimal-organic-reorg</code></td><td>9</td><td>the network agents: partitions and organic reorgs</td></tr>
+    <tr><td><code>basic</code></td><td>9</td><td>the full local stack</td></tr>
+    <tr><td><code>all-tools</code></td><td>13</td><td>electrs and the mempool.space explorer</td></tr>
+  </table>
+  <div class="gotcha">
+    <code>fresh-chain.sh</code> always starts from block 0 and destroys the chain you already have.
+    To resume an existing one use <code>docker compose --profile all-tools up -d</code> instead.
+  </div>
+  <div class="check"><code>docker compose ps</code> lists thirteen running containers, and the mining controller's log has stopped talking about bootstrap.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain#profiles">README — Profiles</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s1">Mark step complete</button></div>
+</section>
+
+<section class="step" id="s2" data-step data-act="1">
+  <div class="step-head">
+    <span class="stamp">STEP 2</span>
+    <h2 class="title">Meet the three nodes</h2>
+    <span class="tag">~3 min</span>
+    <span class="diff" title="difficulty">●<span class="off">●●</span></span>
+  </div>
+  <div class="goal">understand why there are three nodes instead of one, and which one is yours.</div>
+  <p>Plain regtest gives you one node that mines whenever you ask. Simchain separates the roles on purpose:</p>
+  <table>
+    <tr><th>Node</th><th>Role</th><th>Reachable at</th></tr>
+    <tr><td><b>node1</b></td><td>Never mines. Wallet disabled, <code>txindex</code> on. Stands in for a third-party node you don't control — <em>this is your endpoint</em>.</td><td><code>localhost:18443</code></td></tr>
+    <tr><td><b>node2</b></td><td>Miner with a wallet. The one you will mine and spend from by hand.</td><td><code>localhost:28443</code></td></tr>
+    <tr><td><b>node3</b></td><td>Miner with no host port at all, reachable only inside Docker — which makes it the one to isolate in Act IV.</td><td>Docker only</td></tr>
+  </table>
+  <p>Ask a node who it is connected to:</p>
+<pre><code>docker exec btc-simnet-node1 bitcoin-cli -regtest \
+  -rpcuser=foo -rpcpassword=rpcpassword getconnectioncount</code></pre>
+  <div class="expect">Peers on every node — they form a full mesh, so each is connected to both others.</div>
+  <div class="why">
+    Point your application at <b>node1</b> for the whole walkthrough. That is the entire design: if
+    your tests can only pass by mining on demand, they are testing a fantasy.
+  </div>
+  <div class="check">You can say which node your app should connect to, and why it cannot mine.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/NETWORK_TOPOLOGY.md">NETWORK_TOPOLOGY.md</a> · <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/INTRO.md">INTRO.md</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s2">Mark step complete</button></div>
+</section>
+
+<section class="step" id="s3" data-step data-act="1">
+  <div class="step-head">
+    <span class="stamp">STEP 3</span>
+    <h2 class="title">Read the chain</h2>
+    <span class="tag">~4 min</span>
+    <span class="diff" title="difficulty">●<span class="off">●●</span></span>
+  </div>
+  <div class="goal">get a live view you will keep open for the rest of the walkthrough.</div>
+  <p>Open a second terminal pane and leave one of these running. Do not skip it — almost every later
+  step is judged by what this pane does.</p>
+<pre><code># block-by-block feed, prints a banner when the chain reorganises
+./scripts/chainwatch.sh
+
+# or: aggregate chain and worker status, refreshed
+cargo run -p simchainctl -- status --watch</code></pre>
+  <div class="expect">
+    A block every few seconds, alternating between miners. <code>status</code> also shows each node's
+    height and tip, the mining and spam workers, the mempool, and a <b>generation</b> counter — remember
+    that counter, it is how you will confirm your changes landed in Act II.
+  </div>
+  <div class="challenge">
+    Watch for a minute and note the gaps between blocks. Evenly spaced, or irregular? You are about to
+    change that answer deliberately.
+  </div>
+  <div class="check">You have a pane showing new blocks as they arrive, and you can find the current height without thinking about it.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/RUNBOOK.md">RUNBOOK.md</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s3">Mark step complete</button></div>
+</section>
+
+<section class="step" id="s4" data-step data-act="1">
+  <div class="step-head">
+    <span class="stamp">STEP 4</span>
+    <h2 class="title">Try to cheat</h2>
+    <span class="tag">~3 min</span>
+    <span class="diff" title="difficulty">●<span class="off">●●</span></span>
+  </div>
+  <div class="goal">discover the boundary that makes this different from regtest — by hitting it.</div>
+  <div class="predict">
+    You are about to ask node1 — a regtest node — to mine you a block. Regtest always allows that.
+    What do you think happens?
+  </div>
+<pre><code>curl -sS --user foo:rpcpassword \
+  --data-binary '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
+  http://127.0.0.1:18443/
+
+curl -i --user foo:rpcpassword \
+  --data-binary '{"jsonrpc":"2.0","id":2,"method":"generatetoaddress","params":[1,"bcrt1qexample"]}' \
+  http://127.0.0.1:18443/</code></pre>
+  <div class="expect">
+    The first call returns a height. The second returns <b>HTTP 403 Forbidden</b> — and that 403 comes
+    from Bitcoin Core's own per-user <code>rpcwhitelist</code>, not from a proxy in front of it. Mining,
+    mock time, chain-choice and node-administration calls are all denied on node1.
+  </div>
+  <div class="why">
+    This is the single most important idea in the project. Your application cannot mine its way out of
+    a test. If your code needs a block, it has to <em>wait</em> for one exactly as it would on mainnet —
+    which is the class of bug that otherwise only surfaces in production.
+  </div>
+  <p>The same credentials are unrestricted on node2, which is how you will still mine on demand:</p>
+<pre><code>docker exec btc-simnet-node2 bitcoin-cli -regtest \
+  -rpcuser=foo -rpcpassword=rpcpassword getblockcount</code></pre>
+  <div class="challenge">
+    Find another call node1 refuses — try <code>invalidateblock</code>, <code>setmocktime</code> or
+    <code>stop</code>. Then try <code>addnode</code>, which is deliberately allowed. Can you work out
+    why that exception exists?
+  </div>
+  <div class="check">You got a 403 from node1 and a normal answer from node2, using the same username and password.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/SETTINGS.md#node1-rpc-method-policy">Node1 RPC method policy</a> · <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/RUNBOOK.md#node1-rpc-boundary">RUNBOOK.md</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s4">Mark step complete</button></div>
+</section>
+
+<!-- ===================================== ACT II ==================================== -->
+<div class="act">
+  <div class="actline">
+    <span class="badge">🎛</span>
+    <h2>Act II · Touch</h2>
+    <span class="actprog" data-actprog="2"></span>
+  </div>
+  <p>Now you change things — on the running chain, with no restarts, and with the result visible in
+  your watcher within seconds. Everything here is reversible.</p>
+</div>
+
+<section class="step" id="s5" data-step data-act="2">
+  <div class="step-head">
+    <span class="stamp">STEP 5</span>
+    <h2 class="title">Change the weather</h2>
+    <span class="tag">~5 min</span>
+    <span class="diff" title="difficulty">●●<span class="off">●</span></span>
+  </div>
+  <div class="goal">reshape how blocks arrive, live, and watch it take effect.</div>
+  <p>Look at the current settings first:</p>
+<pre><code>cargo run -p simchainctl -- config show</code></pre>
+  <p>Now switch the cadence from evenly spaced to Poisson — the distribution real mining follows:</p>
+<pre><code>cargo run -p simchainctl -- config set \
+  BLOCK_INTERVAL_MODE=poisson \
+  BLOCK_INTERVAL_MIN_SECS=5 \
+  BLOCK_INTERVAL_MEAN_SECS=8 \
+  BLOCK_INTERVAL_MAX_SECS=12</code></pre>
+  <div class="expect">
+    Within seconds the pace speeds up and turns irregular in your watcher, and the <b>generation</b>
+    counter increments. No container was recreated and no node restarted.
+  </div>
+  <div class="why">
+    Irregular block timing is where confirmation-latency bugs live. Code that quietly assumes "a block
+    every N seconds" passes on fixed-interval regtest and fails on mainnet, where you might wait forty
+    minutes and then get three blocks in ninety seconds.
+  </div>
+  <p>For runs you need to reproduce exactly, pin miner selection and the RNG:</p>
+<pre><code>cargo run -p simchainctl -- config set \
+  MINER_WEIGHTS=node2:1,node3:1 \
+  MINING_RNG_SEED=42</code></pre>
+  <p>And take manual control when you want it:</p>
+<pre><code>cargo run -p simchainctl -- mining pause
+cargo run -p simchainctl -- mine --node node2 --blocks 1 --wait
+cargo run -p simchainctl -- mining resume</code></pre>
+  <div class="gotcha">
+    <code>BLOCK_INTERVAL_MEAN_SECS</code> must fall inside <code>[MIN, MAX]</code> or the change is
+    rejected. Defaults ship as min 10 / max 20, so a mean of 8 on its own is refused — set all three
+    together whenever you move the mean outside the current bounds.
+  </div>
+  <div class="challenge">
+    Try setting only the mean to 8 and read the error. Then run <code>config set</code> from two
+    terminals at once — one gets a <code>409</code>. That is compare-and-swap protecting you from a
+    half-applied config, not a bug.
+  </div>
+  <div class="check">Your watcher shows visibly irregular block gaps, and <code>config show</code> reports a higher generation than when you started this step.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/RETUNING.md">RETUNING.md</a> · <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/SETTINGS.md#mining-controller">Mining settings</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s5">Mark step complete</button></div>
+</section>
+
+<section class="step" id="s6" data-step data-act="2">
+  <div class="step-head">
+    <span class="stamp">STEP 6</span>
+    <h2 class="title">Fill the blocks</h2>
+    <span class="tag">~6 min</span>
+    <span class="diff" title="difficulty">●●<span class="off">●</span></span>
+  </div>
+  <div class="goal">turn empty blocks into full ones, with a real fee market above them.</div>
+  <p>Empty blocks are the other great regtest lie. Turn the pressure up:</p>
+<pre><code>cargo run -p simchainctl -- config set \
+  ENABLE_SPAM=true \
+  SPAM_FILL_BLOCK_RATIO=3</code></pre>
+  <div class="expect">
+    Blocks stop being empty and a backlog forms. A ratio of 3 keeps roughly three blocks' worth of
+    transactions queued, so there is always competition for the next block.
+  </div>
+  <div class="why">
+    The fee floor is created by <em>paying</em> for it, never by editing Bitcoin Core's relay or mempool
+    policy. That is Simchain's central rule: mainnet behaviour is imitated, not configured away — so a
+    transaction mainnet would reject is rejected here too.
+  </div>
+  <p>For a controlled spike instead of steady pressure, provision capacity and then burst:</p>
+<pre><code>cargo run -p simchainctl -- mining pause
+cargo run -p simchainctl -- spam prepare --node node2 --txs 100 --data-bytes 8000
+cargo run -p simchainctl -- spam burst  --node node2 --txs 100 --data-bytes 8000
+cargo run -p simchainctl -- mine --node node2 --blocks 1 --wait
+cargo run -p simchainctl -- mining resume</code></pre>
+  <div class="expect">
+    The mempool inflates by 100 transactions, then drains into exactly one fat block.
+    <code>--data-bytes</code> selects DATA mode: each transaction carries one OP_RETURN payload of that
+    size, filling blocks fast without growing the UTXO set.
+  </div>
+  <div class="gotcha">
+    <code>prepare</code> mines the confirmation blocks for the burst's dedicated capacity; the burst
+    itself never mines. Skip it and a burst short of capacity fails outright rather than half-filling.
+    Swap <code>--data-bytes</code> for <code>--outputs-per-tx N</code> if you want wallet-shaped
+    transactions instead of OP_RETURN payloads.
+  </div>
+  <div class="challenge">
+    Push <code>SPAM_FILL_BLOCK_RATIO</code> up until the mempool never drains, then watch the median
+    fee rate of each new block. You have just built a fee market.
+  </div>
+  <div class="check">A recent block in your watcher is close to full, and the mempool holds a backlog instead of emptying every block.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/SETTINGS.md#spammer">Spammer settings</a> · <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/SETTINGS.md#the-fee-market-what-spam-pays-and-how-to-set-a-price-floor">The fee market</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s6">Mark step complete</button></div>
+</section>
+
+<section class="step" id="s7" data-step data-act="2">
+  <div class="step-head">
+    <span class="stamp">STEP 7</span>
+    <h2 class="title">Get yourself paid</h2>
+    <span class="tag">~5 min</span>
+    <span class="diff" title="difficulty">●●<span class="off">●</span></span>
+  </div>
+  <div class="goal">put real coins in an address you control — your first concrete artifact.</div>
+  <p>You need a regtest address. The quickest source is the dashboard's built-in test wallet
+  (Step 8), but any <code>bcrt1</code> address works:</p>
+<pre><code>cargo run -p simchainctl -- faucet --to bcrt1q...=1.5btc --wait</code></pre>
+  <p>Pass several <code>--to ADDRESS=AMOUNT</code> pairs to fund a batch. Amounts take decimal BTC
+  (<code>1</code>, <code>0.25</code>, <code>1btc</code>) or integer satoshis (<code>25000000sat</code>).</p>
+  <div class="predict">Before you run it: what fee do you think this transaction pays?</div>
+  <div class="expect">
+    A transaction paying <b>exactly zero fee</b>, confirmed in the next normal block — even though the
+    mempool you just filled is competitive.
+  </div>
+  <div class="why">
+    A zero-fee transaction is normally unmineable. The miners give this one a virtual priority delta so
+    it gets included — again without touching relay policy. Change the miner's preferences, never the
+    network's rules. That distinction is worth internalising.
+  </div>
+  <div class="gotcha">
+    Safety limits here are fixed, not settings: at most 100 outputs and 10,000 vB per transaction, a
+    confirmed reserve each miner wallet must retain, and a cap on total value per request.
+  </div>
+  <div class="challenge">
+    Find your funded transaction in the local explorer at <a href="http://localhost:1080/">localhost:1080</a>
+    and look at its fee. Zero, mined anyway.
+  </div>
+  <div class="check">An address you control shows a confirmed balance, and you found the transaction's zero fee.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/CONTROL_PLANE.md">CONTROL_PLANE.md</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s7">Mark step complete</button></div>
+</section>
+
+<!-- ===================================== ACT III =================================== -->
+<div class="act">
+  <div class="actline">
+    <span class="badge">🚪</span>
+    <h2>Act III · Doors</h2>
+    <span class="actprog" data-actprog="3"></span>
+  </div>
+  <p>Short act. Everything you just did through the CLI is available through three other doors — and
+  they are genuinely the same operations, not parallel implementations.</p>
+</div>
+
+<section class="step" id="s8" data-step data-act="3">
+  <div class="step-head">
+    <span class="stamp">STEP 8</span>
+    <h2 class="title">The dashboard</h2>
+    <span class="tag">~5 min</span>
+    <span class="diff" title="difficulty">●<span class="off">●●</span></span>
+  </div>
+  <div class="goal">do Act II again in a browser, and find the built-in test wallet.</div>
+  <p>Open <a href="http://localhost:8090/">http://localhost:8090/</a>. Worth clicking through:</p>
+  <ul>
+    <li><b>Status</b> — the same data as <code>status --watch</code>.</li>
+    <li><b>Live retuning</b> — change <code>BLOCK_INTERVAL_MEAN_SECS</code> here and watch the generation bump, exactly as in Step 5.</li>
+    <li><b>Pause / resume</b> workers with a click.</li>
+    <li><b>Faucet — test wallet card</b> — a deterministic BIP84 wallet from a public mnemonic, with reveal and copy buttons. Copy an address, paste it into the faucet form, fund it from the browser. This is the easy way to do Step 7.</li>
+    <li><b>Jobs</b> — every mine, burst and reorg as a durable server-side job with progress and results.</li>
+  </ul>
+  <div class="why">
+    Dashboard, CLI, HTTP API and MCP are four adapters over one operation set — one mutation lock, one
+    job coordinator, one source of truth. Nothing you click can drift from what your CI does.
+  </div>
+  <div class="expect">
+    An active-job banner while a job runs. Only one mutation job runs at a time across every surface; a
+    second incompatible request is <b>rejected outright, not queued</b>, because a queued chain mutation
+    can be unsafe by the time it would run.
+  </div>
+  <div class="gotcha">
+    The test wallet's mnemonic is public and printed in the UI. Regtest only — never send real funds to
+    an address derived from it.
+  </div>
+  <div class="check">You changed a setting from the browser and saw the generation counter move in your terminal.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/CONTROL_PLANE.md#dashboard">CONTROL_PLANE.md — Dashboard</a> · <a href="./dashboard/">preview it without installing</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s8">Mark step complete</button></div>
+</section>
+
+<section class="step" id="s9" data-step data-act="3">
+  <div class="step-head">
+    <span class="stamp">STEP 9</span>
+    <h2 class="title">API and agents</h2>
+    <span class="tag">~5 min</span>
+    <span class="diff" title="difficulty">●●<span class="off">●</span></span>
+  </div>
+  <div class="goal">see that the CLI is a thin client, and hand the chain to an AI agent.</div>
+  <p>Anything you have run so far, your CI can do with <code>curl</code>:</p>
+<pre><code>curl -s localhost:8090/api/v1/status | jq .
+
+token="${SIMCHAIN_CONTROL_TOKEN:-simchain-control-dev-token}"
+generation=$(curl -s localhost:8090/api/v1/config | jq .generation)
+
+curl -s -X PATCH localhost:8090/api/v1/config \
+  -H "Authorization: Bearer $token" \
+  -H 'Content-Type: application/json' \
+  -d "{\"settings\":{\"SPAM_FEE\":\"0.0005\"},\"base_generation\":$generation}"</code></pre>
+  <ul>
+    <li>Reads are open on localhost; <b>mutations need the bearer token</b>.</li>
+    <li><code>base_generation</code> is the same compare-and-swap the CLI used in Step 5.</li>
+    <li>Also worth knowing: <code>/api/v1/jobs</code>, <code>/api/v1/faucet</code>, <code>/api/v1/config/schema</code>.</li>
+  </ul>
+  <h3>And for coding agents</h3>
+  <p>The same operations are exposed as MCP tools at <code>http://localhost:8090/mcp</code>, behind the
+  same token. Once your editor's agent is connected you can ask in plain language:</p>
+<pre><code>"Slow mining to a 20 second mean and tell me the current height."
+"Partition node3, mine 5 blocks on it, heal, and report the winning tip."</code></pre>
+  <div class="why">
+    An agent debugging your wallet code can reshape the chain underneath it — add fee pressure, trigger
+    a reorg, split the network — without you translating each request into commands.
+  </div>
+  <div class="gotcha">
+    The API binds to <code>127.0.0.1</code> only and rejects any non-loopback <code>Host</code> header,
+    which is what stops a hostile web page from pointing its own hostname at your loopback. Do not put
+    it behind a public reverse proxy.
+  </div>
+  <div class="check">You changed a setting with <code>curl</code>, and got a <code>409</code> when you deliberately reused a stale <code>base_generation</code>.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/CONTROL_PLANE.md#http-api">HTTP API</a> · <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/MCP.md">MCP.md</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s9">Mark step complete</button></div>
+</section>
+
+<!-- ===================================== ACT IV ==================================== -->
+<div class="act">
+  <div class="actline">
+    <span class="badge">💥</span>
+    <h2>Act IV · Break</h2>
+    <span class="actprog" data-actprog="4"></span>
+  </div>
+  <p>The reason the project exists. You will rewrite history, unwind it, split the network in two and
+  let both halves mine, then make the wires slow. Keep your watcher visible throughout.</p>
+</div>
+
+<section class="step" id="s10" data-step data-act="4">
+  <div class="step-head">
+    <span class="stamp">STEP 10</span>
+    <h2 class="title">Rewrite history</h2>
+    <span class="tag">~5 min</span>
+    <span class="diff" title="difficulty">●●<span class="off">●</span></span>
+  </div>
+  <div class="goal">make confirmed transactions unconfirmed on purpose, and see what your app assumes.</div>
+<pre><code>cargo run -p simchainctl -- reorg start --depth 2 --node node3 \
+  --adds-new-txs 1 --double-spend-pct 1 --wait
+
+cargo run -p simchainctl -- jobs watch</code></pre>
+  <div class="expect">
+    Chain height steps <em>backwards</em>, then replacement blocks rebuild from the live mempool —
+    including one injected transaction and one deliberate double spend. Your watcher prints a reorg banner.
+  </div>
+  <div class="why">
+    Ask the honest question of your own code: does it handle a confirmed transaction becoming
+    unconfirmed? A transaction permanently replaced by a conflicting one? Most code has simply never
+    been asked.
+  </div>
+  <p>Variations worth trying:</p>
+  <ul>
+    <li><code>--empty</code> mines empty replacement blocks, so orphaned transactions stay unconfirmed — a chaos reorg.</li>
+    <li><code>--double-spend-pct N</code> permanently drops a share of orphaned wallet transactions by mining conflicting spends.</li>
+    <li>Continuous mode re-runs a reorg every N blocks, for sustained instability.</li>
+  </ul>
+  <div class="gotcha">
+    This is an <em>administrative</em> reorg: <code>invalidateblock</code> is node-local and does not
+    propagate over P2P, so the coordinator applies it to each node. For a reorg produced by the real
+    mechanism, that is Step 12 — and it is far more satisfying.
+  </div>
+  <div class="challenge">
+    Fund an address, wait for one confirmation, then reorg deeper than that confirmation. Does your
+    wallet code still believe it has the money?
+  </div>
+  <div class="check">You saw the height go down and then back up, and <code>jobs watch</code> reported the reorg job succeeded.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/REORGS.md">REORGS.md</a> · <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/REORGS.md#permanent-drop-double-spend">Permanent drop</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s10">Mark step complete</button></div>
+</section>
+
+<section class="step" id="s11" data-step data-act="4">
+  <div class="step-head">
+    <span class="stamp">STEP 11</span>
+    <h2 class="title">Unwind it</h2>
+    <span class="tag">~3 min</span>
+    <span class="diff" title="difficulty">●●<span class="off">●</span></span>
+  </div>
+  <div class="goal">move the tip backwards without replacing it — a reorg's quieter cousin.</div>
+<pre><code>cargo run -p simchainctl -- rewind --blocks 3 --wait</code></pre>
+  <div class="expect">
+    All three nodes land on the same genuinely lower height, with no replacement blocks mined.
+    Transactions from the discarded blocks can return to node-local mempools.
+  </div>
+  <div class="why">
+    Useful when you want to replay the same block range under different conditions, or to test how your
+    indexer copes with a tip that simply moved backwards rather than sideways.
+  </div>
+  <div class="gotcha">
+    The job never goes below bootstrap height 204, persists rollback information before mutating, and
+    uses <code>reconsiderblock</code> to restore the original branch if it fails partway. If an electrs
+    profile is running, its disposable index may not follow a rollback-only shape —
+    <code>./scripts/recover-explorer.sh</code> rebuilds it and waits for its tip to match node1.
+  </div>
+  <div class="check">Your watcher shows a lower height than before, and it stayed there.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/REORGS.md#rewind-without-a-replacement-chain">REORGS.md — Rewind</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s11">Mark step complete</button></div>
+</section>
+
+<section class="step" id="s12" data-step data-act="4">
+  <div class="step-head">
+    <span class="stamp">STEP 12</span>
+    <h2 class="title">Split the network 🏆</h2>
+    <span class="tag">~10 min · the big one</span>
+    <span class="diff" title="difficulty">●●●</span>
+  </div>
+  <div class="goal">run two real Bitcoin chains at once, then make them fight.</div>
+  <div class="req">the network agents — <code>--profile minimal-organic-reorg</code> or richer. <code>all-tools</code> has them.</div>
+  <p><b>Set up your watchers before splitting</b>, or you will only see the aftermath. node3 has no host
+  RPC port by design, so inject the watcher into the container itself:</p>
+<pre><code>./scripts/inject-tools.sh btc-simnet-node3</code></pre>
+<pre><code># Pane A — connected side (node2, host-exposed RPC)
+./scripts/chainwatch.sh -P 28443 -i 1
+
+# Pane B — isolated side, watched from inside the container
+docker exec -it btc-simnet-node3 chainwatch \
+  -H 127.0.0.1 -P 18443 -u foo -p rpcpassword -i 1</code></pre>
+  <p>Both panes should agree on height and tip. Now cut the mesh:</p>
+<pre><code>cargo run -p simchainctl -- partition start --node node3 \
+  --main-blocks 3 --isolated-blocks 5 --heal-delay-secs 15</code></pre>
+  <div class="expect">
+    Pane A climbs by 3 blocks; Pane B climbs by 5. Different heights, different tips, same starting
+    point — two real, independently valid Bitcoin chains growing side by side on your machine. The
+    <code>--heal-delay-secs</code> hold keeps them apart long enough to actually look at.
+  </div>
+  <div class="predict">
+    Before the hold expires: which branch wins, and what happens to the three blocks on the other one?
+  </div>
+  <div class="expect">
+    When the hold ends the job heals the split by itself. Because <code>isolated-blocks (5)</code> is
+    greater than <code>main-blocks (3)</code>, node3's branch has more work: Pane A jumps up to node3's
+    height and prints a reorg banner, while Pane B stays quiet — it was already on the winning tip.
+  </div>
+  <div class="why">
+    That is an <b>organic</b> reorg. Nobody told any node to abandon a branch — each independently chose
+    the most-work chain, which is exactly what happens on mainnet. Step 10 simulated the symptom; this
+    reproduced the cause.
+  </div>
+  <p>Bitcoin Core remembers the branch that lost. Ask it:</p>
+<pre><code>docker exec btc-simnet-node1 bitcoin-cli -regtest \
+  -rpcuser=foo -rpcpassword=rpcpassword getchaintips</code></pre>
+  <div class="gotcha">
+    Only P2P traffic is cut — control traffic rides a separate Docker network, which is why you can
+    watch both sides throughout. If you forget the watcher panes, <code>getchaintips</code> still shows
+    the losing branch as a <code>valid-fork</code> entry afterwards.
+  </div>
+  <div class="challenge">
+    Reverse the numbers (<code>--main-blocks 5 --isolated-blocks 3</code>) so the connected side wins
+    instead, and watch which pane prints the banner this time. Then try equal counts and find out why
+    the tool refuses.
+  </div>
+  <div class="check">You watched two panes show different heights at the same time, then saw one reorg onto the other's chain.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/PARTITIONS.md">PARTITIONS.md</a> · <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/PARTITIONS.md#watch-both-sides-live">Watch both sides live</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s12">Mark step complete</button></div>
+</section>
+
+<section class="step" id="s13" data-step data-act="4">
+  <div class="step-head">
+    <span class="stamp">STEP 13</span>
+    <h2 class="title">Slow the wires</h2>
+    <span class="tag">~5 min</span>
+    <span class="diff" title="difficulty">●●<span class="off">●</span></span>
+  </div>
+  <div class="goal">make nodes disagree about the tip for a few seconds — the way they really do.</div>
+  <div class="req">the network agents, same as Step 12.</div>
+<pre><code>cargo run -p simchainctl -- degrade start --node node2 \
+  --delay-ms 5000 --loss-pct 0 --seconds 30
+
+# while that job reports observing_degraded_network:
+cargo run -p simchainctl -- mine --node node2 --blocks 1 --wait</code></pre>
+  <div class="expect">
+    <code>mine</code> returns immediately — RPC is on the separate control network and is never shaped —
+    but node1 and node3 only learn about the new tip about five seconds later, when the delayed P2P
+    announcement lands. In <code>status --watch</code>, node2's height ticks up first and the others lag.
+  </div>
+  <div class="why">
+    In normal regtest every node learns everything instantly, so "all nodes agree on the tip right now"
+    is an assumption that never gets tested. Here it is false for five seconds on demand.
+  </div>
+  <div class="gotcha">
+    Impairment is lease-based with a TTL: if the control plane dies mid-job, the agent clears its own
+    qdisc and the link heals itself. Degradations use a per-node lane rather than the global mutation
+    lock, so a manual mine on the same node may overlap, as may degradations on other nodes.
+  </div>
+  <div class="check">You saw node2's height move before node1's, with a visible gap between them.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/PARTITIONS.md#timed-latency-and-loss">Timed latency and loss</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s13">Mark step complete</button></div>
+</section>
+
+<!-- ===================================== ACT V ===================================== -->
+<div class="act">
+  <div class="actline">
+    <span class="badge">🔁</span>
+    <h2>Act V · Repeat</h2>
+    <span class="actprog" data-actprog="5"></span>
+  </div>
+  <p>Everything you have done by hand becomes a file you can check in, and a chain state you can
+  restore in seconds. This is the part that turns a demo into a test suite.</p>
+</div>
+
+<section class="step" id="s14" data-step data-act="5">
+  <div class="step-head">
+    <span class="stamp">STEP 14</span>
+    <h2 class="title">Record the run</h2>
+    <span class="tag">~6 min</span>
+    <span class="diff" title="difficulty">●●<span class="off">●</span></span>
+  </div>
+  <div class="goal">replace this whole walkthrough with one YAML file your CI can run.</div>
+  <p>Open <code>scenarios/all-features-live.yml</code> and read it: every action from Acts II and IV as
+  ordered, version-controlled steps with assertions and checkpoints. Then run a small one:</p>
+<pre><code>cargo run -p simchainctl -- scenario validate scenarios/pause-then-burst.yml
+cargo run -p simchainctl -- scenario explain  scenarios/pause-then-burst.yml
+cargo run -p simchainctl -- scenario run      scenarios/pause-then-burst.yml \
+  --result results/burst.json</code></pre>
+  <div class="expect">
+    Steps tick through while the chain reacts in your watcher. The server validates the whole document
+    before reserving the mutation coordinator, waits for height 204, and persists step events and results.
+  </div>
+  <div class="why">
+    This is the CI story. Scenarios are durable server-side jobs — disconnecting the client does not
+    cancel the run — and named <b>checkpoints</b> let a CI job block on an exact chain state, run its own
+    assertions against it, then release.
+  </div>
+  <div class="gotcha">
+    A scenario containing <code>partition</code> or <code>degrade</code> steps needs the network agents.
+    On a stack without them the whole scenario is rejected at submission with a <code>503</code> naming
+    the profile to start — deliberately, so it cannot fail halfway through after already mutating the
+    chain. Set <code>restore_settings: true</code> to auto-revert the config map afterwards.
+  </div>
+  <div class="challenge">
+    Write a five-line scenario of your own: wait for a height, burst, mine one block, assert the mempool
+    drained. That file is now a regression test.
+  </div>
+  <div class="check">A scenario ran to completion and wrote a result JSON you can read.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/SCENARIOS.md">SCENARIOS.md</a> · <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/SCENARIOS.md#checkpoints-and-ci">Checkpoints and CI</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s14">Mark step complete</button></div>
+</section>
+
+<section class="step" id="s15" data-step data-act="5">
+  <div class="step-head">
+    <span class="stamp">STEP 15</span>
+    <h2 class="title">Save your world</h2>
+    <span class="tag">~4 min</span>
+    <span class="diff" title="difficulty">●<span class="off">●●</span></span>
+  </div>
+  <div class="goal">stop paying the bootstrap cost, ever again.</div>
+<pre><code>./scripts/snapshot.sh save after-walkthrough
+./scripts/snapshot.sh list
+./scripts/snapshot.sh restore after-walkthrough --profile all-tools</code></pre>
+  <div class="expect">
+    A restore brings back blocks, chainstate, miner wallets, the mempool and the recorded Compose
+    profile — not merely the block height.
+  </div>
+  <div class="why">
+    Every fresh start otherwise re-mines to height 204 before anything interesting can happen. A snapshot
+    turns the state you just spent an hour building into a fixture you can hand to a test suite.
+  </div>
+  <div class="gotcha">
+    Take snapshots from a live stack, and let a shutdown finish on its own — force-killing bitcoind
+    mid-write can corrupt the chainstate you were trying to preserve.
+  </div>
+  <div class="check">You restored a snapshot and the chain came back at the height you saved it at.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/SNAPSHOTS.md">SNAPSHOTS.md</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s15">Mark step complete</button></div>
+</section>
+
+<!-- ===================================== ACT VI ==================================== -->
+<div class="act">
+  <div class="actline">
+    <span class="badge">🚀</span>
+    <h2>Act VI · Ship</h2>
+    <span class="actprog" data-actprog="6"></span>
+  </div>
+  <p>Point your own application at it, learn the one thing that would otherwise confuse you a week from
+  now, and you are done.</p>
+</div>
+
+<section class="step" id="s16" data-step data-act="6">
+  <div class="step-head">
+    <span class="stamp">STEP 16</span>
+    <h2 class="title">Plug your app in</h2>
+    <span class="tag">~5 min</span>
+    <span class="diff" title="difficulty">●●<span class="off">●</span></span>
+  </div>
+  <div class="goal">connect your real application and re-run Act IV underneath it.</div>
+  <p>Four ways in, all pointed at node1 — the node you do not control:</p>
+  <table>
+    <tr><th>Interface</th><th>Endpoint</th><th>For</th></tr>
+    <tr><td>Bitcoin Core RPC</td><td><code>localhost:18443</code></td><td>wallets, custody systems, anything speaking Core RPC</td></tr>
+    <tr><td>ZMQ</td><td><code>28332</code>–<code>28336</code></td><td>LND / CLN, indexers, watchers — all five topics</td></tr>
+    <tr><td>Electrum RPC</td><td><code>localhost:60001</code></td><td>Electrum-protocol clients, via electrs</td></tr>
+    <tr><td>Explorer</td><td><a href="http://localhost:1080/">localhost:1080</a></td><td>a local mempool.space following node1</td></tr>
+  </table>
+  <p>All five ZMQ topics are published — <code>rawblock</code>, <code>rawtx</code>,
+  <code>hashblock</code>, <code>hashtx</code> and <code>sequence</code>. The last is the reorg-aware one:
+  it reports mempool add/remove and block connect/disconnect, so a consumer can follow the events from
+  Act IV correctly.</p>
+  <div class="why">
+    Now go back and re-run Step 10 or Step 12 with your own application attached and watching. A reorg
+    your code has never seen is the entire reason this project exists.
+  </div>
+  <div class="gotcha">
+    electrs maintains a disposable index. After a rewind or deep reorg it may need
+    <code>./scripts/recover-explorer.sh</code> to rebuild and catch up with node1.
+  </div>
+  <div class="check">Your application is connected to node1 and reacted to a reorg you triggered.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain#zmq-notifications">ZMQ notifications</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s16">Mark step complete</button></div>
+</section>
+
+<section class="step" id="s17" data-step data-act="6">
+  <div class="step-head">
+    <span class="stamp">STEP 17</span>
+    <h2 class="title">The one trap</h2>
+    <span class="tag">~4 min</span>
+    <span class="diff" title="difficulty">●●<span class="off">●</span></span>
+  </div>
+  <div class="goal">learn the one behaviour that confuses everybody — before it confuses you.</div>
+  <p>Compose boot settings live in <code>.env</code>: images, credentials, host ports, node policy,
+  wallet names, and the <em>initial</em> mining and spam policy. Every one has a default, so the stack
+  runs with no <code>.env</code> at all.</p>
+  <div class="predict">
+    You edit <code>BLOCK_INTERVAL_MEAN_SECS</code> in <code>.env</code> and restart the stack. What
+    happens to the block cadence?
+  </div>
+<pre><code># edit .env, then:
+docker compose --profile all-tools up -d</code></pre>
+  <div class="expect"><b>Nothing changes.</b> Same cadence, same spam behaviour.</div>
+  <div class="why">
+    The control plane copies mining and spam policy into <code>state.json</code> on its <em>first ever</em>
+    boot and treats that file as authoritative from then on. Restarts replay <code>state.json</code>, not
+    <code>.env</code>. This is precisely why Act II used the CLI rather than a restart: a running chain
+    needs a control surface, not a config file.
+  </div>
+  <p>If you genuinely want to re-read <code>.env</code>, reset only the control plane's own memory. The
+  chain is untouched:</p>
+<pre><code>docker compose stop btc-simnet-control-plane
+docker volume rm btc-simnet-control-state
+docker compose --profile all-tools up -d btc-simnet-control-plane</code></pre>
+  <div class="expect">
+    Height and mempool never move — no node container was restarted — but the workers pick up the new
+    values immediately as the control plane reseeds and reconciles.
+  </div>
+  <div class="gotcha">
+    That reset discards your <em>policy</em> history, never your chain. Remember the two layers:
+    <code>.env</code> owns boot-time infrastructure; once <code>state.json</code> exists, it owns live
+    mining and spam policy.
+  </div>
+  <div class="check">You can explain in one sentence why editing <code>.env</code> and restarting does not change the block cadence.</div>
+  <div class="docs"><a href="https://github.com/danielemiliogarcia/simchain#configuration">README — Configuration</a> · <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/RETUNING.md#configuration-ownership">Configuration ownership</a></div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s17">Mark step complete</button></div>
+</section>
+
+<section class="step" id="s18" data-step data-act="6">
+  <div class="step-head">
+    <span class="stamp">STEP 18</span>
+    <h2 class="title">Graduation</h2>
+    <span class="tag">~2 min</span>
+    <span class="diff" title="difficulty">●<span class="off">●●</span></span>
+  </div>
+  <div class="goal">know what you now know.</div>
+  <p>You have run every feature Simchain has:</p>
+  <ul>
+    <li><b>Act I</b> — three nodes, one of which refuses to help you cheat.</li>
+    <li><b>Act II</b> — a running chain is reshaped through a control surface, never a restart.</li>
+    <li><b>Act III</b> — dashboard, CLI, API and MCP are four doors into one operation set.</li>
+    <li><b>Act IV</b> — reorgs, rewinds, splits and propagation delay, on demand.</li>
+    <li><b>Act V</b> — all of it as checked-in YAML, with snapshots to skip the bootstrap.</li>
+    <li><b>Act VI</b> — your application in the middle of it, and the <code>.env</code> trap behind you.</li>
+  </ul>
+  <p>Tear down when you are finished — the chain survives on named volumes and resumes on the next
+  <code>up</code>:</p>
+<pre><code>docker compose --profile "*" down
+
+# or discard the chain too
+docker compose --profile "*" down -v</code></pre>
+  <div class="challenge">
+    The real final boss: take the flakiest Bitcoin-related test in your own project, point it at node1,
+    and run it while a reorg lands mid-test. Fix what breaks.
+  </div>
+  <div class="docs">
+    <a href="https://github.com/danielemiliogarcia/simchain#readme">README</a> ·
+    <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/FEATURES.md">FEATURES.md</a> ·
+    <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/SETTINGS.md">SETTINGS.md</a> ·
+    <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/RUNBOOK.md">RUNBOOK.md</a> ·
+    <a href="https://github.com/danielemiliogarcia/simchain/blob/master/docs/NICE-TO-HAVE.md">NICE-TO-HAVE.md</a>
+  </div>
+  <div class="markwrap"><button class="mark" type="button" data-for="s18">Mark step complete</button></div>
+</section>
+
+<div id="finale">
+  <div style="font-size:2.4rem">🏆</div>
+  <h2>All eighteen steps complete</h2>
+  <p>You have started, reshaped, broken, automated and shipped against a Bitcoin network that behaves
+  like mainnet. Go point it at something you actually care about.</p>
+</div>
+
+</main>
+</div>
+
+<footer>
+  Simchain feature walkthrough ·
+  <a href="./index.html">site</a> ·
+  <a href="https://github.com/danielemiliogarcia/simchain">source</a>
+</footer>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var KEY = "simchain-walkthrough-progress-v1";
+  var steps = Array.prototype.slice.call(document.querySelectorAll("section.step[data-step]"));
+  var total = steps.length;
+
+  function load() {
+    try {
+      var raw = localStorage.getItem(KEY);
+      if (!raw) return {};
+      var parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (_) { return {}; }
+  }
+  function save(state) {
+    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (_) {}
+  }
+
+  var state = load();
+
+  function render() {
+    var done = 0;
+    steps.forEach(function (section) {
+      var isDone = !!state[section.id];
+      if (isDone) done += 1;
+      section.classList.toggle("done", isDone);
+      var button = section.querySelector("button.mark");
+      if (button) button.textContent = isDone ? "✓ Completed" : "Mark step complete";
+      var item = document.querySelector('li[data-tocfor="' + section.id + '"]');
+      if (item) item.classList.toggle("done", isDone);
+    });
+
+    var score = document.getElementById("score");
+    if (score) score.textContent = String(done);
+    var fill = document.getElementById("progress-fill");
+    if (fill) fill.style.width = (total ? (done / total) * 100 : 0) + "%";
+
+    Array.prototype.forEach.call(document.querySelectorAll("[data-actprog]"), function (el) {
+      var act = el.getAttribute("data-actprog");
+      var inAct = steps.filter(function (s) { return s.getAttribute("data-act") === act; });
+      var actDone = inAct.filter(function (s) { return !!state[s.id]; }).length;
+      el.textContent = actDone + " / " + inAct.length;
+    });
+
+    var finale = document.getElementById("finale");
+    if (finale) finale.classList.toggle("show", total > 0 && done === total);
+  }
+
+  document.addEventListener("click", function (event) {
+    var target = event.target;
+    while (target && target !== document && !(target.classList && target.classList.contains("mark"))) {
+      target = target.parentNode;
+    }
+    if (!target || target === document) return;
+    var id = target.getAttribute("data-for");
+    if (!id) return;
+    if (state[id]) { delete state[id]; } else { state[id] = 1; }
+    save(state);
+    render();
+  });
+
+  var reset = document.getElementById("reset");
+  if (reset) {
+    reset.addEventListener("click", function () {
+      state = {};
+      save(state);
+      render();
+    });
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,10 +1,22 @@
 # BTC Simchain
 
-[![CI](https://github.com/danielemiliogarcia/simchain/actions/workflows/ci.yml/badge.svg)](https://github.com/danielemiliogarcia/simchain/actions/workflows/ci.yml) [![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](./LICENSE)
+[![CI](https://github.com/danielemiliogarcia/simchain/actions/workflows/ci.yml/badge.svg)](https://github.com/danielemiliogarcia/simchain/actions/workflows/ci.yml) [![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](./LICENSE) [![Walkthrough and dashboard preview](https://img.shields.io/badge/%F0%9F%8C%90_Walkthrough-%26_dashboard_preview-f7931a)](https://danielemiliogarcia.github.io/simchain/)
 
 A regtest Bitcoin simulation network that tries to stay as close to mainnet reality as
 regtest allows: several P2P-connected nodes, rotating miners, non-empty blocks a non-mining full node as
 the user endpoint emulating a 3rd party provided node. See [Features](#features) for more.
+
+<h2 align="center">
+  🌐 <a href="https://danielemiliogarcia.github.io/simchain/">See what it looks like, before you install →</a>
+</h2>
+<p align="center">
+  A guided tour of every feature, and a <b>clickable preview of the control dashboard</b>: the real
+  UI, filled with sample data.<br>
+  It is a screenshot you can scroll — no chain runs behind it, and the controls are inert.
+  Running Simchain is the two commands below.<br>
+  <a href="https://danielemiliogarcia.github.io/simchain/walkthrough.html">Guided walkthrough</a> ·
+  <a href="https://danielemiliogarcia.github.io/simchain/dashboard/">Dashboard preview</a>
+</p>
 
 ## Quickstart
 
@@ -28,6 +40,7 @@ Read this document below for more details.
 
 - [Quickstart](#quickstart)
 - [Intro](#intro)
+- [Versions, and how they were built](#versions-and-how-they-were-built)
 - [Scope and non-goals](#scope-and-non-goals)
 - [Features](#features)
 - [Network topology overview](#network-topology-overview)
@@ -59,6 +72,25 @@ Blockchain regtest tool that helps write tests needing minimal changes to run on
 Three P2P-connected nodes, rotating miners, non-mining user endpoint, non-empty blocks, configurable reorgs.
 
 For detailed component descriptions, see [INTRO.md](./docs/INTRO.md).
+
+## Versions, and how they were built
+
+| Version | How it was written |
+|---|---|
+| **[v1.0.0](https://github.com/danielemiliogarcia/simchain/releases/tag/v1.0.0)** | The original project: designed and hand-written by me, in my spare time. |
+| **[v2.0.0](https://github.com/danielemiliogarcia/simchain/releases)** | The same project, built with heavy AI assistance. |
+
+I am telling you this because it is the kind of thing I would want to know about someone else's
+repository, not because either answer is the right one.
+
+v2 is not vibe-coded. I made the design decisions, I reviewed what landed, and the project's
+constraints held throughout: Bitcoin Core's relay and mempool policy is never modified, the control
+plane has no Docker socket, and node1 refuses mining RPCs. What changed is throughput — a large
+share of the implementation, tests and documentation came out of AI pair-programming, which is why
+this version moved as far as it did in as little time as it did.
+
+If you would rather run a codebase written without AI assistance, **v1.0.0 is still there and still
+works**; it does exactly what it always did. Everything documented in this README describes v2.
 
 ## Scope and non-goals
 
@@ -451,6 +483,10 @@ exclude = ["path/to/simchain"]
   document that covers it.
 - [NETWORK_TOPOLOGY.md](./docs/NETWORK_TOPOLOGY.md), the full container-level diagrams
   behind the topology overview: nodes, workers, agents, and the explorer stack.
+- [docs/html/](./docs/html), the published site: a step-by-step feature walkthrough and a
+  read-only dashboard preview, deployed to
+  [GitHub Pages](https://danielemiliogarcia.github.io/simchain/) by
+  [`.github/workflows/pages.yml`](./.github/workflows/pages.yml).
 - [RETUNING.md](./docs/RETUNING.md), how to retune mining cadence, fee floor, and block fill on a live chain.
 - [MCP.md](./docs/MCP.md), connecting coding agents to the Simchain MCP endpoint.
 - [REORGS.md](./docs/REORGS.md), simulating chain reorganizations and shorter-chain

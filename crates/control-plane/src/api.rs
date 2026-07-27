@@ -1949,6 +1949,13 @@ steps:
         assert!(html.contains("id=\"rewind-explorer-warning\" hidden"));
         assert!(html.contains("./scripts/recover-explorer.sh"));
         assert!(html.contains("not a proof-of-work reorg"));
+        // The snapshot card advertises a host-side feature this process cannot
+        // perform itself. It must keep saying why, so the missing Docker socket
+        // reads as a deliberate boundary rather than an oversight.
+        assert!(html.contains("id=\"snapshot-save\""));
+        assert!(html.contains("id=\"snapshot-restore\""));
+        assert!(html.contains("no Docker socket and no Docker CLI"));
+        assert!(html.contains("danielemiliogarcia.github.io/simchain/"));
     }
 
     #[test]

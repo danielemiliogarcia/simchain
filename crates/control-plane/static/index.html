@@ -19,6 +19,9 @@
           <option value="60000">60s</option>
         </select>
       </label>
+      <a class="docs-link" href="https://danielemiliogarcia.github.io/simchain/"
+         target="_blank" rel="noopener noreferrer"
+         title="Simchain documentation, guided walkthrough and dashboard preview">docs ↗</a>
       <div id="conn" class="conn">connecting…</div>
     </div>
   </header>
@@ -238,6 +241,10 @@ steps:
       </div>
     </section>
 
+    <!-- Right-hand column. The panel itself is a two-column grid, so cards
+         that belong under "Live retune" are stacked here rather than left to
+         auto-place into the next free cell, which is under the jobs card. -->
+    <div class="panel-stack">
     <section class="card" id="settings-card">
       <h2>Live retune</h2>
       <p class="hint">Desired configuration is managed by the control plane; effective values are
@@ -252,6 +259,28 @@ steps:
       </div>
       <pre id="result" class="result" hidden></pre>
     </section>
+
+    <section class="card" id="snapshot-card">
+      <h2>Chain snapshots</h2>
+      <p class="hint">Save the whole chain — blocks, chainstate, miner wallets, mempool and the
+        active Compose profile — and restore it later instead of re-running the bootstrap.
+        These run from your shell, not from this page.</p>
+      <div class="snapshot-actions">
+        <button id="snapshot-save" type="button"
+          data-help="Show the command that saves the current chain as a named snapshot.">Take snapshot</button>
+        <button id="snapshot-restore" type="button"
+          data-help="Show the command that restores a previously saved snapshot.">Restore snapshot</button>
+      </div>
+      <pre id="snapshot-command" class="result" hidden></pre>
+      <div id="snapshot-result" class="action-result"></div>
+      <p class="hint snapshot-rationale"><b>Why not a button that just does it?</b> Snapshotting
+        means stopping containers and copying Docker volumes. This control plane deliberately has
+        no Docker socket and no Docker CLI in its image — it can reach the nodes and workers only
+        over authenticated APIs, and that boundary is asserted in CI. Giving the dashboard the
+        power to drive the Docker stack, or nesting Docker inside Docker to fake it, is a trade
+        this project has not made. So snapshots stay a host-side script.</p>
+    </section>
+    </div>
     </section>
 
     <section id="panel-faucet" class="dashboard-panel" role="tabpanel" aria-labelledby="tab-faucet" data-panel="faucet" hidden>
