@@ -7,7 +7,7 @@ regtest allows: several P2P-connected nodes, rotating miners, non-empty blocks a
 the user endpoint emulating a 3rd party provided node. See [Features](#features) for more.
 
 <h2 align="center">
-  🌐 <a href="https://danielemiliogarcia.github.io/simchain/">See what it looks like, before you install →</a>
+  🌐 <a href="https://danielemiliogarcia.github.io/simchain/">See what it looks like, before running the stack →</a>
 </h2>
 <p align="center">
   A guided tour of every feature, and a <b>clickable preview of the control dashboard</b>: the real
