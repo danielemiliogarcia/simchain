@@ -6,6 +6,7 @@ mod config;
 mod error;
 mod faucet;
 mod jobs;
+mod scenario;
 mod status;
 
 pub use config::{
@@ -24,6 +25,10 @@ pub use jobs::{
     JobEventsResponse, JobFailure, JobKind, JobLease, JobListResponse, JobState, JobSummary,
     MineJobRequest, PartitionJobRequest, ReleaseCheckpointRequest, ReorgJobRequest,
     RewindJobRequest, ScenarioJobRequest, ScenarioStepStatus, SpamBurstJobRequest,
+};
+pub use scenario::{
+    ScenarioFieldSchema, ScenarioObjectSchema, ScenarioSchemaResponse, ScenarioStepSchema,
+    ScenarioVariantSchema,
 };
 pub use status::{
     BlockSummary, Cadence, ComponentControlResponse, ComponentState, ExplorerStatus, FeeBucket,

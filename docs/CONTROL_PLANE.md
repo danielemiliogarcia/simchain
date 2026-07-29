@@ -92,9 +92,15 @@ Everything the UI shows comes from the versioned localhost HTTP API. Common read
 GET /api/v1/status
 GET /api/v1/config
 GET /api/v1/config/schema
+GET /api/v1/scenario/schema
 GET /api/v1/jobs
 GET /api/v1/faucet
 ```
+
+`/api/v1/config/schema` is the runtime-setting catalog; `/api/v1/scenario/schema` is the
+declarative scenario language, described in [SCENARIOS.md](./SCENARIOS.md). Both are
+generated from the same catalogs the server validates against, so neither can drift from
+what the control plane actually accepts.
 
 Mutating calls need a bearer token. The default zero-config stack uses
 `simchain-control-dev-token`; if you override `CONTROL_PLANE_API_TOKEN`, pass the same

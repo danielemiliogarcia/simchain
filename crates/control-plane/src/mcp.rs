@@ -7,11 +7,12 @@ use crate::apply::{apply, ApplyRequest};
 use crate::service::{
     abort_job as abort_job_service, config, faucet_status as faucet_status_service,
     faucet_transfer as faucet_transfer_service, get_job as get_job_service,
-    list_jobs as list_jobs_service, schema, set_mining_state as set_mining_state_service,
-    set_spam_state as set_spam_state_service, start_degrade as start_degrade_service,
-    start_faucet as start_faucet_service, start_partition as start_partition_service,
-    start_reorg as start_reorg_service, start_rewind as start_rewind_service,
-    start_scenario as start_scenario_service, status, ServiceError,
+    list_jobs as list_jobs_service, scenario_schema, schema,
+    set_mining_state as set_mining_state_service, set_spam_state as set_spam_state_service,
+    start_degrade as start_degrade_service, start_faucet as start_faucet_service,
+    start_partition as start_partition_service, start_reorg as start_reorg_service,
+    start_rewind as start_rewind_service, start_scenario as start_scenario_service, status,
+    ServiceError,
 };
 use crate::state::SharedState;
 use rmcp::handler::server::wrapper::Parameters;
@@ -256,6 +257,19 @@ impl ControlPlaneMcp {
     )]
     pub(crate) async fn get_config_schema(&self) -> Result<CallToolResult, ErrorData> {
         success_json(&schema())
+    }
+
+    #[tool(
+        name = "get_scenario_schema",
+        description = "Get the complete declarative scenario language: every step type with its fields, value types, requirement rules, defaults, constraints, and the smallest Compose profile that can run it. Read this before authoring a scenario YAML instead of guessing field names.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn get_scenario_schema(&self) -> Result<CallToolResult, ErrorData> {
+        success_json(&scenario_schema())
     }
 
     #[tool(
