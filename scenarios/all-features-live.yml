@@ -1,4 +1,20 @@
+# Exercises every step type in the scenario language, and the option variants
+# that are easy to miss. A test asserts this file still covers the whole
+# catalog, so a new step type fails the suite until it is demonstrated here.
+#
+# Needs the network agents for `partition` and `degrade`:
+#   docker compose --profile minimal-organic-reorg up -d
+# Needs one environment variable for the faucet destinations:
+#   export SCENARIO_ALL_FEATURES_ADDRESS="$(your regtest address)"
+#
+# This file PAUSES at the `all_features_ready` checkpoint and waits for a
+# release before it finishes. See docs/SCENARIOS.md.
 version: 1
+
+# Captures the whole pre-scenario desired config and restores it when the job
+# ends, however it ends, so the demo leaves no configuration behind.
+restore_settings: true
+
 steps:
   - type: set_config
     settings:
@@ -10,6 +26,8 @@ steps:
       SPAM_FILL_BLOCK_RATIO: 3
       SPAM_FEE: 0.0005
 
+  # `effective: true` also requires the workers to expose the new policy, not
+  # just that the durable desired values were recorded.
   - type: assert_config
     effective: true
     settings:
@@ -21,8 +39,19 @@ steps:
       SPAM_FILL_BLOCK_RATIO: 3
       SPAM_FEE: 0.0005
 
+  # `effective: false` checks only the durable desired map, which is what you
+  # want right after a change whose apply mode defers to the next safe point.
+  - type: assert_config
+    effective: false
+    settings:
+      SPAM_FEE: 0.0005
+
   - type: wait_height
     height: 204
+
+  # Relative wait: the same file behaves the same way at any chain height.
+  - type: wait_n_blocks
+    n: 1
 
   - type: wait_until
     timeout_secs: 60
@@ -50,8 +79,10 @@ steps:
       reachable: true
       status: active
 
+  # Range form. `equals` is the third option and cannot be combined with these.
   - type: assert_height
     at_least: 204
+    at_most: 100000000
 
   - type: assert_component
     component: mining
@@ -68,18 +99,44 @@ steps:
     status: clear
     active_lease_count: 0
 
+  # A transaction that was never broadcast is `missing` from the start, so this
+  # returns immediately and needs no external setup. Real use is `txid_env`
+  # with `state: confirmed`. Literal txids are quoted because an all-digit hex
+  # string would otherwise be read as a number.
+  - type: wait_tx
+    txid: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    state: missing
+    timeout_secs: 60
+
   - type: sleep
     secs: 1
 
+  # `pause: false` records a durable milestone and continues immediately.
+  - type: checkpoint
+    name: all_features_started
+    pause: false
+
+  # The default checkpoint pauses. Release it with:
+  #   simchainctl scenario release <job> all_features_ready
   - type: checkpoint
     name: all_features_ready
     timeout_secs: 600
 
+  # Zero outputs sends sequential single-output transactions.
   - type: spam_burst
     node: node2
     txs: 1
     outputs_per_tx: 0
 
+  # A positive value sends that many 546-sat burn outputs per transaction.
+  - type: spam_burst
+    node: node3
+    txs: 2
+    outputs_per_tx: 5
+
+  # Two destinations, showing both amount formats: integer satoshis with a
+  # `sat` suffix, and decimal BTC. The bare decimal must be quoted, or YAML
+  # hands the parser a float and the file is rejected.
   - type: faucet
     source: auto
     wait_confirmed: true
@@ -87,6 +144,8 @@ steps:
     outputs:
       - address_env: SCENARIO_ALL_FEATURES_ADDRESS
         amount: 10000sat
+      - address_env: SCENARIO_ALL_FEATURES_ADDRESS
+        amount: "0.0001"
 
   - type: pause_mining
 
@@ -104,18 +163,29 @@ steps:
   - type: reorg
     depth: 1
     empty: false
-    node: node3
+    node: node2
     adds_new_txs: 1
     double_spend_pct: 1
 
+  # `heal_delay_secs` holds the completed competing branches apart, which is
+  # where an application can observe the split before the winner is settled.
   - type: partition
     node: node3
     main_blocks: 3
     isolated_blocks: 5
+    heal_delay_secs: 2
 
   - type: degrade
     node: node2
     delay_ms: 50
+    seconds: 2
+
+  # Packet loss instead of latency. `delay_ms` is structurally required even
+  # when the impairment is pure loss, so it is written explicitly as 0.
+  - type: degrade
+    node: node1
+    delay_ms: 0
+    loss_pct: 1
     seconds: 2
 
   - type: degrade

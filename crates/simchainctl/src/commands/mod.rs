@@ -456,6 +456,8 @@ pub enum ScenarioCommand {
     Start(ScenarioStartArgs),
     /// Upload a scenario and wait for its terminal result.
     Run(ScenarioRunArgs),
+    /// Print the scenario language reference, also served at /api/v1/scenario/schema.
+    Schema(ScenarioSchemaArgs),
     /// Wait until one named checkpoint is durably reached.
     Wait(ScenarioWaitArgs),
     /// Release a reached pausing checkpoint using its current generation.
@@ -511,6 +513,19 @@ pub struct ScenarioRunArgs {
     /// Optional retry key; identical retries return the original job.
     #[arg(long)]
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ScenarioSchemaArgs {
+    /// Describe only this step type instead of the whole language.
+    #[arg(long)]
+    pub step: Option<String>,
+    /// Emit the stable machine-readable schema as JSON.
+    #[arg(long, conflicts_with = "markdown")]
+    pub json: bool,
+    /// Emit the generated reference block committed to docs/SCENARIOS.md.
+    #[arg(long, conflicts_with = "json")]
+    pub markdown: bool,
 }
 
 #[derive(Debug, Args)]

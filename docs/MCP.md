@@ -90,6 +90,7 @@ Common tools:
 get_status
 get_config
 get_config_schema
+get_scenario_schema
 set_config
 set_mining_state
 set_spam_state
@@ -106,6 +107,12 @@ list_jobs
 abort_job
 release_checkpoint
 ```
+
+`get_scenario_schema` returns the complete declarative scenario language: every step type
+with its fields, value types, requirement rules, defaults, constraints, and the smallest
+Compose profile that can run it. Call it before authoring a scenario for `start_scenario`
+rather than guessing field names; it is generated from the same catalog the server
+validates against, so it cannot describe a step the engine would reject.
 
 `rewind_chain` is a rollback-only administrative action. When an electrs-based profile
 is active, inspect the completed job's structured warning: the disposable explorer

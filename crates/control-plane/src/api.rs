@@ -4,9 +4,9 @@
 use crate::apply::{apply, ApplyRequest};
 use crate::service::{
     abort_job, config, faucet_status, faucet_transfer, get_checkpoint, get_job, job_events,
-    list_jobs, release_checkpoint, schema, set_mining_state, set_spam_state, start_degrade,
-    start_faucet, start_mine, start_partition, start_reorg, start_rewind, start_scenario,
-    start_spam_burst, start_spam_prepare, status, ErrorCode, ServiceError,
+    list_jobs, release_checkpoint, scenario_schema, schema, set_mining_state, set_spam_state,
+    start_degrade, start_faucet, start_mine, start_partition, start_reorg, start_rewind,
+    start_scenario, start_spam_burst, start_spam_prepare, status, ErrorCode, ServiceError,
 };
 use crate::state::SharedState;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -48,6 +48,7 @@ pub fn router(app: SharedState) -> Router {
             get(config_handler).patch(config_patch_handler),
         )
         .route("/api/v1/config/schema", get(schema_handler))
+        .route("/api/v1/scenario/schema", get(scenario_schema_handler))
         .route("/api/v1/dashboard", get(dashboard_handler))
         .route("/api/v1/mining/state", put(mining_state_handler))
         .route("/api/v1/spam/state", put(spam_state_handler))
@@ -399,6 +400,10 @@ fn dashboard_snapshot(
 
 async fn schema_handler() -> Response {
     Json(schema()).into_response()
+}
+
+async fn scenario_schema_handler() -> Response {
+    Json(scenario_schema()).into_response()
 }
 
 async fn config_patch_handler(State(app): State<SharedState>, request: Request) -> Response {
@@ -1198,6 +1203,38 @@ mod tests {
             .as_array()
             .expect("boot settings")
             .is_empty());
+
+        let (status, body) = send(&fx.router, get("/api/v1/scenario/schema")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["version"], 1);
+        assert_eq!(
+            body["bootstrap_height"],
+            simchain_scenario_engine::CATALOG_BOOTSTRAP_HEIGHT
+        );
+        assert_eq!(
+            body["steps"].as_array().expect("steps").len(),
+            simchain_scenario_engine::STEP_CATALOG.len()
+        );
+        // The served document must describe the language, not merely list it:
+        // a step with fields carries their names, and nested objects resolve.
+        let burst = body["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .find(|step| step["kind"] == "spam_burst")
+            .expect("spam_burst step");
+        let fields: Vec<&str> = burst["fields"]
+            .as_array()
+            .expect("fields")
+            .iter()
+            .map(|field| field["name"].as_str().expect("field name"))
+            .collect();
+        assert_eq!(fields, vec!["node", "txs", "outputs_per_tx"]);
+        assert!(body["objects"]
+            .as_array()
+            .expect("objects")
+            .iter()
+            .any(|object| object["name"] == "wait_condition"));
 
         let (status, body) = send(&fx.router, get("/health/live")).await;
         assert_eq!(status, StatusCode::OK);
@@ -2031,6 +2068,7 @@ steps:
                 "get_faucet_status",
                 "get_faucet_transfer",
                 "get_job",
+                "get_scenario_schema",
                 "get_status",
                 "list_jobs",
                 "release_checkpoint",

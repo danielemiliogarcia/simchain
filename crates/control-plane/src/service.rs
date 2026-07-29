@@ -11,8 +11,8 @@ use simchain_common::control_api::{
     DegradeJobRequest, EffectiveComponentConfig, FaucetJobRequest, FaucetStatusResponse,
     FaucetTransfer, JobCheckpointResponse, JobCreatedResponse, JobDetail, JobEventsResponse,
     JobListResponse, MineJobRequest, OperationSummary, PartitionJobRequest,
-    ReleaseCheckpointRequest, ReorgJobRequest, RewindJobRequest, SchemaResponse, SettingSchema,
-    SpamBurstJobRequest,
+    ReleaseCheckpointRequest, ReorgJobRequest, RewindJobRequest, ScenarioSchemaResponse,
+    SchemaResponse, SettingSchema, SpamBurstJobRequest,
 };
 pub use simchain_common::control_api::{
     ApiError as ServiceError, ErrorCode, ErrorDetail, RollbackReport,
@@ -88,6 +88,12 @@ pub fn schema() -> SchemaResponse {
             },
         ],
     }
+}
+
+/// The declarative scenario language, described from the engine's own catalog
+/// so the served contract cannot drift from what `Scenario::validate` accepts.
+pub fn scenario_schema() -> ScenarioSchemaResponse {
+    simchain_scenario_engine::schema_response()
 }
 
 /// The `-fallbackfee` the nodes booted with: docker-compose interpolates the

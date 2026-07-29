@@ -300,6 +300,14 @@ fn run(cli: Cli) -> Result<(), ClientError> {
                 let scenario = load_scenario(&args.file)?;
                 print_scenario_explain(&scenario, args.json)?;
             }
+            ScenarioCommand::Schema(args) => {
+                if args.markdown {
+                    let mut out = std::io::stdout().lock();
+                    writeln!(out, "{}", simchain_scenario_engine::reference_markdown())?;
+                } else {
+                    print_scenario_schema(args.step.as_deref(), args.json)?;
+                }
+            }
             ScenarioCommand::Start(args) => {
                 let yaml = read_scenario(&args.file)?;
                 let response = client.start_scenario(yaml, args.idempotency_key.as_deref())?;
@@ -525,6 +533,102 @@ fn print_scenario_validation(scenario: &Scenario, json: bool) -> Result<(), Clie
         scenario.version,
         scenario.steps.len()
     )?;
+    Ok(())
+}
+
+/// Renders the language reference from the engine catalog. Local like
+/// `validate` and `explain`, so it works with no stack running; the control
+/// plane serves the identical document at `/api/v1/scenario/schema`.
+fn print_scenario_schema(step: Option<&str>, json: bool) -> Result<(), ClientError> {
+    let mut schema = simchain_scenario_engine::schema_response();
+    if let Some(kind) = step {
+        schema.steps.retain(|spec| spec.kind == kind);
+        if schema.steps.is_empty() {
+            let known = simchain_scenario_engine::STEP_CATALOG
+                .iter()
+                .map(|spec| spec.kind)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ClientError::Local(format!(
+                "unknown step type '{kind}'; known types are {known}"
+            )));
+        }
+    }
+    if json {
+        let mut out = std::io::stdout().lock();
+        serde_json::to_writer_pretty(&mut out, &schema)
+            .map_err(|error| ClientError::Output(error.to_string()))?;
+        writeln!(out)?;
+        return Ok(());
+    }
+    let mut out = std::io::stdout().lock();
+    if step.is_none() {
+        writeln!(
+            out,
+            "scenario language version {} (bootstrap height {})",
+            schema.version, schema.bootstrap_height
+        )?;
+        writeln!(out)?;
+    }
+    for spec in &schema.steps {
+        writeln!(out, "{}", spec.kind)?;
+        writeln!(out, "  {}", spec.summary)?;
+        if spec.requires != "control-plane" {
+            writeln!(
+                out,
+                "  requires: {} (profile {})",
+                spec.requires, spec.minimum_profile
+            )?;
+        }
+        if spec.fields.is_empty() {
+            writeln!(out, "  fields: none")?;
+        }
+        for field in &spec.fields {
+            let mut kind = field.value_type.clone();
+            if let Some(options) = &field.options {
+                kind = options.join(" | ");
+            }
+            let requirement = match (field.requirement.as_str(), &field.requirement_group) {
+                ("required", _) => "required".to_string(),
+                ("optional", _) => "optional".to_string(),
+                (rule, Some(group)) => format!("{rule} ({group})"),
+                (rule, None) => rule.to_string(),
+            };
+            let default = field
+                .default
+                .as_deref()
+                .map(|value| format!(", default {value}"))
+                .unwrap_or_default();
+            writeln!(out, "    {}: {kind} [{requirement}{default}]", field.name)?;
+            writeln!(out, "      {}", field.help)?;
+            if let Some(object) = &field.object {
+                writeln!(out, "      see object: {object}")?;
+            }
+        }
+        for note in &spec.notes {
+            writeln!(out, "  note: {note}")?;
+        }
+        writeln!(out)?;
+    }
+    if step.is_some() {
+        return Ok(());
+    }
+    for object in &schema.objects {
+        writeln!(out, "object {}", object.name)?;
+        writeln!(out, "  {}", object.summary)?;
+        for field in &object.fields {
+            writeln!(out, "    {}: {}", field.name, field.help)?;
+        }
+        for variant in &object.variants {
+            let tag = object.tag.as_deref().unwrap_or("kind");
+            writeln!(out, "    {tag}: {}", variant.tag_value)?;
+            writeln!(out, "      {}", variant.summary)?;
+            for field in &variant.fields {
+                writeln!(out, "        {}: {}", field.name, field.help)?;
+            }
+        }
+        writeln!(out)?;
+    }
     Ok(())
 }
 
