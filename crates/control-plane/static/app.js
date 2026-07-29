@@ -1,6 +1,6 @@
 /* Schema-driven control plane: the form comes from /api/v1/config/schema and
- * is populated from /api/v1/config; nothing here hard-codes individual settings
- * beyond the UI-only ignore rules below. */
+ * is populated from /api/v1/config. The dashboard-only SPAM_FEE unit selector
+ * and the relevance rules below are setting-specific presentation adapters. */
 "use strict";
 
 const TOKEN = window.CONTROL_PLANE_TOKEN;
@@ -42,6 +42,11 @@ const DEFAULT_DASHBOARD_IDLE_POLL_MS = 10000;
 const DASHBOARD_IDLE_POLL_OPTIONS = [5000, 10000, 30000, 60000];
 const DASHBOARD_IDLE_POLL_STORAGE_KEY = "simchain-dashboard-idle-poll-ms";
 const MAX_SELECTED_JOB_EVENTS = 1000;
+const FEE_UNIT_BTC_KVB = "btc-kvb";
+const FEE_UNIT_SAT_VB = "sat-vb";
+const SAT_VB_PER_BTC_KVB = 100_000;
+const AMOUNT_UNIT_BTC = "btc";
+const AMOUNT_UNIT_SATS = "sats";
 let dashboardIdlePollMs = loadDashboardIdlePollMs();
 let activeDashboardTab = "overview";
 let openHelpPopover = null;
@@ -52,6 +57,45 @@ const GROUP_TITLES = {
   "spam-basics": "Spam basics",
   "spam-advanced": "Spam advanced",
 };
+
+function formatFeeRate(value) {
+  if (!Number.isFinite(value)) return "";
+  return String(Number(value.toPrecision(15)));
+}
+
+function convertFeeRate(value, fromUnit, toUnit) {
+  if (String(value).trim() === "" || fromUnit === toUnit) return String(value);
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return String(value);
+  const satVb = fromUnit === FEE_UNIT_BTC_KVB
+    ? numeric * SAT_VB_PER_BTC_KVB
+    : numeric;
+  return formatFeeRate(toUnit === FEE_UNIT_BTC_KVB
+    ? satVb / SAT_VB_PER_BTC_KVB
+    : satVb);
+}
+
+function feeUnitLabel(unit) {
+  return unit === FEE_UNIT_BTC_KVB ? "BTC/kvB" : "sat/vB";
+}
+
+function buildFeeUnitSelect(id, selectedUnit, ariaLabel) {
+  const select = document.createElement("select");
+  select.id = id;
+  select.className = "fee-unit-select";
+  select.setAttribute("aria-label", ariaLabel);
+  for (const [value, label] of [
+    [FEE_UNIT_BTC_KVB, "BTC/kvB"],
+    [FEE_UNIT_SAT_VB, "sat/vB"],
+  ]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    option.selected = value === selectedUnit;
+    select.append(option);
+  }
+  return select;
+}
 
 const REGTEST_TEST_MNEMONIC =
   "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -769,15 +813,36 @@ function buildForm() {
         if (spec.maximum != null) input.max = String(spec.maximum);
         input.placeholder = spec.optional ? "(empty = unset)" : `default: ${spec.default}`;
       }
-      input.addEventListener("input", () => onEdit(spec.key, input.value));
-      input.addEventListener("change", () => onEdit(spec.key, input.value));
+      input.dataset.settingInput = "";
+      let inputControl = input;
+      let feeUnit = null;
+      if (spec.key === "SPAM_FEE") {
+        feeUnit = buildFeeUnitSelect(
+          "spam-fee-unit",
+          FEE_UNIT_BTC_KVB,
+          "SPAM_FEE rate unit",
+        );
+        const wrapper = document.createElement("div");
+        wrapper.className = "fee-input-control";
+        wrapper.append(input, feeUnit);
+        inputControl = wrapper;
+        feeUnit.addEventListener("change", refreshForm);
+      }
+      const edit = () => onEdit(
+        spec.key,
+        feeUnit
+          ? convertFeeRate(input.value, feeUnit.value, FEE_UNIT_BTC_KVB)
+          : input.value,
+      );
+      input.addEventListener("input", edit);
+      input.addEventListener("change", edit);
 
       const running = document.createElement("div");
       running.className = "running";
       const validation = document.createElement("div");
       validation.className = "field-error";
 
-      field.append(label, input, running, validation);
+      field.append(label, inputControl, running, validation);
       if (spec.warning) {
         const warn = document.createElement("div");
         warn.className = "fieldwarn";
@@ -838,10 +903,25 @@ function refreshForm() {
   for (const spec of schema.settings) {
     const field = document.querySelector(`.field[data-key="${spec.key}"]`);
     if (!field) continue;
-    const input = field.querySelector("input, select");
+    const input = field.querySelector("[data-setting-input]");
+    const feeUnit = spec.key === "SPAM_FEE" ? $("#spam-fee-unit") : null;
     const isDirty = dirty.has(spec.key);
     if (document.activeElement !== input) {
-      input.value = isDirty ? dirty.get(spec.key) : (lastState.desired[spec.key] ?? "");
+      const nativeValue = isDirty ? dirty.get(spec.key) : (lastState.desired[spec.key] ?? "");
+      input.value = feeUnit
+        ? convertFeeRate(nativeValue, FEE_UNIT_BTC_KVB, feeUnit.value)
+        : nativeValue;
+    }
+    if (feeUnit) {
+      if (spec.minimum != null) {
+        input.min = convertFeeRate(spec.minimum, FEE_UNIT_BTC_KVB, feeUnit.value);
+      }
+      if (spec.maximum != null) {
+        input.max = convertFeeRate(spec.maximum, FEE_UNIT_BTC_KVB, feeUnit.value);
+      }
+      input.placeholder = spec.optional
+        ? "(empty = unset)"
+        : `default: ${convertFeeRate(spec.default, FEE_UNIT_BTC_KVB, feeUnit.value)}`;
     }
     field.classList.toggle("dirty", isDirty);
 
@@ -870,7 +950,12 @@ function refreshForm() {
         : "effective: –";
       runningEl.className = "running" + (componentUnavailable ? " unavailable" : "");
     } else {
-      runningEl.textContent = "effective: " + (effective === "" ? "(unset)" : effective);
+      const displayedEffective = feeUnit && effective !== ""
+        ? convertFeeRate(effective, FEE_UNIT_BTC_KVB, feeUnit.value)
+        : effective;
+      const effectiveUnit = feeUnit && effective !== "" ? ` ${feeUnitLabel(feeUnit.value)}` : "";
+      runningEl.textContent = "effective: " +
+        (displayedEffective === "" ? "(unset)" : displayedEffective + effectiveUnit);
       const differs = (lastState.desired[spec.key] ?? "") !== effective;
       runningEl.className = "running" + (differs ? " differs" : "");
     }
@@ -1314,6 +1399,40 @@ function parseBtcSats(value) {
   return Number(sats);
 }
 
+function parseSats(value) {
+  const text = String(value).trim();
+  if (!/^[1-9][0-9]*$/.test(text)) {
+    throw new Error("enter a positive whole-satoshi amount");
+  }
+  const sats = BigInt(text);
+  if (sats > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("amount is outside the supported range");
+  }
+  return Number(sats);
+}
+
+function parseFaucetAmount(value, unit) {
+  return unit === AMOUNT_UNIT_SATS ? parseSats(value) : parseBtcSats(value);
+}
+
+function formatFaucetAmount(amountSats, unit) {
+  return unit === AMOUNT_UNIT_SATS ? String(amountSats) : satsToBtc(amountSats);
+}
+
+function buildFaucetAmountUnitSelect() {
+  const select = document.createElement("select");
+  select.className = "faucet-amount-unit";
+  select.setAttribute("aria-label", "Faucet destination amount unit");
+  for (const [value, label] of [[AMOUNT_UNIT_BTC, "BTC"], [AMOUNT_UNIT_SATS, "satoshis"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.append(option);
+  }
+  select.dataset.previousUnit = AMOUNT_UNIT_BTC;
+  return select;
+}
+
 function validRegtestAddress(value) {
   const address = value.trim();
   return /^(bcrt1[ac-hj-np-z02-9]{8,}|[mn2][1-9A-HJ-NP-Za-km-z]{20,})$/.test(address);
@@ -1338,15 +1457,36 @@ function addFaucetOutput(address = "", amount = "1") {
   addressLabel.append(addressInput);
 
   const amountLabel = document.createElement("label");
-  amountLabel.textContent = "Amount (BTC)";
-  attachHelpButton(amountLabel, "BTC amount for this destination. Example: 0.5 sends 0.5 BTC; values may use up to 8 decimal places.");
+  amountLabel.textContent = "Amount";
+  attachHelpButton(amountLabel, "Amount for this destination. Choose BTC or whole satoshis; the dashboard converts either unit to the API's amount_sats value.");
   const amountInput = document.createElement("input");
   amountInput.type = "text";
   amountInput.inputMode = "decimal";
   amountInput.placeholder = "1.00000000";
   amountInput.value = amount;
   amountInput.required = true;
-  amountLabel.append(amountInput);
+  const amountUnit = buildFaucetAmountUnitSelect();
+  const amountControl = document.createElement("span");
+  amountControl.className = "faucet-amount-control";
+  amountControl.append(amountInput, amountUnit);
+  amountLabel.append(amountControl);
+  amountUnit.addEventListener("change", () => {
+    const previousUnit = amountUnit.dataset.previousUnit || AMOUNT_UNIT_BTC;
+    if (amountInput.value.trim() !== "") {
+      try {
+        const amountSats = parseFaucetAmount(amountInput.value, previousUnit);
+        amountInput.value = formatFaucetAmount(amountSats, amountUnit.value);
+      } catch (_) {
+        // Keep an incomplete value editable under the newly selected unit;
+        // normal form validation will explain its requirements on review.
+      }
+    }
+    amountUnit.dataset.previousUnit = amountUnit.value;
+    amountInput.inputMode = amountUnit.value === AMOUNT_UNIT_SATS ? "numeric" : "decimal";
+    amountInput.placeholder = amountUnit.value === AMOUNT_UNIT_SATS ? "100000000" : "1.00000000";
+    amountInput.setCustomValidity("");
+    renderFaucetControls();
+  });
 
   const remove = document.createElement("button");
   remove.type = "button";
@@ -1405,7 +1545,8 @@ function collectFaucetRequest() {
     seen.add(address);
     let amountSats;
     try {
-      amountSats = parseBtcSats(amountInput.value);
+      const amountUnit = row.querySelector(".faucet-amount-unit").value;
+      amountSats = parseFaucetAmount(amountInput.value, amountUnit);
       amountInput.setCustomValidity("");
     } catch (error) {
       amountInput.setCustomValidity(error.message);
