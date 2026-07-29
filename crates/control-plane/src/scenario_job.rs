@@ -29,6 +29,7 @@ const MAX_MANUAL_PREPARATION_BLOCKS: u64 = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpamBurstTarget {
     pub node: MinerNode,
+    pub txs: u64,
     pub outputs_per_tx: u64,
 }
 
@@ -328,11 +329,14 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
         control: &dyn ScenarioControl,
     ) -> Result<Value> {
         let policy = self.burst_policy()?;
-        let branches = policy.fanout_utxos.max(1);
         let deadline = Instant::now() + self.timeout;
         let mut prepared = Vec::new();
         self.ensure_mining_can_confirm_burst_funding()?;
         for target in targets {
+            // Size preparation by the same rule the burst step enforces, so a
+            // scenario never funds fewer branches than its own bursts require.
+            // The background fanout stays a floor, never a cap.
+            let branches = burst_required_branches(target.txs).max(policy.fanout_utxos.max(1));
             self.with_burst_engine(target.node, policy.fee_rate_sat_vb(), |engine| {
                 engine.set_burst_shape(policy.fee_rate_sat_vb(), target.outputs_per_tx);
                 wait_for_burst_branches(
@@ -351,12 +355,13 @@ impl ScenarioActionBackend for RpcScenarioActionBackend {
             })?;
             prepared.push(json!({
                 "node": target.node.to_string(),
-                "outputs_per_transaction": target.outputs_per_tx
+                "transactions": target.txs,
+                "outputs_per_transaction": target.outputs_per_tx,
+                "branches": branches
             }));
         }
         Ok(json!({
             "prepared": prepared,
-            "branches": branches,
             "timeout_secs": self.timeout.as_secs()
         }))
     }
