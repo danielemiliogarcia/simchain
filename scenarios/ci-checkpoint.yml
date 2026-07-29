@@ -1,7 +1,7 @@
 version: 1
 steps:
   - type: wait_height
-    height: 204
+    height: 220
 
   - type: pause_mining
 

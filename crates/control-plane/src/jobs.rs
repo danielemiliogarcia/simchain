@@ -6435,12 +6435,14 @@ fn spam_burst_targets(scenario: &Scenario) -> Vec<IndexedSpamBurstTarget> {
         .filter_map(|(zero_index, step)| match step {
             Step::SpamBurst {
                 node,
+                txs,
                 outputs_per_tx,
                 ..
             } => Some(IndexedSpamBurstTarget {
                 step_index: zero_index + 1,
                 target: SpamBurstTarget {
                     node: *node,
+                    txs: *txs,
                     outputs_per_tx: *outputs_per_tx,
                 },
             }),
@@ -6450,7 +6452,9 @@ fn spam_burst_targets(scenario: &Scenario) -> Vec<IndexedSpamBurstTarget> {
 }
 
 /// Collapse burst steps to one preparation per miner node, keeping the widest
-/// requested burn-output shape because that is the most expensive shape to fund.
+/// requested burn-output shape because that is the most expensive shape to fund,
+/// and the largest requested transaction count because that sets how many
+/// confirmed branches the strictest later burst step will demand.
 fn coalesced_spam_burst_targets(
     targets: impl IntoIterator<Item = SpamBurstTarget>,
 ) -> Vec<SpamBurstTarget> {
@@ -6460,6 +6464,7 @@ fn coalesced_spam_burst_targets(
             .entry(target.node.short_name())
             .and_modify(|existing| {
                 existing.outputs_per_tx = existing.outputs_per_tx.max(target.outputs_per_tx);
+                existing.txs = existing.txs.max(target.txs);
             })
             .or_insert(target);
     }
@@ -7958,10 +7963,12 @@ steps:
             vec![
                 SpamBurstTarget {
                     node: MinerNode::Node2,
+                    txs: 2,
                     outputs_per_tx: 25,
                 },
                 SpamBurstTarget {
                     node: MinerNode::Node3,
+                    txs: 1,
                     outputs_per_tx: 30,
                 },
             ]
@@ -7971,10 +7978,12 @@ steps:
             vec![
                 SpamBurstTarget {
                     node: MinerNode::Node2,
+                    txs: 2,
                     outputs_per_tx: 25,
                 },
                 SpamBurstTarget {
                     node: MinerNode::Node3,
+                    txs: 1,
                     outputs_per_tx: 7,
                 },
             ]
@@ -8014,10 +8023,12 @@ steps:
             vec![
                 SpamBurstTarget {
                     node: MinerNode::Node2,
+                    txs: 1,
                     outputs_per_tx: 25,
                 },
                 SpamBurstTarget {
                     node: MinerNode::Node3,
+                    txs: 1,
                     outputs_per_tx: 7,
                 },
             ]
