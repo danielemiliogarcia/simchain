@@ -1,0 +1,34 @@
+# Code owners for BTC Simchain.
+#
+# Every pull request gets @danielemiliogarcia as a reviewer by default. The
+# later, more specific rules exist to make the sensitive areas explicit: the
+# control-plane trust boundary, the privileged network agent, the CI boundary
+# checks, and the security policy itself. A match further down this file wins,
+# so those paths are listed last on purpose.
+
+*                               @danielemiliogarcia
+
+# Single public backend — HTTP, MCP, CLI, and dashboard adapters over one
+# domain service layer. Must never gain Docker socket, Docker CLI, repo bind
+# mount, or process-lifecycle executor.
+/crates/control-plane/          @danielemiliogarcia
+
+# Private, namespace-local owner of tc/nft P2P impairments. Lease/TTL bounded
+# and unreachable from host ports or public networks.
+/crates/network-agent/          @danielemiliogarcia
+
+# Shared helper crate: changes here ripple through every tool.
+/crates/simchain-common/        @danielemiliogarcia
+
+# Compose topology and image builds define the trust boundary.
+/docker-compose.yml             @danielemiliogarcia
+/docker/                        @danielemiliogarcia
+
+# Boundary assertions enforced by CI.
+/scripts/check-compose-security.sh  @danielemiliogarcia
+/scripts/check-docker-images.sh     @danielemiliogarcia
+
+# CI and repository policy.
+/.github/                       @danielemiliogarcia
+/CONTRIBUTING.md                @danielemiliogarcia
+/LICENSE                        @danielemiliogarcia

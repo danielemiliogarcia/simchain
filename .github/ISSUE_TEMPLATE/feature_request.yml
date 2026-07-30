@@ -1,0 +1,57 @@
+name: Feature request
+description: Propose a new capability or a broad behavioral change
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please open this before implementing, so the use case and its effect on
+        mainnet fidelity can be agreed first. Check
+        [docs/NICE-TO-HAVE.md](https://github.com/danielemiliogarcia/simchain/blob/master/docs/NICE-TO-HAVE.md) — the idea may
+        already be scoped there.
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Application-testing use case
+      description: >
+        What are you trying to test in your application that you cannot test today?
+        Describe the use case before the mechanism.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed mechanism
+      description: How you think it should work, and which component it belongs in.
+    validations:
+      required: true
+
+  - type: textarea
+    id: fidelity
+    attributes:
+      label: Effect on mainnet fidelity
+      description: >
+        The tools imitate mainnet **behavior**. Does this add relay, mempool, or
+        capacity policy that diverges from Bitcoin Core's mainnet defaults? If so,
+        justify it.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: >
+            I have read [Scope and non-goals](https://github.com/danielemiliogarcia/simchain/blob/master/README.md#scope-and-non-goals)
+            and this does not turn Simchain into a consensus, miner, or
+            network-decentralization testbed.
+          required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing settings, scripts, or scenarios you tried first.
