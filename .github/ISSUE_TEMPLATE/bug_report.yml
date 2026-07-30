@@ -5,8 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Please reproduce against current `master` first. For a security issue, do
-        **not** file here — follow [SECURITY.md](https://github.com/danielemiliogarcia/simchain/blob/master/SECURITY.md).
+        Please reproduce against current `master` first.
 
   - type: textarea
     id: what-happened
@@ -68,5 +67,5 @@ body:
       label: Non-default settings
       description: >
         Any `.env` overrides or runtime settings that differ from the defaults in
-        `.env.example`. Redact tokens.
+        `.env.example`.
       render: shell

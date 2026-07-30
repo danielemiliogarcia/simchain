@@ -506,7 +506,7 @@ exclude = ["path/to/simchain"]
 All known limitations, future enhancements and proposed features live in
 [NICE-TO-HAVE.md](./docs/NICE-TO-HAVE.md).
 
-## Security
+## Security Issues
 ### Security Policy
 
 BTC Simchain is a disposable **regtest** simulation stack for developers. It never

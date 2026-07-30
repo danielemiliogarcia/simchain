@@ -16,7 +16,6 @@ This document is the contributor-facing entry point. Deeper repository conventio
 - [Commit and pull request conventions](#commit-and-pull-request-conventions)
 - [Reporting bugs](#reporting-bugs)
 - [Proposing features](#proposing-features)
-- [Security issues](#security-issues)
 - [License of contributions](#license-of-contributions)
 
 ## Before you start
