@@ -506,10 +506,18 @@ exclude = ["path/to/simchain"]
 All known limitations, future enhancements and proposed features live in
 [NICE-TO-HAVE.md](./docs/NICE-TO-HAVE.md).
 
+## Security Issues
+### Security Policy
+
+BTC Simchain is a disposable **regtest** simulation stack for developers. It never
+touches mainnet funds and holds no real value.
+
 ## Contributing
 
-Bug reports, documentation, tests, reviews, and code contributions are welcome. For
-a new feature or broad behavioral change, please
+Bug reports, documentation, tests, reviews, and code contributions are welcome.
+**[CONTRIBUTING.md](./CONTRIBUTING.md) is the full guide**; the essentials:
+
+For a new feature or broad behavioral change, please
 [open an issue](https://github.com/danielemiliogarcia/simchain/issues) first so the
 use case and its effect on mainnet fidelity can be agreed before implementation.
 Small, self-contained fixes can go directly to a pull request.

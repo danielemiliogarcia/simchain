@@ -1,0 +1,71 @@
+name: Bug report
+description: Something in the simnet, control plane, or tooling misbehaves
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please reproduce against current `master` first.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Exact commands, Compose profile, and scenario file if any. Include the chain
+        height or state at the time if it matters.
+      placeholder: |
+        1. docker compose --profile all-tools up -d
+        2. ./scripts/simulate-reorg.sh 3
+        3. ...
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: >
+        `docker compose logs <service>` output, trimmed to the relevant part.
+      render: text
+
+  - type: input
+    id: component
+    attributes:
+      label: Component
+      description: >
+        control-plane, mining-controller, network-agent, reorg, spammer,
+        scenario-engine, simchainctl, a script, Compose/images, or docs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Host OS, Docker version, Compose version, Rust version if building locally.
+      placeholder: |
+        OS: Ubuntu 24.04
+        docker: 27.x
+        docker compose: v2.x
+        rustc: 1.8x
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Non-default settings
+      description: >
+        Any `.env` overrides or runtime settings that differ from the defaults in
+        `.env.example`.
+      render: shell
