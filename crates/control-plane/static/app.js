@@ -5,12 +5,15 @@
 
 const TOKEN = window.CONTROL_PLANE_TOKEN;
 const $ = (sel) => document.querySelector(sel);
+const FEE_UNITS = window.SimchainFeeUnits;
 
 let schema = null;          // {settings: [{key, default, group, scope, control, options, optional, help, warning}], boot_settings: [{key, value, group, help}]}
 let explorerWasDetected = false;
 let lastState = null;       // last /api/v1/config payload
 let dirty = new Map();      // key -> edited value (string)
 let fieldErrors = new Map(); // key -> latest client/server validation message
+let liveSpamFeeUnit = FEE_UNITS.BTC_KVB;
+let burstFeeCanonicalSatVb = "10";
 let applying = false;
 let latestStatus = null;
 let latestJobs = null;
@@ -769,15 +772,49 @@ function buildForm() {
         if (spec.maximum != null) input.max = String(spec.maximum);
         input.placeholder = spec.optional ? "(empty = unset)" : `default: ${spec.default}`;
       }
-      input.addEventListener("input", () => onEdit(spec.key, input.value));
-      input.addEventListener("change", () => onEdit(spec.key, input.value));
+      if (spec.key === "SPAM_FEE") {
+        input.id = "spam-fee-rate";
+        label.htmlFor = input.id;
+        const inputRow = document.createElement("div");
+        inputRow.className = "fee-input-row";
+        const unitLabel = document.createElement("label");
+        unitLabel.className = "visually-hidden";
+        unitLabel.htmlFor = "spam-fee-unit";
+        unitLabel.textContent = "SPAM_FEE unit";
+        const unit = document.createElement("select");
+        unit.id = "spam-fee-unit";
+        unit.setAttribute("aria-label", "SPAM_FEE unit");
+        for (const [value, text] of [[FEE_UNITS.BTC_KVB, "BTC/kvB"], [FEE_UNITS.SAT_VB, "sat/vB"]]) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = text;
+          unit.append(option);
+        }
+        input.addEventListener("input", () => onSpamFeeEdit(input));
+        input.addEventListener("change", () => onSpamFeeEdit(input));
+        unit.addEventListener("change", () => {
+          const switched = FEE_UNITS.switchLiveUnit(spamFeeState(), unit.value);
+          if (!switched.ok) {
+            unit.value = liveSpamFeeUnit;
+            return;
+          }
+          liveSpamFeeUnit = unit.value;
+          refreshForm();
+        });
+        inputRow.append(input, unitLabel, unit);
+        field.append(label, inputRow);
+      } else {
+        input.addEventListener("input", () => onEdit(spec.key, input.value));
+        input.addEventListener("change", () => onEdit(spec.key, input.value));
+        field.append(label, input);
+      }
 
       const running = document.createElement("div");
       running.className = "running";
       const validation = document.createElement("div");
       validation.className = "field-error";
 
-      field.append(label, input, running, validation);
+      field.append(running, validation);
       if (spec.warning) {
         const warn = document.createElement("div");
         warn.className = "fieldwarn";
@@ -831,6 +868,30 @@ function onEdit(key, value) {
   refreshForm();
 }
 
+function spamFeeState() {
+  return {
+    desired: lastState ? (lastState.desired.SPAM_FEE ?? "") : "",
+    effective: lastState ? (effectiveValueFor({ key: "SPAM_FEE", component: "spam" }) ?? "") : "",
+    dirty: dirty.get("SPAM_FEE") ?? null,
+    unit: liveSpamFeeUnit,
+  };
+}
+
+function onSpamFeeEdit(input) {
+  const result = FEE_UNITS.editLive(spamFeeState(), input.value, liveSpamFeeUnit);
+  if (!result.ok) {
+    input.setCustomValidity(result.error);
+    fieldErrors.set("SPAM_FEE", result.error);
+    refreshForm();
+    return;
+  }
+  input.setCustomValidity("");
+  fieldErrors.delete("SPAM_FEE");
+  if (result.state.dirty == null) dirty.delete("SPAM_FEE");
+  else dirty.set("SPAM_FEE", result.state.dirty);
+  refreshForm();
+}
+
 function refreshForm() {
   if (!schema || !lastState) return;
   const values = desiredValues();
@@ -839,9 +900,16 @@ function refreshForm() {
     const field = document.querySelector(`.field[data-key="${spec.key}"]`);
     if (!field) continue;
     const input = field.querySelector("input, select");
+    const feeUnit = spec.key === "SPAM_FEE" ? field.querySelector("#spam-fee-unit") : null;
     const isDirty = dirty.has(spec.key);
     if (document.activeElement !== input) {
-      input.value = isDirty ? dirty.get(spec.key) : (lastState.desired[spec.key] ?? "");
+      const canonical = isDirty ? dirty.get(spec.key) : (lastState.desired[spec.key] ?? "");
+      if (spec.key === "SPAM_FEE") {
+        const displayed = FEE_UNITS.displayLiveCanonical(canonical, liveSpamFeeUnit);
+        input.value = displayed.ok ? displayed.value : "";
+      } else {
+        input.value = canonical;
+      }
     }
     field.classList.toggle("dirty", isDirty);
 
@@ -855,6 +923,7 @@ function refreshForm() {
     field.title = reason || "";
     input.disabled = componentUnavailable || activeMutationId() != null ||
       dependencyIgnoredReason(spec.key, values) != null;
+    if (feeUnit) feeUnit.disabled = input.disabled;
 
     const validationEl = field.querySelector(".field-error");
     let validation = fieldErrors.get(spec.key) || "";
@@ -870,7 +939,11 @@ function refreshForm() {
         : "effective: –";
       runningEl.className = "running" + (componentUnavailable ? " unavailable" : "");
     } else {
-      runningEl.textContent = "effective: " + (effective === "" ? "(unset)" : effective);
+      const displayedEffective = spec.key === "SPAM_FEE"
+        ? FEE_UNITS.displayLiveCanonical(effective, liveSpamFeeUnit)
+        : { ok: true, value: effective };
+      runningEl.textContent = "effective: " +
+        (effective === "" ? "(unset)" : (displayedEffective.ok ? displayedEffective.value : "invalid"));
       const differs = (lastState.desired[spec.key] ?? "") !== effective;
       runningEl.className = "running" + (differs ? " differs" : "");
     }
@@ -1976,9 +2049,23 @@ async function startBoundedAction(event, action) {
     } else {
       request.outputs_per_tx = Number($("#burst-outputs-per-tx").value);
     }
-    if ($("#burst-fee-enabled").checked) {
-      request.fee_rate_sat_vb = Number($("#burst-fee-rate").value);
+    const prepared = FEE_UNITS.burstRequest(
+      isPrepare ? "spam-prepare" : "spam-burst",
+      request,
+      {
+        enabled: $("#burst-fee-enabled").checked,
+        value: $("#burst-fee-rate").value,
+        unit: $("#burst-fee-unit").value,
+      },
+    );
+    if (!prepared.ok) {
+      $("#burst-fee-rate").setCustomValidity(prepared.error);
+      $("#burst-fee-rate").reportValidity();
+      startingAction[action] = false;
+      renderJobs();
+      return;
     }
+    request = prepared.value.request;
   }
   result.textContent = `Submitting ${isMine ? "mine" : (isPrepare ? "capacity preparation" : "tx burst")} job…`;
   result.className = "action-result";
@@ -2058,6 +2145,30 @@ function renderBurstControls() {
   $("#burst-data-bytes").disabled = !dataShape;
   $("#burst-outputs-per-tx").disabled = dataShape;
   $("#burst-fee-rate").disabled = !$("#burst-fee-enabled").checked;
+  $("#burst-fee-unit").disabled = !$("#burst-fee-enabled").checked;
+  renderJobs();
+}
+
+function editBurstFee() {
+  const input = $("#burst-fee-rate");
+  const converted = FEE_UNITS.convert(input.value, $("#burst-fee-unit").value, FEE_UNITS.SAT_VB);
+  if (!converted.ok) {
+    input.setCustomValidity(converted.error);
+    return;
+  }
+  input.setCustomValidity("");
+  burstFeeCanonicalSatVb = converted.value;
+}
+
+function switchBurstFeeUnit(event) {
+  const input = $("#burst-fee-rate");
+  const displayed = FEE_UNITS.switchBurstUnit(burstFeeCanonicalSatVb, event.target.value);
+  if (!displayed.ok) {
+    event.target.value = FEE_UNITS.SAT_VB;
+    return;
+  }
+  input.value = displayed.value;
+  input.setCustomValidity("");
   renderJobs();
 }
 
@@ -2297,6 +2408,8 @@ async function init() {
   $("#burst-form").addEventListener("input", renderJobs);
   $("#burst-shape").addEventListener("change", renderBurstControls);
   $("#burst-fee-enabled").addEventListener("change", renderBurstControls);
+  $("#burst-fee-rate").addEventListener("input", editBurstFee);
+  $("#burst-fee-unit").addEventListener("change", switchBurstFeeUnit);
   renderBurstControls();
   $("#partition-form").addEventListener("submit", (event) => startNetworkAction(event, "partition"));
   $("#partition-form").addEventListener("input", renderJobs);

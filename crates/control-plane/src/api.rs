@@ -27,6 +27,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
+const FEE_UNITS_JS: &str = include_str!("../static/fee-units.js");
 const APP_JS: &str = include_str!("../static/app.js");
 const STYLES_CSS: &str = include_str!("../static/styles.css");
 
@@ -39,6 +40,7 @@ pub fn router(app: SharedState) -> Router {
 
     Router::new()
         .route("/", get(index))
+        .route("/fee-units.js", get(fee_units_js))
         .route("/app.js", get(app_js))
         .route("/styles.css", get(styles_css))
         .route("/health/live", get(live_handler))
@@ -182,6 +184,13 @@ async fn app_js() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
         APP_JS,
+    )
+}
+
+async fn fee_units_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        FEE_UNITS_JS,
     )
 }
 
@@ -1970,8 +1979,23 @@ steps:
         assert!(html.contains("id=\"burst-prepare\""));
         assert!(html.contains("id=\"burst-fee-enabled\" type=\"checkbox\""));
         assert!(html.contains(
-            "id=\"burst-fee-rate\" type=\"number\" min=\"0.001\" step=\"0.001\" value=\"10\" required disabled"
+            "id=\"burst-fee-rate\" type=\"number\" min=\"0.00000001\" step=\"any\" value=\"10\" required disabled"
         ));
+        assert!(html.contains("id=\"burst-fee-unit\" aria-label=\"Burst fee unit\" disabled"));
+        assert!(html.contains("<script src=\"/fee-units.js\"></script>"));
+        assert!(
+            html.find("<script src=\"/fee-units.js\"></script>")
+                < html.find("<script src=\"/app.js\"></script>")
+        );
+        assert!(html.contains("https://danielemiliogarcia.github.io/simchain/"));
+        assert!(html.contains("https://github.com/danielemiliogarcia/simchain"));
+        assert!(html.contains("GitHub repository ↗"));
+        assert!(html.contains("<svg aria-hidden=\"true\""));
+        assert!(
+            html.matches("target=\"_blank\" rel=\"noopener noreferrer\"")
+                .count()
+                >= 2
+        );
         assert!(html.contains(
             "id=\"partition-heal-delay\" type=\"number\" min=\"0\" max=\"86400\" value=\"15\""
         ));
@@ -1992,7 +2016,27 @@ steps:
         assert!(html.contains("id=\"snapshot-save\""));
         assert!(html.contains("id=\"snapshot-restore\""));
         assert!(html.contains("no Docker socket and no Docker CLI"));
-        assert!(html.contains("danielemiliogarcia.github.io/simchain/"));
+        let response = fx
+            .router
+            .clone()
+            .oneshot(get("/fee-units.js"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        let javascript = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert!(String::from_utf8_lossy(&javascript).contains("SimchainFeeUnits"));
+        assert!(APP_JS.contains("input.id = \"spam-fee-rate\""));
+        assert!(APP_JS.contains("label.htmlFor = input.id"));
+        assert!(APP_JS.contains("unitLabel.htmlFor = \"spam-fee-unit\""));
     }
 
     #[test]

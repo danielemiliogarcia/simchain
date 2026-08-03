@@ -71,6 +71,13 @@ The mining card contains separate **Mine blocks** and **Rewind chain** subpanels
 always targets all three nodes, shows the expected lower height in a confirmation, and
 warns that disconnected transactions can return to node-local mempools.
 
+Fee controls can display either BTC/kvB or sat/vB. The live `SPAM_FEE` editor defaults
+to BTC/kvB and converts back to the API's canonical BTC/kvB string when applied. The
+manual burst override defaults to sat/vB and converts back to the existing
+`fee_rate_sat_vb` request field for both capacity preparation and burst submission.
+Changing either selector affects only browser display state and does not dirty live
+configuration or add an API setting.
+
 Configuration applies never touch node chain state, and mixed mining/spam applies roll
 back transactionally if a worker cannot accept or verify the new generation. Mining
 cadence and weights apply at a scheduler safe point; spam hot changes apply between
