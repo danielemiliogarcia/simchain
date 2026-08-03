@@ -28,10 +28,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # full history: full-snapshot.test.sh (T7) diffs scripts/snapshot.sh
+          # against its merge-base with origin/master, which a shallow clone
+          # would not have.
+          fetch-depth: 0
       - name: Validate no-socket control boundary
         run: ./scripts/check-compose-security.sh
       - name: Build images and inspect control-plane rootfs
         run: ./scripts/check-docker-images.sh
+      - name: full-snapshot.sh contract tests
+        run: ./scripts/tests/full-snapshot.test.sh
 
   build-all:
     runs-on: ubuntu-latest
