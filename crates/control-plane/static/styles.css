@@ -102,6 +102,22 @@ h3 { font-size: 0.85rem; margin: 0.8rem 0 0.35rem; color: var(--dim); }
 main {
   padding: 1rem 1.2rem;
 }
+.dashboard-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55rem;
+  padding: 0.2rem 1.2rem 1.2rem;
+  color: var(--dim);
+  font-size: 0.76rem;
+}
+.dashboard-footer a {
+  color: var(--dim);
+  text-decoration: none;
+}
+.dashboard-footer a:hover { color: var(--accent); }
+.github-link { display: inline-flex; align-items: center; gap: 0.3rem; }
+.github-logo { width: 1rem; height: 1rem; fill: currentColor; }
 .dashboard-tabs {
   display: flex;
   gap: 0.4rem;
@@ -193,7 +209,7 @@ td:first-child, th:first-child { text-align: left; }
   align-items: end;
 }
 .faucet-output-row label, .faucet-source { color: var(--dim); font-size: 0.72rem; }
-.faucet-output-row input, .faucet-source select {
+.faucet-output-row input, .faucet-output-row select, .faucet-source select {
   display: block;
   width: 100%;
   margin-top: 0.15rem;
@@ -203,6 +219,16 @@ td:first-child, th:first-child { text-align: left; }
   border-radius: 4px;
   padding: 0.3rem 0.45rem;
   font: inherit;
+}
+.faucet-amount-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.4rem;
+  width: 100%;
+}
+.faucet-output-row .faucet-amount-control > .faucet-amount-unit {
+  width: auto;
+  min-width: 6.5rem;
 }
 .faucet-source { display: block; margin: 0.65rem 0; max-width: 16rem; }
 .faucet-progress, .faucet-transfer {
@@ -339,6 +365,16 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.72); }
   padding: 0.25rem 0.4rem;
   font: inherit;
 }
+.fee-input-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.4rem;
+  width: 100%;
+}
+.field .fee-input-control > .fee-unit-select {
+  width: auto;
+  min-width: 7rem;
+}
 .mini-action-form input:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -468,6 +504,7 @@ button.small { padding: 0.15rem 0.45rem; font-size: 0.7rem; }
   padding: 0.25rem 0.45rem;
   font: inherit;
 }
+.field .fee-input-control { min-width: 0; }
 .field.dirty input, .field.dirty select { border-color: var(--dirty); }
 .field.invalid input, .field.invalid select { border-color: var(--err); }
 .field.dirty label::after { content: " ●"; color: var(--dirty); }
